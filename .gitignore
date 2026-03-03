@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-wheel-metadata/
+.pytest_cache/
+
+# local secrets
+.env
+**/.env
+
+# runtime data
+/data/events.jsonl
+/data/config.yaml
+/data/policy.yaml
+/data/policy.yaml.bak
+/data/logs/
+/data/artifacts/
+/data/upgrade_pending.json

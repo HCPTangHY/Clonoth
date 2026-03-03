@@ -1,0 +1,103 @@
+# Clonoth policy configuration example
+# Copy to data/policy.yaml to override the defaults.
+#
+# Notes:
+# - This policy is NOT a strong security boundary (no OS sandbox).
+# - It is designed to provide: auditability + human approvals + rollback-friendly guardrails.
+#
+# Decision values:
+# - auto
+# - approval_required
+# - deny
+#
+# Pattern matching for read/write rules uses glob-like string matching on workspace-relative POSIX paths.
+# (e.g. tools/**, data/config.yaml, **/.env)
+
+version: 1
+
+read_file:
+  default: auto
+  rules:
+    - pattern: ".env"
+      decision: deny
+      reason: "do not allow reading dotenv secrets"
+    - pattern: "**/.env"
+      decision: deny
+      reason: "do not allow reading dotenv secrets"
+
+write_file:
+  default: auto
+  rules:
+    - pattern: "tools/**"
+      decision: approval_required
+      reason: "creating/updating tools requires approval"
+    - pattern: "config/runtime.yaml"
+      decision: auto
+      reason: "runtime tuning config (can be tightened by humans in data/policy.yaml)"
+    - pattern: "config/prompts/**"
+      decision: approval_required
+      reason: "prompt changes require approval"
+    - pattern: "data/config.yaml"
+      decision: approval_required
+      reason: "config changes require approval"
+    - pattern: "data/policy.yaml"
+      decision: deny
+      reason: "policy is high-risk (human-only)"
+    - pattern: "data/events.jsonl"
+      decision: deny
+      reason: "event log is append-only; never modify"
+    - pattern: ".env"
+      decision: deny
+      reason: "do not allow writing dotenv secrets"
+    - pattern: "**/.env"
+      decision: deny
+      reason: "do not allow writing dotenv secrets"
+
+execute_command:
+  default: approval_required
+  auto_patterns:
+    - "^git\\s+status"
+    - "^git\\s+diff"
+    - "^git\\s+rev-parse"
+    - "^python\\s+--version$"
+    - "^pip\\s+--version$"
+    - "^python\\s+-m\\s+compileall\\b"
+  deny_patterns:
+    # destructive commands
+    - "\\brm\\s+-rf\\b"
+    - "\\bdel\\s+/s\\b"
+    - "\\brmdir\\s+/s\\b"
+    - "\\bformat\\b"
+    - "\\bshutdown\\b"
+    - "\\breboot\\b"
+    - "Remove-Item\\s+.*-Recurse\\s+.*-Force"
+
+    # env / dotenv (avoid accidental secret exfiltration)
+    - "\\.env"
+    - "^set(\\s|$)"
+    - "^setx(\\s|$)"
+    - "^env(\\s|$)"
+    - "^printenv(\\s|$)"
+    - "Get-ChildItem\\s+Env:"
+    - "\\$env:"
+
+    # raw network / exfil (recommend using dedicated tools instead)
+    - "\\bcurl\\b"
+    - "\\bwget\\b"
+    - "Invoke-WebRequest"
+    - "Start-BitsTransfer"
+    - "\\bnc\\b"
+    - "\\bnetcat\\b"
+    - "\\bscp\\b"
+    - "\\bssh\\b"
+
+    # explicit secret name leakage
+    - "OPENAI_API_KEY"
+    - "ANTHROPIC_API_KEY"
+    - "GEMINI_API_KEY"
+
+restart:
+  default: approval_required
+
+kernel_loop_guard:
+  repeat_tool_call_threshold: 3

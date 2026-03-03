@@ -1,0 +1,95 @@
+# Clonoth runtime tuning config (versioned)
+#
+# - This file is safe to commit. It contains NON-SECRET tuning knobs.
+# - Secrets (API keys) should stay in environment variables and/or data/config.yaml (gitignored).
+
+version: 1
+
+kernel:
+  # Max reasoning/tool loop steps per task.
+  max_steps: 32
+
+  # How many recent chat messages to load as context for a task.
+  history_limit: 80
+
+  # Kernel polling interval when there is no task (used when CLI arg/env is not set).
+  task_poll_interval_sec: 1.0
+
+  # How often the kernel polls approval status.
+  approval_poll_interval_sec: 0.5
+
+  http:
+    # httpx client timeout (seconds)
+    client_timeout_sec: 60.0
+
+  supervisor:
+    # Health API timeout while waiting for supervisor.
+    health_timeout_sec: 2.0
+    # Poll interval while waiting for supervisor.
+    wait_poll_interval_sec: 0.5
+
+  tool_trace:
+    # Max chars of RAW tool result that will be inlined into the model observation.
+    # Full output is always persisted to data/artifacts.
+    max_inline_chars: 8000
+
+    # Max chars of tool arguments shown in progress messages.
+    max_progress_arg_chars: 320
+
+providers:
+  openai:
+    # HTTP timeout for OpenAI-compatible endpoint calls (seconds)
+    timeout_sec: 60.0
+
+meta:
+  execute_command:
+    default_timeout_sec: 90.0
+    max_output_chars: 12000
+
+  git:
+    # Max chars stored for git diff artifact in restart approvals.
+    diff_max_chars: 600000
+
+  search:
+    # Skip searching files larger than this size.
+    max_file_size_bytes: 3000000
+    # Stop after collecting this many matches.
+    max_matches: 100
+
+tools:
+  command:
+    # Default timeout for declarative command tools (when tool does not set TIMEOUT_SEC).
+    default_timeout_sec: 60.0
+
+shell:
+  default_conversation_key: "cli:default"
+
+  orchestrator:
+    # Enable LLM-based routing: reply directly for simple questions, create Kernel tasks only when needed.
+    enabled: true
+    # How many recent session messages to provide to the orchestrator.
+    history_limit: 40
+    # Optional: override chat model for orchestrator only. Empty -> use OpenAI config model.
+    model: ""
+
+  http:
+    client_timeout_sec: 10.0
+
+  supervisor:
+    health_timeout_sec: 2.0
+    wait_poll_interval_sec: 0.5
+
+  # Poll interval for fetching session events.
+  events_poll_interval_sec: 0.5
+
+supervisor:
+  process_manager:
+    stop_wait_timeout_sec: 5.0
+
+    # null -> platform default; env CLONOTH_SHELL_NEW_CONSOLE still overrides
+    shell_new_console: null
+
+  upgrade_watchdog:
+    poll_interval_sec: 0.5
+    timeout_sec: 20.0
+    max_attempts: 2

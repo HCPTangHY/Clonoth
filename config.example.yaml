@@ -1,0 +1,21 @@
+# Clonoth configuration example
+# Copy to data/config.yaml and fill in your settings.
+
+version: 1
+provider: openai
+
+openai:
+  # OpenAI-compatible base URL
+  # - Official: https://api.openai.com/v1
+  # - Local/Proxy: http://localhost:11434/v1
+  # You can keep base_url in env if you consider it sensitive.
+  # If empty, Kernel will fallback to https://api.openai.com/v1
+  base_url: "${OPENAI_BASE_URL}"
+
+  # API key (keep it local; do NOT commit)
+  # Recommended: keep API key in environment variables.
+  api_key: "${OPENAI_API_KEY}"
+
+  # Default model
+  # If empty, Kernel will fallback to gpt-4o-mini
+  model: "${OPENAI_MODEL}"
