@@ -94,9 +94,25 @@ Clonoth 不依赖关系型数据库，所有的对话、任务、工具调用状
 - **L2 需审批**：执行系统命令、修改核心代码、重启系统。请求会推送到终端，需人类确认（可手动干预修改为自动放行）。
 - **L3 硬拒绝**：高危指令阻断。
 
-### 2.3 工具系统 (Tools Hot-reload)
-`tools/` 目录下的工具为“声明式命令工具”。Kernel 进程**不会去 import 或执行**这些未知的 Python 代码，而是通过 AST（抽象语法树）解析出工具的 `SPEC`（输入规范）和 `COMMANDS`。
-这既能实现工具编写后的**即刻热加载**，又能避免恶意代码绕过 Supervisor 的 Policy 拦截。
+### 2.3 工具系统与自进化 (Tools)
+系统中的工具分为两类：**内置元工具（Meta Tools）** 和 **自生成工具（Declarative Tools）**。
+
+1. **核心内置元工具 (Meta Tools)**：
+   由框架手写（位于 `kernel/meta_tools.py`），提供系统的基础能力，受 `data/policy.yaml` 严格管控：
+   - 读取/搜索：`read_file` / `list_dir` / `search_in_files`
+   - 修改系统：`write_file` / `execute_command`
+   - 自进化专有：`create_or_update_tool` / `reload_tools` / `request_restart`
+
+2. **声明式命令工具 (Declarative Tools)**：
+   由 Agent 自身调用 `create_or_update_tool` 自动生成的工具，存放在 `tools/` 目录下。
+   - **安全机制 (Tool v2)**：Kernel **绝不会 import/执行** `tools/` 目录下的 Python 代码。它仅仅通过 **AST（抽象语法树）解析** 提取文件中的 `SPEC` (定义) 和 `COMMANDS` (命令模板)。
+   - **优势**：这既实现了工具编写后的**即刻无缝热加载**，又从根本上杜绝了 Agent 在工具内插入恶意/越权 Python 逻辑绕过 Supervisor 的可能性。
+   - **示例结构**：
+     ```python
+     SPEC = {"name": "my_tool", "description": "...", "input_schema": {...}}
+     COMMANDS = ["npm run build --prefix {path}"]
+     TIMEOUT_SEC = 30.0
+     ```
 
 ### 2.4 Runtime 动态调参
 `config/runtime.yaml` 提供运行时的非敏感参数调整（如 Kernel 轮询间隔、最大执行步数、工具历史截断长度等）。这些参数可由人类修改，也可授权给 Agent 自身进行优化。
@@ -107,7 +123,7 @@ Clonoth 不依赖关系型数据库，所有的对话、任务、工具调用状
 
 Clonoth 将复杂性封装在后端，对外提供了一套稳定的 Gateway API，非常适合接入 Telegram、Discord 或企业微信等外部平台。
 
-### 收发消息
+### 3.1 接收用户输入 (Inbound)
 ```http
 POST /v1/inbound
 ```
@@ -122,7 +138,22 @@ POST /v1/inbound
 ```
 *(提示：若 `use_context` 设为 `false`，则由外部 Bot 平台完全自行管理历史记忆。)*
 
-### 动态修改配置
+### 3.2 轮询系统输出 (Outbound & Approvals)
+外部平台只需通过无状态的长轮询/短轮询拉取针对某 `session_id` 的增量事件即可：
+```http
+GET /v1/sessions/{session_id}/events?after_seq={seq}
+```
+关注两类核心事件：
+- `type == "outbound_message"`：系统的最终回复（提取 `payload.text` 即可发给用户）。
+- `type == "approval_requested"`：高危操作拦截请求（若外接平台支持交互，可向管理员推送此消息，并通过 `POST /v1/approvals/{approval_id}` 提交 `allow/deny`）。
+
+### 3.3 消息处理生命周期（供网关开发者参考）
+1. **网关 (Adapter)** 发送 `/v1/inbound`。
+2. **Shell (Orchestrator)** 接收后，如果是日常闲聊，直接产生 `outbound_message` ；若是复杂任务，则生成一个 `task` 放入队列。
+3. **Kernel** 领取 `task`，进行多步思考与工具调用（过程中可能触发 `approval` 拦截）。执行完毕后写入原始草稿（`task_completed`）。
+4. **Shell (Responder)** 监测到任务完成，会重新收集工具执行日志，总结出一份干净友好的面向用户的答复，最终触发 `outbound_message`。
+
+### 3.4 动态修改配置
 通过 API 直接更新对应 provider 的配置（以 OpenAI 为例）：
 ```bash
 curl -X POST http://127.0.0.1:8765/v1/config/openai \
