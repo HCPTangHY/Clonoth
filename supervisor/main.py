@@ -28,6 +28,11 @@ def main() -> None:
     parser.add_argument("--no-kernel", action="store_true", help="do not spawn kernel worker")
     parser.add_argument("--no-workers", action="store_true", help="do not spawn any workers")
     parser.add_argument("--log-level", default=os.getenv("CLONOTH_LOG_LEVEL", "info"))
+    parser.add_argument(
+        "--access-log",
+        action="store_true",
+        help="enable uvicorn access log (VERY noisy because workers poll endpoints frequently)",
+    )
 
     args = parser.parse_args()
 
@@ -83,13 +88,20 @@ def main() -> None:
     )
     watchdog.start()
 
-    # Disable uvicorn access log (which prints "GET /v1/inbound/next..." spam)
-    import logging
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
     app = create_app(state=state, process_manager=process_manager, config_store=config_store)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    # Access log is extremely noisy because Shell/Kernel poll endpoints frequently.
+    # Disabled by default. Enable via `--access-log` or `CLONOTH_ACCESS_LOG=1` when debugging.
+    env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
+    access_log = bool(args.access_log or env_access_log)
+
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        access_log=access_log,
+    )
 
 
 if __name__ == "__main__":
