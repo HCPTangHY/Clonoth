@@ -4,14 +4,18 @@ import json
 import os
 import pprint
 import re
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from clonoth_runtime import get_float, get_int, load_runtime_config
 
 from .context import KernelContext
+from . import mcp_runtime
 
 
 _SENSITIVE_ENV_KEYS_UPPER = {
@@ -24,6 +28,8 @@ _SENSITIVE_ENV_KEYS_UPPER = {
 
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
 
 # Reserved names: built-in meta tools (cannot be overridden by dynamic tools)
 _RESERVED_TOOL_NAMES = {
@@ -32,10 +38,34 @@ _RESERVED_TOOL_NAMES = {
     "write_file",
     "execute_command",
     "search_in_files",
+    "create_or_update_skill",
+    "list_skills",
+    "delete_skill",
+    "create_or_update_mcp_client",
+    "list_mcp_clients",
+    "delete_mcp_client",
+    "test_mcp_client",
+    "list_mcp_tools",
+    "call_mcp_tool",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "list_mcp_prompts",
+    "get_mcp_prompt",
     "create_or_update_tool",
     "reload_tools",
     "request_restart",
 }
+
+
+def _parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}, text
+    head = text[4:end]
+    body = text[end + 5 :]
+    return (yaml.safe_load(head) or {}), body
 
 
 def _safe_subprocess_env() -> dict[str, str]:
@@ -67,6 +97,70 @@ def _resolve_under_root(root: Path, rel_path: str) -> Path:
     except ValueError:
         raise ValueError("path escapes workspace root")
     return p
+
+
+def _load_extra_roots_from_policy(workspace_root: Path) -> list[Path]:
+    """Load extra_roots allowlist from data/policy.yaml.
+
+    This is a *defense-in-depth* check. The real enforcement happens in Supervisor policy
+    evaluation, but Kernel should not read/write arbitrary paths even after approval.
+    """
+
+    p = workspace_root / "data" / "policy.yaml"
+    try:
+        if not p.exists():
+            return []
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return []
+        raw = data.get("extra_roots")
+        if not isinstance(raw, list):
+            return []
+    except Exception:
+        return []
+
+    roots: list[Path] = []
+    for it in raw:
+        if not isinstance(it, str) or not it.strip():
+            continue
+        try:
+            rp = Path(it.strip()).expanduser()
+            if not rp.is_absolute():
+                continue
+            rr = rp.resolve()
+        except Exception:
+            continue
+
+        if rr == workspace_root:
+            continue
+        if rr not in roots:
+            roots.append(rr)
+
+    return roots
+
+
+def _resolve_under_allowed_roots(workspace_root: Path, path_str: str) -> Path:
+    """Resolve path under workspace_root or policy-configured extra_roots."""
+
+    extra_roots = _load_extra_roots_from_policy(workspace_root)
+
+    raw = Path(path_str)
+    p = raw.resolve() if raw.is_absolute() else (workspace_root / path_str).resolve()
+
+    try:
+        p.relative_to(workspace_root)
+        return p
+    except ValueError:
+        pass
+
+    for r in extra_roots:
+        try:
+            p.relative_to(r)
+            return p
+        except ValueError:
+            continue
+
+    raise ValueError("path escapes workspace root")
 
 
 def _run_capture(*, args: list[str], cwd: Path, timeout_sec: float = 10.0) -> tuple[int, str]:
@@ -230,7 +324,7 @@ async def read_file(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
         if approval.get("status") != "allowed":
             return {"ok": False, "error": "user denied approval", "approval_id": approval_id}
 
-    p = _resolve_under_root(ctx.workspace_root, path)
+    p = _resolve_under_allowed_roots(ctx.workspace_root, path)
     if not p.exists() or not p.is_file():
         return {"ok": False, "error": "file not found", "path": path}
 
@@ -271,7 +365,7 @@ async def write_file(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]
         if approval.get("status") != "allowed":
             return {"ok": False, "error": "user denied approval", "approval_id": approval_id}
 
-    p = _resolve_under_root(ctx.workspace_root, path)
+    p = _resolve_under_allowed_roots(ctx.workspace_root, path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return {"ok": True, "path": path, "bytes": len(content.encode("utf-8"))}
@@ -376,6 +470,192 @@ async def search_in_files(args: dict[str, Any], ctx: KernelContext) -> dict[str,
                 break
 
     return {"ok": True, "query": query, "matches": matches}
+
+
+async def create_or_update_skill(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    name = str(args.get("name", "")).strip()
+    description = str(args.get("description", "")).strip()
+    content = args.get("content")
+    enabled = bool(args.get("enabled", True))
+
+    if not name:
+        return {"ok": False, "error": "empty skill name"}
+    if not _SKILL_NAME_RE.fullmatch(name):
+        return {"ok": False, "error": "invalid skill name: only [A-Za-z0-9][A-Za-z0-9_-]{0,63} is allowed"}
+
+    path = f"skills/{name}/SKILL.md"
+    if not isinstance(content, str) or not content.strip():
+        meta = {
+            "name": name,
+            "description": description,
+            "enabled": enabled,
+        }
+        body = description or f"Skill {name}"
+        content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + body.strip() + "\n"
+    else:
+        meta, body = _parse_skill_frontmatter(content)
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["name"] = name
+        if description:
+            meta["description"] = description
+        elif not isinstance(meta.get("description"), str):
+            meta["description"] = ""
+        meta["enabled"] = enabled
+        content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + str(body or "").strip() + "\n"
+
+    res = await write_file({"path": path, "content": content}, ctx)
+    if not res.get("ok"):
+        return res
+    return {"ok": True, "path": path, "name": name, "enabled": enabled}
+
+
+async def list_skills(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    skills_dir = ctx.workspace_root / "skills"
+    if not skills_dir.exists():
+        return {"ok": True, "skills": []}
+
+    items: list[dict[str, Any]] = []
+    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+        try:
+            rel = skill_md.relative_to(ctx.workspace_root).as_posix()
+            text = skill_md.read_text(encoding="utf-8")
+            meta, _body = _parse_skill_frontmatter(text)
+            if not isinstance(meta, dict):
+                meta = {}
+            items.append(
+                {
+                    "name": str(meta.get("name") or skill_md.parent.name),
+                    "description": str(meta.get("description") or ""),
+                    "enabled": bool(meta.get("enabled", True)),
+                    "path": rel,
+                }
+            )
+        except Exception as e:
+            items.append({"name": skill_md.parent.name, "path": skill_md.relative_to(ctx.workspace_root).as_posix(), "error": str(e)})
+
+    return {"ok": True, "skills": items}
+
+
+async def delete_skill(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    name = str(args.get("name", "")).strip()
+    if not name:
+        return {"ok": False, "error": "empty skill name"}
+    if not _SKILL_NAME_RE.fullmatch(name):
+        return {"ok": False, "error": "invalid skill name"}
+
+    skill_dir = _resolve_under_allowed_roots(ctx.workspace_root, f"skills/{name}")
+    if not skill_dir.exists():
+        return {"ok": False, "error": f"skill not found: {name}"}
+    if not skill_dir.is_dir():
+        return {"ok": False, "error": f"not a skill directory: {name}"}
+
+    op = await ctx.request_op("write_file", {"path": f"skills/{name}/SKILL.md", "delete": True})
+    if op.get("safety_level") == "deny":
+        return {"ok": False, "error": op.get("reason", "denied")}
+    if op.get("safety_level") == "approval_required":
+        approval = await ctx.wait_for_approval(op.get("approval_id"))
+        if approval.get("status") != "allowed":
+            return {"ok": False, "error": "user denied approval", "approval_id": op.get("approval_id")}
+
+    shutil.rmtree(skill_dir)
+    return {"ok": True, "deleted": True, "name": name}
+
+
+async def create_or_update_mcp_client(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    try:
+        spec = mcp_runtime.upsert_client(ctx.workspace_root, args)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "client": spec, "path": "data/mcp_clients.yaml"}
+
+
+async def list_mcp_clients(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    try:
+        clients = mcp_runtime.list_clients(ctx.workspace_root)
+        return {"ok": True, "clients": clients}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def delete_mcp_client(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    client_id = str(args.get("id", "")).strip()
+    if not client_id:
+        return {"ok": False, "error": "empty client id"}
+    try:
+        ok = mcp_runtime.delete_client(ctx.workspace_root, client_id)
+        if not ok:
+            return {"ok": False, "error": f"client not found: {client_id}"}
+        return {"ok": True, "deleted": True, "id": client_id}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def test_mcp_client(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    client_id = str(args.get("id", "")).strip()
+    if not client_id:
+        return {"ok": False, "error": "empty client id"}
+    try:
+        return await mcp_runtime.test_client(ctx.workspace_root, client_id)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "id": client_id}
+
+
+async def list_mcp_tools(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    try:
+        return await mcp_runtime.list_tools(ctx.workspace_root, str(args.get("id", "")).strip())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def call_mcp_tool(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    try:
+        return await mcp_runtime.call_tool(
+            ctx.workspace_root,
+            str(args.get("id", "")).strip(),
+            str(args.get("tool_name", "")).strip(),
+            args.get("arguments") if isinstance(args.get("arguments"), dict) else {},
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def list_mcp_resources(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    try:
+        return await mcp_runtime.list_resources(ctx.workspace_root, str(args.get("id", "")).strip())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def read_mcp_resource(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    try:
+        return await mcp_runtime.read_resource(
+            ctx.workspace_root,
+            str(args.get("id", "")).strip(),
+            str(args.get("uri", "")).strip(),
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def list_mcp_prompts(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    try:
+        return await mcp_runtime.list_prompts(ctx.workspace_root, str(args.get("id", "")).strip())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def get_mcp_prompt(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+    try:
+        return await mcp_runtime.get_prompt(
+            ctx.workspace_root,
+            str(args.get("id", "")).strip(),
+            str(args.get("prompt_name", "")).strip(),
+            args.get("arguments") if isinstance(args.get("arguments"), dict) else {},
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 
 def _render_command_tool_py(*, spec: dict[str, Any], commands: list[str], timeout_sec: float | None) -> str:

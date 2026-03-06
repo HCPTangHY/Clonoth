@@ -219,6 +219,7 @@ def create_app(
             return st.create_task(
                 session_id=inp.session_id,
                 instruction=inp.instruction,
+                workflow_id=inp.workflow_id,
                 priority=inp.priority,
                 context=inp.context,
                 source_inbound_seq=inp.source_inbound_seq,

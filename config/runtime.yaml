@@ -36,6 +36,12 @@ kernel:
     # Max chars of tool arguments shown in progress messages.
     max_progress_arg_chars: 320
 
+  executor:
+    # Bootstrap profile used by kernel runtime.
+    profile_id: "bootstrap.kernel_executor"
+    # Optional: override chat model for kernel executor only. Empty -> use model routing/provider config.
+    model: ""
+
 providers:
   openai:
     # HTTP timeout for OpenAI-compatible endpoint calls (seconds)
@@ -63,13 +69,23 @@ tools:
 
 shell:
   default_conversation_key: "cli:default"
+  # Reserved for future workflow runtime entry selection.
+  workflow_id: "bootstrap.default_chat"
 
   orchestrator:
+    # Bootstrap profile used by shell runtime.
+    profile_id: "bootstrap.shell_orchestrator"
     # Enable LLM-based routing: reply directly for simple questions, create Kernel tasks only when needed.
     enabled: true
     # How many recent session messages to provide to the orchestrator.
     history_limit: 40
-    # Optional: override chat model for orchestrator only. Empty -> use OpenAI config model.
+    # Optional: override chat model for orchestrator only. Empty -> use model routing/provider config.
+    model: ""
+
+  responder:
+    # Bootstrap profile used for task finalization.
+    profile_id: "bootstrap.task_responder"
+    # Optional: override chat model for responder only. Empty -> use model routing/provider config.
     model: ""
 
   http:

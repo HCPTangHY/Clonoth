@@ -197,6 +197,139 @@ class ToolRegistry:
                 meta_tools.search_in_files,
             ),
             (
+                "create_or_update_skill",
+                "Create or update a skill under skills/<name>/SKILL.md.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "content": {"type": "string", "description": "full SKILL.md content (optional; frontmatter will be normalized)"},
+                        "enabled": {"type": "boolean"},
+                    },
+                    "required": ["name"],
+                },
+                meta_tools.create_or_update_skill,
+            ),
+            (
+                "list_skills",
+                "List local skills under skills/*/SKILL.md.",
+                {"type": "object", "properties": {}, "required": []},
+                meta_tools.list_skills,
+            ),
+            (
+                "delete_skill",
+                "Delete a skill directory under skills/<name>/.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                    },
+                    "required": ["name"],
+                },
+                meta_tools.delete_skill,
+            ),
+            (
+                "create_or_update_mcp_client",
+                "Create or update an MCP client config in data/mcp_clients.yaml. Supports stdio, sse, and streamable_http transports.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "description": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "transport": {"type": "string", "enum": ["stdio", "sse", "streamable_http", "streamable-http", "http"]},
+                        "command": {"type": "string"},
+                        "args": {"type": "array", "items": {"type": "string"}},
+                        "env": {"type": "object"},
+                        "url": {"type": "string"},
+                        "headers": {"type": "object"},
+                    },
+                    "required": ["id", "transport"],
+                },
+                meta_tools.create_or_update_mcp_client,
+            ),
+            (
+                "list_mcp_clients",
+                "List configured MCP clients.",
+                {"type": "object", "properties": {}, "required": []},
+                meta_tools.list_mcp_clients,
+            ),
+            (
+                "delete_mcp_client",
+                "Delete an MCP client config by id.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                    },
+                    "required": ["id"],
+                },
+                meta_tools.delete_mcp_client,
+            ),
+            (
+                "test_mcp_client",
+                "Connect to an MCP client and inspect available tools/resources/prompts.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                    },
+                    "required": ["id"],
+                },
+                meta_tools.test_mcp_client,
+            ),
+            (
+                "list_mcp_tools",
+                "List tools exposed by a configured MCP client.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                    },
+                    "required": ["id"],
+                },
+                meta_tools.list_mcp_tools,
+            ),
+            (
+                "call_mcp_tool",
+                "Call a tool exposed by a configured MCP client.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "tool_name": {"type": "string"},
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["id", "tool_name"],
+                },
+                meta_tools.call_mcp_tool,
+            ),
+            (
+                "list_mcp_resources",
+                "List resources exposed by a configured MCP client.",
+                {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+                meta_tools.list_mcp_resources,
+            ),
+            (
+                "read_mcp_resource",
+                "Read a resource exposed by a configured MCP client.",
+                {"type": "object", "properties": {"id": {"type": "string"}, "uri": {"type": "string"}}, "required": ["id", "uri"]},
+                meta_tools.read_mcp_resource,
+            ),
+            (
+                "list_mcp_prompts",
+                "List prompts exposed by a configured MCP client.",
+                {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+                meta_tools.list_mcp_prompts,
+            ),
+            (
+                "get_mcp_prompt",
+                "Get a prompt from a configured MCP client.",
+                {"type": "object", "properties": {"id": {"type": "string"}, "prompt_name": {"type": "string"}, "arguments": {"type": "object"}}, "required": ["id", "prompt_name"]},
+                meta_tools.get_mcp_prompt,
+            ),
+            (
                 "create_or_update_tool",
                 "Create/update a declarative command tool under tools/ (parsed via AST; not imported/executed).",
                 {

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from clonoth_profiles import assemble_prompt_for_profile
+from clonoth_runtime import get_str, load_runtime_config
+
 
 DEFAULT_KERNEL_SYSTEM_PROMPT = """\
 你是 Clonoth 的 Kernel（执行核），目标是完成 Supervisor 下发的 task。
@@ -17,6 +20,12 @@ DEFAULT_KERNEL_SYSTEM_PROMPT = """\
 
 安全注意：
 - `execute_command` 子进程环境会剥离常见 API_KEY 环境变量（例如 OPENAI_API_KEY），避免被命令读取/外传。
+- 系统可能会在请求中附加一个 `CLONOTH_SKILLS_INDEX` 块，其中只包含 skills 的元数据（`name` / `description` / `path`）。
+- 这遵循 skills 的 progressive disclosure：
+  1) 先只看 metadata；
+  2) 当任务明显匹配某个 skill 的 description，或用户显式提到 skill 名时，再用 `read_file` 读取对应 `SKILL.md`；
+  3) 如果 `SKILL.md` 引用了 `references/`、`scripts/`、`assets/`，只按需读取具体文件，不要整包加载。
+- `description` 是 skill 触发的主信号；如果用户明确点名某个 skill，也应优先使用它。
 
 工具调用协议（重要）：
 - 你可以（也应该）通过 **函数调用（tool calls）** 来请求系统执行工具。
@@ -60,7 +69,7 @@ DEFAULT_KERNEL_SYSTEM_PROMPT = """\
 KERNEL_SYSTEM_PROMPT = DEFAULT_KERNEL_SYSTEM_PROMPT
 
 
-def load_kernel_system_prompt(*, workspace_root: Path) -> str:
+def load_kernel_system_prompt(*, workspace_root: Path, profile_id: str = "") -> str:
     """Load kernel system prompt from `config/prompts/kernel_system_prompt.txt`.
 
     Rationale: prompt is part of "behavior configuration" and should be editable without changing core code.
@@ -68,12 +77,17 @@ def load_kernel_system_prompt(*, workspace_root: Path) -> str:
     Safety: The policy engine should require approval for writing prompt files.
     """
 
+    runtime_cfg = load_runtime_config(workspace_root)
+    chosen_profile_id = (profile_id or "").strip() or get_str(runtime_cfg, "kernel.executor.profile_id", "bootstrap.kernel_executor").strip() or "bootstrap.kernel_executor"
+    assembled = assemble_prompt_for_profile(workspace_root=workspace_root, profile_id=chosen_profile_id)
+    if assembled:
+        return assembled
+
     p = workspace_root / "config" / "prompts" / "kernel_system_prompt.txt"
     try:
         if p.exists() and p.is_file():
             text = p.read_text(encoding="utf-8", errors="ignore")
             if text.strip():
-                # Prevent accidental huge prompt.
                 if len(text) > 200_000:
                     return text[:200_000] + "\n...<truncated>"
                 return text

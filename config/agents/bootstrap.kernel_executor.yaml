@@ -1,0 +1,48 @@
+version: 1
+kind: agent_profile
+id: bootstrap.kernel_executor
+name: "Bootstrap Kernel Executor"
+runtime: kernel
+mode: execute_task
+
+description: >-
+  兼容当前 kernel.worker.run_task 行为的默认 Agent Profile。
+  它的职责是：基于 task 指令完成多步思考、工具调用、观察与结果草拟。
+
+model_route: kernel_executor_default
+
+prompt:
+  pack: bootstrap_cn
+  assembly: kernel_executor
+  prefill: ""
+
+context:
+  injectors:
+    - id: session_messages
+      enabled: true
+      params:
+        limit_runtime_key: kernel.history_limit
+        fallback_limit: 80
+    - id: task_contract
+      enabled: true
+    - id: tool_protocol_summary
+      enabled: true
+    - id: policy_summary
+      enabled: true
+
+capabilities:
+  can_direct_reply: false
+  can_create_task: false
+  can_use_tools: true
+  can_request_restart: true
+  tool_access: all
+
+output:
+  channel: task_draft
+  format: plain_text
+  strip_internal_tool_trace: true
+
+compat:
+  current_runtime_mapping:
+    python_entrypoint: kernel.worker.run_task
+    legacy_prompt_file: config/prompts/kernel_system_prompt.txt

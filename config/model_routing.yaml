@@ -1,0 +1,36 @@
+version: 1
+
+defaults:
+  provider: openai
+  timeout_runtime_key: providers.openai.timeout_sec
+  fallback_model: gpt-4o-mini
+
+routes:
+  shell_orchestrator_default:
+    description: "用于 Shell 路由与轻量判断"
+    candidates:
+      - provider: openai
+        model_runtime_key: shell.orchestrator.model
+        fallback_to_provider_config_model: true
+        fallback_model: gpt-4o-mini
+
+  task_responder_default:
+    description: "用于 task 完成后的最终表达"
+    candidates:
+      - provider: openai
+        model_runtime_key: shell.responder.model
+        fallback_to_provider_config_model: true
+        fallback_model: gpt-4o-mini
+
+  kernel_executor_default:
+    description: "用于 Kernel 执行"
+    candidates:
+      - provider: openai
+        model_runtime_key: kernel.executor.model
+        fallback_to_provider_config_model: true
+        fallback_model: gpt-4o-mini
+
+notes:
+  - 当前代码已开始消费本文件中的 route 选择，但仍以 OpenAI 路径为主。
+  - future: 可按 agent / workflow / task_type / cost policy 做路由。
+  - future: 可为每个 route 定义 provider fallback、熔断与质量/成本偏好。

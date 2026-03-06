@@ -116,6 +116,7 @@ class InboundAckOut(BaseModel):
 class CreateTaskIn(BaseModel):
     session_id: str
     instruction: str
+    workflow_id: str | None = None
     priority: int = 0
     context: dict[str, Any] = Field(default_factory=dict)
     # Optional idempotency key: when provided, Supervisor will dedupe task creation
@@ -128,6 +129,8 @@ class Task(BaseModel):
     task_id: str
     session_id: str
     instruction: str
+    workflow_id: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
     source_inbound_seq: int | None = None
     use_context: bool = True
     status: TaskStatus

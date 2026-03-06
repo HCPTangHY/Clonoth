@@ -23,6 +23,10 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
             "max_inline_chars": 8000,
             "max_progress_arg_chars": 320,
         },
+        "executor": {
+            "profile_id": "bootstrap.kernel_executor",
+            "model": "",
+        },
     },
     "providers": {
         "openai": {
@@ -45,6 +49,15 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     },
     "shell": {
         "default_conversation_key": "cli:default",
+        "workflow_id": "bootstrap.default_chat",
+        "orchestrator": {
+            "profile_id": "bootstrap.shell_orchestrator",
+            "model": "",
+        },
+        "responder": {
+            "profile_id": "bootstrap.task_responder",
+            "model": "",
+        },
         "http": {"client_timeout_sec": 10.0},
         "supervisor": {
             "health_timeout_sec": 2.0,

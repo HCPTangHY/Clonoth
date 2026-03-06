@@ -11,6 +11,8 @@ from typing import Any
 import httpx
 
 from clonoth_runtime import get_float, get_int, get_str, load_runtime_config
+from clonoth_profiles import assemble_prompt_for_profile, resolve_openai_model_for_profile
+from clonoth_workflows import resolve_workflow_binding
 from providers.openai import OpenAIProvider
 
 
@@ -87,9 +89,9 @@ def _load_text_file(path: Path, max_chars: int = 200_000) -> str:
         return ""
 
 
-def load_shell_orchestrator_prompt(*, workspace_root: Path) -> str:
+def load_shell_orchestrator_prompt(*, workspace_root: Path, profile_id: str = "bootstrap.shell_orchestrator") -> str:
     p = workspace_root / "config" / "prompts" / "shell_orchestrator_prompt.txt"
-    text = _load_text_file(p)
+    text = assemble_prompt_for_profile(workspace_root=workspace_root, profile_id=profile_id) or _load_text_file(p)
     if text:
         return text
 
@@ -100,9 +102,9 @@ def load_shell_orchestrator_prompt(*, workspace_root: Path) -> str:
     )
 
 
-def load_task_responder_prompt(*, workspace_root: Path) -> str:
+def load_task_responder_prompt(*, workspace_root: Path, profile_id: str = "bootstrap.task_responder") -> str:
     p = workspace_root / "config" / "prompts" / "task_responder_prompt.txt"
-    text = _load_text_file(p)
+    text = assemble_prompt_for_profile(workspace_root=workspace_root, profile_id=profile_id) or _load_text_file(p)
     if text:
         return text
 
@@ -125,15 +127,16 @@ async def orchestrate(
     workspace_root: Path,
     session_id: str,
     use_context: bool,
-) -> tuple[str, str]:
+) -> tuple[str, dict[str, Any]]:
     """Return (action, payload).
 
     action:
-      - "reply": payload is assistant reply text
-      - "task":  payload is kernel task instruction
+      - "reply": payload = {"text": assistant reply text}
+      - "task":  payload = {"instruction", "workflow_id", "context"}
     """
 
     runtime_cfg = load_runtime_config(workspace_root)
+    active_binding = resolve_workflow_binding(workspace_root=workspace_root, runtime_cfg=runtime_cfg)
 
     # Fetch recent chat history (canonical) and include it in the orchestrator call.
     # External channel adapters can disable context per-message.
@@ -169,7 +172,7 @@ async def orchestrate(
                 continue
         cleaned_history.append({"role": str(role), "content": content})
 
-    prompt = load_shell_orchestrator_prompt(workspace_root=workspace_root)
+    prompt = load_shell_orchestrator_prompt(workspace_root=workspace_root, profile_id=active_binding.route_profile_id)
 
     # LLM config
     cfg = await fetch_openai_config_secret(supervisor_http, supervisor_url)
@@ -177,17 +180,25 @@ async def orchestrate(
     base_url = _resolve_env_ref(cfg.get("base_url")) or None
     default_model = _resolve_env_ref(cfg.get("model")) or "gpt-4o-mini"
 
-    model_override = get_str(runtime_cfg, "shell.orchestrator.model", "").strip()
-    model = model_override or default_model
+    model = resolve_openai_model_for_profile(
+        workspace_root=workspace_root,
+        runtime_cfg=runtime_cfg,
+        profile_id=active_binding.route_profile_id,
+        provider_default_model=default_model,
+        legacy_runtime_key="shell.orchestrator.model",
+    )
 
     if not api_key:
         # No key => cannot call Kernel either. Reply an actionable error.
         return (
             "reply",
-            "OpenAI api_key 未配置。\n"
-            "请在 .env 中设置 OPENAI_API_KEY，或在 data/config.yaml 中配置 openai.api_key（可引用 ${OPENAI_API_KEY}）。",
+            {
+                "text": "OpenAI api_key 未配置。\n"
+                "请在 .env 中设置 OPENAI_API_KEY，或在 data/config.yaml 中配置 openai.api_key（可引用 ${OPENAI_API_KEY}）。"
+            },
         )
 
+    print(f"[shell-worker] workflow={active_binding.workflow_id} route_profile={active_binding.route_profile_id} model={model}", flush=True)
     provider = OpenAIProvider(http=llm_http, api_key=api_key, base_url=base_url, model=model)
 
     tools = [
@@ -209,14 +220,13 @@ async def orchestrate(
             },
         }
     ]
-
     resp = await provider.chat(messages=[{"role": "system", "content": prompt}, *cleaned_history], tools=tools)
 
     if not resp.ok:
         # Important: DO NOT fallback to creating tasks when LLM is failing.
         # Kernel also depends on the same provider and would likely fail too.
         err = resp.error or "unknown error"
-        return "reply", f"Orchestrator LLM 调用失败：{err}\n请稍后重试。"
+        return "reply", {"text": f"Orchestrator LLM 调用失败：{err}\n请稍后重试。"}
 
     if resp.tool_calls:
         for tc in resp.tool_calls:
@@ -224,14 +234,14 @@ async def orchestrate(
                 continue
             instruction = tc.arguments.get("instruction")
             if isinstance(instruction, str) and instruction.strip():
-                return "task", instruction.strip()
+                return "task", {"instruction": instruction.strip(), "workflow_id": active_binding.workflow_id}
 
             # Tool-call emitted but args are invalid/missing -> fallback to using user text.
-            return "task", ""
+            return "task", {"instruction": "", "workflow_id": active_binding.workflow_id}
 
     # Default: direct reply
     text = (resp.text or "").strip()
-    return "reply", text
+    return "reply", {"text": text}
 
 
 def _short_text(s: str, max_chars: int) -> str:
@@ -385,20 +395,33 @@ async def generate_task_final_reply(
         limit=get_int(runtime_cfg, "shell.responder.tool_trace_history_limit", 200, min_value=50, max_value=500),
     )
 
-    prompt = load_task_responder_prompt(workspace_root=workspace_root)
+    task_context = task.get("context") if isinstance(task.get("context"), dict) else {}
+    binding = resolve_workflow_binding(
+        workspace_root=workspace_root,
+        runtime_cfg=runtime_cfg,
+        workflow_id=str(task.get("workflow_id") or "").strip(),
+        task_context=task_context,
+    )
+    prompt = load_task_responder_prompt(workspace_root=workspace_root, profile_id=binding.responder_profile_id)
 
     cfg = await fetch_openai_config_secret(supervisor_http, supervisor_url)
     api_key = _resolve_env_ref(cfg.get("api_key"))
     base_url = _resolve_env_ref(cfg.get("base_url")) or None
     default_model = _resolve_env_ref(cfg.get("model")) or "gpt-4o-mini"
 
-    model_override = get_str(runtime_cfg, "shell.responder.model", "").strip()
-    model = model_override or default_model
+    model = resolve_openai_model_for_profile(
+        workspace_root=workspace_root,
+        runtime_cfg=runtime_cfg,
+        profile_id=binding.responder_profile_id,
+        provider_default_model=default_model,
+        legacy_runtime_key="shell.responder.model",
+    )
 
     if not api_key:
         # No LLM available -> fallback to Kernel draft.
         return draft or f"任务已完成（status={status}），但 LLM 未配置，无法生成最终回复。"
 
+    print(f"[shell-worker] finalize workflow={binding.workflow_id} responder_profile={binding.responder_profile_id} model={model}", flush=True)
     provider = OpenAIProvider(http=llm_http, api_key=api_key, base_url=base_url, model=model)
 
     inp = {
@@ -518,7 +541,8 @@ async def main_async() -> None:
                     )
 
                     if action == "reply":
-                        cleaned = strip_tool_trace_blocks(payload)
+                        text_out = str((payload or {}).get("text") or "")
+                        cleaned = strip_tool_trace_blocks(text_out)
                         if not cleaned:
                             cleaned = "（无输出）"
                         rr = await supervisor_http.post(
@@ -530,12 +554,14 @@ async def main_async() -> None:
                         else:
                             print(f"[shell-worker] outbound conflict (seq={inbound_seq}): {rr.text}", flush=True)
                     else:
-                        instruction = payload.strip() if payload.strip() else text
+                        instruction = str((payload or {}).get("instruction") or "").strip() or text
                         tr = await supervisor_http.post(
                             f"{base_url}/v1/tasks",
                             json={
                                 "session_id": session_id,
                                 "instruction": instruction,
+                                "workflow_id": str((payload or {}).get("workflow_id") or "").strip()
+                                or get_str(runtime_cfg, "shell.workflow_id", "bootstrap.default_chat"),
                                 "priority": 0,
                                 "context": {},
                                 "source_inbound_seq": inbound_seq,

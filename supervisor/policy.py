@@ -27,6 +27,16 @@ def _default_policy_dict() -> dict[str, Any]:
 
     return {
         "version": 1,
+        # Extra filesystem roots that are allowed for read_file/write_file.
+        #
+        # Use case:
+        # - Clonoth is deployed under `/www/wwwroot/clonoth`, but you want to manage sibling
+        #   files like `/www/wwwroot/monitor-sku.py`.
+        #
+        # Security:
+        # - Even if a path is under extra_roots, it still goes through rules + approvals.
+        # - For external paths, defaults are tightened from auto -> approval_required.
+        "extra_roots": [],
         "kernel_loop_guard": {
             "repeat_tool_call_threshold": 3,
         },
@@ -164,6 +174,9 @@ class PolicyEngine:
         # parsed config
         self._cfg: dict[str, Any] = _default_policy_dict()
 
+        # Extra allowed roots (absolute). Loaded from policy.yaml.
+        self._extra_roots: list[Path] = []
+
         self._read_default: SafetyLevel = SafetyLevel.auto
         self._write_default: SafetyLevel = SafetyLevel.auto
         self._restart_default: SafetyLevel = SafetyLevel.approval_required
@@ -234,6 +247,29 @@ class PolicyEngine:
         return default, rules
 
     def _compile(self) -> None:
+        # Extra roots
+        extra_roots: list[Path] = []
+        extra_raw = self._cfg.get("extra_roots")
+        if isinstance(extra_raw, list):
+            for it in extra_raw:
+                if not isinstance(it, str) or not it.strip():
+                    continue
+                try:
+                    p = Path(it.strip()).expanduser()
+                    if not p.is_absolute():
+                        continue
+                    rp = p.resolve()
+                except Exception:
+                    continue
+
+                # Avoid duplicates.
+                if rp == self._root:
+                    continue
+                if rp not in extra_roots:
+                    extra_roots.append(rp)
+
+        self._extra_roots = extra_roots
+
         read_sec = self._cfg.get("read_file")
         if isinstance(read_sec, dict):
             self._read_default, self._read_rules = self._compile_rules(read_sec)
@@ -273,18 +309,35 @@ class PolicyEngine:
         else:
             self._restart_default = SafetyLevel.approval_required
 
-    def _resolve_relpath(self, path_str: str) -> tuple[Path | None, str]:
+    def _resolve_relpath(self, path_str: str) -> tuple[Path | None, str, bool]:
+        """Resolve a user-provided path into an allowed absolute path.
+
+        Returns: (resolved_path, match_key, is_external)
+
+        - If under workspace root: match_key is workspace-relative POSIX path.
+        - If under extra_roots: match_key is absolute POSIX path.
+        """
+
         try:
-            p = (self._root / path_str).resolve()
+            raw = Path(path_str)
+            p = raw.resolve() if raw.is_absolute() else (self._root / path_str).resolve()
         except Exception as e:  # pragma: no cover
-            return None, f"invalid path: {e}"
+            return None, f"invalid path: {e}", False
 
         try:
             rel = p.relative_to(self._root)
+            return p, rel.as_posix(), False
         except ValueError:
-            return None, "path escapes workspace root"
+            pass
 
-        return p, rel.as_posix()
+        for r in self._extra_roots:
+            try:
+                p.relative_to(r)
+                return p, p.as_posix(), True
+            except ValueError:
+                continue
+
+        return None, "path escapes workspace root", False
 
     @staticmethod
     def _match_rules(rel: str, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel) -> PolicyDecision:
@@ -296,20 +349,30 @@ class PolicyEngine:
     def evaluate_read_file(self, *, path: str) -> PolicyDecision:
         self._reload_if_needed()
 
-        resolved, rel = self._resolve_relpath(path)
+        resolved, rel, is_external = self._resolve_relpath(path)
         if resolved is None:
             return PolicyDecision(SafetyLevel.deny, rel)
 
-        return self._match_rules(rel, self._read_rules, self._read_default)
+        default = self._read_default
+        # Tighten defaults for external paths.
+        if is_external and default == SafetyLevel.auto:
+            default = SafetyLevel.approval_required
+
+        return self._match_rules(rel, self._read_rules, default)
 
     def evaluate_write_file(self, *, path: str) -> PolicyDecision:
         self._reload_if_needed()
 
-        resolved, rel = self._resolve_relpath(path)
+        resolved, rel, is_external = self._resolve_relpath(path)
         if resolved is None:
             return PolicyDecision(SafetyLevel.deny, rel)
 
-        return self._match_rules(rel, self._write_rules, self._write_default)
+        default = self._write_default
+        # Tighten defaults for external paths.
+        if is_external and default == SafetyLevel.auto:
+            default = SafetyLevel.approval_required
+
+        return self._match_rules(rel, self._write_rules, default)
 
     def evaluate_execute_command(self, *, command: str) -> PolicyDecision:
         self._reload_if_needed()

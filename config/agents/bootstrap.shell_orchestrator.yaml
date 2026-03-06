@@ -1,0 +1,47 @@
+version: 1
+kind: agent_profile
+id: bootstrap.shell_orchestrator
+name: "Bootstrap Shell Orchestrator"
+runtime: shell
+mode: route_inbound
+
+description: >-
+  兼容当前 shell.worker.orchestrate 行为的默认 Agent Profile。
+  它的职责是：判断用户输入是直接回复，还是创建一个 Kernel task。
+
+model_route: shell_orchestrator_default
+
+prompt:
+  pack: bootstrap_cn
+  assembly: shell_orchestrator
+  prefill: ""
+
+context:
+  injectors:
+    - id: session_messages
+      enabled: true
+      params:
+        limit_runtime_key: shell.orchestrator.history_limit
+        fallback_limit: 40
+    - id: strip_internal_tool_trace
+      enabled: true
+    - id: conversation_mode
+      enabled: true
+      params:
+        use_context_field: use_context
+
+capabilities:
+  can_direct_reply: true
+  can_create_task: true
+  can_use_tools: false
+  can_request_restart: false
+
+output:
+  channel: user
+  format: plain_text
+  strip_internal_tool_trace: true
+
+compat:
+  current_runtime_mapping:
+    python_entrypoint: shell.worker.orchestrate
+    legacy_prompt_file: config/prompts/shell_orchestrator_prompt.txt

@@ -11,13 +11,16 @@ from typing import Any
 import httpx
 import yaml
 
-from clonoth_runtime import get_float, get_int, load_runtime_config
+from clonoth_runtime import get_float, get_int, get_str, load_runtime_config
+from clonoth_profiles import resolve_openai_model_for_profile
+from clonoth_workflows import resolve_workflow_binding
 
 from providers.openai import OpenAIProvider
 
 from .context import KernelContext
 from .prompts import load_kernel_system_prompt
 from .registry import ToolRegistry
+from .skills_runtime import format_skill_discovery_message
 
 
 async def wait_supervisor(
@@ -184,6 +187,45 @@ def _summarize_tool_result(tool_name: str, tool_args: dict[str, Any], result: An
         reloaded = result.get("reloaded")
         return f"已更新工具 {path}（registry tools={reloaded}）"
 
+    if tool_name == "create_or_update_skill":
+        path = str(result.get("path") or "")
+        return f"已更新 skill：{path}"
+
+    if tool_name == "list_skills":
+        skills = result.get("skills")
+        if isinstance(skills, list):
+            return f"已列出 skills（count={len(skills)}）"
+        return "已列出 skills"
+
+    if tool_name == "create_or_update_mcp_client":
+        client = result.get("client")
+        if isinstance(client, dict):
+            cid = str(client.get("id") or "")
+            transport = str(client.get("transport") or "")
+            return f"已更新 MCP client：{cid}（{transport}）"
+        return "已更新 MCP client"
+
+    if tool_name == "list_mcp_clients":
+        clients = result.get("clients")
+        if isinstance(clients, list):
+            return f"已列出 MCP clients（count={len(clients)}）"
+        return "已列出 MCP clients"
+
+    if tool_name == "test_mcp_client":
+        client = result.get("client")
+        if isinstance(client, dict):
+            cid = str(client.get("id") or "")
+            return f"已测试 MCP client：{cid}"
+        return "已测试 MCP client"
+
+    if tool_name in {"list_mcp_tools", "list_mcp_resources", "list_mcp_prompts"}:
+        cid = str(result.get("client_id") or "")
+        return f"已读取 MCP 能力：{tool_name}（client={cid}）"
+
+    if tool_name in {"call_mcp_tool", "read_mcp_resource", "get_mcp_prompt"}:
+        cid = str(result.get("client_id") or "")
+        return f"已执行 MCP 调用：{tool_name}（client={cid}）"
+
     if tool_name == "reload_tools":
         n = result.get("tools")
         return f"已重载 tools（count={n}）"
@@ -276,6 +318,7 @@ async def run_task(
     provider: OpenAIProvider,
     registry: ToolRegistry,
     task: dict,
+    executor_profile_id: str,
 ) -> str:
     session_id = task["session_id"]
     task_id = task["task_id"]
@@ -283,6 +326,7 @@ async def run_task(
 
     workspace_root = Path(__file__).resolve().parents[1]
     runtime_cfg = load_runtime_config(workspace_root)
+    workflow_id = str(task.get("workflow_id") or "").strip()
 
     history_limit = get_int(runtime_cfg, "kernel.history_limit", 60, min_value=10, max_value=400)
     max_steps = get_int(runtime_cfg, "kernel.max_steps", 24, min_value=4, max_value=200)
@@ -332,8 +376,19 @@ async def run_task(
             if not isinstance(history, list):
                 history = []
 
-    system_prompt = load_kernel_system_prompt(workspace_root=workspace_root)
+    skills_discovery = format_skill_discovery_message(
+        workspace_root,
+        task_text=str(instruction or ""),
+    )
+
+    await ctx.emit_event("task_progress", {"message": f"开始处理：{instruction}"})
+
+    profile_id = (executor_profile_id or "").strip() or get_str(runtime_cfg, "kernel.executor.profile_id", "bootstrap.kernel_executor").strip() or "bootstrap.kernel_executor"
+    print(f"[kernel] workflow={workflow_id or '(default)'} executor_profile={profile_id} model={provider.model}", flush=True)
+    system_prompt = load_kernel_system_prompt(workspace_root=workspace_root, profile_id=profile_id)
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    if skills_discovery:
+        messages.append({"role": "system", "content": skills_discovery})
     messages.extend(history)
     messages.append(
         {
@@ -342,15 +397,12 @@ async def run_task(
         }
     )
 
-    await ctx.emit_event("task_progress", {"message": f"开始处理：{instruction}"})
-
     repeat_threshold = _load_repeat_tool_call_threshold(ctx.workspace_root, default=3)
     repeat_counts: dict[str, int] = {}
     for _step in range(max_steps):
         tools = to_openai_tools(registry.list_specs())
         resp = await provider.chat(messages=messages, tools=tools)
 
-        # Rust-like provider: explicit ok/error instead of raising.
         if not resp.ok:
             err = resp.error or "unknown error"
             sc = f" (status={resp.status_code})" if resp.status_code else ""
@@ -359,14 +411,11 @@ async def run_task(
             return msg
 
         if resp.tool_calls:
-            # If model emitted helper text alongside tool calls, keep it.
             if resp.text and resp.text.strip():
                 messages.append({"role": "assistant", "content": resp.text.strip()})
 
             trace_entries: list[dict[str, Any]] = []
-
             for tc in resp.tool_calls:
-                # Repeat-call guard: identical tool calls beyond threshold usually mean the model is stuck.
                 try:
                     canon_args = json.dumps(tc.arguments, ensure_ascii=False, sort_keys=True)
                 except Exception:
@@ -383,18 +432,14 @@ async def run_task(
 
                 args_json = _short_json(tc.arguments, max_progress_arg_chars)
                 await ctx.emit_event("task_progress", {"message": f"调用工具：{tc.name} {args_json}"})
-
                 await ctx.emit_event(
                     "tool_call",
                     {"tool_call_id": tc.id, "name": tc.name, "arguments": tc.arguments},
                 )
 
                 result = await registry.execute(name=tc.name, arguments=tc.arguments, ctx=ctx)
-
                 summary = _summarize_tool_result(tc.name, tc.arguments, result)
                 raw_format, raw_text = _tool_result_to_raw(tc.name, tc.arguments, result)
-
-                # Always persist the full raw result as artifact (for debugging and for LLM to re-read if needed)
                 ref = await _write_artifact(
                     workspace_root=ctx.workspace_root,
                     task_id=task_id,
@@ -407,7 +452,6 @@ async def run_task(
                 truncated = len(raw_text) > max_inline_tool_result_chars
                 raw_inline = raw_text if not truncated else _short_text(raw_text, max_inline_tool_result_chars)
 
-                # Event stream: summary only (+ ref)
                 await ctx.emit_event(
                     "tool_result",
                     {
@@ -419,7 +463,6 @@ async def run_task(
                         "truncated": truncated,
                     },
                 )
-
                 await ctx.emit_event("task_progress", {"message": f"工具完成：{tc.name} -> {summary}"})
 
                 trace_entries.append(
@@ -434,7 +477,6 @@ async def run_task(
                     }
                 )
 
-            # Observation (canonical): feed RAW tool results to the model.
             messages.append({"role": "assistant", "content": _format_tool_trace(trace_entries)})
             continue
 
@@ -448,7 +490,6 @@ async def run_task(
                 await ctx.emit_event("task_progress", {"message": "已生成最终回复"})
                 return cleaned
 
-            # 模型只输出了内部 trace（或空白），强制其再给一次面向用户的最终回复。
             messages.append(
                 {
                     "role": "system",
@@ -562,17 +603,36 @@ async def main_async() -> None:
 
                 cfg = await fetch_openai_config(http, base_url)
                 api_key = _resolve_env_ref(cfg.get("api_key"))
-                model = _resolve_env_ref(cfg.get("model")) or "gpt-4o-mini"
+                provider_default_model = _resolve_env_ref(cfg.get("model")) or "gpt-4o-mini"
                 openai_base_url = _resolve_env_ref(cfg.get("base_url")) or "https://api.openai.com/v1"
+                task_context = task.get("context") if isinstance(task.get("context"), dict) else {}
+                runtime_cfg_now = load_runtime_config(workspace_root)
+                binding = resolve_workflow_binding(
+                    workspace_root=workspace_root,
+                    runtime_cfg=runtime_cfg_now,
+                    workflow_id=str(task.get("workflow_id") or "").strip(),
+                    task_context=task_context,
+                )
+                executor_profile_id = binding.executor_profile_id
+                model = resolve_openai_model_for_profile(
+                    workspace_root=workspace_root,
+                    runtime_cfg=runtime_cfg_now,
+                    profile_id=executor_profile_id,
+                    provider_default_model=provider_default_model,
+                    legacy_runtime_key="kernel.executor.model",
+                )
 
                 if not api_key:
-                    text = (
-                        "OpenAI api_key 未配置（环境变量中也未找到）。\n"
-                        "请确保以下任一条件满足：\n"
-                        "1. 在当前终端/环境中设置了正确的环境变量（如 OPENAI_API_KEY，且在 data/config.yaml 中配置了引用如 ${OPENAI_API_KEY}）。\n"
-                        "2. 在 data/config.yaml 中直接填入了 openai.api_key。\n"
-                        "3. 调用 Supervisor API：POST http://127.0.0.1:8765/v1/config/openai { api_key, base_url?, model? }"
-                    )
+                    result_payload = {
+                        "draft": (
+                            "OpenAI api_key 未配置（环境变量中也未找到）。\n"
+                            "请确保以下任一条件满足：\n"
+                            "1. 在当前终端/环境中设置了正确的环境变量（如 OPENAI_API_KEY，且在 data/config.yaml 中配置了引用如 ${OPENAI_API_KEY}）。\n"
+                            "2. 在 data/config.yaml 中直接填入了 openai.api_key。\n"
+                            "3. 调用 Supervisor API：POST http://127.0.0.1:8765/v1/config/openai { api_key, base_url?, model? }"
+                        ),
+                        "error": "missing_openai_api_key",
+                    }
                 else:
                     provider = OpenAIProvider(http=llm_http, api_key=api_key, base_url=openai_base_url, model=model)
                     text = await run_task(
@@ -582,14 +642,16 @@ async def main_async() -> None:
                         provider=provider,
                         registry=registry,
                         task=task,
+                        executor_profile_id=executor_profile_id,
                     )
+                    result_payload = {"draft": text}
 
                 # Do NOT emit outbound_message directly from Kernel.
                 # Kernel only provides a draft result; Shell (chat AI) will post-process
                 # and produce the final user-facing outbound_message.
                 cr = await http.post(
                     f"{base_url}/v1/tasks/{task['task_id']}/complete",
-                    json={"status": "done", "result": {"draft": text}},
+                    json={"status": "done", "result": result_payload},
                 )
                 cr.raise_for_status()
 

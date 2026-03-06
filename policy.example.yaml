@@ -15,6 +15,18 @@
 
 version: 1
 
+# Extra filesystem roots that are allowed for read_file/write_file.
+#
+# Use case:
+# - Clonoth is deployed under `/www/wwwroot/clonoth`, but you want to manage sibling
+#   files like `/www/wwwroot/monitor-sku.py`.
+#
+# Notes:
+# - This is a security-sensitive setting. Prefer adding the minimal required roots.
+# - For paths under extra_roots, Supervisor will tighten defaults from auto -> approval_required.
+# - You can still add explicit rules to auto-allow certain absolute paths.
+extra_roots: []
+
 read_file:
   default: auto
   rules:
@@ -52,6 +64,11 @@ write_file:
     - pattern: "**/.env"
       decision: deny
       reason: "do not allow writing dotenv secrets"
+
+    # Example: allow managing a specific external file under extra_roots
+    # - pattern: "/www/wwwroot/monitor-sku.py"
+    #   decision: approval_required
+    #   reason: "manage external script"
 
 execute_command:
   default: approval_required

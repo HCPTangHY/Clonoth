@@ -1,0 +1,31 @@
+﻿ M README.md
+ M clonoth_runtime.py
+ M config/prompts/kernel_system_prompt.txt
+ M config/runtime.yaml
+ M docs/tools_and_evolution.md
+ M kernel/meta_tools.py
+ M kernel/prompts.py
+ M kernel/registry.py
+ M kernel/worker.py
+ M policy.example.yaml
+ M requirements.txt
+ M shell/worker.py
+ M supervisor/api.py
+ M supervisor/policy.py
+ M supervisor/state.py
+ M supervisor/types.py
+?? .limcode/plans/substrate-vnext.plan.md
+?? .limcode/review_diff.patch
+?? .limcode/review_diff_utf8.patch
+?? .limcode/review_status.txt
+?? .limcode/review_status_utf8.txt
+?? clonoth_profiles.py
+?? clonoth_workflows.py
+?? config/agents/
+?? config/model_routing.yaml
+?? config/prompt_packs/
+?? config/workflows/
+?? docs/config_surface_drafts.md
+?? docs/substrate_manifesto.md
+?? kernel/mcp_runtime.py
+?? kernel/skills_runtime.py

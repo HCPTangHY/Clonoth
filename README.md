@@ -12,7 +12,7 @@ Clonoth 采用了多进程的架构：
 
 - **Supervisor**：最小且稳定的核心。负责暴露 Gateway API、统一记录基于 JSONL 的事件日志（Event Sourcing）、执行 Policy 权限策略、管理审批流，以及对 Shell 和 Kernel 进行健康检查和重启。
 - **Shell Worker**：面向用户的沟通界面（目前为 CLI）。负责维护对话上下文，判断是直接回复还是将复杂任务结构化下发给 Kernel，并向用户展示 Kernel 的进度。
-- **Kernel Worker**：核心执行引擎。运行“思考 → 工具调用 → 观察”循环，动态加载 `tools/` 目录下的工具。当遇到敏感操作时，主动向 Supervisor 发起审批。
+- **Kernel Worker**：核心执行引擎。运行“思考 → 工具调用 → 观察”循环，动态加载 `tools/` 目录下的工具；同时管理本地 `skills/` 与 `data/mcp_clients.yaml`，并可通过 MCP Client 访问外部 MCP Server 能力。当遇到敏感操作时，主动向 Supervisor 发起审批。
 - **Tools**：Agent 自行生成和更新的 Python 模块（Tool v2）。采用声明式规范（AST 解析提取），无需重启进程即可热加载。
 
 ---
@@ -79,6 +79,20 @@ python -m shell.worker  --supervisor http://127.0.0.1:8765
 python -m shell.cli     --supervisor http://127.0.0.1:8765
 ```
 
+### 1.4 启动后可直接尝试的请求
+
+当前推荐的交互方式仍然是：**你对 Shell 说需求，Shell 创建 task，Kernel 用内建工具完成工作。**
+
+例如：
+
+- “新增一个 `release-note` skill，用来生成 changelog。”
+- “列出当前所有 skills。”
+- “新增一个 github MCP client，transport 是 stdio，command 是 `npx`，args 是 `-y @modelcontextprotocol/server-github`。”
+- “测试一下 github 这个 MCP client 是否可用。”
+- “列出 github 这个 MCP client 提供的 tools。”
+
+> 提示：涉及 token / API key 时，建议在环境变量中提供，再在 MCP 配置里用 `${ENV_NAME}` 引用。
+
 ---
 
 ## 2. 核心机制
@@ -102,6 +116,9 @@ Clonoth 不依赖关系型数据库，所有的对话、任务、工具调用状
    - 读取/搜索：`read_file` / `list_dir` / `search_in_files`
    - 修改系统：`write_file` / `execute_command`
    - 自进化专有：`create_or_update_tool` / `reload_tools` / `request_restart`
+   - Skill 管理：`create_or_update_skill` / `list_skills` / `delete_skill`
+   - MCP Client 管理：`create_or_update_mcp_client` / `list_mcp_clients` / `delete_mcp_client` / `test_mcp_client`
+   - MCP 能力访问：`list_mcp_tools` / `call_mcp_tool` / `list_mcp_resources` / `read_mcp_resource` / `list_mcp_prompts` / `get_mcp_prompt`
 
 2. **声明式命令工具 (Declarative Tools)**：
    由 Agent 自身调用 `create_or_update_tool` 自动生成的工具，存放在 `tools/` 目录下。
@@ -114,7 +131,75 @@ Clonoth 不依赖关系型数据库，所有的对话、任务、工具调用状
      TIMEOUT_SEC = 30.0
      ```
 
-### 2.4 Runtime 动态调参
+### 2.4 Skills 与 progressive disclosure
+
+Clonoth 采用兼容主流 Agent Skills 的最小形式：
+
+```text
+skills/
+  <skill-name>/
+    SKILL.md
+```
+
+`SKILL.md` 推荐使用 YAML frontmatter + 正文说明，至少包含：
+
+```md
+---
+name: release-note
+description: 当用户要求生成发布说明、changelog、release notes 时使用。
+enabled: true
+---
+
+这里写这个 skill 的工作流、输出要求、注意事项。
+```
+
+Skill 在请求中的拼接方式不是“把所有 `SKILL.md` 全文塞进 prompt”，而是采用 **progressive disclosure**：
+
+1. **请求开始时**：Kernel 只向模型注入 skills 的元数据索引（`name` / `description` / `path`）。
+2. **模型判断命中时**：再通过 `read_file` 按需读取对应的 `skills/<name>/SKILL.md`。
+3. **若 skill 继续引用 `references/` / `scripts/` / `assets/`**：只读取实际需要的文件，不整包加载。
+
+这使得：
+
+- skills 可以很多，但不会拖垮每次请求的上下文；
+- `description` 成为 skill 触发的主信号；
+- 你既可以显式点名某个 skill，也可以让模型根据任务语义自行选择。
+
+### 2.5 MCP Client
+
+Clonoth 当前实现的是 **MCP Client**，不是 MCP Server。MCP client 配置保存在：`data/mcp_clients.yaml`。
+
+支持三种 transport：
+
+- `stdio`
+- `sse`
+- `streamable_http`
+
+MCP server 常见暴露三类能力：
+
+- `tools`
+- `resources`
+- `prompts`
+
+最小配置示例：
+
+```yaml
+version: 1
+clients:
+  github:
+    transport: stdio
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-github"
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+    enabled: true
+```
+
+当前实现采用 **通用代理工具** 访问 MCP，而不是把远端每个工具动态注册成一个本地工具名。也就是说，Kernel 会通过 `call_mcp_tool` / `read_mcp_resource` / `get_mcp_prompt` 这类通用工具访问指定 client 的能力。
+
+### 2.6 Runtime 动态调参
 `config/runtime.yaml` 提供运行时的非敏感参数调整（如 Kernel 轮询间隔、最大执行步数、工具历史截断长度等）。这些参数可由人类修改，也可授权给 Agent 自身进行优化。
 
 ---
@@ -170,8 +255,9 @@ Clonoth/
 ├── shell/          # 路由层：对话维护、意图识别、任务下发（含本地 CLI）
 ├── kernel/         # 执行层：Task 执行循环、请求审批、调用工具
 ├── providers/      # 大模型适配层 (OpenAI / Gemini / Anthropic)
+├── skills/         # 本地 skill 包：skills/<name>/SKILL.md
 ├── tools/          # 自进化区：Agent 编写的工具（热加载）
 ├── config/         # 运行时配置、Prompts
-├── data/           # events.jsonl, config.yaml, policy.yaml等动态数据
+├── data/           # events.jsonl, config.yaml, policy.yaml, mcp_clients.yaml 等动态数据
 └── public/         # 静态资源（如 logo）
 ```
