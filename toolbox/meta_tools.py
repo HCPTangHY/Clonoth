@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pprint
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -142,14 +144,22 @@ async def _request_guard(
     op_res = await ctx.request_op(op, parameters)
     safety_level = str(op_res.get("safety_level") or "")
 
+    if await ctx.check_cancelled():
+        return op_res, {"ok": False, "error": "task cancelled", "cancelled": True}
+
     if safety_level == "deny":
         return op_res, {"ok": False, "error": op_res.get("reason", "denied")}
 
     if safety_level == "approval_required":
         approval_id = op_res.get("approval_id")
         approval = await ctx.wait_for_approval(approval_id)
+        if approval.get("status") == "cancelled":
+            return op_res, {"ok": False, "error": "task cancelled", "approval_id": approval_id, "cancelled": True}
         if approval.get("status") != "allowed":
             return op_res, {"ok": False, "error": "user denied approval", "approval_id": approval_id}
+
+    if await ctx.check_cancelled():
+        return op_res, {"ok": False, "error": "task cancelled", "cancelled": True}
 
     return op_res, None
 
@@ -377,22 +387,41 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if err is not None:
         return err
 
+    if await ctx.check_cancelled():
+        return {"ok": False, "error": "task cancelled", "cancelled": True}
+
     try:
-        cp = subprocess.run(
+        proc = await asyncio.create_subprocess_shell(
             command,
-            shell=True,
             cwd=str(ctx.workspace_root),
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=_safe_subprocess_env(),
         )
-        out = (cp.stdout or "") + ("\n" + cp.stderr if cp.stderr else "")
+        waiter = asyncio.create_task(proc.communicate())
+        started = time.monotonic()
+        while True:
+            done, _pending = await asyncio.wait({waiter}, timeout=0.2)
+            if waiter in done:
+                stdout_bytes, stderr_bytes = waiter.result()
+                break
+            if await ctx.check_cancelled():
+                proc.kill()
+                await asyncio.gather(waiter, return_exceptions=True)
+                return {"ok": False, "error": "task cancelled", "cancelled": True}
+            if time.monotonic() - started >= timeout_sec:
+                proc.kill()
+                await asyncio.gather(waiter, return_exceptions=True)
+                return {"ok": False, "error": f"timeout after {timeout_sec}s"}
+
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+        out = (stdout_text or "") + ("\n" + stderr_text if stderr_text else "")
         if len(out) > max_output_chars:
             out = out[:max_output_chars] + "\n...<truncated>"
-        return {"ok": True, "returncode": cp.returncode, "output": out}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"timeout after {timeout_sec}s"}
+        return {"ok": True, "returncode": int(proc.returncode or 0), "output": out}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -785,3 +814,30 @@ async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     save_schedules(ctx.workspace_root, schedules)
     return {"ok": True, "deleted": True, "id": sid}
+
+
+# ---------------------------------------------------------------------------
+#  任务管理工具
+# ---------------------------------------------------------------------------
+
+async def cancel_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """取消当前会话中所有正在执行的下游 task。
+
+    入口节点在收到新用户消息后，如果判断旧任务不再需要，调用此工具取消。
+    """
+    try:
+        r = await ctx.http.post(
+            f"{ctx.supervisor_url}/v1/sessions/{ctx.session_id}/cancel_active_tasks",
+            params={"exclude_task_id": ctx.task_id},
+        )
+        if r.status_code >= 400:
+            return {"ok": False, "error": r.text}
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def list_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """列出当前会话中所有活跃 task 的摘要。"""
+    # active_tasks_summary 已经通过 input_data 注入，这里提供一个实时查询接口
+    return {"ok": True, "note": "活跃任务信息已在系统上下文中注入，无需额外查询。"}

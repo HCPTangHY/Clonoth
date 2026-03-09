@@ -16,6 +16,7 @@ tool_access:
     - create_schedule
     - list_schedules
     - delete_schedule
+    - cancel_active_tasks
 output_mode: reply
 skills:
   mode: none

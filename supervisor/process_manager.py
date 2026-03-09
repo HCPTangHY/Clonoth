@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from clonoth_runtime import get_bool, get_float, load_runtime_config
+from clonoth_runtime import get_bool, get_float, get_int, load_runtime_config
 
 
 def _timestamp() -> str:
@@ -30,7 +30,7 @@ class ProcessManager:
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        self.engine: ManagedProcess | None = None
+        self.engines: list[ManagedProcess] = []
         self.shell_cli: ManagedProcess | None = None
 
         runtime_cfg = load_runtime_config(workspace_root)
@@ -41,6 +41,13 @@ class ProcessManager:
             5.0,
             min_value=0.1,
             max_value=30.0,
+        )
+        self.engine_workers = get_int(
+            runtime_cfg,
+            "supervisor.process_manager.engine_workers",
+            2,
+            min_value=1,
+            max_value=8,
         )
 
         platform_default_new_console = sys.platform == "win32"
@@ -97,21 +104,33 @@ class ProcessManager:
         return ManagedProcess(name=name, popen=p, log_path=log_path)
 
     def start_engine(self) -> None:
-        if self.engine and self.engine.popen.poll() is None:
-            return
-        self.engine = self._spawn(name="engine", module="engine", capture_output=True, new_console=False)
+        self.engines = [proc for proc in self.engines if proc.popen.poll() is None]
+        while len(self.engines) < self.engine_workers:
+            idx = len(self.engines) + 1
+            name = f"engine-{idx}"
+            proc = self._spawn(
+                name=name,
+                module="engine",
+                capture_output=True,
+                new_console=False,
+                extra_args=["--worker-id", name],
+            )
+            self.engines.append(proc)
 
     def start_shell_cli(self) -> None:
         if self.shell_cli and self.shell_cli.popen.poll() is None:
             return
         self.shell_cli = self._spawn(
-            name="shell-cli", module="shell.cli", capture_output=False, new_console=self.shell_new_console,
+            name="shell-cli",
+            module="shell.cli",
+            capture_output=False,
+            new_console=self.shell_new_console,
         )
 
     def stop_engine(self) -> None:
-        if self.engine:
-            self._stop(self.engine)
-            self.engine = None
+        for proc in list(self.engines):
+            self._stop(proc)
+        self.engines = []
 
     def stop_shell_cli(self) -> None:
         if self.shell_cli:

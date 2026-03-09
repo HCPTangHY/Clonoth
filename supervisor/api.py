@@ -38,6 +38,8 @@ from .types import (
     OutboundMessageOut,
     RestartIn,
     RestartOut,
+    Task,
+    TaskCompleteIn,
 )
 
 
@@ -83,7 +85,6 @@ def create_app(
         st: SupervisorState = app.state.state
 
         out = cs.update_openai(body)
-
         st.eventlog.append(
             session_id="__system__",
             component="supervisor",
@@ -122,9 +123,7 @@ def create_app(
             type_="inbound_message",
             payload=msg.model_dump(),
         )
-
         st.record_inbound_message_event(evt)
-
         return InboundMessageOut(session_id=session_id, accepted=True)
 
     @app.get("/v1/inbound/next", response_model=InboundWorkItem)
@@ -147,6 +146,31 @@ def create_app(
             raise HTTPException(status_code=404, detail="inbound item not found")
         return InboundAckOut(ok=True)
 
+    @app.get("/v1/tasks/next", response_model=Task)
+    async def task_next(
+        worker_id: str = Query(..., min_length=1),
+        lease_sec: float = Query(120.0, ge=1.0, le=3600.0),
+    ) -> Task:
+        st: SupervisorState = app.state.state
+        st.mark_engine_seen(worker_id=worker_id)
+        item = st.assign_next_task(worker_id=worker_id, lease_sec=float(lease_sec))
+        if item is None:
+            return Response(status_code=204)  # type: ignore[return-value]
+        return Task.model_validate(item)
+
+    @app.post("/v1/tasks/{task_id}/complete")
+    async def task_complete(task_id: str, body: TaskCompleteIn) -> dict[str, Any]:
+        st: SupervisorState = app.state.state
+        task = st.complete_task(task_id=task_id, worker_id=body.worker_id, result=dict(body.result or {}))
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return {"ok": True, "task_id": task.task_id, "status": task.status.value}
+
+    @app.get("/v1/tasks/{task_id}/cancelled")
+    async def task_cancelled(task_id: str) -> dict[str, Any]:
+        st: SupervisorState = app.state.state
+        return {"cancelled": st.is_task_cancelled(task_id)}
+
     @app.post("/v1/sessions/{session_id}/outbound", response_model=OutboundMessageOut)
     async def session_outbound(session_id: str, body: OutboundMessageIn) -> OutboundMessageOut:
         st: SupervisorState = app.state.state
@@ -162,17 +186,40 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e) or "bad request")
         except RuntimeError as e:
             raise HTTPException(status_code=409, detail=str(e) or "conflict")
-
         return OutboundMessageOut(ok=True)
 
     @app.get("/v1/sessions/{session_id}/events", response_model=list[Event])
+    async def session_events(
+        session_id: str,
+        after_seq: int = Query(0, ge=0),
+    ) -> list[Event]:
+        st: SupervisorState = app.state.state
+        evts = st.list_events(session_id=session_id, after_seq=after_seq)
+        out: list[Event] = []
+        for e in evts:
+            try:
+                out.append(
+                    Event(
+                        schema_version=int(e.get("schema_version", 1)),
+                        seq=int(e.get("seq", 0)),
+                        event_id=str(e.get("event_id")),
+                        ts=datetime.fromisoformat(str(e.get("ts"))),
+                        run_id=str(e.get("run_id")),
+                        session_id=str(e.get("session_id")),
+                        component=str(e.get("component")),
+                        type=str(e.get("type")),
+                        payload=dict(e.get("payload") or {}),
+                    )
+                )
+            except Exception:
+                continue
+        return out
 
     @app.get("/v1/events", response_model=list[Event])
     async def global_events(
         after_seq: int = Query(0, ge=0),
         types: str = Query("", description="comma-separated event types to filter"),
     ) -> list[Event]:
-        """全局事件接口。返回所有 session 中 seq > after_seq 的事件。"""
         st: SupervisorState = app.state.state
         evts = st.eventlog.list_all_events(after_seq=after_seq)
         type_filter = {t.strip() for t in types.split(",") if t.strip()} if types else set()
@@ -192,33 +239,6 @@ def create_app(
                     type=str(e.get("type")),
                     payload=dict(e.get("payload") or {}),
                 ))
-            except Exception:
-                continue
-        return out
-
-    async def session_events(
-        session_id: str,
-        after_seq: int = Query(0, ge=0),
-    ) -> list[Event]:
-        st: SupervisorState = app.state.state
-        evts = st.list_events(session_id=session_id, after_seq=after_seq)
-
-        out: list[Event] = []
-        for e in evts:
-            try:
-                out.append(
-                    Event(
-                        schema_version=int(e.get("schema_version", 1)),
-                        seq=int(e.get("seq", 0)),
-                        event_id=str(e.get("event_id")),
-                        ts=datetime.fromisoformat(str(e.get("ts"))),
-                        run_id=str(e.get("run_id")),
-                        session_id=str(e.get("session_id")),
-                        component=str(e.get("component")),
-                        type=str(e.get("type")),
-                        payload=dict(e.get("payload") or {}),
-                    )
-                )
             except Exception:
                 continue
         return out
@@ -248,7 +268,6 @@ def create_app(
 
     @app.post("/v1/sessions/{session_id}/cancel")
     async def session_cancel(session_id: str) -> dict[str, Any]:
-        """取消 session 中正在执行的任务。"""
         st: SupervisorState = app.state.state
         ok = st.cancel_session(session_id)
         if not ok:
@@ -257,16 +276,24 @@ def create_app(
 
     @app.get("/v1/sessions/{session_id}/cancelled")
     async def session_cancelled(session_id: str) -> dict[str, Any]:
-        """查询 session 是否被标记为取消。"""
         st: SupervisorState = app.state.state
         return {"cancelled": st.is_cancelled(session_id)}
 
     @app.post("/v1/sessions/{session_id}/cancel/clear")
     async def session_cancel_clear(session_id: str) -> dict[str, Any]:
-        """清除 session 的取消标记。engine 开始处理新任务时调用。"""
         st: SupervisorState = app.state.state
         st.clear_cancelled(session_id)
         return {"ok": True}
+
+    @app.post("/v1/sessions/{session_id}/cancel_active_tasks")
+    async def session_cancel_active_tasks(
+        session_id: str, exclude_task_id: str = Query(""),
+    ) -> dict[str, Any]:
+        """取消 session 中所有活跃 task。供 AI 工具调用。"""
+        st: SupervisorState = app.state.state
+        if session_id not in st.sessions:
+            raise HTTPException(status_code=404, detail="session not found")
+        return st.cancel_active_tasks(session_id, exclude_task_id=exclude_task_id)
 
     @app.post("/v1/approvals/request", response_model=Approval)
     async def approval_request(inp: ApprovalRequestIn) -> Approval:
@@ -303,8 +330,6 @@ def create_app(
         pm: ProcessManager | None = app.state.process_manager
         st: SupervisorState = app.state.state
 
-        workspace_root = Path(__file__).resolve().parents[1]
-
         st.eventlog.append(
             session_id="__system__",
             component="supervisor",
@@ -320,9 +345,7 @@ def create_app(
         if inp.target == "engine":
             if pm is None:
                 raise HTTPException(status_code=409, detail="process manager not enabled")
-
             pm.restart_engine()
-
             st.eventlog.append(
                 session_id="__system__",
                 component="supervisor",

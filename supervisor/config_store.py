@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,17 @@ from .types import (
     OpenAIConfigSecret,
     OpenAIConfigUpdateIn,
 )
+
+
+def _resolve_env_value(value: str) -> str:
+    s = (value or "").strip()
+    if not s:
+        return ""
+    if s.startswith("${") and s.endswith("}") and len(s) > 3:
+        return os.getenv(s[2:-1].strip(), "").strip()
+    if s.startswith("$ENV{") and s.endswith("}") and len(s) > 6:
+        return os.getenv(s[5:-1].strip(), "").strip()
+    return s
 
 
 def _redact_api_key(api_key: str) -> tuple[bool, str]:
@@ -102,7 +114,10 @@ class ConfigStore:
 
     def get_public(self) -> AppConfigPublic:
         with self._lock:
-            cfg = self._config
+            cfg = self._config.model_copy(deep=True)
+            cfg.openai.base_url = _resolve_env_value(cfg.openai.base_url)
+            cfg.openai.api_key = _resolve_env_value(cfg.openai.api_key)
+            cfg.openai.model = _resolve_env_value(cfg.openai.model)
             present, redacted = _redact_api_key(cfg.openai.api_key)
             openai_pub = OpenAIConfigPublic(
                 base_url=cfg.openai.base_url,
@@ -114,11 +129,18 @@ class ConfigStore:
 
     def get_openai_secret(self) -> OpenAIConfigSecret:
         with self._lock:
-            return self._config.openai.model_copy(deep=True)
+            cfg = self._config.openai.model_copy(deep=True)
+            cfg.base_url = _resolve_env_value(cfg.base_url)
+            cfg.api_key = _resolve_env_value(cfg.api_key)
+            cfg.model = _resolve_env_value(cfg.model)
+            return cfg
 
     def get_openai_public(self) -> OpenAIConfigPublic:
         with self._lock:
-            cfg = self._config
+            cfg = self._config.model_copy(deep=True)
+            cfg.openai.base_url = _resolve_env_value(cfg.openai.base_url)
+            cfg.openai.api_key = _resolve_env_value(cfg.openai.api_key)
+            cfg.openai.model = _resolve_env_value(cfg.openai.model)
             present, redacted = _redact_api_key(cfg.openai.api_key)
             return OpenAIConfigPublic(
                 base_url=cfg.openai.base_url,

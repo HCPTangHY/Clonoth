@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +9,7 @@ import httpx
 
 @dataclass
 class RunContext:
-    """一次完整图执行的运行上下文。"""
+    """单个 task 执行片段的运行上下文。"""
 
     workspace_root: Path
     supervisor_url: str
@@ -21,6 +21,8 @@ class RunContext:
     base_url: str = ""
     default_model: str = "gpt-4o-mini"
     user_text: str = ""
+    task_id: str = ""
+    session_generation: int = 0
 
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         try:
@@ -32,13 +34,15 @@ class RunContext:
             pass
 
     async def check_cancelled(self) -> bool:
-        """轮询 Supervisor 检查当前 session 是否被取消。"""
         try:
-            r = await self.http.get(
-                f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled",
-            )
-            if r.status_code == 200:
-                return bool(r.json().get("cancelled", False))
+            if self.task_id:
+                r = await self.http.get(f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled")
+                if r.status_code == 200:
+                    return bool(r.json().get("cancelled", False))
+            else:
+                r = await self.http.get(f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled")
+                if r.status_code == 200:
+                    return bool(r.json().get("cancelled", False))
         except Exception:
             pass
         return False

@@ -67,6 +67,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
         "process_manager": {
             "stop_wait_timeout_sec": 5.0,
             "shell_new_console": None,
+            "engine_workers": 2,
         },
     },
 }
@@ -79,240 +80,153 @@ def runtime_config_path(workspace_root: Path) -> Path:
     return workspace_root / "config" / "runtime.yaml"
 
 
-def policy_config_path(workspace_root: Path) -> Path:
-    return workspace_root / "data" / "policy.yaml"
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
+    path = runtime_config_path(workspace_root)
+    try:
+        mtime = path.stat().st_mtime if path.exists() else -1.0
+    except Exception:
+        mtime = -1.0
+
+    key = str(path.resolve())
+    cached = _CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return copy.deepcopy(cached[1])
+
+    user_cfg: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                user_cfg = loaded
+        except Exception:
+            user_cfg = {}
+
+    merged = _deep_merge(DEFAULT_RUNTIME_CONFIG, user_cfg)
+    _CACHE[key] = (mtime, merged)
+    return copy.deepcopy(merged)
+
+
+def get_str(data: dict[str, Any], dotted_key: str, default: str = "") -> str:
+    cur: Any = data
+    for part in dotted_key.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return str(cur) if cur is not None else default
+
+
+def get_int(data: dict[str, Any], dotted_key: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    raw = get_str(data, dotted_key, "")
+    try:
+        val = int(raw)
+    except Exception:
+        val = int(default)
+    if min_value is not None:
+        val = max(min_value, val)
+    if max_value is not None:
+        val = min(max_value, val)
+    return val
+
+
+def get_float(data: dict[str, Any], dotted_key: str, default: float, *, min_value: float | None = None, max_value: float | None = None) -> float:
+    raw = get_str(data, dotted_key, "")
+    try:
+        val = float(raw)
+    except Exception:
+        val = float(default)
+    if min_value is not None:
+        val = max(min_value, val)
+    if max_value is not None:
+        val = min(max_value, val)
+    return val
+
+
+def get_bool(data: dict[str, Any], dotted_key: str, default: bool = False) -> bool:
+    raw = get_str(data, dotted_key, "")
+    if not raw:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def load_yaml_dict(path: Path) -> dict[str, Any] | None:
     try:
-        if not path.exists() or not path.is_file():
-            return None
-        text = path.read_text(encoding="utf-8")
-        if not text.strip():
-            return None
-        data = yaml.safe_load(text)
-        if not isinstance(data, dict):
-            return None
-        return data
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    return data if isinstance(data, dict) else None
 
 
-def load_policy_config(workspace_root: Path) -> dict[str, Any] | None:
-    return load_yaml_dict(policy_config_path(workspace_root))
-
-
-def parse_extra_roots(workspace_root: Path, raw: Any) -> list[Path]:
-    roots: list[Path] = []
-    if not isinstance(raw, list):
-        return roots
-
-    for it in raw:
-        if not isinstance(it, str) or not it.strip():
-            continue
-        try:
-            p = Path(it.strip()).expanduser()
-            if not p.is_absolute():
-                continue
-            rp = p.resolve()
-        except Exception:
-            continue
-
-        if rp == workspace_root:
-            continue
-        if rp not in roots:
-            roots.append(rp)
-    return roots
-
-
-def load_text_file(path: Path, max_chars: int = 200_000) -> str:
+def load_text_file(path: Path, default: str = "") -> str:
     try:
-        if not path.exists() or not path.is_file():
-            return ""
-        text = path.read_text(encoding="utf-8", errors="ignore").strip()
-        if not text:
-            return ""
-        if len(text) > max_chars:
-            return text[:max_chars] + "\n...<truncated>"
-        return text
+        return path.read_text(encoding="utf-8")
     except Exception:
-        return ""
-
-
-def _deep_update(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
-    for k, v in src.items():
-        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            _deep_update(dst[k], v)  # type: ignore[index]
-        else:
-            dst[k] = v
-    return dst
-
-
-def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
-    p = runtime_config_path(workspace_root)
-
-    try:
-        mtime = float(p.stat().st_mtime)
-    except Exception:
-        return copy.deepcopy(DEFAULT_RUNTIME_CONFIG)
-
-    cache_key = str(p.resolve())
-    cached = _CACHE.get(cache_key)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-
-    try:
-        text = p.read_text(encoding="utf-8")
-        data = yaml.safe_load(text) if text.strip() else None
-    except Exception:
-        data = None
-
-    cfg = copy.deepcopy(DEFAULT_RUNTIME_CONFIG)
-    if isinstance(data, dict):
-        try:
-            _deep_update(cfg, data)
-        except Exception:
-            cfg = copy.deepcopy(DEFAULT_RUNTIME_CONFIG)
-
-    _CACHE[cache_key] = (mtime, cfg)
-    return cfg
-
-
-def get_value(cfg: dict[str, Any], key_path: str, default: Any = None) -> Any:
-    cur: Any = cfg
-    for part in (key_path or "").split("."):
-        if not part:
-            continue
-        if not isinstance(cur, dict) or part not in cur:
-            return default
-        cur = cur.get(part)
-    return cur
-
-
-def get_int(
-    cfg: dict[str, Any],
-    key_path: str,
-    default: int,
-    *,
-    min_value: int | None = None,
-    max_value: int | None = None,
-) -> int:
-    v = get_value(cfg, key_path, default)
-    try:
-        out = int(v)
-    except Exception:
-        out = int(default)
-
-    if min_value is not None and out < min_value:
-        out = min_value
-    if max_value is not None and out > max_value:
-        out = max_value
-    return out
-
-
-def get_float(
-    cfg: dict[str, Any],
-    key_path: str,
-    default: float,
-    *,
-    min_value: float | None = None,
-    max_value: float | None = None,
-) -> float:
-    v = get_value(cfg, key_path, default)
-    try:
-        out = float(v)
-    except Exception:
-        out = float(default)
-
-    if min_value is not None and out < min_value:
-        out = min_value
-    if max_value is not None and out > max_value:
-        out = max_value
-    return out
-
-
-def get_bool(cfg: dict[str, Any], key_path: str, default: bool | None) -> bool | None:
-    v = get_value(cfg, key_path, default)
-
-    if isinstance(v, bool):
-        return v
-
-    if v is None:
         return default
 
-    if isinstance(v, (int, float)):
-        return bool(v)
 
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
-            return True
-        if s in {"0", "false", "no", "n", "off"}:
-            return False
-
-    return default
-
-
-def get_str(cfg: dict[str, Any], key_path: str, default: str) -> str:
-    v = get_value(cfg, key_path, default)
-    if isinstance(v, str):
-        return v
-    if v is None:
-        return default
-    return str(v)
-
-
-def resolve_env_ref(raw: Any) -> str:
-    if raw is None:
-        return ""
-    s = str(raw).strip()
+def resolve_env_ref(text: str) -> str:
+    s = str(text or "")
+    if s.startswith("$ENV{") and s.endswith("}"):
+        return os.getenv(s[5:-1], "")
     if s.startswith("${") and s.endswith("}") and len(s) > 3:
-        return (os.getenv(s[2:-1]) or "").strip()
+        return os.getenv(s[2:-1], "")
     return s
 
 
-async def fetch_json_dict(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
-    response = await client.get(url)
-    response.raise_for_status()
-    payload = response.json()
-    return payload if isinstance(payload, dict) else {}
+async def fetch_openai_secret(http: httpx.AsyncClient, supervisor_url: str) -> dict[str, Any]:
+    r = await http.get(f"{supervisor_url.rstrip('/')}/v1/config/openai/secret")
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, dict) else {}
 
 
-async def fetch_openai_secret(client: httpx.AsyncClient, supervisor_url: str) -> dict[str, Any]:
-    return await fetch_json_dict(client, f"{supervisor_url}/v1/config/openai/secret")
-
-
-def normalize_openai_secret(
-    cfg: dict[str, Any],
-) -> tuple[str, str, str]:
-    openai_cfg = cfg.get("openai") if isinstance(cfg, dict) else None
-    if isinstance(openai_cfg, dict):
-        base_url = resolve_env_ref(openai_cfg.get("base_url") or "")
-        api_key = resolve_env_ref(openai_cfg.get("api_key") or "")
-        model = resolve_env_ref(openai_cfg.get("model") or "")
-    else:
-        base_url = resolve_env_ref(cfg.get("base_url") or "") if isinstance(cfg, dict) else ""
-        api_key = resolve_env_ref(cfg.get("api_key") or "") if isinstance(cfg, dict) else ""
-        model = resolve_env_ref(cfg.get("model") or "") if isinstance(cfg, dict) else ""
-
-    if not base_url:
-        base_url = "https://api.openai.com/v1"
-    if not model:
-        model = "gpt-4o-mini"
+def normalize_openai_secret(data: dict[str, Any]) -> tuple[str, str, str]:
+    if not isinstance(data, dict):
+        return "", "", ""
+    api_key = resolve_env_ref(str(data.get("api_key") or "").strip())
+    base_url = resolve_env_ref(str(data.get("base_url") or "").strip())
+    model = resolve_env_ref(str(data.get("model") or "gpt-4o-mini").strip()) or "gpt-4o-mini"
     return api_key, base_url, model
 
 
-import re as _re
+def load_policy_config(workspace_root: Path) -> dict[str, Any]:
+    p = workspace_root / "data" / "policy.yaml"
+    data = load_yaml_dict(p)
+    return data if isinstance(data, dict) else {}
 
-_TOOL_TRACE_RE = _re.compile(
-    r"\[CLONOTH_TOOL_TRACE[^\]]*\].*?\[/CLONOTH_TOOL_TRACE\]",
-    _re.DOTALL,
-)
+
+def parse_extra_roots(workspace_root: Path, raw: Any) -> list[Path]:
+    items = raw if isinstance(raw, list) else []
+    out: list[Path] = []
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        p = Path(item)
+        p = p.resolve() if p.is_absolute() else (workspace_root / p).resolve()
+        out.append(p)
+    return out
 
 
 def strip_tool_trace_blocks(text: str) -> str:
-    """Remove [CLONOTH_TOOL_TRACE ...] blocks from text for display."""
-    if not text:
-        return text
-    cleaned = _TOOL_TRACE_RE.sub("", text).strip()
-    return cleaned
+    s = str(text or "")
+    start = "[CLONOTH_TOOL_TRACE v1]"
+    end = "[/CLONOTH_TOOL_TRACE]"
+    while True:
+        i = s.find(start)
+        if i < 0:
+            break
+        j = s.find(end, i)
+        if j < 0:
+            s = s[:i].rstrip()
+            break
+        s = (s[:i] + s[j + len(end):]).strip()
+    return s.strip()

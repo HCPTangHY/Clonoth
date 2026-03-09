@@ -3,8 +3,8 @@ kind: workflow
 id: bootstrap.plan_execute_review
 name: "计划-执行-复核"
 description: >-
-  入口节点判断后，进入 planner → executor → reviewer 三个节点，最后回到入口节点输出最终回复。
-  执行节点需要运行命令时，通过 handoff 交给审核节点。
+  入口节点判断后，以 handoff 方式进入 planner → executor → reviewer 子链。
+  子链结束后，再回到入口节点继续生成对用户的最终回复。
 
 entry_node: bootstrap.shell_orchestrator
 
@@ -12,17 +12,18 @@ nodes:
   bootstrap.shell_orchestrator:
     on:
       reply: $reply
+    handoffs:
       handoff: bootstrap.planner
 
   bootstrap.planner:
     on:
       completed: bootstrap.executor
-      failed: bootstrap.shell_orchestrator
+      failed: $end
 
   bootstrap.executor:
     on:
       completed: bootstrap.reviewer
-      failed: bootstrap.shell_orchestrator
+      failed: $end
     handoffs:
       cmd_review: bootstrap.cmd_reviewer
 
@@ -33,5 +34,5 @@ nodes:
 
   bootstrap.reviewer:
     on:
-      completed: bootstrap.shell_orchestrator
-      failed: bootstrap.shell_orchestrator
+      completed: $end
+      failed: $end

@@ -15,6 +15,8 @@ from typing import Any, TYPE_CHECKING
 
 import yaml
 
+from engine.context_store import cleanup_old_contexts
+
 if TYPE_CHECKING:
     from .state import SupervisorState
 
@@ -123,11 +125,16 @@ class SchedulerThread:
         log.info("[scheduler] started")
 
     def _loop(self) -> None:
+        tick_count = 0
         while True:
             try:
                 self._tick()
             except Exception as e:
                 log.warning(f"[scheduler] tick error: {e}")
+            tick_count += 1
+            # 每 30 分钟清理一次旧上下文快照（30 ticks × 60s = 30min）
+            if tick_count % 30 == 0:
+                self._cleanup()
             time.sleep(60)
 
     def _tick(self) -> None:
@@ -161,6 +168,7 @@ class SchedulerThread:
             text = str(s.get("text") or f"[scheduled:{sid}]").strip()
             conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
             msg_id = f"scheduler:{sid}:{uuid.uuid4()}"
+            workflow_id = str(s.get("workflow_id") or "").strip()
 
             try:
                 session_id = self._state.get_or_create_session(
@@ -176,6 +184,7 @@ class SchedulerThread:
                         "message_id": msg_id,
                         "text": text,
                         "schedule_id": sid,
+                        "workflow_id": workflow_id,
                     },
                 )
                 self._state.record_inbound_message_event(evt)
@@ -194,3 +203,53 @@ class SchedulerThread:
             log.info(f"[scheduler] removed once-schedule: {sid}")
         except Exception as e:
             log.warning(f"[scheduler] failed to remove once-schedule {sid}: {e}")
+
+    def _cleanup(self) -> None:
+        """定期清理旧的上下文快照和已完成 task 的内存。"""
+        try:
+            from .types import TaskStatus
+
+            # 在锁内收集 keep_refs 快照
+            with self._state._lock:
+                keep_refs: set[str] = set()
+                for task in self._state.tasks.values():
+                    if task.status not in {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}:
+                        ref = str(task.input.get("context_ref") or "").strip()
+                        if ref:
+                            keep_refs.add(ref)
+                        cref = str(task.continuation.get("resume_context_ref") or "").strip()
+                        if cref:
+                            keep_refs.add(cref)
+                        for frame in (task.continuation.get("resume_stack") or []):
+                            if isinstance(frame, dict):
+                                fref = str(frame.get("context_ref") or "").strip()
+                                if fref:
+                                    keep_refs.add(fref)
+
+            # 文件清理在锁外执行（IO 操作）
+            count = cleanup_old_contexts(
+                self._workspace_root,
+                max_age_seconds=3600.0,  # 1 小时前的快照
+                keep_refs=keep_refs,
+            )
+            if count > 0:
+                log.info(f"[scheduler] cleaned up {count} old context snapshots")
+
+            # 在锁内清理内存中已终结的旧 task（保留最近 200 个）
+            with self._state._lock:
+                terminal = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
+                finished_ids = [
+                    tid for tid in self._state._task_order
+                    if tid in self._state.tasks and self._state.tasks[tid].status in terminal
+                ]
+                if len(finished_ids) > 200:
+                    to_remove = finished_ids[:-200]
+                    for tid in to_remove:
+                        self._state.tasks.pop(tid, None)
+                    self._state._task_order = [
+                        tid for tid in self._state._task_order if tid in self._state.tasks
+                    ]
+                    log.info(f"[scheduler] pruned {len(to_remove)} old tasks from memory")
+        except Exception as e:
+            log.warning(f"[scheduler] cleanup error: {e}")
+

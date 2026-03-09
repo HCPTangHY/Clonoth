@@ -3,8 +3,9 @@ kind: workflow
 id: bootstrap.default_chat
 name: "默认对话流"
 description: >-
-  入口节点判断是否直接回复；若需下游处理，交给执行节点；执行完成后回到入口节点输出最终回复。
-  执行节点需要运行命令时，通过 handoff 交给审核节点。
+  入口节点先判断是否直接回复。若需要下游处理，则以 handoff 方式交给执行节点。
+  执行节点与命令审核节点也通过 handoff 协作。所有节点之间均由 task 调度衔接，
+  不再直接阻塞等待。
 
 entry_node: bootstrap.shell_orchestrator
 
@@ -12,14 +13,14 @@ nodes:
   bootstrap.shell_orchestrator:
     on:
       reply: $reply
-      handoff: bootstrap.executor
     handoffs:
+      handoff: bootstrap.executor
       cmd_review: bootstrap.cmd_reviewer
 
   bootstrap.executor:
     on:
-      completed: bootstrap.shell_orchestrator
-      failed: bootstrap.shell_orchestrator
+      completed: $end
+      failed: $end
     handoffs:
       cmd_review: bootstrap.cmd_reviewer
 

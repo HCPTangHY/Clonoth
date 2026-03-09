@@ -6,19 +6,10 @@
 version: 1
 
 engine:
-  # 单个节点移交链的最大执行步数。
   max_steps: 32
-
-  # 流式输出开关。启用后入口节点 LLM 响应逐块推送到 CLI。
   streaming: true
-
-  # 执行节点移交时载入的历史消息数量。
   history_limit: 80
-
-  # 无节点移交时的轮询间隔。
   poll_interval_sec: 1.0
-
-  # 审批轮询间隔。
   approval_poll_interval_sec: 0.5
 
   http:
@@ -32,7 +23,6 @@ engine:
     max_inline_chars: 8000
     max_progress_arg_chars: 320
 
-  # engine 统一模型覆盖。为空时走 profile 路由。
   model: ""
 
 providers:
@@ -57,8 +47,6 @@ tools:
 
 shell:
   default_conversation_key: "cli:default"
-
-  # shell 运行时默认加载的 workflow。
   workflow_id: "bootstrap.default_chat"
 
   entry_node:
@@ -82,3 +70,4 @@ supervisor:
   process_manager:
     stop_wait_timeout_sec: 5.0
     shell_new_console: null
+    engine_workers: 2

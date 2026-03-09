@@ -109,10 +109,24 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                 cwd=str(root) if isinstance(root, Path) else None,
                 env=meta_tools._safe_subprocess_env(),
             )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(input=input_json.encode("utf-8")),
-                timeout=timeout_val,
-            )
+            waiter = asyncio.create_task(proc.communicate(input=input_json.encode("utf-8")))
+            started = asyncio.get_running_loop().time()
+            while True:
+                done, _pending = await asyncio.wait({waiter}, timeout=0.2)
+                if waiter in done:
+                    stdout_bytes, stderr_bytes = waiter.result()
+                    break
+                try:
+                    if hasattr(ctx, "check_cancelled") and await ctx.check_cancelled():
+                        proc.kill()
+                        await asyncio.gather(waiter, return_exceptions=True)
+                        return {"ok": False, "error": "script task cancelled", "cancelled": True}
+                except Exception:
+                    pass
+                if asyncio.get_running_loop().time() - started >= timeout_val:
+                    proc.kill()
+                    await asyncio.gather(waiter, return_exceptions=True)
+                    return {"ok": False, "error": f"script timeout after {timeout_val}s"}
         except asyncio.TimeoutError:
             try:
                 proc.kill()  # type: ignore[union-attr]
@@ -368,6 +382,13 @@ class ToolRegistry:
                     "required": ["id"],
                 },
                 meta_tools.delete_schedule,
+            ),
+            (
+                "cancel_active_tasks",
+                "Cancel all active downstream tasks in the current session. "
+                "Use when the user's new message makes the previous task unnecessary.",
+                {"type": "object", "properties": {}, "required": []},
+                meta_tools.cancel_active_tasks,
             ),
         ]
 

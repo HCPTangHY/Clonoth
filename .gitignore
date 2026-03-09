@@ -19,3 +19,4 @@ pip-wheel-metadata/
 /data/logs/
 /data/artifacts/
 /data/upgrade_pending.json
+/data/node_contexts/

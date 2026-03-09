@@ -7,15 +7,13 @@ from pathlib import Path
 import uvicorn
 from dotenv import load_dotenv
 
-from clonoth_runtime import get_float, load_runtime_config
-
 from .api import create_app
 from .config_store import ConfigStore
 from .eventlog import EventLog
 from .policy import PolicyEngine
 from .process_manager import ProcessManager
-from .state import SupervisorState
 from .scheduler import SchedulerThread
+from .state import SupervisorState
 
 
 def main() -> None:
@@ -33,7 +31,6 @@ def main() -> None:
         action="store_true",
         help="enable uvicorn access log (VERY noisy because workers poll endpoints frequently)",
     )
-
     args = parser.parse_args()
 
     workspace_root = Path(__file__).resolve().parents[1]
@@ -41,17 +38,13 @@ def main() -> None:
     events_path = data_dir / "events.jsonl"
     config_path = data_dir / "config.yaml"
 
-    # run_id 每次启动不同（用于 Boot Event Injection）
     run_id = os.urandom(16).hex()
 
     eventlog = EventLog(events_path, run_id=run_id)
     policy = PolicyEngine(workspace_root=workspace_root)
-    state = SupervisorState(eventlog=eventlog, policy=policy)
+    state = SupervisorState(workspace_root=workspace_root, eventlog=eventlog, policy=policy)
 
-    # YAML 配置（provider/base_url/key/model 等）
     config_store = ConfigStore(path=config_path)
-
-    # 写 boot 事件
     state.write_boot_event()
 
     base_url = f"http://{args.host}:{args.port}"
@@ -63,21 +56,16 @@ def main() -> None:
             workspace_root=workspace_root,
             log_dir=data_dir / "logs",
         )
-
         if not args.no_kernel:
             process_manager.start_engine()
-        if not args.no_shell:
-            if process_manager.spawn_shell_cli:
-                process_manager.start_shell_cli()
-
+        if not args.no_shell and process_manager.spawn_shell_cli:
+            process_manager.start_shell_cli()
 
     scheduler = SchedulerThread(state=state, workspace_root=workspace_root)
     scheduler.start()
 
     app = create_app(state=state, process_manager=process_manager, config_store=config_store)
 
-    # Access log is extremely noisy because shell and kernel runtimes poll endpoints frequently.
-    # Disabled by default. Enable via `--access-log` or `CLONOTH_ACCESS_LOG=1` when debugging.
     env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
     access_log = bool(args.access_log or env_access_log)
 
