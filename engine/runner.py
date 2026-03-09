@@ -33,6 +33,37 @@ from .protocol import NodeOutcome
 #  下游能力收集：告诉入口节点下游能做什么
 # ---------------------------------------------------------------------------
 
+def _collect_own_tool_capabilities(
+    node: "Node", registry: ToolRegistry,
+) -> str:
+    """收集节点自身的直接工具能力描述，作为动态上下文注入。"""
+    all_specs = registry.list_specs()
+    mode = (node.tool_access.mode or "none").lower()
+    if mode == "all":
+        denied = set(node.tool_access.deny)
+        tool_specs = [s for s in all_specs if s["name"] not in denied] if denied else list(all_specs)
+    elif mode == "allowlist":
+        allowed = set(node.tool_access.allow)
+        tool_specs = [s for s in all_specs if s["name"] in allowed]
+    else:
+        tool_specs = []
+
+    if not tool_specs:
+        return ""
+
+    lines: list[str] = []
+    for s in tool_specs:
+        name = s["name"]
+        desc = s.get("description", "")
+        lines.append(f"- {name}：{desc}" if desc else f"- {name}")
+
+    return (
+        "## 你的直接工具\n\n"
+        "以下工具已通过 function calling 提供给你，你可以直接调用，无需 handoff：\n\n"
+        + "\n".join(lines)
+    )
+
+
 def _collect_downstream_capabilities(
     workspace_root: Path, workflow: Workflow, registry: ToolRegistry,
 ) -> str:
@@ -76,6 +107,7 @@ def _collect_downstream_capabilities(
     return "## 下游节点能力\n\n通过 handoff 你可以调用以下下游节点：\n\n" + "\n".join(lines)
 
 
+
 # ---------------------------------------------------------------------------
 #  子链执行：从指定节点开始，沿 workflow 执行到终止
 # ---------------------------------------------------------------------------
@@ -106,6 +138,10 @@ async def _run_subchain(
     node_summaries: list[dict[str, Any]] = []
 
     for hop in range(20):
+        # 检查点：取消检测
+        if await rctx.check_cancelled():
+            return NodeOutcome(node_id=current_node_id, outcome="cancelled", text="任务已被用户取消。")
+
         node = load_node(rctx.workspace_root, current_node_id)
         if node is None:
             return NodeOutcome(node_id=current_node_id, outcome="failed", text=f"节点未找到：{current_node_id}")
@@ -218,7 +254,12 @@ async def run_graph(
     if entry_node is None:
         return f"入口节点未找到：{workflow.entry_node}", "failed"
 
-    downstream_caps = _collect_downstream_capabilities(rctx.workspace_root, workflow, registry)
+    own_tool_caps = _collect_own_tool_capabilities(entry_node, registry)
+    downstream_caps = _collect_downstream_capabilities(
+        rctx.workspace_root, workflow, registry,
+    )
+    caps_parts = [p for p in [own_tool_caps, downstream_caps] if p]
+    all_caps = "\n\n".join(caps_parts)
 
     history = await _fetch_history(rctx)
 
@@ -231,6 +272,10 @@ async def run_graph(
         先检查 handoffs 声明，再检查 flow edges。
         返回 str 表示 handoff 成功（结果注入上下文），None 表示非 handoff。
         """
+        # 检查点：取消检测
+        if await rctx.check_cancelled():
+            return "任务已被用户取消。"
+
         # 1. 检查显式 handoff 声明
         ho_target = entry_handoff_map.get(outcome_name, "")
         if ho_target and not ho_target.startswith("$"):
@@ -284,7 +329,7 @@ async def run_graph(
         rctx=rctx, provider=provider, registry=registry, workflow=workflow,
         node=entry_node, instruction=rctx.user_text, history=history,
         run_id=run_id, on_handoff=on_handoff,
-        downstream_capabilities=downstream_caps,
+        downstream_capabilities=all_caps,
         streaming=get_bool(runtime_cfg, "engine.streaming", False),
     )
 
@@ -384,7 +429,16 @@ async def _handle_inbound(
     wf_id = str(item.get("workflow_id") or "").strip() or default_wf_id
 
     # 立即 ACK，避免重启后重复处理
-    await http.post(f"{sup_url}/v1/inbound/ack", json={"session_id": session_id, "inbound_seq": inbound_seq})
+    await http.post(
+        f"{sup_url}/v1/inbound/{inbound_seq}/ack",
+        json={"worker_id": worker_id},
+    )
+
+    # 清除上一轮的取消标记，避免新任务被误杀
+    try:
+        await http.post(f"{sup_url}/v1/sessions/{session_id}/cancel/clear")
+    except Exception:
+        pass
 
     cfg_raw = await fetch_openai_secret(http, sup_url)
     api_key, base_url, default_model = normalize_openai_secret(cfg_raw)
@@ -408,5 +462,7 @@ async def _handle_inbound(
 
     final_text, status = await run_graph(rctx=rctx, registry=registry, workflow=wf)
 
-    await http.post(f"{sup_url}/v1/sessions/{session_id}/outbound",
-        json={"text": final_text or "（无输出）", "source_inbound_seq": inbound_seq})
+    # cancelled 时不发 outbound，避免覆盖后续新任务的输出
+    if status != "cancelled":
+        await http.post(f"{sup_url}/v1/sessions/{session_id}/outbound",
+            json={"text": final_text or "（无输出）", "source_inbound_seq": inbound_seq})

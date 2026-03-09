@@ -65,6 +65,9 @@ class SupervisorState:
         self._InboundLease = _InboundLease
         self._inbound_leases: dict[int, _InboundLease] = {}
 
+        # 取消标记：session_id -> True（仅当次运行有效，不从事件回放）
+        self._cancelled_sessions: set[str] = set()
+
         self.rebuild_from_events(eventlog.events)
 
     # ---- 引擎心跳 ----
@@ -199,6 +202,31 @@ class SupervisorState:
 
     # ---- 公开方法 ----
 
+    def cancel_session(self, session_id: str) -> bool:
+        """标记 session 为已取消。返回是否成功（session 存在）。"""
+        sid = (session_id or "").strip()
+        if not sid:
+            return False
+        with self._lock:
+            if sid not in self.sessions:
+                return False
+            self._cancelled_sessions.add(sid)
+        self.eventlog.append(
+            session_id=sid,
+            component="supervisor",
+            type_="cancel_requested",
+            payload={"session_id": sid, "ts": _now().isoformat()},
+        )
+        return True
+
+    def is_cancelled(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._cancelled_sessions
+
+    def clear_cancelled(self, session_id: str) -> None:
+        with self._lock:
+            self._cancelled_sessions.discard(session_id)
+
     def record_inbound_message_event(self, evt: dict[str, Any]) -> None:
         if not isinstance(evt, dict) or evt.get("type") != "inbound_message":
             return
@@ -211,6 +239,9 @@ class SupervisorState:
         if not isinstance(payload, dict):
             return
         with self._lock:
+            # 同 session 有新 inbound 进来，自动取消正在执行的旧任务
+            if session_id and session_id in self.sessions:
+                self._cancelled_sessions.add(session_id)
             self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
             self._advance_inbound_cursor()
 

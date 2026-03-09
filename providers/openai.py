@@ -23,6 +23,10 @@ def _normalize_base_url(base_url: str | None) -> str:
     if not base:
         base = "https://api.openai.com/v1"
 
+    # 缺少协议前缀时补上 https://
+    if base and not base.startswith("http://") and not base.startswith("https://"):
+        base = "https://" + base
+
     if not base.endswith("/v1"):
         base = base + "/v1"
 

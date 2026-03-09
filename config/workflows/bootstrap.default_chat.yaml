@@ -13,6 +13,8 @@ nodes:
     on:
       reply: $reply
       handoff: bootstrap.executor
+    handoffs:
+      cmd_review: bootstrap.cmd_reviewer
 
   bootstrap.executor:
     on:

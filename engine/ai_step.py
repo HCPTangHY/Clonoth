@@ -187,6 +187,11 @@ async def run_ai_node(
     use_stream = streaming  # 仅入口节点由 runner 传入 True
 
     for _step in range(max_steps):
+        # 检查点：取消检测
+        if await rctx.check_cancelled():
+            await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "step": _step})
+            return NodeOutcome(node_id=node.id, outcome="cancelled", text="任务已被用户取消。")
+
         text_buf: _StreamBuffer | None = None
         think_buf: _StreamBuffer | None = None
 
@@ -271,6 +276,11 @@ async def run_ai_node(
                             "truncated": False, "ref": "", "summary": f"工具不存在: {tc.name}",
                         })
                         continue
+
+                    # 检查点：工具执行前取消检测
+                    if await rctx.check_cancelled():
+                        await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "step": _step})
+                        return NodeOutcome(node_id=node.id, outcome="cancelled", text="任务已被用户取消。")
 
                     result = await func(tc.arguments or {}, kctx)
                     summary = summarize_result(tc.name, result)

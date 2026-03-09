@@ -13,6 +13,9 @@ tool_access:
   mode: allowlist
   allow:
     - request_restart
+    - create_schedule
+    - list_schedules
+    - delete_schedule
 output_mode: reply
 skills:
   mode: none

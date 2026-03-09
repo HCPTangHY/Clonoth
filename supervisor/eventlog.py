@@ -115,6 +115,13 @@ class EventLog:
             if e.get("session_id") == session_id and int(e.get("seq", 0)) > after_seq
         ]
 
+    def list_all_events(self, *, after_seq: int = 0) -> list[dict[str, Any]]:
+        """返回所有 session 中 seq > after_seq 的事件。"""
+        return [
+            e for e in self._events
+            if int(e.get("seq", 0)) > after_seq
+        ]
+
     def last_event(self) -> dict[str, Any] | None:
         return self._events[-1] if self._events else None
 

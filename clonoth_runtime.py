@@ -287,13 +287,13 @@ def normalize_openai_secret(
 ) -> tuple[str, str, str]:
     openai_cfg = cfg.get("openai") if isinstance(cfg, dict) else None
     if isinstance(openai_cfg, dict):
-        base_url = str(openai_cfg.get("base_url") or "").strip()
-        api_key = str(openai_cfg.get("api_key") or "").strip()
-        model = str(openai_cfg.get("model") or "").strip()
+        base_url = resolve_env_ref(openai_cfg.get("base_url") or "")
+        api_key = resolve_env_ref(openai_cfg.get("api_key") or "")
+        model = resolve_env_ref(openai_cfg.get("model") or "")
     else:
-        base_url = str(cfg.get("base_url") or "").strip() if isinstance(cfg, dict) else ""
-        api_key = str(cfg.get("api_key") or "").strip() if isinstance(cfg, dict) else ""
-        model = str(cfg.get("model") or "").strip() if isinstance(cfg, dict) else ""
+        base_url = resolve_env_ref(cfg.get("base_url") or "") if isinstance(cfg, dict) else ""
+        api_key = resolve_env_ref(cfg.get("api_key") or "") if isinstance(cfg, dict) else ""
+        model = resolve_env_ref(cfg.get("model") or "") if isinstance(cfg, dict) else ""
 
     if not base_url:
         base_url = "https://api.openai.com/v1"

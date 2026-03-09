@@ -51,6 +51,9 @@ write_file:
     - pattern: "data/events.jsonl"
       decision: deny
       reason: "event log is append-only; never modify"
+    - pattern: "data/schedules.yaml"
+      decision: approval_required
+      reason: "schedule changes require approval"
     - pattern: "engine/**"
       decision: approval_required
       reason: "engine source changes require approval"

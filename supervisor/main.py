@@ -15,6 +15,7 @@ from .eventlog import EventLog
 from .policy import PolicyEngine
 from .process_manager import ProcessManager
 from .state import SupervisorState
+from .scheduler import SchedulerThread
 
 
 def main() -> None:
@@ -69,6 +70,9 @@ def main() -> None:
             if process_manager.spawn_shell_cli:
                 process_manager.start_shell_cli()
 
+
+    scheduler = SchedulerThread(state=state, workspace_root=workspace_root)
+    scheduler.start()
 
     app = create_app(state=state, process_manager=process_manager, config_store=config_store)
 

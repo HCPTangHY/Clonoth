@@ -331,6 +331,44 @@ class ToolRegistry:
                 },
                 meta_tools.request_restart,
             ),
+            (
+                "create_schedule",
+                "Create or update a scheduled task in data/schedules.yaml. "
+                "The task fires as an inbound message at the specified cron time (UTC). "
+                "Requires approval.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "unique schedule id"},
+                        "cron": {"type": "string", "description": "5-field cron: minute hour day month weekday (UTC)"},
+                        "text": {"type": "string", "description": "message text injected as inbound"},
+                        "conversation_key": {"type": "string", "description": "conversation key (default: scheduler:{id})"},
+                        "workflow_id": {"type": "string", "description": "optional workflow override"},
+                        "enabled": {"type": "boolean"},
+                        "once": {"type": "boolean", "description": "if true, auto-delete after first trigger"},
+                    },
+                    "required": ["id", "cron", "text"],
+                },
+                meta_tools.create_schedule,
+            ),
+            (
+                "list_schedules",
+                "List all scheduled tasks from data/schedules.yaml.",
+                {"type": "object", "properties": {}, "required": []},
+                meta_tools.list_schedules,
+            ),
+            (
+                "delete_schedule",
+                "Delete a scheduled task by id. Requires approval.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "schedule id to delete"},
+                    },
+                    "required": ["id"],
+                },
+                meta_tools.delete_schedule,
+            ),
         ]
 
         for name, desc, schema, func in builtins:

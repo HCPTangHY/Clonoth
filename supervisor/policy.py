@@ -54,6 +54,7 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "data/config.yaml", "decision": "approval_required", "reason": "config changes require approval"},
                 {"pattern": "data/policy.yaml", "decision": "deny", "reason": "policy is high-risk (human-only)"},
                 {"pattern": "data/events.jsonl", "decision": "deny", "reason": "event log is append-only; never modify"},
+                {"pattern": "data/schedules.yaml", "decision": "approval_required", "reason": "schedule changes require approval"},
                 {"pattern": "engine/**", "decision": "approval_required", "reason": "engine source changes require approval"},
                 {"pattern": "supervisor/**", "decision": "approval_required", "reason": "supervisor source changes require approval"},
                 {"pattern": "toolbox/**", "decision": "approval_required", "reason": "toolbox source changes require approval"},

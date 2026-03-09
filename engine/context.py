@@ -30,3 +30,15 @@ class RunContext:
             )
         except Exception:
             pass
+
+    async def check_cancelled(self) -> bool:
+        """轮询 Supervisor 检查当前 session 是否被取消。"""
+        try:
+            r = await self.http.get(
+                f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled",
+            )
+            if r.status_code == 200:
+                return bool(r.json().get("cancelled", False))
+        except Exception:
+            pass
+        return False
