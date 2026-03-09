@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import Response
 
 from .config_store import ConfigStore
@@ -41,6 +42,8 @@ from .types import (
     Task,
     TaskCompleteIn,
 )
+from .admin_api import create_admin_router
+from .admin_api import get_admin_token, verify_admin_token
 
 
 def _now() -> datetime:
@@ -365,5 +368,28 @@ def create_app(
         th = threading.Thread(target=_do_execv, daemon=True)
         th.start()
         return RestartOut(scheduled=True, target="all")
+
+    admin_router = create_admin_router(workspace_root=state.workspace_root)
+    app.include_router(admin_router, prefix="/v1/admin/config")
+
+    # 认证校验端点：前端用来验证 token 是否正确
+    @app.get("/v1/admin/auth/check")
+    async def admin_auth_check(request: Request) -> dict[str, Any]:
+        try:
+            verify_admin_token(request)
+        except HTTPException:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return {"ok": True}
+
+    from fastapi import Request as _Req  # noqa: already imported above
+
+    admin_dir = state.workspace_root / "public" / "admin"
+    admin_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/admin", StaticFiles(directory=str(admin_dir), html=True), name="admin")
+
+    # 启动时打印 token
+    token = get_admin_token()
+    print(f"[admin] 管理界面地址: http://{{host}}:{{port}}/admin/", flush=True)
+    print(f"[admin] 管理 Token: {token}", flush=True)
 
     return app

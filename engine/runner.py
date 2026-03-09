@@ -264,8 +264,6 @@ async def _run_node_task(
 
     own_caps = _collect_own_tool_capabilities(node, registry)
     downstream_caps = _collect_downstream_capabilities(ws_root, wf, registry, node.id)
-    cap_parts = [p for p in [own_caps, downstream_caps] if p]
-    all_caps = "\n\n".join(cap_parts)
 
     runtime_cfg = load_runtime_config(ws_root)
     rp = resolve_provider(ws_root, runtime_cfg, node, default_model)
@@ -294,7 +292,8 @@ async def _run_node_task(
         run_id=task_id,
         context_ref=context_ref,
         resume_data=input_data.get("resume_data") if isinstance(input_data.get("resume_data"), dict) else None,
-        downstream_capabilities=all_caps,
+        own_tools_text=own_caps,
+        downstream_capabilities=downstream_caps,
         streaming=bool(node.id == wf.entry_node and get_bool(runtime_cfg, "engine.streaming", False)),
     )
 

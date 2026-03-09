@@ -169,6 +169,7 @@ async def run_ai_node(
     context_ref: str = "",
     resume_data: dict[str, Any] | None = None,
     downstream_capabilities: str = "",
+    own_tools_text: str = "",
 ) -> TaskResult:
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
@@ -182,7 +183,16 @@ async def run_ai_node(
         except Exception:
             step_count = 0
     else:
-        system_prompt = assemble_prompt(rctx.workspace_root, node)
+        prompt_vars: dict[str, str] = {
+            "node_id": node.id,
+            "node_name": node.name,
+            "instruction": instruction,
+        }
+        if own_tools_text:
+            prompt_vars["own_tools"] = own_tools_text
+        if downstream_capabilities:
+            prompt_vars["downstream"] = downstream_capabilities
+        system_prompt = assemble_prompt(rctx.workspace_root, node, variables=prompt_vars)
         skills_msg = format_skill_discovery_message(
             rctx.workspace_root,
             instruction_text=instruction,
@@ -192,8 +202,6 @@ async def run_ai_node(
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         if skills_msg:
             messages.append({"role": "system", "content": skills_msg})
-        if downstream_capabilities:
-            messages.append({"role": "system", "content": downstream_capabilities})
         messages.extend(history)
         ctx_lines = [f"当前节点={node.id}", f"请完成指令：{instruction}"]
         messages.append({"role": "user", "content": "\n".join(ctx_lines)})

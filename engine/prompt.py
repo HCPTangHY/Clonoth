@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
 
 from clonoth_runtime import load_text_file, load_yaml_dict
@@ -20,7 +22,15 @@ def _load_pack_manifest(workspace_root: Path, pack_id: str) -> dict[str, Any] | 
     return data
 
 
-def assemble_prompt(workspace_root: Path, node: Node) -> str:
+def _render_variables(text: str, variables: dict[str, str]) -> str:
+    """替换 {{key}} 占位符。未匹配的保留原样。"""
+    def _repl(m: re.Match) -> str:
+        key = m.group(1).strip()
+        return variables.get(key, m.group(0))
+    return re.sub(r'\{\{(\w+)\}\}', _repl, text)
+
+
+def assemble_prompt(workspace_root: Path, node: Node, *, variables: dict[str, str] | None = None) -> str:
     """根据节点定义的 prompt 引用，组装完整 system prompt。"""
     if not node.prompt.pack or not node.prompt.assembly:
         return DEFAULT_PROMPT
@@ -53,4 +63,20 @@ def assemble_prompt(workspace_root: Path, node: Node) -> str:
             return DEFAULT_PROMPT
         parts.append(text)
 
-    return "\n\n".join(parts).strip() or DEFAULT_PROMPT
+    result = "\n\n".join(parts).strip() or DEFAULT_PROMPT
+
+    # 合并变量：manifest variables 为默认值，运行时传入的覆盖
+    merged: dict[str, str] = {}
+    pack_vars = pack.get("variables")
+    if isinstance(pack_vars, dict):
+        for k, v in pack_vars.items():
+            merged[str(k)] = str(v)
+    if variables:
+        merged.update(variables)
+    # 系统保留变量
+    merged.setdefault("node_id", node.id)
+    merged.setdefault("node_name", node.name)
+    merged.setdefault("now", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    if merged:
+        result = _render_variables(result, merged)
+    return result
