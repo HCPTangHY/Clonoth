@@ -2,7 +2,7 @@
 
 ## 1. 内置工具
 
-当前 14 个内置工具，分为文件操作、命令执行、搜索、Skill 管理、MCP 管理、工具管理和系统管理七类。
+当前 17 个内置工具，分为文件操作、命令执行、搜索、Skill 管理、MCP 管理、工具管理、系统管理和任务管理八类。
 
 ### 1.1 文件操作
 
@@ -53,6 +53,8 @@
 命令执行前经过双层审核：cmd_reviewer 节点做 AI 语义审核，Supervisor Policy 做硬规则和人类审批。`rm -rf /`、`shutdown` 等命令会被硬拒绝。
 
 返回 `exit_code`、`stdout`、`stderr`。输出超过 `meta.execute_command.max_output_chars`（默认 12000 字符）时截断。
+
+命令执行期间，系统每 0.2 秒检查一次取消状态。如果 task 被取消，子进程会被立即终止。
 
 ### 1.3 搜索
 
@@ -171,20 +173,84 @@ MCP 工具注册后的名称格式为 `mcp_{client_id}_{tool_name}`。
 2. 通过 Supervisor Policy 发起 `restart` 审批
 3. 审批通过后执行 git checkpoint 和重启
 
+### 1.8 定时调度
+
+#### create_schedule
+
+创建或更新定时调度任务。调度定义存储在 `data/schedules.yaml` 中。到达指定时间时，系统会自动注入一条 inbound 消息。受审批保护。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `id` | string | 是 | 调度任务标识。只允许 `[A-Za-z_][A-Za-z0-9_-]{0,63}`。 |
+| `cron` | string | 是 | 5 字段 cron 表达式：minute hour day month weekday（UTC）。 |
+| `text` | string | 是 | 触发时注入的消息文本。 |
+| `conversation_key` | string | 否 | 会话标识。默认 `scheduler:{id}`。 |
+| `workflow_id` | string | 否 | 指定使用的 workflow。为空时使用默认 workflow。 |
+| `enabled` | boolean | 否 | 是否启用。默认 true。 |
+| `once` | boolean | 否 | 是否只触发一次。触发后自动删除。默认 false。 |
+
+#### list_schedules
+
+列出所有定时调度任务。无参数。
+
+#### delete_schedule
+
+删除定时调度任务。受审批保护。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `id` | string | 是 | 调度任务标识 |
+
+### 1.9 任务管理
+
+#### cancel_active_tasks
+
+取消当前会话中所有活跃的下游 task。无参数。
+
+入口节点在收到新用户消息后，如果判断旧任务不再需要，调用此工具取消。取消时会自动保留当前调用链上的 task，不会把自己取消掉。
+
 ---
 
-## 2. 脚本工具
+## 2. 工具执行模型
+
+### 2.1 task 化执行
+
+所有工具调用都以独立的 tool task 形式执行。流程如下：
+
+1. AI 节点发出工具调用请求
+2. AI 节点返回 `yield_tool` 结果，保存当前上下文快照到 `data/node_contexts/{session_id}/`
+3. Supervisor 为每个工具调用创建独立的 tool task
+4. Engine worker 领取 tool task 并执行
+5. 同一批次的所有 tool task 完成后，Supervisor 创建恢复 task
+6. 恢复 task 加载之前保存的上下文快照，把工具结果注入 AI 对话历史，继续执行
+
+### 2.2 可中断性
+
+所有工具在执行期间每 0.2 秒检查一次取消状态。以下操作均可被中断：
+
+- LLM 调用（流式和非流式）：每 0.3 秒检查
+- 子进程命令执行：每 0.2 秒检查，取消时 kill 子进程
+- 脚本工具执行：每 0.2 秒检查，取消时 kill 子进程
+- 审批等待：每次轮询间隔检查
+
+### 2.3 上下文快照
+
+节点在执行过程中会将对话历史保存为 JSON 快照文件，存储在 `data/node_contexts/{session_id}/` 下。调度线程每 30 分钟清理超过 1 小时的旧快照，活跃 task 引用的快照不会被清理。
+
+---
+
+## 3. 脚本工具
 
 `tools/*.py` 下的脚本工具以独立子进程运行。
 
-### 2.1 协议
+### 3.1 协议
 
 - 输入：工具参数作为 JSON 从 stdin 读入
 - 输出：结果作为 JSON 写到 stdout
 - 环境：敏感变量（API key 等）被自动剥离
 - 超时：可在脚本中通过 `TIMEOUT_SEC` 变量配置
 
-### 2.2 注册
+### 3.2 注册
 
 Engine 启动时扫描 `tools/` 目录，通过 AST 解析每个 `.py` 文件中的 `SPEC` 字典获取工具声明。不执行、不 import 脚本代码。
 
@@ -209,15 +275,16 @@ if __name__ == "__main__":
     pass
 ```
 
-### 2.3 安全隔离
+### 3.3 安全隔离
 
 - 脚本在独立子进程中运行，不在主 Engine 进程内 import 或 eval
 - 子进程环境自动剥离 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 等敏感变量
 - 子进程工作目录为工作区根目录
+- 执行期间每 0.2 秒检查取消状态，取消时直接 kill 子进程
 
 ---
 
-## 3. 安全模型
+## 4. 安全模型
 
 安全分为四层：
 
@@ -228,13 +295,13 @@ if __name__ == "__main__":
 
 AI 审核不能替代人类审批。
 
-### 3.1 SafetyLevel
+### 4.1 SafetyLevel
 
 - `auto`：自动允许
 - `approval_required`：需要人类审批
 - `deny`：硬拒绝
 
-### 3.2 文件保护
+### 4.2 文件保护
 
 | 路径 | 策略 | 原因 |
 |---|---|---|
@@ -249,7 +316,7 @@ AI 审核不能替代人类审批。
 | `.env`、`**/.env` | 硬拒绝 | 密钥文件 |
 | `config/runtime.yaml` | 自动允许 | 调优参数 |
 
-### 3.3 extra_roots
+### 4.3 extra_roots
 
 在 `data/policy.yaml` 中声明额外允许访问的路径：
 
@@ -260,11 +327,11 @@ extra_roots:
 
 对 `extra_roots` 下的路径，默认策略收紧为 `approval_required`。
 
-### 3.4 命令硬拒绝
+### 4.4 命令硬拒绝
 
 以下命令模式被硬拒绝：`rm -rf /`、`rm -rf ~`、`rm -rf *`、`format`、`mkfs`、`fdisk`、`dd if=/dev/zero`、`shutdown`、`reboot`。
 
-### 3.5 审批守卫
+### 4.5 审批守卫
 
 所有需要 Policy 判定的工具内部统一使用 `_request_guard` 函数。流程如下：
 
@@ -273,15 +340,15 @@ extra_roots:
 3. 如果判定为 `approval_required`，轮询等待人类审批结果
 4. 如果判定为 `auto`，直接执行
 
-这样每个工具不需要自己处理审批等待逻辑。
+等待审批期间也会检查取消状态。如果 task 被取消，审批等待会立即终止。
 
 ---
 
-## 4. 自进化
+## 5. 自进化
 
 AI 可以在人类审批下修改系统自身。
 
-### 4.1 能做的事
+### 5.1 能做的事
 
 | 操作 | 途径 | 审批 |
 |---|---|---|
@@ -293,15 +360,17 @@ AI 可以在人类审批下修改系统自身。
 | 修改引擎源码 | `write_file` → `engine/**` 等 | 需要 |
 | 接入 MCP 服务 | `create_or_update_mcp_client` | 不需要 |
 | 调整运行参数 | `write_file` → `config/runtime.yaml` | 不需要 |
+| 创建定时任务 | `create_schedule` | 需要 |
+| 取消下游任务 | `cancel_active_tasks` | 不需要 |
 | 重启使改动生效 | `request_restart` | 需要 |
 
-### 4.2 不能做的事
+### 5.2 不能做的事
 
 - 修改安全策略（`data/policy.yaml`）：硬拒绝
 - 修改事件日志（`data/events.jsonl`）：硬拒绝
 - 读写密钥文件（`.env`）：硬拒绝
 
-### 4.3 典型流程：创建新工具
+### 5.3 典型流程：创建新工具
 
 1. AI 调用 `create_or_update_tool`，生成 `tools/xxx.py`
 2. Policy 拦截，弹出审批
@@ -309,7 +378,7 @@ AI 可以在人类审批下修改系统自身。
 4. AI 调用 `reload_tools` 或 `request_restart` 使工具生效
 5. AI 后续可以直接调用新工具
 
-### 4.4 典型流程：修改节点行为
+### 5.4 典型流程：修改节点行为
 
 1. AI 调用 `write_file` 修改 `config/nodes/bootstrap.executor.yaml`
 2. Policy 拦截，弹出审批
@@ -321,7 +390,7 @@ AI 可以在人类审批下修改系统自身。
 
 ---
 
-## 5. Tool Trace 与 Artifacts
+## 6. Tool Trace 与 Artifacts
 
 工具调用完成后，系统保留：
 
@@ -333,10 +402,13 @@ artifact 文件保存在 `data/artifacts/{run_id}/` 下，可供人工复盘。
 
 ---
 
-## 6. runtime.yaml 中的相关配置
+## 7. runtime.yaml 中的相关配置
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
+| `engine.max_steps` | 32 | AI 节点单次执行的最大步数 |
+| `engine.streaming` | true | 入口节点是否使用流式输出 |
+| `engine.poll_interval_sec` | 1.0 | worker 轮询 task 队列的间隔 |
 | `meta.execute_command.default_timeout_sec` | 90 | 命令执行默认超时 |
 | `meta.execute_command.max_output_chars` | 12000 | 命令输出最大字符数 |
 | `meta.git.diff_max_chars` | 600000 | restart 时 git diff 最大字符数 |
@@ -344,3 +416,4 @@ artifact 文件保存在 `data/artifacts/{run_id}/` 下，可供人工复盘。
 | `meta.search.max_matches` | 100 | 搜索最大匹配数 |
 | `engine.tool_trace.max_inline_chars` | 8000 | 工具输出内联显示的最大字符数 |
 | `tools.command.default_timeout_sec` | 60 | 脚本工具默认超时 |
+| `supervisor.process_manager.engine_workers` | 2 | Engine worker 进程数 |
