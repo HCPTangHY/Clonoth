@@ -1,14 +1,13 @@
 """Clonoth launcher.
 
-默认启动 Supervisor（包含 Gateway API），并自动拉起 Shell CLI 与 Kernel Worker。
+默认启动 Supervisor，并自动拉起统一引擎进程与本地 CLI。
 
 用法：
     python main.py
 
 也可以单独启动：
     python -m supervisor.main
-    python -m shell.worker
-    python -m kernel.worker
+    python -m engine
 """
 
 from __future__ import annotations

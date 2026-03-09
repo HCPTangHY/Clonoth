@@ -21,34 +21,30 @@ from .types import (
     ApprovalDecisionIn,
     ApprovalRequestIn,
     ConfigReloadOut,
-    CreateTaskIn,
     Event,
+    HandoffEventIn,
     HealthOut,
+    InboundAckIn,
+    InboundAckOut,
     InboundMessageIn,
     InboundMessageOut,
     InboundWorkItem,
-    InboundAckIn,
-    InboundAckOut,
-    OutboundMessageIn,
-    OutboundMessageOut,
     OpenAIConfigPublic,
     OpenAIConfigSecret,
     OpenAIConfigUpdateIn,
     OpRequestIn,
     OpRequestOut,
+    OutboundMessageIn,
+    OutboundMessageOut,
     RestartIn,
     RestartOut,
-    Task,
-    TaskCompleteIn,
-    TaskEventIn,
-    TaskStatus,
 )
-
-from .upgrade import create_upgrade_marker
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
 def create_app(
     *,
     state: SupervisorState,
@@ -66,10 +62,6 @@ def create_app(
         uptime = (_now() - st.started_at).total_seconds()
         return HealthOut(run_id=st.eventlog.run_id, started_at=st.started_at, uptime_seconds=uptime)
 
-    # ----------------------------
-    # Config APIs (YAML-backed)
-    # ----------------------------
-
     @app.get("/v1/config", response_model=AppConfigPublic)
     async def get_config() -> AppConfigPublic:
         cs: ConfigStore = app.state.config_store
@@ -82,8 +74,6 @@ def create_app(
 
     @app.get("/v1/config/openai/secret", response_model=OpenAIConfigSecret)
     async def get_openai_config_secret() -> OpenAIConfigSecret:
-        # 注意：当前 MVP 仅绑定 127.0.0.1；此接口会返回 api_key。
-        # 后续如需更强安全，可加入 internal token。
         cs: ConfigStore = app.state.config_store
         return cs.get_openai_secret()
 
@@ -94,7 +84,6 @@ def create_app(
 
         out = cs.update_openai(body)
 
-        # 记录配置更新事件（不写入明文 api_key）
         st.eventlog.append(
             session_id="__system__",
             component="supervisor",
@@ -134,7 +123,6 @@ def create_app(
             payload=msg.model_dump(),
         )
 
-        # update in-memory inbound queue for orchestrator worker
         st.record_inbound_message_event(evt)
 
         return InboundMessageOut(session_id=session_id, accepted=True)
@@ -145,6 +133,7 @@ def create_app(
         lease_sec: float = Query(30.0, ge=1.0, le=600.0),
     ) -> InboundWorkItem:
         st: SupervisorState = app.state.state
+        st.mark_engine_seen(worker_id=worker_id)
         item = st.assign_next_inbound(worker_id=worker_id, lease_sec=float(lease_sec))
         if item is None:
             return Response(status_code=204)  # type: ignore[return-value]
@@ -166,14 +155,12 @@ def create_app(
                 session_id=session_id,
                 text=str(body.text or ""),
                 source_inbound_seq=body.source_inbound_seq,
-                source_task_id=body.source_task_id,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="session not found")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e) or "bad request")
         except RuntimeError as e:
-            # route conflict (same inbound already routed to task)
             raise HTTPException(status_code=409, detail=str(e) or "conflict")
 
         return OutboundMessageOut(ok=True)
@@ -186,7 +173,6 @@ def create_app(
         st: SupervisorState = app.state.state
         evts = st.list_events(session_id=session_id, after_seq=after_seq)
 
-        # Event.ts 在 log 中是 ISO string，这里转为 datetime 给 Pydantic
         out: list[Event] = []
         for e in evts:
             try:
@@ -207,82 +193,28 @@ def create_app(
                 continue
         return out
 
-    @app.get("/v1/sessions/{session_id}/messages")
-    async def session_messages(session_id: str, limit: int = Query(50, ge=0, le=500)) -> list[dict[str, Any]]:
+    @app.post("/v1/sessions/{session_id}/events")
+    async def session_event(session_id: str, ev: HandoffEventIn) -> dict[str, Any]:
         st: SupervisorState = app.state.state
-        return st.session_messages(session_id=session_id, limit=limit)
+        if session_id not in st.sessions:
+            raise HTTPException(status_code=404, detail="session not found")
 
-    @app.post("/v1/tasks", response_model=Task)
-    async def create_task(inp: CreateTaskIn) -> Task:
-        st: SupervisorState = app.state.state
-        try:
-            return st.create_task(
-                session_id=inp.session_id,
-                instruction=inp.instruction,
-                workflow_id=inp.workflow_id,
-                priority=inp.priority,
-                context=inp.context,
-                source_inbound_seq=inp.source_inbound_seq,
-                use_context=inp.use_context,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e) or "bad request")
-        except RuntimeError as e:
-            raise HTTPException(status_code=409, detail=str(e) or "conflict")
-
-    @app.get("/v1/tasks/next", response_model=Task)
-    async def next_task(worker_id: str = Query(..., min_length=1)) -> Task:
-        st: SupervisorState = app.state.state
-        # kernel worker heartbeat (best-effort)
-        st.mark_kernel_seen(worker_id=worker_id)
-        t = st.assign_next_task(worker_id=worker_id)
-        if t is None:
-            return Response(status_code=204)  # type: ignore[return-value]
-        return t
-
-    @app.get("/v1/task_results/next", response_model=Task)
-    async def next_task_result(
-        worker_id: str = Query(..., min_length=1),
-        lease_sec: float = Query(30.0, ge=1.0, le=600.0),
-    ) -> Task:
-        """Get a completed task that needs Shell post-processing.
-
-        Shell will call LLM to generate the final user-facing reply, then append an
-        outbound_message with source_task_id.
-        """
-
-        st: SupervisorState = app.state.state
-        t = st.assign_next_task_result(worker_id=worker_id, lease_sec=float(lease_sec))
-        if t is None:
-            return Response(status_code=204)  # type: ignore[return-value]
-        return t
-
-    @app.post("/v1/tasks/{task_id}/events")
-    async def task_event(task_id: str, ev: TaskEventIn) -> dict[str, Any]:
-        st: SupervisorState = app.state.state
-        if task_id not in st.tasks:
-            raise HTTPException(status_code=404, detail="task not found")
-
-        t = st.tasks[task_id]
+        transient = ev.type in {"stream_delta", "stream_end"}
         evt = st.eventlog.append(
-            session_id=t.session_id,
-            component="kernel",
+            session_id=session_id,
+            component="shell",
             type_=ev.type,
-            payload={"task_id": task_id, **(ev.payload or {})},
+            payload=dict(ev.payload or {}),
+            transient=transient,
         )
-
-        # Update derived state for task reply dedup (Kernel may emit outbound_message here).
         if ev.type == "outbound_message":
             st.record_outbound_message_event(evt)
         return {"ok": True}
 
-    @app.post("/v1/tasks/{task_id}/complete", response_model=Task)
-    async def task_complete(task_id: str, body: TaskCompleteIn) -> Task:
+    @app.get("/v1/sessions/{session_id}/messages")
+    async def session_messages(session_id: str, limit: int = Query(50, ge=0, le=500)) -> list[dict[str, Any]]:
         st: SupervisorState = app.state.state
-        t = st.complete_task(task_id=task_id, status=body.status, result=body.result)
-        if t is None:
-            raise HTTPException(status_code=404, detail="task not found")
-        return t
+        return st.session_messages(session_id=session_id, limit=limit)
 
     @app.post("/v1/approvals/request", response_model=Approval)
     async def approval_request(inp: ApprovalRequestIn) -> Approval:
@@ -321,7 +253,6 @@ def create_app(
 
         workspace_root = Path(__file__).resolve().parents[1]
 
-        # 记录事件（即使 pm 不存在也能追踪）
         st.eventlog.append(
             session_id="__system__",
             component="supervisor",
@@ -334,25 +265,11 @@ def create_app(
             },
         )
 
-        if inp.target in {"shell", "kernel"}:
+        if inp.target == "engine":
             if pm is None:
                 raise HTTPException(status_code=409, detail="process manager not enabled")
 
-            # If this restart is part of a self-evolution approval flow, create an upgrade marker
-            # so the watchdog can auto-rollback if the new version fails.
-            create_upgrade_marker(
-                workspace_root=workspace_root,
-                state=st,
-                process_manager=pm,
-                target=inp.target,
-                reason=inp.reason,
-                approval_id=inp.approval_id,
-            )
-
-            if inp.target == "shell":
-                pm.restart_shell()
-            else:
-                pm.restart_kernel()
+            pm.restart_engine()
 
             st.eventlog.append(
                 session_id="__system__",
@@ -362,15 +279,6 @@ def create_app(
             )
             return RestartOut(scheduled=True, target=inp.target)
 
-        # all: stop children then execv self
-        create_upgrade_marker(
-            workspace_root=workspace_root,
-            state=st,
-            process_manager=pm,
-            target="all",
-            reason=inp.reason,
-            approval_id=inp.approval_id,
-        )
         def _do_execv() -> None:
             try:
                 if pm is not None:

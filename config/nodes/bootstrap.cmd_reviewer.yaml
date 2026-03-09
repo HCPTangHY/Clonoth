@@ -1,0 +1,18 @@
+version: 1
+kind: node
+id: bootstrap.cmd_reviewer
+type: ai
+name: "命令审核节点"
+description: >-
+  审核并执行 shell 命令。接收执行节点的命令请求，判断安全性后执行。
+model_route: executor_default
+prompt:
+  pack: bootstrap_cn
+  assembly: cmd_reviewer
+tool_access:
+  mode: allowlist
+  allow:
+    - execute_command
+skills:
+  mode: none
+output_mode: draft

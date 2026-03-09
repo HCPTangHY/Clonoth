@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from clonoth_runtime import resolve_env_ref
+
 _MCP_IMPORT_ERROR: Exception | None = None
 
 try:
@@ -40,15 +42,6 @@ def _ensure_sdk() -> None:
 
 def _config_path(workspace_root: Path) -> Path:
     return workspace_root / _CONFIG_REL_PATH
-
-
-def _resolve_env_ref(raw: Any) -> str:
-    if raw is None:
-        return ""
-    s = str(raw).strip()
-    if s.startswith("${") and s.endswith("}") and len(s) > 3:
-        return (os.getenv(s[2:-1]) or "").strip()
-    return s
 
 
 def _default_config() -> dict[str, Any]:
@@ -264,41 +257,14 @@ def _normalize_tool_entry(tool: Any) -> dict[str, Any]:
         input_schema = raw.get("input_schema")
     if not isinstance(input_schema, dict):
         input_schema = {"type": "object", "properties": {}, "required": []}
-    return {
-        "name": name,
-        "description": description,
-        "input_schema": input_schema,
-    }
-
-
-def _normalize_resource_entry(resource: Any) -> dict[str, Any]:
-    raw = _to_plain(resource)
-    if not isinstance(raw, dict):
-        return {"uri": str(raw), "name": str(raw), "description": ""}
-    return {
-        "uri": str(raw.get("uri") or "").strip(),
-        "name": str(raw.get("name") or raw.get("uri") or "").strip(),
-        "description": str(raw.get("description") or "").strip(),
-        "mimeType": raw.get("mimeType") or raw.get("mime_type"),
-    }
-
-
-def _normalize_prompt_entry(prompt: Any) -> dict[str, Any]:
-    raw = _to_plain(prompt)
-    if not isinstance(raw, dict):
-        return {"name": str(raw), "description": ""}
-    return {
-        "name": str(raw.get("name") or "").strip(),
-        "description": str(raw.get("description") or "").strip(),
-        "arguments": raw.get("arguments") if isinstance(raw.get("arguments"), list) else [],
-    }
+    return {"name": name, "description": description, "input_schema": input_schema}
 
 
 @asynccontextmanager
-async def open_session(workspace_root: Path, client_id: str, *, allow_disabled: bool = False):
+async def open_session(workspace_root: Path, client_id: str):
     _ensure_sdk()
     spec = get_client_spec(workspace_root, client_id)
-    if not allow_disabled and not bool(spec.get("enabled", True)):
+    if not bool(spec.get("enabled", True)):
         raise RuntimeError(f"MCP client is disabled: {client_id}")
 
     transport = str(spec.get("transport") or "stdio")
@@ -311,25 +277,16 @@ async def open_session(workspace_root: Path, client_id: str, *, allow_disabled: 
             args = spec.get("args") or []
             env = os.environ.copy()
             for k, v in (spec.get("env") or {}).items():
-                env[str(k)] = _resolve_env_ref(v)
+                env[str(k)] = resolve_env_ref(v)
             read_stream, write_stream = await stack.enter_async_context(
-                stdio_client(
-                    StdioServerParameters(
-                        command=command,
-                        args=[str(x) for x in args],
-                        env=env,
-                    )
-                )
+                stdio_client(StdioServerParameters(command=command, args=[str(x) for x in args], env=env))
             )
         elif transport == "sse":
             url = str(spec.get("url") or "").strip()
             if not url:
                 raise RuntimeError("sse client missing url")
             transport_obj = await stack.enter_async_context(
-                sse_client(
-                    url,
-                    headers={str(k): _resolve_env_ref(v) for k, v in (spec.get("headers") or {}).items()},
-                )
+                sse_client(url, headers={str(k): resolve_env_ref(v) for k, v in (spec.get("headers") or {}).items()})
             )
             if not isinstance(transport_obj, tuple) or len(transport_obj) < 2:
                 raise RuntimeError("invalid SSE transport object")
@@ -339,10 +296,7 @@ async def open_session(workspace_root: Path, client_id: str, *, allow_disabled: 
             if not url:
                 raise RuntimeError("streamable_http client missing url")
             transport_obj = await stack.enter_async_context(
-                streamable_http_client(
-                    url,
-                    headers={str(k): _resolve_env_ref(v) for k, v in (spec.get("headers") or {}).items()},
-                )
+                streamable_http_client(url, headers={str(k): resolve_env_ref(v) for k, v in (spec.get("headers") or {}).items()})
             )
             if not isinstance(transport_obj, tuple) or len(transport_obj) < 2:
                 raise RuntimeError("invalid streamable HTTP transport object")
@@ -351,42 +305,6 @@ async def open_session(workspace_root: Path, client_id: str, *, allow_disabled: 
         session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
         await session.initialize()
         yield session
-
-
-async def test_client(workspace_root: Path, client_id: str) -> dict[str, Any]:
-    spec = get_client_spec(workspace_root, client_id)
-    out: dict[str, Any] = {
-        "ok": True,
-        "client": spec,
-        "client_features_known": ["roots", "sampling", "elicitation"],
-        "server_primitives_known": ["tools", "resources", "prompts"],
-    }
-    async with open_session(workspace_root, client_id, allow_disabled=True) as session:
-        try:
-            tools_res = await session.list_tools()
-            tools_raw = _to_plain(tools_res)
-            tools = tools_raw.get("tools") if isinstance(tools_raw, dict) else []
-            out["tools_count"] = len(tools) if isinstance(tools, list) else 0
-        except Exception as e:
-            out["tools_error"] = str(e)
-
-        try:
-            resources_res = await session.list_resources()
-            resources_raw = _to_plain(resources_res)
-            resources = resources_raw.get("resources") if isinstance(resources_raw, dict) else []
-            out["resources_count"] = len(resources) if isinstance(resources, list) else 0
-        except Exception as e:
-            out["resources_error"] = str(e)
-
-        try:
-            prompts_res = await session.list_prompts()
-            prompts_raw = _to_plain(prompts_res)
-            prompts = prompts_raw.get("prompts") if isinstance(prompts_raw, dict) else []
-            out["prompts_count"] = len(prompts) if isinstance(prompts, list) else 0
-        except Exception as e:
-            out["prompts_error"] = str(e)
-
-    return out
 
 
 async def list_tools(workspace_root: Path, client_id: str) -> dict[str, Any]:
@@ -401,50 +319,4 @@ async def list_tools(workspace_root: Path, client_id: str) -> dict[str, Any]:
 async def call_tool(workspace_root: Path, client_id: str, tool_name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     async with open_session(workspace_root, client_id) as session:
         res = await session.call_tool(tool_name, arguments=arguments or {})
-        return {
-            "ok": True,
-            "client_id": client_id,
-            "tool_name": tool_name,
-            "result": _to_plain(res),
-        }
-
-
-async def list_resources(workspace_root: Path, client_id: str) -> dict[str, Any]:
-    async with open_session(workspace_root, client_id) as session:
-        res = await session.list_resources()
-        raw = _to_plain(res)
-        items = raw.get("resources") if isinstance(raw, dict) else []
-        resources = [_normalize_resource_entry(it) for it in items] if isinstance(items, list) else []
-        return {"ok": True, "client_id": client_id, "resources": resources}
-
-
-async def read_resource(workspace_root: Path, client_id: str, uri: str) -> dict[str, Any]:
-    async with open_session(workspace_root, client_id) as session:
-        res = await session.read_resource(uri)
-        return {
-            "ok": True,
-            "client_id": client_id,
-            "uri": uri,
-            "result": _to_plain(res),
-        }
-
-
-async def list_prompts(workspace_root: Path, client_id: str) -> dict[str, Any]:
-    async with open_session(workspace_root, client_id) as session:
-        res = await session.list_prompts()
-        raw = _to_plain(res)
-        items = raw.get("prompts") if isinstance(raw, dict) else []
-        prompts = [_normalize_prompt_entry(it) for it in items] if isinstance(items, list) else []
-        return {"ok": True, "client_id": client_id, "prompts": prompts}
-
-
-async def get_prompt(workspace_root: Path, client_id: str, prompt_name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
-    clean_args = {str(k): json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v) for k, v in (arguments or {}).items()}
-    async with open_session(workspace_root, client_id) as session:
-        res = await session.get_prompt(prompt_name, arguments=clean_args)
-        return {
-            "ok": True,
-            "client_id": client_id,
-            "prompt_name": prompt_name,
-            "result": _to_plain(res),
-        }
+        return {"ok": True, "client_id": client_id, "tool_name": tool_name, "result": _to_plain(res)}

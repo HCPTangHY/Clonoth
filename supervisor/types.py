@@ -4,21 +4,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SafetyLevel(str, Enum):
     auto = "auto"
     approval_required = "approval_required"
     deny = "deny"
-
-
-class TaskStatus(str, Enum):
-    pending = "pending"
-    running = "running"
-    done = "done"
-    failed = "failed"
-    cancelled = "cancelled"
 
 
 class ApprovalStatus(str, Enum):
@@ -39,21 +31,12 @@ class Event(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
-    content: str
-    name: str | None = None
-    tool_call_id: str | None = None
-
-
 class InboundMessageIn(BaseModel):
     channel: str = "cli"
     conversation_key: str
     message_id: str | None = None
     text: str
     attachments: list[dict[str, Any]] | None = None
-    # Whether Shell Orchestrator should include conversation history when routing this message.
-    # External channel adapters can set this to false to make the orchestrator stateless.
     use_context: bool = True
 
 
@@ -63,40 +46,17 @@ class InboundMessageOut(BaseModel):
 
 
 class OutboundMessageIn(BaseModel):
-    """Append an outbound assistant message into a session.
-
-    Used by Shell Orchestrator when it decides to answer directly (without creating a task).
-    """
-
     text: str
-    # Optional idempotency key: when provided, Supervisor will dedupe outbound replies
-    # produced for the same inbound message.
     source_inbound_seq: int | None = None
-
-    # Optional idempotency key: when provided, Supervisor will dedupe outbound messages
-    # produced as the *final response* for a completed Kernel task.
-    #
-    # This is used by Shell (chat AI) to post-process Kernel task results and then
-    # send exactly-once user-facing replies.
-    source_task_id: str | None = None
 
 
 class OutboundMessageOut(BaseModel):
     ok: bool = True
 
 
-# ----------------------------
-# Inbound routing queue (Shell Orchestrator Worker)
-# ----------------------------
-
-
 class InboundWorkItem(BaseModel):
-    """A pending inbound message to be processed by Shell Orchestrator."""
-
     inbound_seq: int
     session_id: str
-
-    # Original inbound payload
     channel: str = "cli"
     conversation_key: str
     message_id: str | None = None
@@ -113,42 +73,14 @@ class InboundAckOut(BaseModel):
     ok: bool = True
 
 
-class CreateTaskIn(BaseModel):
-    session_id: str
-    instruction: str
-    workflow_id: str | None = None
-    priority: int = 0
-    context: dict[str, Any] = Field(default_factory=dict)
-    # Optional idempotency key: when provided, Supervisor will dedupe task creation
-    # for the same inbound message.
-    source_inbound_seq: int | None = None
-    use_context: bool = True
-
-
-class Task(BaseModel):
-    task_id: str
-    session_id: str
-    instruction: str
-    workflow_id: str | None = None
-    context: dict[str, Any] = Field(default_factory=dict)
-    source_inbound_seq: int | None = None
-    use_context: bool = True
-    status: TaskStatus
-    priority: int = 0
-    created_at: datetime
-    updated_at: datetime
-    assigned_to: str | None = None
-    result: dict[str, Any] | None = None
-
-
-class TaskEventIn(BaseModel):
+# 事件输入（session 级别）
+class SessionEventIn(BaseModel):
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class TaskCompleteIn(BaseModel):
-    status: TaskStatus = TaskStatus.done
-    result: dict[str, Any] = Field(default_factory=dict)
+# 兼容别名
+HandoffEventIn = SessionEventIn
 
 
 class ApprovalRequestIn(BaseModel):
@@ -188,14 +120,14 @@ class OpRequestOut(BaseModel):
 
 
 class RestartIn(BaseModel):
-    target: Literal["shell", "kernel", "all"]
+    target: Literal["engine", "all"]
     reason: str | None = None
     approval_id: str | None = None
 
 
 class RestartOut(BaseModel):
     scheduled: bool
-    target: Literal["shell", "kernel", "all"]
+    target: str
 
 
 class HealthOut(BaseModel):
@@ -207,9 +139,9 @@ class HealthOut(BaseModel):
 
 class AdminStateOut(BaseModel):
     sessions: int
-    tasks: dict[str, int]
     approvals: dict[str, int]
     pending_approvals: list[Approval] = Field(default_factory=list)
+    engine_runtime: dict[str, Any] = Field(default_factory=dict)
 
 
 # ----------------------------

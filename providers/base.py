@@ -26,6 +26,7 @@ class ProviderResponse:
     ok: bool
     text: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    thinking: str | None = None
     error: str | None = None
     status_code: int | None = None
     raw: dict[str, Any] | None = None

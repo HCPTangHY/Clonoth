@@ -79,6 +79,7 @@ class EventLog:
         component: str,
         type_: str,
         payload: dict[str, Any] | None = None,
+        transient: bool = False,
     ) -> dict[str, Any]:
         payload = payload or {}
 
@@ -98,9 +99,10 @@ class EventLog:
                 "payload": payload,
             }
 
-            line = json.dumps(evt, ensure_ascii=False)
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            if not transient:
+                line = json.dumps(evt, ensure_ascii=False)
+                with self._path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
 
             self._events.append(evt)
             return evt

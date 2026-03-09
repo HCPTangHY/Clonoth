@@ -4,8 +4,8 @@ id: bootstrap_cn
 name: "Bootstrap 中文提示词包"
 
 description: >-
-  将当前三个固定 prompt 重构为 fragments 的第一版草案。
-  目标不是立刻替换现有逻辑，而是先建立未来可组合提示词系统的基本形状。
+  当前节点系统的默认提示词包。
+  入口节点、执行节点、规划节点、复核节点和回复节点都从这里组装提示词。
 
 fragments_root: fragments
 
@@ -16,24 +16,27 @@ assemblies:
     - roles/shell_orchestrator.md
     - styles/concise_zh.md
 
-  task_responder:
-    - core/substrate_boundary.md
-    - core/non_fabrication.md
-    - roles/task_responder.md
-    - styles/concise_zh.md
-
-  kernel_executor:
+  executor:
     - core/substrate_boundary.md
     - core/non_fabrication.md
     - core/tool_protocol.md
-    - roles/kernel_executor.md
+    - roles/executor.md
     - styles/concise_zh.md
+
+  planner:
+    - core/substrate_boundary.md
+    - core/non_fabrication.md
+    - roles/planner.md
+    - styles/concise_zh.md
+
+  reviewer:
+    - core/substrate_boundary.md
+    - core/non_fabrication.md
+    - roles/reviewer.md
+    - styles/concise_zh.md
+
+  cmd_reviewer:
+    - roles/cmd_reviewer.md
 
 variables:
   default_language: zh-CN
-
-compat:
-  legacy_prompt_files:
-    shell_orchestrator: config/prompts/shell_orchestrator_prompt.txt
-    task_responder: config/prompts/task_responder_prompt.txt
-    kernel_executor: config/prompts/kernel_system_prompt.txt

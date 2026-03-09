@@ -79,20 +79,29 @@ def _infer_explicit_skill_mentions(text: str, skills: list[dict[str, Any]]) -> l
     return hits
 
 
-def format_skill_discovery_message(workspace_root: Path, *, task_text: str = "") -> str:
+def format_skill_discovery_message(
+    workspace_root: Path, *, instruction_text: str = "",
+    skill_mode: str = "all", skill_allow: list[str] | None = None,
+) -> str:
     skills = [s for s in load_skill_catalog(workspace_root) if bool(s.get("enabled", True))]
+
+    if skill_mode == "none":
+        return ""
+    if skill_mode == "allowlist" and skill_allow is not None:
+        allow_set = set(skill_allow)
+        skills = [s for s in skills if s.get("name") in allow_set]
     if not skills:
         return ""
 
     lines: list[str] = [
         "[CLONOTH_SKILLS_INDEX v1]",
         "仅加载 skill 元数据（name / description / path）。",
-        "按 progressive disclosure 使用：只有当任务明显匹配 skill 的 description，或用户明确提到 skill 名时，才去读取对应 SKILL.md 全文。",
+        "按 progressive disclosure 使用：只有当当前请求明显匹配 skill 的 description，或用户明确提到 skill 名时，才去读取对应 SKILL.md 全文。",
         "不要一次性读取所有 SKILL.md。",
         "",
     ]
 
-    explicit = set(_infer_explicit_skill_mentions(task_text, skills))
+    explicit = set(_infer_explicit_skill_mentions(instruction_text, skills))
     if explicit:
         lines.append("用户显式提到的 skill 候选：" + ", ".join(sorted(explicit)))
         lines.append("")

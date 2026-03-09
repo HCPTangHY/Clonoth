@@ -1,0 +1,18 @@
+version: 1
+kind: node
+id: bootstrap.shell_orchestrator
+type: ai
+name: "入口交互节点"
+description: >-
+  面向用户的入口 AI 节点。判断当前请求是直接回复，还是移交给下游节点继续处理。
+model_route: shell_orchestrator_default
+prompt:
+  pack: bootstrap_cn
+  assembly: shell_orchestrator
+tool_access:
+  mode: allowlist
+  allow:
+    - request_restart
+output_mode: reply
+skills:
+  mode: none

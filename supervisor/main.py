@@ -15,7 +15,6 @@ from .eventlog import EventLog
 from .policy import PolicyEngine
 from .process_manager import ProcessManager
 from .state import SupervisorState
-from .upgrade import UpgradeWatchdog
 
 
 def main() -> None:
@@ -24,8 +23,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Clonoth Supervisor")
     parser.add_argument("--host", default=os.getenv("CLONOTH_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("CLONOTH_PORT", "8765")))
-    parser.add_argument("--no-shell", action="store_true", help="do not spawn shell worker")
-    parser.add_argument("--no-kernel", action="store_true", help="do not spawn kernel worker")
+    parser.add_argument("--no-shell", action="store_true", help="do not spawn shell runtime")
+    parser.add_argument("--no-kernel", action="store_true", help="do not spawn kernel runtime")
     parser.add_argument("--no-workers", action="store_true", help="do not spawn any workers")
     parser.add_argument("--log-level", default=os.getenv("CLONOTH_LOG_LEVEL", "info"))
     parser.add_argument(
@@ -48,15 +47,6 @@ def main() -> None:
     policy = PolicyEngine(workspace_root=workspace_root)
     state = SupervisorState(eventlog=eventlog, policy=policy)
 
-    runtime_cfg = load_runtime_config(workspace_root)
-    watchdog_poll_interval_sec = get_float(
-        runtime_cfg,
-        "supervisor.upgrade_watchdog.poll_interval_sec",
-        0.5,
-        min_value=0.1,
-        max_value=5.0,
-    )
-
     # YAML 配置（provider/base_url/key/model 等）
     config_store = ConfigStore(path=config_path)
 
@@ -74,23 +64,15 @@ def main() -> None:
         )
 
         if not args.no_kernel:
-            process_manager.start_kernel()
+            process_manager.start_engine()
         if not args.no_shell:
-            process_manager.start_shell()
+            if process_manager.spawn_shell_cli:
+                process_manager.start_shell_cli()
 
-    # Start upgrade watchdog (auto-rollback) after workers are spawned.
-    # It watches `data/upgrade_pending.json` written by `/v1/admin/restart`.
-    watchdog = UpgradeWatchdog(
-        workspace_root=workspace_root,
-        state=state,
-        process_manager=process_manager,
-        poll_interval_sec=watchdog_poll_interval_sec,
-    )
-    watchdog.start()
 
     app = create_app(state=state, process_manager=process_manager, config_store=config_store)
 
-    # Access log is extremely noisy because Shell/Kernel poll endpoints frequently.
+    # Access log is extremely noisy because shell and kernel runtimes poll endpoints frequently.
     # Disabled by default. Enable via `--access-log` or `CLONOTH_ACCESS_LOG=1` when debugging.
     env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
     access_log = bool(args.access_log or env_access_log)

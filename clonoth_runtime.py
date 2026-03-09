@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
 
 
@@ -12,7 +14,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "kernel": {
         "max_steps": 32,
         "history_limit": 80,
-        "task_poll_interval_sec": 1.0,
+        "poll_interval_sec": 1.0,
         "approval_poll_interval_sec": 0.5,
         "http": {"client_timeout_sec": 60.0},
         "supervisor": {
@@ -23,14 +25,10 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
             "max_inline_chars": 8000,
             "max_progress_arg_chars": 320,
         },
-        "executor": {
-            "profile_id": "bootstrap.kernel_executor",
-            "model": "",
-        },
+        "model": "",
     },
     "providers": {
         "openai": {
-            # HTTP timeout for OpenAI-compatible endpoint calls (seconds)
             "timeout_sec": 60.0,
         }
     },
@@ -50,12 +48,12 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "shell": {
         "default_conversation_key": "cli:default",
         "workflow_id": "bootstrap.default_chat",
-        "orchestrator": {
-            "profile_id": "bootstrap.shell_orchestrator",
+        "entry_node": {
+            "history_limit": 40,
             "model": "",
         },
-        "responder": {
-            "profile_id": "bootstrap.task_responder",
+        "reply_node": {
+            "tool_trace_history_limit": 200,
             "model": "",
         },
         "http": {"client_timeout_sec": 10.0},
@@ -70,21 +68,75 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
             "stop_wait_timeout_sec": 5.0,
             "shell_new_console": None,
         },
-        "upgrade_watchdog": {
-            "poll_interval_sec": 0.5,
-            "timeout_sec": 20.0,
-            "max_attempts": 2,
-        },
     },
 }
 
 
-# path(str) -> (mtime, cfg)
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def runtime_config_path(workspace_root: Path) -> Path:
     return workspace_root / "config" / "runtime.yaml"
+
+
+def policy_config_path(workspace_root: Path) -> Path:
+    return workspace_root / "data" / "policy.yaml"
+
+
+def load_yaml_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        text = path.read_text(encoding="utf-8")
+        if not text.strip():
+            return None
+        data = yaml.safe_load(text)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def load_policy_config(workspace_root: Path) -> dict[str, Any] | None:
+    return load_yaml_dict(policy_config_path(workspace_root))
+
+
+def parse_extra_roots(workspace_root: Path, raw: Any) -> list[Path]:
+    roots: list[Path] = []
+    if not isinstance(raw, list):
+        return roots
+
+    for it in raw:
+        if not isinstance(it, str) or not it.strip():
+            continue
+        try:
+            p = Path(it.strip()).expanduser()
+            if not p.is_absolute():
+                continue
+            rp = p.resolve()
+        except Exception:
+            continue
+
+        if rp == workspace_root:
+            continue
+        if rp not in roots:
+            roots.append(rp)
+    return roots
+
+
+def load_text_file(path: Path, max_chars: int = 200_000) -> str:
+    try:
+        if not path.exists() or not path.is_file():
+            return ""
+        text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not text:
+            return ""
+        if len(text) > max_chars:
+            return text[:max_chars] + "\n...<truncated>"
+        return text
+    except Exception:
+        return ""
 
 
 def _deep_update(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
@@ -97,13 +149,6 @@ def _deep_update(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
-    """Load workspace runtime config from `config/runtime.yaml`.
-
-    - Safe defaults are always applied.
-    - Invalid YAML falls back to defaults.
-    - Uses a best-effort mtime cache.
-    """
-
     p = runtime_config_path(workspace_root)
 
     try:
@@ -215,3 +260,59 @@ def get_str(cfg: dict[str, Any], key_path: str, default: str) -> str:
     if v is None:
         return default
     return str(v)
+
+
+def resolve_env_ref(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if s.startswith("${") and s.endswith("}") and len(s) > 3:
+        return (os.getenv(s[2:-1]) or "").strip()
+    return s
+
+
+async def fetch_json_dict(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+    response = await client.get(url)
+    response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+async def fetch_openai_secret(client: httpx.AsyncClient, supervisor_url: str) -> dict[str, Any]:
+    return await fetch_json_dict(client, f"{supervisor_url}/v1/config/openai/secret")
+
+
+def normalize_openai_secret(
+    cfg: dict[str, Any],
+) -> tuple[str, str, str]:
+    openai_cfg = cfg.get("openai") if isinstance(cfg, dict) else None
+    if isinstance(openai_cfg, dict):
+        base_url = str(openai_cfg.get("base_url") or "").strip()
+        api_key = str(openai_cfg.get("api_key") or "").strip()
+        model = str(openai_cfg.get("model") or "").strip()
+    else:
+        base_url = str(cfg.get("base_url") or "").strip() if isinstance(cfg, dict) else ""
+        api_key = str(cfg.get("api_key") or "").strip() if isinstance(cfg, dict) else ""
+        model = str(cfg.get("model") or "").strip() if isinstance(cfg, dict) else ""
+
+    if not base_url:
+        base_url = "https://api.openai.com/v1"
+    if not model:
+        model = "gpt-4o-mini"
+    return api_key, base_url, model
+
+
+import re as _re
+
+_TOOL_TRACE_RE = _re.compile(
+    r"\[CLONOTH_TOOL_TRACE[^\]]*\].*?\[/CLONOTH_TOOL_TRACE\]",
+    _re.DOTALL,
+)
+
+
+def strip_tool_trace_blocks(text: str) -> str:
+    """Remove [CLONOTH_TOOL_TRACE ...] blocks from text for display."""
+    if not text:
+        return text
+    cleaned = _TOOL_TRACE_RE.sub("", text).strip()
+    return cleaned

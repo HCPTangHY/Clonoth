@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from clonoth_runtime import load_yaml_dict, parse_extra_roots
+
 from .types import SafetyLevel
 
 
@@ -20,127 +22,61 @@ class PolicyDecision:
 def _default_policy_dict() -> dict[str, Any]:
     """Built-in default policy.
 
-    Notes:
-    - This is NOT a strong security boundary (no OS sandbox).
-    - It is a supervisor-side control plane rule-set for approvals/denies.
+    注意：在不引入 OS 沙盒的前提下，这套策略不是强安全边界；
+    它是控制面约束和人类确认的执行规范。
+
+    命令审核采用双层机制：
+    1. cmd_reviewer 节点做 AI 前置审核；
+    2. Supervisor 继续做人类审批与硬规则兜底。
+
+    AI 审核不能替代人类审批。
     """
 
     return {
         "version": 1,
-        # Extra filesystem roots that are allowed for read_file/write_file.
-        #
-        # Use case:
-        # - Clonoth is deployed under `/www/wwwroot/clonoth`, but you want to manage sibling
-        #   files like `/www/wwwroot/monitor-sku.py`.
-        #
-        # Security:
-        # - Even if a path is under extra_roots, it still goes through rules + approvals.
-        # - For external paths, defaults are tightened from auto -> approval_required.
         "extra_roots": [],
-        "kernel_loop_guard": {
-            "repeat_tool_call_threshold": 3,
-        },
         "read_file": {
             "default": "auto",
             "rules": [
-                {
-                    "pattern": ".env",
-                    "decision": "deny",
-                    "reason": "do not allow reading dotenv secrets",
-                },
-                {
-                    "pattern": "**/.env",
-                    "decision": "deny",
-                    "reason": "do not allow reading dotenv secrets",
-                },
+                {"pattern": ".env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
+                {"pattern": "**/.env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
             ],
         },
         "write_file": {
-            # As requested: writing is generally not sensitive.
             "default": "auto",
             "rules": [
-                {
-                    "pattern": "tools/**",
-                    "decision": "approval_required",
-                    "reason": "creating/updating tools requires approval",
-                },
-                {
-                    "pattern": "config/runtime.yaml",
-                    "decision": "auto",
-                    "reason": "runtime tuning config (can be tightened in data/policy.yaml)",
-                },
-                {
-                    "pattern": "config/prompts/**",
-                    "decision": "approval_required",
-                    "reason": "prompt changes require approval",
-                },
-                {
-                    "pattern": "data/config.yaml",
-                    "decision": "approval_required",
-                    "reason": "config changes require approval",
-                },
-                {
-                    "pattern": "data/policy.yaml",
-                    "decision": "deny",
-                    "reason": "policy is high-risk (human-only)",
-                },
-                {
-                    "pattern": "data/events.jsonl",
-                    "decision": "deny",
-                    "reason": "event log is append-only; never modify",
-                },
-                {
-                    "pattern": ".env",
-                    "decision": "deny",
-                    "reason": "do not allow writing dotenv secrets",
-                },
-                {
-                    "pattern": "**/.env",
-                    "decision": "deny",
-                    "reason": "do not allow writing dotenv secrets",
-                },
+                {"pattern": "tools/**", "decision": "approval_required", "reason": "creating/updating tools requires approval"},
+                {"pattern": "config/runtime.yaml", "decision": "auto", "reason": "runtime tuning config"},
+                {"pattern": "config/model_routing.yaml", "decision": "approval_required", "reason": "model routing changes affect node behavior"},
+                {"pattern": "config/nodes/**", "decision": "approval_required", "reason": "node definition changes affect execution"},
+                {"pattern": "config/workflows/**", "decision": "approval_required", "reason": "workflow changes affect node graph"},
+                {"pattern": "config/prompt_packs/**", "decision": "approval_required", "reason": "prompt pack changes require approval"},
+                {"pattern": "data/config.yaml", "decision": "approval_required", "reason": "config changes require approval"},
+                {"pattern": "data/policy.yaml", "decision": "deny", "reason": "policy is high-risk (human-only)"},
+                {"pattern": "data/events.jsonl", "decision": "deny", "reason": "event log is append-only; never modify"},
+                {"pattern": "engine/**", "decision": "approval_required", "reason": "engine source changes require approval"},
+                {"pattern": "supervisor/**", "decision": "approval_required", "reason": "supervisor source changes require approval"},
+                {"pattern": "toolbox/**", "decision": "approval_required", "reason": "toolbox source changes require approval"},
+                {"pattern": "providers/**", "decision": "approval_required", "reason": "provider source changes require approval"},
+                {"pattern": "shell/**", "decision": "approval_required", "reason": "shell source changes require approval"},
+                {"pattern": "clonoth_runtime.py", "decision": "approval_required", "reason": "runtime lib changes require approval"},
+                {"pattern": "main.py", "decision": "approval_required", "reason": "entrypoint changes require approval"},
+                {"pattern": ".env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
+                {"pattern": "**/.env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
             ],
         },
         "execute_command": {
             "default": "approval_required",
-            "auto_patterns": [
-                r"^git\s+status",
-                r"^git\s+diff",
-                r"^git\s+rev-parse",
-                r"^python\s+--version$",
-                r"^pip\s+--version$",
-                r"^python\s+-m\s+compileall\b",
-            ],
             "deny_patterns": [
-                # destructive
-                r"\brm\s+-rf\b",
-                r"\bdel\s+/s\b",
-                r"\brmdir\s+/s\b",
+                r"\brm\s+-rf\s+/",
+                r"\brm\s+-rf\s+~",
+                r"\brm\s+-rf\s+\*",
                 r"\bformat\b",
+                r"\bmkfs\b",
+                r"\bfdisk\b",
+                r"\bdd\s+if=/dev/zero\b",
                 r"\bshutdown\b",
                 r"\breboot\b",
-                r"Remove-Item\s+.*-Recurse\s+.*-Force",
-                # env / dotenv (avoid accidental secret exfiltration)
-                r"\.env",
-                r"^set(\s|$)",
-                r"^setx(\s|$)",
-                r"^env(\s|$)",
-                r"^printenv(\s|$)",
-                r"Get-ChildItem\s+Env:",
-                r"\$env:",
-                # raw network / exfil
-                r"\bcurl\b",
-                r"\bwget\b",
-                r"Invoke-WebRequest",
-                r"Start-BitsTransfer",
-                r"\bnc\b",
-                r"\bnetcat\b",
-                r"\bscp\b",
-                r"\bssh\b",
-                # explicit secret name leakage
-                r"OPENAI_API_KEY",
-                r"ANTHROPIC_API_KEY",
-                r"GEMINI_API_KEY",
             ],
         },
         "restart": {
@@ -158,11 +94,13 @@ def _to_safety_level(s: str) -> SafetyLevel:
 
 
 class PolicyEngine:
-    """Very small policy engine (MVP).
+    """策略引擎。
 
-    目标：把“是否需要审批/是否禁止”从 Shell/Kernel 中拿出来，集中在 Supervisor。
+    - read_file / write_file: 用 glob 规则匹配。
+    - execute_command: 先做硬拒绝，再做人类审批。
 
-    注意：在不引入 OS 沙盒的前提下，这套策略不是强安全边界；它是“控制面约束 + 人类确认”的执行规范。
+    命令的语义审核交给 cmd_reviewer 节点。
+    是否真正放行，仍由 Supervisor 的审批流程决定。
     """
 
     def __init__(self, *, workspace_root: Path, policy_path: Path | None = None):
@@ -171,10 +109,8 @@ class PolicyEngine:
 
         self._cached_mtime: float | None = None
 
-        # parsed config
         self._cfg: dict[str, Any] = _default_policy_dict()
 
-        # Extra allowed roots (absolute). Loaded from policy.yaml.
         self._extra_roots: list[Path] = []
 
         self._read_default: SafetyLevel = SafetyLevel.auto
@@ -185,7 +121,6 @@ class PolicyEngine:
         self._read_rules: list[tuple[str, SafetyLevel, str]] = []
         self._write_rules: list[tuple[str, SafetyLevel, str]] = []
         self._deny_command_patterns: list[re.Pattern[str]] = []
-        self._auto_command_patterns: list[re.Pattern[str]] = []
 
         self._ensure_policy_file_exists()
         self._reload_if_needed(force=True)
@@ -195,14 +130,9 @@ class PolicyEngine:
             return
         try:
             self._policy_path.parent.mkdir(parents=True, exist_ok=True)
-            text = yaml.safe_dump(
-                _default_policy_dict(),
-                sort_keys=False,
-                allow_unicode=True,
-            )
+            text = yaml.safe_dump(_default_policy_dict(), sort_keys=False, allow_unicode=True)
             self._policy_path.write_text(text, encoding="utf-8")
         except Exception:
-            # If we cannot write the policy file, we still operate with defaults.
             pass
 
     def _reload_if_needed(self, *, force: bool = False) -> None:
@@ -215,12 +145,7 @@ class PolicyEngine:
         if not force and self._cached_mtime is not None and mtime == self._cached_mtime:
             return
 
-        try:
-            text = self._policy_path.read_text(encoding="utf-8")
-            data = yaml.safe_load(text) if text.strip() else None
-        except Exception:
-            data = None
-
+        data = load_yaml_dict(self._policy_path)
         if not isinstance(data, dict):
             data = _default_policy_dict()
 
@@ -247,28 +172,7 @@ class PolicyEngine:
         return default, rules
 
     def _compile(self) -> None:
-        # Extra roots
-        extra_roots: list[Path] = []
-        extra_raw = self._cfg.get("extra_roots")
-        if isinstance(extra_raw, list):
-            for it in extra_raw:
-                if not isinstance(it, str) or not it.strip():
-                    continue
-                try:
-                    p = Path(it.strip()).expanduser()
-                    if not p.is_absolute():
-                        continue
-                    rp = p.resolve()
-                except Exception:
-                    continue
-
-                # Avoid duplicates.
-                if rp == self._root:
-                    continue
-                if rp not in extra_roots:
-                    extra_roots.append(rp)
-
-        self._extra_roots = extra_roots
+        self._extra_roots = parse_extra_roots(self._root, self._cfg.get("extra_roots"))
 
         read_sec = self._cfg.get("read_file")
         if isinstance(read_sec, dict):
@@ -286,20 +190,13 @@ class PolicyEngine:
         if isinstance(cmd_sec, dict):
             self._command_default = _to_safety_level(str(cmd_sec.get("default", "approval_required")))
             deny_pats = cmd_sec.get("deny_patterns")
-            auto_pats = cmd_sec.get("auto_patterns")
         else:
             self._command_default = SafetyLevel.approval_required
             deny_pats = None
-            auto_pats = None
 
         self._deny_command_patterns = [
             re.compile(p, re.IGNORECASE)
             for p in (deny_pats if isinstance(deny_pats, list) else [])
-            if isinstance(p, str) and p.strip()
-        ]
-        self._auto_command_patterns = [
-            re.compile(p, re.IGNORECASE)
-            for p in (auto_pats if isinstance(auto_pats, list) else [])
             if isinstance(p, str) and p.strip()
         ]
 
@@ -310,18 +207,10 @@ class PolicyEngine:
             self._restart_default = SafetyLevel.approval_required
 
     def _resolve_relpath(self, path_str: str) -> tuple[Path | None, str, bool]:
-        """Resolve a user-provided path into an allowed absolute path.
-
-        Returns: (resolved_path, match_key, is_external)
-
-        - If under workspace root: match_key is workspace-relative POSIX path.
-        - If under extra_roots: match_key is absolute POSIX path.
-        """
-
         try:
             raw = Path(path_str)
             p = raw.resolve() if raw.is_absolute() else (self._root / path_str).resolve()
-        except Exception as e:  # pragma: no cover
+        except Exception as e:
             return None, f"invalid path: {e}", False
 
         try:
@@ -348,35 +237,26 @@ class PolicyEngine:
 
     def evaluate_read_file(self, *, path: str) -> PolicyDecision:
         self._reload_if_needed()
-
         resolved, rel, is_external = self._resolve_relpath(path)
         if resolved is None:
             return PolicyDecision(SafetyLevel.deny, rel)
-
         default = self._read_default
-        # Tighten defaults for external paths.
         if is_external and default == SafetyLevel.auto:
             default = SafetyLevel.approval_required
-
         return self._match_rules(rel, self._read_rules, default)
 
     def evaluate_write_file(self, *, path: str) -> PolicyDecision:
         self._reload_if_needed()
-
         resolved, rel, is_external = self._resolve_relpath(path)
         if resolved is None:
             return PolicyDecision(SafetyLevel.deny, rel)
-
         default = self._write_default
-        # Tighten defaults for external paths.
         if is_external and default == SafetyLevel.auto:
             default = SafetyLevel.approval_required
-
         return self._match_rules(rel, self._write_rules, default)
 
     def evaluate_execute_command(self, *, command: str) -> PolicyDecision:
         self._reload_if_needed()
-
         cmd = command.strip()
         if not cmd:
             return PolicyDecision(SafetyLevel.deny, "empty command")
@@ -385,22 +265,16 @@ class PolicyEngine:
             if pat.search(cmd):
                 return PolicyDecision(SafetyLevel.deny, f"command denied by pattern: {pat.pattern}")
 
-        for pat in self._auto_command_patterns:
-            if pat.search(cmd):
-                return PolicyDecision(SafetyLevel.auto, f"command auto-allowed: {pat.pattern}")
-
         if self._command_default == SafetyLevel.auto:
-            return PolicyDecision(SafetyLevel.auto, "command default=auto")
+            return PolicyDecision(SafetyLevel.auto, "command auto-allowed by default")
         if self._command_default == SafetyLevel.deny:
-            return PolicyDecision(SafetyLevel.deny, "command default=deny")
+            return PolicyDecision(SafetyLevel.deny, "command denied by default")
         return PolicyDecision(SafetyLevel.approval_required, "command requires approval")
 
     def evaluate_restart(self, *, target: str) -> PolicyDecision:
         self._reload_if_needed()
-
-        if target not in {"shell", "kernel", "all"}:
+        if target not in {"engine", "all"}:
             return PolicyDecision(SafetyLevel.deny, f"unknown restart target: {target}")
-
         if self._restart_default == SafetyLevel.auto:
             return PolicyDecision(SafetyLevel.auto, f"restart {target} auto-allowed")
         if self._restart_default == SafetyLevel.deny:
@@ -416,5 +290,4 @@ class PolicyEngine:
             return self.evaluate_execute_command(command=str(parameters.get("command", "")))
         if op == "restart":
             return self.evaluate_restart(target=str(parameters.get("target", "")))
-
         return PolicyDecision(SafetyLevel.deny, f"unknown op: {op}")

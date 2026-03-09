@@ -1,0 +1,14 @@
+version: 1
+kind: node
+id: bootstrap.reviewer
+type: ai
+name: "复核节点"
+description: >-
+  复核型 AI 节点。检查上游执行结果是否完整，并整理成可供下游输出节点使用的结论。
+model_route: executor_default
+prompt:
+  pack: bootstrap_cn
+  assembly: reviewer
+tool_access:
+  mode: none
+output_mode: draft

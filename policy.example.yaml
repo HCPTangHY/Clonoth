@@ -1,30 +1,14 @@
-# Clonoth policy configuration example
-# Copy to data/policy.yaml to override the defaults.
+# Clonoth policy configuration
+# Copy to data/policy.yaml to override defaults.
 #
-# Notes:
-# - This policy is NOT a strong security boundary (no OS sandbox).
-# - It is designed to provide: auditability + human approvals + rollback-friendly guardrails.
+# 命令安全采用双层机制：
+# 1. cmd_reviewer 节点做 AI 前置审核。
+# 2. Supervisor 继续做人类审批与硬规则兜底。
 #
-# Decision values:
-# - auto
-# - approval_required
-# - deny
-#
-# Pattern matching for read/write rules uses glob-like string matching on workspace-relative POSIX paths.
-# (e.g. tools/**, data/config.yaml, **/.env)
+# AI 审核不能替代人类审批。
 
 version: 1
 
-# Extra filesystem roots that are allowed for read_file/write_file.
-#
-# Use case:
-# - Clonoth is deployed under `/www/wwwroot/clonoth`, but you want to manage sibling
-#   files like `/www/wwwroot/monitor-sku.py`.
-#
-# Notes:
-# - This is a security-sensitive setting. Prefer adding the minimal required roots.
-# - For paths under extra_roots, Supervisor will tighten defaults from auto -> approval_required.
-# - You can still add explicit rules to auto-allow certain absolute paths.
 extra_roots: []
 
 read_file:
@@ -45,10 +29,19 @@ write_file:
       reason: "creating/updating tools requires approval"
     - pattern: "config/runtime.yaml"
       decision: auto
-      reason: "runtime tuning config (can be tightened by humans in data/policy.yaml)"
-    - pattern: "config/prompts/**"
+      reason: "runtime tuning config"
+    - pattern: "config/model_routing.yaml"
       decision: approval_required
-      reason: "prompt changes require approval"
+      reason: "model routing changes affect node behavior"
+    - pattern: "config/nodes/**"
+      decision: approval_required
+      reason: "node definition changes affect execution"
+    - pattern: "config/workflows/**"
+      decision: approval_required
+      reason: "workflow changes affect node graph"
+    - pattern: "config/prompt_packs/**"
+      decision: approval_required
+      reason: "prompt pack changes require approval"
     - pattern: "data/config.yaml"
       decision: approval_required
       reason: "config changes require approval"
@@ -58,6 +51,27 @@ write_file:
     - pattern: "data/events.jsonl"
       decision: deny
       reason: "event log is append-only; never modify"
+    - pattern: "engine/**"
+      decision: approval_required
+      reason: "engine source changes require approval"
+    - pattern: "supervisor/**"
+      decision: approval_required
+      reason: "supervisor source changes require approval"
+    - pattern: "toolbox/**"
+      decision: approval_required
+      reason: "toolbox source changes require approval"
+    - pattern: "providers/**"
+      decision: approval_required
+      reason: "provider source changes require approval"
+    - pattern: "shell/**"
+      decision: approval_required
+      reason: "shell source changes require approval"
+    - pattern: "clonoth_runtime.py"
+      decision: approval_required
+      reason: "runtime lib changes require approval"
+    - pattern: "main.py"
+      decision: approval_required
+      reason: "entrypoint changes require approval"
     - pattern: ".env"
       decision: deny
       reason: "do not allow writing dotenv secrets"
@@ -65,56 +79,21 @@ write_file:
       decision: deny
       reason: "do not allow writing dotenv secrets"
 
-    # Example: allow managing a specific external file under extra_roots
-    # - pattern: "/www/wwwroot/monitor-sku.py"
-    #   decision: approval_required
-    #   reason: "manage external script"
-
+# 命令执行策略。
+# default=approval_required：AI 审核之后，仍需人类审批。
+# deny_patterns：仅拦截明确不可逆的破坏命令，作为最后防线。
 execute_command:
   default: approval_required
-  auto_patterns:
-    - "^git\\s+status"
-    - "^git\\s+diff"
-    - "^git\\s+rev-parse"
-    - "^python\\s+--version$"
-    - "^pip\\s+--version$"
-    - "^python\\s+-m\\s+compileall\\b"
   deny_patterns:
-    # destructive commands
-    - "\\brm\\s+-rf\\b"
-    - "\\bdel\\s+/s\\b"
-    - "\\brmdir\\s+/s\\b"
+    - "\\brm\\s+-rf\\s+/"
+    - "\\brm\\s+-rf\\s+~"
+    - "\\brm\\s+-rf\\s+\\*"
     - "\\bformat\\b"
+    - "\\bmkfs\\b"
+    - "\\bfdisk\\b"
+    - "\\bdd\\s+if=/dev/zero\\b"
     - "\\bshutdown\\b"
     - "\\breboot\\b"
-    - "Remove-Item\\s+.*-Recurse\\s+.*-Force"
-
-    # env / dotenv (avoid accidental secret exfiltration)
-    - "\\.env"
-    - "^set(\\s|$)"
-    - "^setx(\\s|$)"
-    - "^env(\\s|$)"
-    - "^printenv(\\s|$)"
-    - "Get-ChildItem\\s+Env:"
-    - "\\$env:"
-
-    # raw network / exfil (recommend using dedicated tools instead)
-    - "\\bcurl\\b"
-    - "\\bwget\\b"
-    - "Invoke-WebRequest"
-    - "Start-BitsTransfer"
-    - "\\bnc\\b"
-    - "\\bnetcat\\b"
-    - "\\bscp\\b"
-    - "\\bssh\\b"
-
-    # explicit secret name leakage
-    - "OPENAI_API_KEY"
-    - "ANTHROPIC_API_KEY"
-    - "GEMINI_API_KEY"
 
 restart:
   default: approval_required
-
-kernel_loop_guard:
-  repeat_tool_call_threshold: 3

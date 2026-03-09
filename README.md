@@ -1,25 +1,24 @@
 <div align="center">
   <img src="public/logo.jpg" alt="Clonoth Logo" width="200" />
   <h1>Clonoth</h1>
-  <p>一个“自进化”的 Agent 基座</p>
+  <p>一个自进化的 Agent 基座</p>
 </div>
 
-## 0. 理念与架构
+## 0. 架构
 
-Clonoth 的目标是成为一个**自进化**的个人 Agent 基座：我们只完成最小且可靠的框架，其余能力（工具、工作流、适配器、甚至部分运行时逻辑）尽可能由 Agent 自己在运行中生成、热加载与迭代。
+Clonoth 采用节点图架构，由以下部分组成：
 
-Clonoth 采用了多进程的架构：
+- **Supervisor**：控制面。负责 HTTP API、事件日志、审批流程、安全策略、进程管理。
+- **Engine**：执行引擎。加载节点图（workflow），按连接关系调度 AI 节点和工具节点，支持子链调用（handoff）。
+- **Toolbox**：工具层。包含 14 个内置工具和 `tools/` 下的脚本工具。
+- **Shell CLI**：终端适配层。负责用户交互、流式输出、审批确认。
 
-- **Supervisor**：最小且稳定的核心。负责暴露 Gateway API、统一记录基于 JSONL 的事件日志（Event Sourcing）、执行 Policy 权限策略、管理审批流，以及对 Shell 和 Kernel 进行健康检查和重启。
-- **Shell Worker**：面向用户的沟通界面（目前为 CLI）。负责维护对话上下文，判断是直接回复还是将复杂任务结构化下发给 Kernel，并向用户展示 Kernel 的进度。
-- **Kernel Worker**：核心执行引擎。运行“思考 → 工具调用 → 观察”循环，动态加载 `tools/` 目录下的工具；同时管理本地 `skills/` 与 `data/mcp_clients.yaml`，并可通过 MCP Client 访问外部 MCP Server 能力。当遇到敏感操作时，主动向 Supervisor 发起审批。
-- **Tools**：Agent 自行生成和更新的 Python 模块（Tool v2）。采用声明式规范（AST 解析提取），无需重启进程即可热加载。
-
----
+节点图中的所有角色——入口节点、执行节点、审核节点、规划节点——都是 AI 节点的不同配置。它们的区别在于提示词、模型路由和工具权限，而不是代码层级。
 
 ## 1. 快速开始
 
 ### 1.1 安装依赖
+
 ```bash
 python -m venv .venv
 
@@ -31,233 +30,141 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 1.2 配置模型 (Provider)
-Clonoth 统一抽象了 OpenAI、Gemini、Anthropic 等模型提供商。默认使用 **YAML** 在本地维护配置信息：`data/config.yaml`（已加入 `.gitignore`）。
+### 1.2 配置模型
 
-建议：**把 base_url / api_key 放在环境变量中**，避免被 Agent 间接泄露。
+编辑 `data/config.yaml`（可参考 `config.example.yaml`）：
 
-创建或编辑 `data/config.yaml`：
 ```yaml
 version: 1
 provider: openai
 openai:
-  base_url: "${OPENAI_BASE_URL}" # 可为空，将 fallback 到默认地址
+  base_url: "${OPENAI_BASE_URL}"
   api_key: "${OPENAI_API_KEY}"
-  model: "${OPENAI_MODEL}"       # 可为空，默认 gpt-4o-mini
+  model: "${OPENAI_MODEL}"
 ```
 
-启动前设置环境变量（以 Windows PowerShell 为例）：
-```powershell
-$env:OPENAI_API_KEY = "YOUR_KEY"
-$env:OPENAI_BASE_URL = "https://api.openai.com/v1"  # 可选
-$env:OPENAI_MODEL = "gpt-5.2"   # 可选
-```
-*(也可在运行后通过 API 动态修改，见下方 API 说明)*
+### 1.3 启动
 
-### 1.3 启动方式
+**单入口启动（推荐）**
 
-**方式一：单入口一键启动**
 ```bash
 python main.py
 ```
-> Windows 提示：Supervisor 会在当前终端运行 API 服务；Shell CLI 默认会在**新控制台窗口**中打开（可通过环境变量 `CLONOTH_SHELL_NEW_CONSOLE=0` 关闭）。
 
-**方式二：多终端手动分离启动（推荐开发者使用）**
-1. 启动控制面 (Supervisor)：
+Supervisor 会自动拉起 Engine 和 Shell CLI。
+
+**分开启动**
+
 ```bash
+# 启动控制面
 python -m supervisor.main --no-workers
-```
-2. 在其它终端分别启动 Worker 和 CLI：
-```bash
-# 启动 Kernel 执行引擎
-python -m kernel.worker --supervisor http://127.0.0.1:8765
 
-# 启动 Shell 路由与对话管理
-python -m shell.worker  --supervisor http://127.0.0.1:8765
+# 启动执行引擎
+python -m engine --supervisor http://127.0.0.1:8765
 
-# 启动 本地交互式 CLI（仅作为终端界面接入 Gateway API）
-python -m shell.cli     --supervisor http://127.0.0.1:8765
+# 启动终端 CLI
+python -m shell.cli --supervisor http://127.0.0.1:8765
 ```
 
-### 1.4 启动后可直接尝试的请求
+## 2. 节点系统
 
-当前推荐的交互方式仍然是：**你对 Shell 说需求，Shell 创建 task，Kernel 用内建工具完成工作。**
+### 2.1 节点定义
 
-例如：
+`config/nodes/*.yaml` 定义节点。每个节点声明自己的类型、提示词、模型路由和工具权限。
 
-- “新增一个 `release-note` skill，用来生成 changelog。”
-- “列出当前所有 skills。”
-- “新增一个 github MCP client，transport 是 stdio，command 是 `npx`，args 是 `-y @modelcontextprotocol/server-github`。”
-- “测试一下 github 这个 MCP client 是否可用。”
-- “列出 github 这个 MCP client 提供的 tools。”
+当前默认节点：
 
-> 提示：涉及 token / API key 时，建议在环境变量中提供，再在 MCP 配置里用 `${ENV_NAME}` 引用。
+| 节点 | 用途 |
+|---|---|
+| `bootstrap.shell_orchestrator` | 入口节点。判断直接回复还是移交下游 |
+| `bootstrap.executor` | 执行节点。多步推理、调用工具 |
+| `bootstrap.cmd_reviewer` | 命令审核节点。对 shell 命令做语义审核 |
+| `bootstrap.planner` | 规划节点 |
+| `bootstrap.reviewer` | 复核节点 |
 
----
+### 2.2 工作流
 
-## 2. 核心机制
+`config/workflows/*.yaml` 定义节点之间的连接关系。
 
-### 2.1 事件驱动与状态恢复 (Event Sourcing)
-Clonoth 不依赖关系型数据库，所有的对话、任务、工具调用状态均基于 `data/events.jsonl` 以追加（Append-only）的方式持久化。
-无论是 Kernel 崩溃、Shell 重启还是整个系统重启，Supervisor 都能从事件流中重建状态队列，实现无缝断点续传。
+当前默认工作流：
 
-### 2.2 审批策略 (Policy & Approval)
-为了防止 Agent 在自进化过程中“破坏世界”，Supervisor 在首次启动时会自动生成 `data/policy.yaml`。
-它对内建操作（如 `read_file`, `write_file`, `execute_command`, `restart`）进行了严格控制，划分为：
-- **L1 自动执行**：只读操作或低风险写入。
-- **L2 需审批**：执行系统命令、修改核心代码、重启系统。请求会推送到终端，需人类确认（可手动干预修改为自动放行）。
-- **L3 硬拒绝**：高危指令阻断。
+- `bootstrap.default_chat`：入口 → 执行 → 命令审核（handoff）→ 回复
+- `bootstrap.plan_execute_review`：规划 → 执行 → 复核
 
-### 2.3 工具系统与自进化 (Tools)
-系统中的工具分为两类：**内置元工具（Meta Tools）** 和 **自生成工具（Declarative Tools）**。
+### 2.3 提示词
 
-1. **核心内置元工具 (Meta Tools)**：
-   由框架手写（位于 `kernel/meta_tools.py`），提供系统的基础能力，受 `data/policy.yaml` 严格管控：
-   - 读取/搜索：`read_file` / `list_dir` / `search_in_files`
-   - 修改系统：`write_file` / `execute_command`
-   - 自进化专有：`create_or_update_tool` / `reload_tools` / `request_restart`
-   - Skill 管理：`create_or_update_skill` / `list_skills` / `delete_skill`
-   - MCP Client 管理：`create_or_update_mcp_client` / `list_mcp_clients` / `delete_mcp_client` / `test_mcp_client`
-   - MCP 能力访问：`list_mcp_tools` / `call_mcp_tool` / `list_mcp_resources` / `read_mcp_resource` / `list_mcp_prompts` / `get_mcp_prompt`
+`config/prompt_packs/` 存放提示词片段和组装规则。按 `manifest.yaml` 中的 assembly 定义拼装最终 system prompt。
 
-2. **声明式命令工具 (Declarative Tools)**：
-   由 Agent 自身调用 `create_or_update_tool` 自动生成的工具，存放在 `tools/` 目录下。
-   - **安全机制 (Tool v2)**：Kernel **绝不会 import/执行** `tools/` 目录下的 Python 代码。它仅仅通过 **AST（抽象语法树）解析** 提取文件中的 `SPEC` (定义) 和 `COMMANDS` (命令模板)。
-   - **优势**：这既实现了工具编写后的**即刻无缝热加载**，又从根本上杜绝了 Agent 在工具内插入恶意/越权 Python 逻辑绕过 Supervisor 的可能性。
-   - **示例结构**：
-     ```python
-     SPEC = {"name": "my_tool", "description": "...", "input_schema": {...}}
-     COMMANDS = ["npm run build --prefix {path}"]
-     TIMEOUT_SEC = 30.0
-     ```
+### 2.4 模型路由
 
-### 2.4 Skills 与 progressive disclosure
+`config/model_routing.yaml` 为不同节点指定模型。支持按节点、按角色分配不同的 provider 和 model。
 
-Clonoth 采用兼容主流 Agent Skills 的最小形式：
+## 3. 工具系统
 
-```text
-skills/
-  <skill-name>/
-    SKILL.md
-```
+### 3.1 内置工具
 
-`SKILL.md` 推荐使用 YAML frontmatter + 正文说明，至少包含：
+14 个内置工具：`list_dir`、`read_file`、`write_file`、`execute_command`、`search_in_files`、`create_or_update_skill`、`list_skills`、`delete_skill`、`create_or_update_mcp_client`、`list_mcp_clients`、`delete_mcp_client`、`create_or_update_tool`、`reload_tools`、`request_restart`。
 
-```md
----
-name: release-note
-description: 当用户要求生成发布说明、changelog、release notes 时使用。
-enabled: true
----
+### 3.2 脚本工具
 
-这里写这个 skill 的工作流、输出要求、注意事项。
-```
+`tools/*.py` 下的脚本工具以独立子进程运行。通过 stdin/stdout 的 JSON 协议通信。AI 可以通过 `create_or_update_tool` 创建新工具。
 
-Skill 在请求中的拼接方式不是“把所有 `SKILL.md` 全文塞进 prompt”，而是采用 **progressive disclosure**：
+### 3.3 MCP 工具
 
-1. **请求开始时**：Kernel 只向模型注入 skills 的元数据索引（`name` / `description` / `path`）。
-2. **模型判断命中时**：再通过 `read_file` 按需读取对应的 `skills/<name>/SKILL.md`。
-3. **若 skill 继续引用 `references/` / `scripts/` / `assets/`**：只读取实际需要的文件，不整包加载。
+MCP 客户端定义在 `data/mcp_clients.yaml`。Engine 启动时自动加载。
 
-这使得：
+## 4. 安全策略
 
-- skills 可以很多，但不会拖垮每次请求的上下文；
-- `description` 成为 skill 触发的主信号；
-- 你既可以显式点名某个 skill，也可以让模型根据任务语义自行选择。
+安全策略定义在 `data/policy.yaml`（参考 `policy.example.yaml`）。
 
-### 2.5 MCP Client
+### 4.1 双层审核
 
-Clonoth 当前实现的是 **MCP Client**，不是 MCP Server。MCP client 配置保存在：`data/mcp_clients.yaml`。
+命令执行采用双层机制：
 
-支持三种 transport：
+1. `cmd_reviewer` 节点做 AI 语义审核
+2. Supervisor Policy 做硬规则和人类审批
 
-- `stdio`
-- `sse`
-- `streamable_http`
+AI 审核不能替代人类审批。
 
-MCP server 常见暴露三类能力：
+### 4.2 文件保护
 
-- `tools`
-- `resources`
-- `prompts`
+| 路径 | 策略 |
+|---|---|
+| `engine/**`、`supervisor/**`、`toolbox/**`、`providers/**`、`shell/**` | 需要审批 |
+| `config/nodes/**`、`config/workflows/**`、`config/prompt_packs/**` | 需要审批 |
+| `tools/**` | 需要审批 |
+| `clonoth_runtime.py`、`main.py` | 需要审批 |
+| `data/policy.yaml` | 硬拒绝 |
+| `data/events.jsonl` | 硬拒绝 |
+| `.env` | 硬拒绝 |
+| `config/runtime.yaml` | 自动允许 |
 
-最小配置示例：
+### 4.3 命令硬拒绝
 
-```yaml
-version: 1
-clients:
-  github:
-    transport: stdio
-    command: npx
-    args:
-      - -y
-      - "@modelcontextprotocol/server-github"
-    env:
-      GITHUB_TOKEN: "${GITHUB_TOKEN}"
-    enabled: true
-```
+以下命令无论如何不会通过：`rm -rf /`、`rm -rf ~`、`rm -rf *`、`format`、`mkfs`、`fdisk`、`dd if=/dev/zero`、`shutdown`、`reboot`。
 
-当前实现采用 **通用代理工具** 访问 MCP，而不是把远端每个工具动态注册成一个本地工具名。也就是说，Kernel 会通过 `call_mcp_tool` / `read_mcp_resource` / `get_mcp_prompt` 这类通用工具访问指定 client 的能力。
+## 5. 自进化
 
-### 2.6 Runtime 动态调参
-`config/runtime.yaml` 提供运行时的非敏感参数调整（如 Kernel 轮询间隔、最大执行步数、工具历史截断长度等）。这些参数可由人类修改，也可授权给 Agent 自身进行优化。
+AI 可以在人类审批下修改自身的节点定义、工作流、提示词、模型路由和工具。修改后通过 `request_restart` 重启 Engine 使改动生效。
 
----
+唯一不可修改的是安全策略（`data/policy.yaml`）和事件日志（`data/events.jsonl`）。
 
-## 3. 对外集成与 API
+## 6. 目录结构
 
-Clonoth 将复杂性封装在后端，对外提供了一套稳定的 Gateway API，非常适合接入 Telegram、Discord 或企业微信等外部平台。
-
-### 3.1 接收用户输入 (Inbound)
-```http
-POST /v1/inbound
-```
-请求体示例：
-```json
-{
-  "channel": "telegram",
-  "conversation_key": "chat_12345",
-  "text": "帮我写一个 python 爬虫脚本",
-  "use_context": true
-}
-```
-*(提示：若 `use_context` 设为 `false`，则由外部 Bot 平台完全自行管理历史记忆。)*
-
-### 3.2 轮询系统输出 (Outbound & Approvals)
-外部平台只需通过无状态的长轮询/短轮询拉取针对某 `session_id` 的增量事件即可：
-```http
-GET /v1/sessions/{session_id}/events?after_seq={seq}
-```
-关注两类核心事件：
-- `type == "outbound_message"`：系统的最终回复（提取 `payload.text` 即可发给用户）。
-- `type == "approval_requested"`：高危操作拦截请求（若外接平台支持交互，可向管理员推送此消息，并通过 `POST /v1/approvals/{approval_id}` 提交 `allow/deny`）。
-
-### 3.3 消息处理生命周期（供网关开发者参考）
-1. **网关 (Adapter)** 发送 `/v1/inbound`。
-2. **Shell (Orchestrator)** 接收后，如果是日常闲聊，直接产生 `outbound_message` ；若是复杂任务，则生成一个 `task` 放入队列。
-3. **Kernel** 领取 `task`，进行多步思考与工具调用（过程中可能触发 `approval` 拦截）。执行完毕后写入原始草稿（`task_completed`）。
-4. **Shell (Responder)** 监测到任务完成，会重新收集工具执行日志，总结出一份干净友好的面向用户的答复，最终触发 `outbound_message`。
-
-### 3.4 动态修改配置
-通过 API 直接更新对应 provider 的配置（以 OpenAI 为例）：
-```bash
-curl -X POST http://127.0.0.1:8765/v1/config/openai \
-  -H "Content-Type: application/json" \
-  -d '{"api_key":"YOUR_KEY","model":"gpt-4o-mini"}'
-```
-
----
-
-## 4. 目录结构
 ```text
 Clonoth/
-├── supervisor/     # 控制面：Gateway API、事件日志(Eventlog)、权限(Policy)、进程管理
-├── shell/          # 路由层：对话维护、意图识别、任务下发（含本地 CLI）
-├── kernel/         # 执行层：Task 执行循环、请求审批、调用工具
-├── providers/      # 大模型适配层 (OpenAI / Gemini / Anthropic)
-├── skills/         # 本地 skill 包：skills/<name>/SKILL.md
-├── tools/          # 自进化区：Agent 编写的工具（热加载）
-├── config/         # 运行时配置、Prompts
-├── data/           # events.jsonl, config.yaml, policy.yaml, mcp_clients.yaml 等动态数据
-└── public/         # 静态资源（如 logo）
+├── supervisor/     # 控制面
+├── engine/         # 执行引擎
+├── shell/          # CLI 适配层
+├── toolbox/        # 工具层（内置工具 + 脚本工具运行器 + MCP）
+├── providers/      # 模型适配层
+├── config/         # nodes / workflows / prompt_packs / model_routing / runtime
+├── tools/          # 脚本工具
+├── skills/         # Skill 文件
+├── data/           # 事件日志、配置、运行时数据
+└── docs/           # 文档
 ```
+
+## 7. 流式输出
+
+`config/runtime.yaml` 中 `engine.streaming: true` 开启后，入口节点的 LLM 响应会逐块推送到 CLI。CLI 同时显示思维链（灰色）和文本内容（逐字输出）。

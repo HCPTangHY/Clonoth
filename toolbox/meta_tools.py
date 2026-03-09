@@ -12,9 +12,15 @@ from typing import Any
 
 import yaml
 
-from clonoth_runtime import get_float, get_int, load_runtime_config
+from clonoth_runtime import (
+    get_float,
+    get_int,
+    load_policy_config,
+    load_runtime_config,
+    parse_extra_roots,
+)
 
-from .context import KernelContext
+from .context import ToolContext
 from . import mcp_runtime
 
 
@@ -44,13 +50,6 @@ _RESERVED_TOOL_NAMES = {
     "create_or_update_mcp_client",
     "list_mcp_clients",
     "delete_mcp_client",
-    "test_mcp_client",
-    "list_mcp_tools",
-    "call_mcp_tool",
-    "list_mcp_resources",
-    "read_mcp_resource",
-    "list_mcp_prompts",
-    "get_mcp_prompt",
     "create_or_update_tool",
     "reload_tools",
     "request_restart",
@@ -71,11 +70,8 @@ def _parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 def _safe_subprocess_env() -> dict[str, str]:
     """Return a subprocess env with common secret variables stripped.
 
-    Rationale:
-    - We want to keep provider keys in environment variables.
-    - But we do NOT want arbitrary `execute_command` calls to be able to read/exfiltrate them.
-
-    This is not a complete security boundary, but it meaningfully reduces accidental leakage.
+    This is not a complete security boundary, but it meaningfully reduces
+    accidental leakage from command execution.
     """
 
     env = os.environ.copy()
@@ -99,50 +95,16 @@ def _resolve_under_root(root: Path, rel_path: str) -> Path:
     return p
 
 
-def _load_extra_roots_from_policy(workspace_root: Path) -> list[Path]:
-    """Load extra_roots allowlist from data/policy.yaml.
-
-    This is a *defense-in-depth* check. The real enforcement happens in Supervisor policy
-    evaluation, but Kernel should not read/write arbitrary paths even after approval.
-    """
-
-    p = workspace_root / "data" / "policy.yaml"
-    try:
-        if not p.exists():
-            return []
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return []
-        raw = data.get("extra_roots")
-        if not isinstance(raw, list):
-            return []
-    except Exception:
-        return []
-
-    roots: list[Path] = []
-    for it in raw:
-        if not isinstance(it, str) or not it.strip():
-            continue
-        try:
-            rp = Path(it.strip()).expanduser()
-            if not rp.is_absolute():
-                continue
-            rr = rp.resolve()
-        except Exception:
-            continue
-
-        if rr == workspace_root:
-            continue
-        if rr not in roots:
-            roots.append(rr)
-
-    return roots
+def _load_allowed_extra_roots(workspace_root: Path) -> list[Path]:
+    """Load extra_roots from policy.yaml for defense in depth path checks."""
+    data = load_policy_config(workspace_root)
+    return parse_extra_roots(workspace_root, data.get("extra_roots") if isinstance(data, dict) else None)
 
 
 def _resolve_under_allowed_roots(workspace_root: Path, path_str: str) -> Path:
     """Resolve path under workspace_root or policy-configured extra_roots."""
 
-    extra_roots = _load_extra_roots_from_policy(workspace_root)
+    extra_roots = _load_allowed_extra_roots(workspace_root)
 
     raw = Path(path_str)
     p = raw.resolve() if raw.is_absolute() else (workspace_root / path_str).resolve()
@@ -163,6 +125,32 @@ def _resolve_under_allowed_roots(workspace_root: Path, path_str: str) -> Path:
     raise ValueError("path escapes workspace root")
 
 
+async def _request_guard(
+    ctx: ToolContext,
+    op: str,
+    parameters: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Request supervisor policy decision and wait for approval when needed.
+
+    Returns (op_response, error_result).
+    error_result is None when the operation may proceed.
+    """
+
+    op_res = await ctx.request_op(op, parameters)
+    safety_level = str(op_res.get("safety_level") or "")
+
+    if safety_level == "deny":
+        return op_res, {"ok": False, "error": op_res.get("reason", "denied")}
+
+    if safety_level == "approval_required":
+        approval_id = op_res.get("approval_id")
+        approval = await ctx.wait_for_approval(approval_id)
+        if approval.get("status") != "allowed":
+            return op_res, {"ok": False, "error": "user denied approval", "approval_id": approval_id}
+
+    return op_res, None
+
+
 def _run_capture(*, args: list[str], cwd: Path, timeout_sec: float = 10.0) -> tuple[int, str]:
     try:
         cp = subprocess.run(
@@ -179,8 +167,8 @@ def _run_capture(*, args: list[str], cwd: Path, timeout_sec: float = 10.0) -> tu
         return 999, str(e)
 
 
-def _write_text_artifact(*, ctx: KernelContext, filename: str, text: str) -> str:
-    artifacts_dir = ctx.workspace_root / "data" / "artifacts" / ctx.task_id
+def _write_text_artifact(*, ctx: ToolContext, filename: str, text: str) -> str:
+    artifacts_dir = ctx.workspace_root / "data" / "artifacts" / ctx.run_id
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     p = artifacts_dir / filename
@@ -188,7 +176,7 @@ def _write_text_artifact(*, ctx: KernelContext, filename: str, text: str) -> str
     return p.relative_to(ctx.workspace_root).as_posix()
 
 
-def _git_snapshot(ctx: KernelContext) -> dict[str, Any]:
+def _git_snapshot(ctx: ToolContext) -> dict[str, Any]:
     root = ctx.workspace_root
 
     runtime_cfg = load_runtime_config(root)
@@ -205,7 +193,6 @@ def _git_snapshot(ctx: KernelContext) -> dict[str, Any]:
     diff_ref = ""
     if stat_rc == 0 and diff_stat.strip():
         diff_rc, diff_text = _run_capture(args=["git", "diff"], cwd=root, timeout_sec=30)
-        # Avoid crazy large diff artifacts.
         if diff_rc == 0:
             if len(diff_text) > diff_max_chars:
                 diff_text = diff_text[:diff_max_chars] + "\n...<truncated>"
@@ -226,7 +213,6 @@ def _git_snapshot(ctx: KernelContext) -> dict[str, Any]:
 
 
 def _git_ensure_identity(*, root: Path) -> None:
-    # Ensure we can commit even on fresh machines.
     rc_name, name = _run_capture(args=["git", "config", "user.name"], cwd=root)
     rc_email, email = _run_capture(args=["git", "config", "user.email"], cwd=root)
 
@@ -237,7 +223,7 @@ def _git_ensure_identity(*, root: Path) -> None:
     _run_capture(args=["git", "config", "user.email", "clonoth@local"], cwd=root)
 
 
-def _git_commit_all(*, ctx: KernelContext, message: str) -> dict[str, Any]:
+def _git_commit_all(*, ctx: ToolContext, message: str) -> dict[str, Any]:
     root = ctx.workspace_root
 
     snap_before = _git_snapshot(ctx)
@@ -246,7 +232,6 @@ def _git_commit_all(*, ctx: KernelContext, message: str) -> dict[str, Any]:
 
     before_head = str(snap_before.get("git_head") or "")
 
-    # Nothing to commit
     if not snap_before.get("git_dirty"):
         return {"ok": True, "committed": False, "before_head": before_head, "after_head": before_head}
 
@@ -266,7 +251,6 @@ def _git_commit_all(*, ctx: KernelContext, message: str) -> dict[str, Any]:
     after_head = str(snap_after.get("git_head") or "") if snap_after.get("git_ok") else before_head
 
     if rc_commit != 0:
-        # e.g. nothing to commit
         return {
             "ok": False,
             "error": "git commit failed",
@@ -284,7 +268,7 @@ def _git_commit_all(*, ctx: KernelContext, message: str) -> dict[str, Any]:
     }
 
 
-async def list_dir(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     path = str(args.get("path", "."))
     p = _resolve_under_root(ctx.workspace_root, path)
     if not p.exists():
@@ -302,12 +286,13 @@ async def list_dir(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
     return {"ok": True, "path": path, "items": items}
 
 
-async def read_file(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     path = str(args.get("path", ""))
     start_line = args.get("start_line")
     end_line = args.get("end_line")
 
-    op = await ctx.request_op(
+    _op, err = await _request_guard(
+        ctx,
         "read_file",
         {
             "path": path,
@@ -315,14 +300,8 @@ async def read_file(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
             "end_line": end_line,
         },
     )
-    if op.get("safety_level") == "deny":
-        return {"ok": False, "error": op.get("reason", "denied")}
-
-    if op.get("safety_level") == "approval_required":
-        approval_id = op.get("approval_id")
-        approval = await ctx.wait_for_approval(approval_id)
-        if approval.get("status") != "allowed":
-            return {"ok": False, "error": "user denied approval", "approval_id": approval_id}
+    if err is not None:
+        return err
 
     p = _resolve_under_allowed_roots(ctx.workspace_root, path)
     if not p.exists() or not p.is_file():
@@ -344,11 +323,12 @@ async def read_file(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
     return {"ok": True, "path": path, "content": numbered}
 
 
-async def write_file(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     path = str(args.get("path", ""))
     content = str(args.get("content", ""))
 
-    op = await ctx.request_op(
+    _op, err = await _request_guard(
+        ctx,
         "write_file",
         {
             "path": path,
@@ -356,14 +336,8 @@ async def write_file(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]
             "content_len": len(content),
         },
     )
-    if op.get("safety_level") == "deny":
-        return {"ok": False, "error": op.get("reason", "denied")}
-
-    if op.get("safety_level") == "approval_required":
-        approval_id = op.get("approval_id")
-        approval = await ctx.wait_for_approval(approval_id)
-        if approval.get("status") != "allowed":
-            return {"ok": False, "error": "user denied approval", "approval_id": approval_id}
+    if err is not None:
+        return err
 
     p = _resolve_under_allowed_roots(ctx.workspace_root, path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -371,7 +345,7 @@ async def write_file(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]
     return {"ok": True, "path": path, "bytes": len(content.encode("utf-8"))}
 
 
-async def execute_command(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     command = str(args.get("command", "")).strip()
 
     runtime_cfg = load_runtime_config(ctx.workspace_root)
@@ -396,15 +370,9 @@ async def execute_command(args: dict[str, Any], ctx: KernelContext) -> dict[str,
     except Exception:
         timeout_sec = float(default_timeout_sec)
 
-    op = await ctx.request_op("execute_command", {"command": command})
-    if op.get("safety_level") == "deny":
-        return {"ok": False, "error": op.get("reason", "denied")}
-
-    if op.get("safety_level") == "approval_required":
-        approval_id = op.get("approval_id")
-        approval = await ctx.wait_for_approval(approval_id)
-        if approval.get("status") != "allowed":
-            return {"ok": False, "error": "user denied approval", "approval_id": approval_id}
+    _op, err = await _request_guard(ctx, "execute_command", {"command": command})
+    if err is not None:
+        return err
 
     try:
         cp = subprocess.run(
@@ -424,7 +392,7 @@ async def execute_command(args: dict[str, Any], ctx: KernelContext) -> dict[str,
         return {"ok": False, "error": f"timeout after {timeout_sec}s"}
 
 
-async def search_in_files(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     query = str(args.get("query", ""))
     rel_path = str(args.get("path", "."))
 
@@ -451,7 +419,6 @@ async def search_in_files(args: dict[str, Any], ctx: KernelContext) -> dict[str,
             continue
         if p.name.endswith((".pyc",)):
             continue
-        # skip big files
         try:
             if p.stat().st_size > max_file_size_bytes:
                 continue
@@ -472,7 +439,7 @@ async def search_in_files(args: dict[str, Any], ctx: KernelContext) -> dict[str,
     return {"ok": True, "query": query, "matches": matches}
 
 
-async def create_or_update_skill(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     name = str(args.get("name", "")).strip()
     description = str(args.get("description", "")).strip()
     content = args.get("content")
@@ -510,7 +477,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: KernelContext) -> di
     return {"ok": True, "path": path, "name": name, "enabled": enabled}
 
 
-async def list_skills(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     skills_dir = ctx.workspace_root / "skills"
     if not skills_dir.exists():
         return {"ok": True, "skills": []}
@@ -537,7 +504,7 @@ async def list_skills(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any
     return {"ok": True, "skills": items}
 
 
-async def delete_skill(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     name = str(args.get("name", "")).strip()
     if not name:
         return {"ok": False, "error": "empty skill name"}
@@ -550,19 +517,15 @@ async def delete_skill(args: dict[str, Any], ctx: KernelContext) -> dict[str, An
     if not skill_dir.is_dir():
         return {"ok": False, "error": f"not a skill directory: {name}"}
 
-    op = await ctx.request_op("write_file", {"path": f"skills/{name}/SKILL.md", "delete": True})
-    if op.get("safety_level") == "deny":
-        return {"ok": False, "error": op.get("reason", "denied")}
-    if op.get("safety_level") == "approval_required":
-        approval = await ctx.wait_for_approval(op.get("approval_id"))
-        if approval.get("status") != "allowed":
-            return {"ok": False, "error": "user denied approval", "approval_id": op.get("approval_id")}
+    _op, err = await _request_guard(ctx, "write_file", {"path": f"skills/{name}/SKILL.md", "delete": True})
+    if err is not None:
+        return err
 
     shutil.rmtree(skill_dir)
     return {"ok": True, "deleted": True, "name": name}
 
 
-async def create_or_update_mcp_client(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def create_or_update_mcp_client(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     try:
         spec = mcp_runtime.upsert_client(ctx.workspace_root, args)
     except Exception as e:
@@ -570,7 +533,7 @@ async def create_or_update_mcp_client(args: dict[str, Any], ctx: KernelContext) 
     return {"ok": True, "client": spec, "path": "data/mcp_clients.yaml"}
 
 
-async def list_mcp_clients(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def list_mcp_clients(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     try:
         clients = mcp_runtime.list_clients(ctx.workspace_root)
         return {"ok": True, "clients": clients}
@@ -578,7 +541,7 @@ async def list_mcp_clients(args: dict[str, Any], ctx: KernelContext) -> dict[str
         return {"ok": False, "error": str(e)}
 
 
-async def delete_mcp_client(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def delete_mcp_client(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     client_id = str(args.get("id", "")).strip()
     if not client_id:
         return {"ok": False, "error": "empty client id"}
@@ -591,160 +554,77 @@ async def delete_mcp_client(args: dict[str, Any], ctx: KernelContext) -> dict[st
         return {"ok": False, "error": str(e)}
 
 
-async def test_mcp_client(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    client_id = str(args.get("id", "")).strip()
-    if not client_id:
-        return {"ok": False, "error": "empty client id"}
-    try:
-        return await mcp_runtime.test_client(ctx.workspace_root, client_id)
-    except Exception as e:
-        return {"ok": False, "error": str(e), "id": client_id}
 
-
-async def list_mcp_tools(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    try:
-        return await mcp_runtime.list_tools(ctx.workspace_root, str(args.get("id", "")).strip())
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-async def call_mcp_tool(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    try:
-        return await mcp_runtime.call_tool(
-            ctx.workspace_root,
-            str(args.get("id", "")).strip(),
-            str(args.get("tool_name", "")).strip(),
-            args.get("arguments") if isinstance(args.get("arguments"), dict) else {},
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-async def list_mcp_resources(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    try:
-        return await mcp_runtime.list_resources(ctx.workspace_root, str(args.get("id", "")).strip())
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-async def read_mcp_resource(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    try:
-        return await mcp_runtime.read_resource(
-            ctx.workspace_root,
-            str(args.get("id", "")).strip(),
-            str(args.get("uri", "")).strip(),
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-async def list_mcp_prompts(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    try:
-        return await mcp_runtime.list_prompts(ctx.workspace_root, str(args.get("id", "")).strip())
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-async def get_mcp_prompt(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    try:
-        return await mcp_runtime.get_prompt(
-            ctx.workspace_root,
-            str(args.get("id", "")).strip(),
-            str(args.get("prompt_name", "")).strip(),
-            args.get("arguments") if isinstance(args.get("arguments"), dict) else {},
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-
-def _render_command_tool_py(*, spec: dict[str, Any], commands: list[str], timeout_sec: float | None) -> str:
+def _render_tool_py(*, spec: dict[str, Any], script_body: str, timeout_sec: float | None) -> str:
+    """Generate a tool .py file from spec and user script body."""
     lines: list[str] = []
     lines.append("from __future__ import annotations")
     lines.append("")
     lines.append(
         "\"\"\"\n"
-        "This is a *declarative command tool* (Clonoth Tool v2).\n"
+        "External tool (Clonoth).\n"
         "\n"
-        "- The Kernel will NOT import/execute this module.\n"
-        "- It will parse this file as AST and extract literals (SPEC/COMMANDS/TIMEOUT_SEC).\n"
-        "- Therefore: do NOT put runtime code here.\n"
+        "The engine parses SPEC via AST at registration time.\n"
+        "At invocation this file runs as a subprocess:\n"
+        "  - Input: tool arguments as JSON on stdin\n"
+        "  - Output: result as JSON on stdout\n"
+        "  - Sensitive env vars are stripped\n"
         "\"\"\""
     )
     lines.append("")
-
-    lines.append("# Tool specification")
     lines.append("SPEC = " + pprint.pformat(spec, width=100))
-    lines.append("")
-
-    lines.append("# Command template(s). You can reference args via Python format: {arg_name}")
-    lines.append("COMMANDS = " + pprint.pformat(commands, width=100))
 
     if timeout_sec is not None:
         lines.append("")
         lines.append(f"TIMEOUT_SEC = {float(timeout_sec)}")
 
     lines.append("")
+    lines.append("")
+    lines.append('if __name__ == "__main__":')
+    lines.append('    import json, sys')
+    lines.append('    _input = json.loads(sys.stdin.read())')
+    lines.append('    def output(result): print(json.dumps(result, ensure_ascii=False)); sys.exit(0)')
+    lines.append('    def fail(error): print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)); sys.exit(1)')
+    lines.append('    args = _input')
+
+    for line in script_body.splitlines():
+        lines.append("    " + line)
+
+    lines.append("")
     return "\n".join(lines)
 
 
-async def create_or_update_tool(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    """Create/update a *declarative command tool* under tools/.
-
-    This replaces the previous 'arbitrary python tool' approach to avoid policy bypass.
-    """
-
+async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Create or update an external tool under tools/."""
     name = str(args.get("name", "")).strip()
     description = str(args.get("description", "")).strip()
     input_schema = args.get("input_schema")
-
     timeout_sec = args.get("timeout_sec")
-
-    command = args.get("command")
-    commands = args.get("commands")
+    script = args.get("script")
 
     if not name:
         return {"ok": False, "error": "empty tool name"}
-
-    # Security: tool name must be a safe identifier to prevent path traversal.
-    # The tool file will be written to tools/{name}.py.
     if not _TOOL_NAME_RE.fullmatch(name):
-        return {
-            "ok": False,
-            "error": "invalid tool name: only [A-Za-z_][A-Za-z0-9_]{0,63} is allowed",
-        }
+        return {"ok": False, "error": "invalid tool name: only [A-Za-z_][A-Za-z0-9_]{0,63} is allowed"}
     if name in _RESERVED_TOOL_NAMES:
         return {"ok": False, "error": f"reserved tool name: {name}"}
-
-    cmd_list: list[str] = []
-    if isinstance(commands, list) and commands:
-        for c in commands:
-            if isinstance(c, str) and c.strip():
-                cmd_list.append(c.strip())
-    elif isinstance(command, str) and command.strip():
-        cmd_list = [command.strip()]
-
-    if not cmd_list:
-        return {"ok": False, "error": "empty command(s)"}
-
+    if not isinstance(script, str) or not script.strip():
+        return {"ok": False, "error": "'script' is required"}
     if not isinstance(input_schema, dict):
-        # default: accept any args
         input_schema = {"type": "object", "properties": {}, "required": []}
 
-    spec: dict[str, Any] = {
-        "name": name,
-        "description": description,
-        "input_schema": input_schema,
-    }
-
-    code = _render_command_tool_py(spec=spec, commands=cmd_list, timeout_sec=float(timeout_sec) if timeout_sec is not None else None)
+    spec = {"name": name, "description": description, "input_schema": input_schema}
+    code = _render_tool_py(
+        spec=spec,
+        script_body=script.strip(),
+        timeout_sec=float(timeout_sec) if timeout_sec is not None else None,
+    )
 
     path = f"tools/{name}.py"
     res = await write_file({"path": path, "content": code}, ctx)
     if not res.get("ok"):
         return res
 
-    # reload tools
     try:
         count = ctx.registry.reload()
     except Exception as e:
@@ -753,7 +633,7 @@ async def create_or_update_tool(args: dict[str, Any], ctx: KernelContext) -> dic
     return {"ok": True, "path": path, "reloaded": count}
 
 
-async def reload_tools(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
+async def reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     try:
         count = ctx.registry.reload()
         return {"ok": True, "tools": count}
@@ -761,44 +641,33 @@ async def reload_tools(args: dict[str, Any], ctx: KernelContext) -> dict[str, An
         return {"ok": False, "error": str(e)}
 
 
-async def request_restart(args: dict[str, Any], ctx: KernelContext) -> dict[str, Any]:
-    target = str(args.get("target", "kernel"))
+async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    target = str(args.get("target", "engine"))
     reason = str(args.get("reason", ""))
 
-    # Prepare git diff summary for approval UI.
     git_info = _git_snapshot(ctx)
 
-    # The approval request MUST contain diff summary/ref (cannot be faked by the LLM).
-    op = await ctx.request_op(
+    op, err = await _request_guard(
+        ctx,
         "restart",
         {
             "target": target,
             "reason": reason,
             "git": git_info,
-            # tell user what will happen
             "will_git_commit_before_restart": True,
         },
     )
-    if op.get("safety_level") == "deny":
-        return {"ok": False, "error": op.get("reason", "denied")}
+    if err is not None:
+        return err
 
-    approval_id: str | None = None
-    if op.get("safety_level") == "approval_required":
-        approval_id = op.get("approval_id")
-        approval = await ctx.wait_for_approval(approval_id)
-        if approval.get("status") != "allowed":
-            return {"ok": False, "error": "user denied approval", "approval_id": approval_id}
+    approval_id: str | None = op.get("approval_id") if op.get("safety_level") == "approval_required" else None
 
-    # After approval: auto-commit current changes (best-effort) to make rollback easy.
     commit_res = _git_commit_all(
         ctx=ctx,
-        message=f"clonoth: checkpoint before restart (task={ctx.task_id}, target={target})",
+        message=f"clonoth: checkpoint before restart (handoff={ctx.run_id}, target={target})",
     )
 
-    # If we're about to restart the kernel (or all), the current task would otherwise be left
-    # in a running state (because the worker may be terminated before it can emit outbound_message
-    # and task_completed). We therefore pre-emit a final outbound message and complete the task.
-    if target in {"kernel", "all"}:
+    if target in {"engine", "all"}:
         final_text = f"已请求重启：{target}。"
         if reason.strip():
             final_text += f"\n原因：{reason.strip()}"
@@ -806,26 +675,9 @@ async def request_restart(args: dict[str, Any], ctx: KernelContext) -> dict[str,
 
         try:
             await ctx.emit_event("outbound_message", {"text": final_text})
-            await ctx.http.post(
-                f"{ctx.supervisor_url}/v1/tasks/{ctx.task_id}/complete",
-                json={
-                    "status": "done",
-                    "result": {
-                        "text": final_text,
-                        "restart": {
-                            "target": target,
-                            "reason": reason,
-                            "git": git_info,
-                            "git_commit": commit_res,
-                        },
-                    },
-                },
-            )
         except Exception:
-            # best-effort only
             pass
 
-    # call supervisor admin restart
     r = await ctx.http.post(
         f"{ctx.supervisor_url}/v1/admin/restart",
         json={"target": target, "reason": reason, "approval_id": approval_id},

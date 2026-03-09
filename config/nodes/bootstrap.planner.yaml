@@ -1,0 +1,14 @@
+version: 1
+kind: node
+id: bootstrap.planner
+type: ai
+name: "规划节点"
+description: >-
+  规划型 AI 节点。负责整理目标、约束和计划，再交给下游执行节点。
+model_route: executor_default
+prompt:
+  pack: bootstrap_cn
+  assembly: planner
+tool_access:
+  mode: none
+output_mode: draft

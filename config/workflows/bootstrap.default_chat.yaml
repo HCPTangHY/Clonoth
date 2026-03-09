@@ -1,60 +1,27 @@
 version: 1
 kind: workflow
 id: bootstrap.default_chat
-name: "Bootstrap 默认对话流"
-
+name: "默认对话流"
 description: >-
-  兼容当前系统的默认流程：Shell 先路由；若需求复杂则创建 task 交给 Kernel 执行；
-  task 完成后再由 Shell Responder 生成最终面向用户的回复。
+  入口节点判断是否直接回复；若需下游处理，交给执行节点；执行完成后回到入口节点输出最终回复。
+  执行节点需要运行命令时，通过 handoff 交给审核节点。
 
-entrypoint:
-  type: inbound_message
-  default_entry_agent: bootstrap.shell_orchestrator
+entry_node: bootstrap.shell_orchestrator
 
-steps:
-  - id: route
-    role: route
-    runtime: shell
-    agent: bootstrap.shell_orchestrator
-    produces:
-      - route_decision
-      - task_instruction
-    transitions:
-      reply:
-        action: emit_outbound
-      task:
-        next: execute_task
+nodes:
+  bootstrap.shell_orchestrator:
+    on:
+      reply: $reply
+      handoff: bootstrap.executor
 
-  - id: execute_task
-    role: execute
-    runtime: kernel
-    agent: bootstrap.kernel_executor
-    input:
-      instruction: from.route.task_instruction
-    produces:
-      - task_draft
-      - task_status
-    transitions:
-      completed:
-        next: finalize
-      failed:
-        next: finalize
-      cancelled:
-        next: finalize
+  bootstrap.executor:
+    on:
+      completed: bootstrap.shell_orchestrator
+      failed: bootstrap.shell_orchestrator
+    handoffs:
+      cmd_review: bootstrap.cmd_reviewer
 
-  - id: finalize
-    role: finalize
-    runtime: shell
-    agent: bootstrap.task_responder
-    input:
-      task_result: from.execute_task.task_draft
-      task_status: from.execute_task.task_status
-    transitions:
-      reply:
-        action: emit_outbound
-
-compat:
-  current_runtime_mapping:
-    shell_route: shell.worker.orchestrate
-    kernel_execute: kernel.worker.run_task
-    shell_finalize: shell.worker.generate_task_final_reply
+  bootstrap.cmd_reviewer:
+    on:
+      completed: $end
+      failed: $end

@@ -1,0 +1,17 @@
+version: 1
+kind: node
+id: bootstrap.executor
+type: ai
+name: "执行节点"
+description: >-
+  执行型 AI 节点。负责多步推理、调用工具，并产出可供下游节点继续处理的结果。
+  需要执行 shell 命令时，通过 cmd_review outcome 交给审核节点。
+model_route: executor_default
+prompt:
+  pack: bootstrap_cn
+  assembly: executor
+tool_access:
+  mode: all
+  deny:
+    - execute_command
+output_mode: draft

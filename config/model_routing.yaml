@@ -2,35 +2,45 @@ version: 1
 
 defaults:
   provider: openai
-  timeout_runtime_key: providers.openai.timeout_sec
   fallback_model: gpt-4o-mini
 
 routes:
   shell_orchestrator_default:
-    description: "用于 Shell 路由与轻量判断"
+    description: "入口节点：路由判断，轻量模型即可"
     candidates:
       - provider: openai
-        model_runtime_key: shell.orchestrator.model
+        model_runtime_key: shell.entry_node.model
         fallback_to_provider_config_model: true
         fallback_model: gpt-4o-mini
 
-  task_responder_default:
-    description: "用于 task 完成后的最终表达"
+  executor_default:
+    description: "执行节点：多步推理，重型模型"
     candidates:
       - provider: openai
-        model_runtime_key: shell.responder.model
+        model_runtime_key: engine.model
         fallback_to_provider_config_model: true
         fallback_model: gpt-4o-mini
 
-  kernel_executor_default:
-    description: "用于 Kernel 执行"
-    candidates:
-      - provider: openai
-        model_runtime_key: kernel.executor.model
-        fallback_to_provider_config_model: true
-        fallback_model: gpt-4o-mini
-
-notes:
-  - 当前代码已开始消费本文件中的 route 选择，但仍以 OpenAI 路径为主。
-  - future: 可按 agent / workflow / task_type / cost policy 做路由。
-  - future: 可为每个 route 定义 provider fallback、熔断与质量/成本偏好。
+# 节点独立 provider 示例（取消注释即可使用）：
+#
+#   custom_node_route:
+#     description: "使用独立 API 端点的节点"
+#     candidates:
+#       - provider: openai
+#         model: claude-3.5-sonnet
+#         base_url_env: CUSTOM_BASE_URL       # 从环境变量读取
+#         api_key_env: CUSTOM_API_KEY         # 从环境变量读取
+#
+#   deepseek_route:
+#     description: "使用 DeepSeek 的节点"
+#     candidates:
+#       - provider: openai
+#         model: deepseek-chat
+#         base_url: "https://api.deepseek.com/v1"
+#         api_key_env: DEEPSEEK_API_KEY
+#
+# 支持的秘密值解引用方式（优先级从高到低）：
+#   api_key_env: ENV_VAR_NAME          从环境变量
+#   api_key_runtime_key: x.y.z        从 runtime.yaml 配置键
+#   api_key: "$ENV{VAR}" 或明文       直接值（支持 $ENV{} 语法）
+#   base_url_env / base_url_runtime_key / base_url 同理

@@ -9,24 +9,7 @@ from typing import Any
 
 import httpx
 
-from clonoth_runtime import get_float, get_str, load_runtime_config
-
-
-def strip_tool_trace_blocks(text: str) -> str:
-    if not text:
-        return ""
-    out: list[str] = []
-    in_block = False
-    for ln in text.splitlines():
-        if "[CLONOTH_TOOL_TRACE v1]" in ln:
-            in_block = True
-            continue
-        if in_block:
-            if "[/CLONOTH_TOOL_TRACE]" in ln:
-                in_block = False
-            continue
-        out.append(ln)
-    return "\n".join(out).strip()
+from clonoth_runtime import get_float, load_runtime_config, strip_tool_trace_blocks
 
 
 def wait_supervisor(
@@ -114,6 +97,15 @@ def main() -> None:
             if text in {"/exit", "/quit", "exit", "quit"}:
                 print("[shell-cli] bye", flush=True)
                 return
+            if text == "/clear":
+                conversation_key = f"cli:{uuid.uuid4()}"
+                session_id = None
+                after_seq = 0
+                print(f"[shell-cli] 上下文已清空，开始新对话。 conversation_key={conversation_key}", flush=True)
+                continue
+            if text == "/help":
+                print("[shell-cli] 可用指令: /clear (清空上下文) /exit (退出)", flush=True)
+                continue
 
             msg_id = str(uuid.uuid4())
             r = client.post(
@@ -181,12 +173,21 @@ def main() -> None:
                     et = e.get("type")
                     payload = e.get("payload") or {}
 
-                    if et == "task_created":
-                        tid = payload.get("task_id")
-                        if tid:
-                            print(f"[task] created: {tid}", flush=True)
+                    if et == "node_started":
+                        nid = payload.get("node_id", "")
+                        nname = payload.get("node_name", "")
+                        label = nname or nid
+                        print(f"[node] ▶ {label} 开始执行", flush=True)
 
-                    if et == "task_progress":
+                    if et == "node_completed":
+                        nid = payload.get("node_id", "")
+                        nname = payload.get("node_name", "")
+                        oc = payload.get("outcome", "")
+                        sm = payload.get("summary", "")
+                        label = nname or nid
+                        print(f"[node] ✓ {label} → {oc}: {sm[:120]}", flush=True)
+
+                    if et == "handoff_progress":
                         msg = payload.get("message")
                         if msg:
                             print(f"[progress] {msg}", flush=True)
@@ -216,12 +217,6 @@ def main() -> None:
                         )
                         dr.raise_for_status()
                         print(f"[approval] decided: {decision}\n", flush=True)
-
-                    if et == "task_completed":
-                        status = payload.get("status")
-                        tid = payload.get("task_id")
-                        if tid:
-                            print(f"[task] completed: {tid} status={status}", flush=True)
 
                 if got_reply:
                     break

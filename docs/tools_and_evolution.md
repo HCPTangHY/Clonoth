@@ -1,368 +1,346 @@
-# Clonoth 工具系统与自进化机制（详细）
+# 工具与自进化
 
-本文档面向 **Clonoth 开发者 / 运维 / Prompt 迭代者**，解释：
+## 1. 内置工具
 
-- 工具系统的分层（Meta Tools vs Declarative Tools）
-- Policy/Approval 如何成为“Root of Trust”的关键安全边界
-- Kernel 的 tool trace / artifacts 如何为“可追溯推理 + 可回放”服务
-- 自进化（写工具、改代码、重启、回滚）的完整闭环与限制
+当前 14 个内置工具，分为文件操作、命令执行、搜索、Skill 管理、MCP 管理、工具管理和系统管理七类。
 
-> 代码参考：
-> - `kernel/meta_tools.py`
-> - `kernel/registry.py`
-> - `kernel/worker.py`
-> - `supervisor/policy.py`, `data/policy.yaml`
-> - `supervisor/upgrade.py`, `supervisor/process_manager.py`
+### 1.1 文件操作
+
+#### list_dir
+
+列出目录内容。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `path` | string | 否 | 相对路径。为空时列出工作区根目录。 |
+
+返回目录下的文件和子目录列表。
+
+#### read_file
+
+读取文本文件。受 Policy 和审批保护。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `path` | string | 是 | 相对路径 |
+| `start_line` | integer | 否 | 起始行号（从 1 开始） |
+| `end_line` | integer | 否 | 结束行号（包含） |
+
+不指定行号时读取整个文件。路径受 Policy 规则约束，`.env` 等文件会被硬拒绝。
+
+#### write_file
+
+写入文本文件。受 Policy 和审批保护。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `path` | string | 是 | 相对路径 |
+| `content` | string | 是 | 文件内容 |
+
+文件不存在时自动创建（含父目录）。写入 `config/nodes/**`、`engine/**` 等受保护路径时需要人类审批。
+
+### 1.2 命令执行
+
+#### execute_command
+
+在工作区根目录下执行 shell 命令。受 Policy 和审批保护。子进程环境会自动剥离敏感变量（API key 等）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `command` | string | 是 | 要执行的命令 |
+| `timeout_sec` | number | 否 | 超时秒数。默认由 `config/runtime.yaml` 的 `meta.execute_command.default_timeout_sec` 决定（默认 90 秒）。 |
+
+命令执行前经过双层审核：cmd_reviewer 节点做 AI 语义审核，Supervisor Policy 做硬规则和人类审批。`rm -rf /`、`shutdown` 等命令会被硬拒绝。
+
+返回 `exit_code`、`stdout`、`stderr`。输出超过 `meta.execute_command.max_output_chars`（默认 12000 字符）时截断。
+
+### 1.3 搜索
+
+#### search_in_files
+
+在文件中搜索文本。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `query` | string | 是 | 搜索关键词 |
+| `path` | string | 否 | 限定搜索的子目录（相对路径）。为空时搜索整个工作区。 |
+
+返回匹配的文件列表和匹配行内容。受 `meta.search.max_file_size_bytes`（默认 3MB）和 `meta.search.max_matches`（默认 100）限制。
+
+### 1.4 Skill 管理
+
+Skill 是存放在 `skills/<name>/SKILL.md` 中的知识模块，会被注入到 AI 节点的 system prompt 中。
+
+#### create_or_update_skill
+
+创建或更新 Skill。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | Skill 名称。只允许 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`。 |
+| `description` | string | 否 | Skill 描述 |
+| `content` | string | 否 | 完整的 SKILL.md 内容。为空时自动生成模板。frontmatter 会被自动规范化。 |
+| `enabled` | boolean | 否 | 是否启用。默认 true。 |
+
+#### list_skills
+
+列出所有 Skill。无参数。
+
+返回每个 Skill 的 `name`、`description`、`enabled`、`path`。
+
+#### delete_skill
+
+删除 Skill 目录。受审批保护。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | Skill 名称 |
+
+### 1.5 MCP 管理
+
+MCP（Model Context Protocol）客户端定义存储在 `data/mcp_clients.yaml` 中。Engine 启动时自动连接已启用的客户端并注册其工具。
+
+#### create_or_update_mcp_client
+
+创建或更新 MCP 客户端配置。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `id` | string | 是 | 客户端标识 |
+| `transport` | string | 是 | 传输方式。可选 `stdio`、`sse`、`streamable_http`。 |
+| `description` | string | 否 | 描述 |
+| `enabled` | boolean | 否 | 是否启用。默认 true。 |
+| `command` | string | 否 | stdio 模式的可执行命令 |
+| `args` | string[] | 否 | 命令参数列表 |
+| `env` | object | 否 | 传递给子进程的环境变量 |
+| `url` | string | 否 | SSE / HTTP 模式的服务端 URL |
+| `headers` | object | 否 | HTTP 请求头 |
+
+stdio 模式需要 `command`；sse 和 streamable_http 模式需要 `url`。
+
+MCP 工具注册后的名称格式为 `mcp_{client_id}_{tool_name}`。
+
+#### list_mcp_clients
+
+列出所有 MCP 客户端配置。无参数。
+
+#### delete_mcp_client
+
+删除 MCP 客户端配置。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `id` | string | 是 | 客户端标识 |
+
+### 1.6 工具管理
+
+#### create_or_update_tool
+
+创建或更新脚本工具。写入 `tools/<name>.py`。受审批保护。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 工具名称。只允许 `[A-Za-z_][A-Za-z0-9_]{0,63}`。不能与内置工具重名。 |
+| `script` | string | 是 | Python 脚本主体。脚本中可以使用 `args`（从 stdin 解析的参数字典）、`output(result)`（输出结果）、`fail(error)`（报告错误）。 |
+| `description` | string | 否 | 工具描述 |
+| `input_schema` | object | 否 | 输入参数的 JSON Schema |
+| `timeout_sec` | number | 否 | 执行超时秒数 |
+
+生成的脚本文件包含输入解析和输出辅助函数。AI 只需编写核心逻辑。
+
+#### reload_tools
+
+重新扫描 `tools/` 目录并加载工具。无参数。
+
+通常在 `create_or_update_tool` 之后调用，使新工具立即生效（无需重启 Engine）。
+
+### 1.7 系统管理
+
+#### request_restart
+
+请求 Supervisor 重启 Engine 或整个系统。受审批保护。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `target` | string | 是 | 重启目标。`engine` 只重启引擎进程；`all` 重启整个系统。 |
+| `reason` | string | 否 | 重启原因 |
+
+重启前会自动执行以下步骤：
+
+1. 生成 git 状态和 diff 摘要
+2. 通过 Supervisor Policy 发起 `restart` 审批
+3. 审批通过后执行 git checkpoint 和重启
 
 ---
 
-## 1. 设计原则：可进化系统的“能力分层”
+## 2. 脚本工具
 
-Clonoth 将“执行危险操作”的能力收敛到 **Kernel + Supervisor**：
+`tools/*.py` 下的脚本工具以独立子进程运行。
 
-- **Supervisor**：Root of Trust（策略、审批、事件日志、进程管理、回滚 watchdog）
-- **Kernel**：执行引擎（多步推理 + 工具调用）
-- **Shell**：
-  - Orchestrator：决定「直接回复」还是「创建 task」
-  - Responder：对 Kernel 结果做最终总结输出（面向用户）
+### 2.1 协议
 
-工具系统的目标不是“无限制执行代码”，而是：
+- 输入：工具参数作为 JSON 从 stdin 读入
+- 输出：结果作为 JSON 写到 stdout
+- 环境：敏感变量（API key 等）被自动剥离
+- 超时：可在脚本中通过 `TIMEOUT_SEC` 变量配置
 
-1) 让 AI 能“做事”（读写文件 / 执行命令 / 生成工具）；
-2) 同时让人类能**审计**、能**拒绝**、能**回滚**；
-3) 保持系统在崩溃、重启、重试时仍然**可恢复**。
+### 2.2 注册
 
----
+Engine 启动时扫描 `tools/` 目录，通过 AST 解析每个 `.py` 文件中的 `SPEC` 字典获取工具声明。不执行、不 import 脚本代码。
 
-## 2. 工具的两大类：Meta Tools 与 Declarative Tools
-
-### 2.1 Meta Tools（内置元工具）
-
-Meta Tools 是框架手写、受控、可审计的“底座能力”，主要位于：`kernel/meta_tools.py`。
-
-当前内置工具（由 `kernel/registry.py` 注册）包括：
-
-- **Workspace 只读**
-  - `list_dir({path})`
-  - `read_file({path, start_line?, end_line?})`
-  - `search_in_files({query, path?})`
-
-- **Workspace 写入**
-  - `write_file({path, content})`
-
-- **命令执行（高风险）**
-  - `execute_command({command, timeout_sec?})`
-
-- **自进化核心**
-  - `create_or_update_tool({name, description?, input_schema?, command/commands, timeout_sec?})`
-  - `reload_tools({})`
-  - `create_or_update_skill({name, description?, content?, enabled?})`
-  - `list_skills({})`
-  - `delete_skill({name})`
-  - `create_or_update_mcp_client({id, transport, command?/args?/env?/url?/headers?, enabled?})`
-  - `list_mcp_clients({})`
-  - `delete_mcp_client({id})`
-  - `test_mcp_client({id})`
-  - `list_mcp_tools({id})`
-  - `call_mcp_tool({id, tool_name, arguments?})`
-  - `list_mcp_resources({id})`
-  - `read_mcp_resource({id, uri})`
-  - `list_mcp_prompts({id})`
-  - `get_mcp_prompt({id, prompt_name, arguments?})`
-  - `request_restart({target, reason?})`
-
-> 安全要点：
-> - Meta Tools 会先调用 `KernelContext.request_op()`，由 Supervisor 做 Policy 判断（auto / approval_required / deny）。
-> - `execute_command` 的子进程环境变量会做“敏感变量剥离”（例如 `*_API_KEY`）以减少误泄露风险（`kernel/meta_tools.py::_safe_subprocess_env`）。
-
-### 2.2 Declarative Tools（声明式命令工具，Tool v2）
-
-Declarative Tools 是 AI 调用 `create_or_update_tool` 自动生成的工具，存放于 `tools/*.py`。
-
-**关键安全机制（Tool v2）**：
-
-- Kernel **不会 import/执行** `tools/` 中任何 Python 代码。
-- Kernel 只用 `ast.parse + ast.literal_eval` 解析文件中的字面量变量：
-  - `SPEC`（工具描述/参数 schema）
-  - `COMMANDS` 或 `COMMAND`
-  - `TIMEOUT_SEC`（可选）
-
-因此：AI 无法在 tool 文件里塞入 Python 运行时代码来“绕过 Policy”。
-
-#### 2.2.1 Declarative Tool 文件格式
-
-一个最小工具文件示例：
+脚本文件必须包含以下结构：
 
 ```python
-# tools/my_tool.py
-
 SPEC = {
-  "name": "my_tool",
-  "description": "Run build",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "path": {"type": "string"}
+    "name": "my_tool",
+    "description": "工具描述",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "param1": {"type": "string", "description": "参数说明"},
+        },
+        "required": ["param1"],
     },
-    "required": ["path"]
-  }
 }
+TIMEOUT_SEC = 60  # 可选
 
-COMMANDS = [
-  "npm run build --prefix {path}",
-  "npm test --prefix {path}",
-]
-
-TIMEOUT_SEC = 60.0
+if __name__ == "__main__":
+    # 核心逻辑
+    pass
 ```
 
-#### 2.2.2 命令模板与参数注入
+### 2.3 安全隔离
 
-- `COMMANDS` 中的字符串使用 Python `str.format(**args)` 做模板渲染。
-- 如果缺少参数，会返回：`{"ok": False, "error": "missing argument ..."}`。
-
-#### 2.2.3 运行与错误语义
-
-Declarative tool 的执行逻辑（见 `kernel/registry.py::_make_command_tool`）：
-
-- 对 `COMMANDS` 逐条调用 Meta Tool `execute_command`
-- 任意一步失败会中断并返回：
-  - `ok=false`
-  - `steps=[{command, result}, ...]`
-
-### 2.3 Skills：把可复用工作流从 prompt 中拆出来
-
-当前实现中的 skill 是本地目录：
-
-```text
-skills/<name>/SKILL.md
-```
-
-最小文件形态：
-
-```md
----
-name: release-note
-description: 当用户要求生成发布说明、changelog、release notes 时使用。
-enabled: true
----
-
-这里写这个 skill 的工作流说明。
-```
-
-#### 2.3.1 Skill 如何进入请求上下文
-
-Clonoth 没有把所有 `SKILL.md` 在每次请求时全部拼进 prompt，而是采用 **progressive disclosure**：
-
-1. Kernel 在请求开头只注入一个 `CLONOTH_SKILLS_INDEX` 块；
-2. 该块只包含每个 skill 的：
-   - `name`
-   - `description`
-   - `path`
-3. 如果模型判断当前任务明显匹配某个 skill，或用户显式点名该 skill，模型再用 `read_file` 读取对应 `SKILL.md`；
-4. 若 `SKILL.md` 再引用 `references/`、`scripts/`、`assets/`，继续按需读取具体文件。
-
-这和主流 Agent Skills 的三层加载方式一致：
-
-- **Discovery**：只看 metadata
-- **Activation**：命中后读完整 `SKILL.md`
-- **Execution**：按需读引用文件
-
-#### 2.3.2 为什么 `description` 很重要
-
-在 progressive disclosure 下，`description` 是 skill 命中的主信号。
-
-因此建议把 description 写成：
-
-```text
-[这个 skill 做什么] + [在什么场景下使用它] + [触发关键词/边界]
-```
-
-例如：
-
-```yaml
-description: 当用户要求生成发布说明、release notes、changelog，或需要按 PR/issue 汇总版本变化时使用。
-```
-
-### 2.4 MCP Client：把外部系统能力挂到 Kernel 上
-
-当前实现的是 **MCP Client**，不是 MCP Server。配置文件：`data/mcp_clients.yaml`。
-
-#### 2.4.1 支持的 transport
-
-- `stdio`
-- `sse`
-- `streamable_http`
-
-#### 2.4.2 当前实现为什么使用“通用代理工具”
-
-当前版本没有把远端 MCP server 的每个 tool 动态注册成 Clonoth 本地工具名，而是保留一组通用入口：
-
-- 工具：`list_mcp_tools` / `call_mcp_tool`
-- 资源：`list_mcp_resources` / `read_mcp_resource`
-- Prompt：`list_mcp_prompts` / `get_mcp_prompt`
-
-这样做的好处是：
-
-1. 不需要复杂的远端工具热注册逻辑；
-2. 不会污染本地工具命名空间；
-3. 与当前“Shell 只 create_task、Kernel 干活”的架构更契合。
-
-#### 2.4.3 MCP 的三类 server primitives
-
-MCP server 常见暴露三类能力：
-
-- `tools`：可执行动作
-- `resources`：可读取上下文/数据
-- `prompts`：服务端维护的模板化提示
-
-Kernel 现在可以分别访问这三类能力。
-
+- 脚本在独立子进程中运行，不在主 Engine 进程内 import 或 eval
+- 子进程环境自动剥离 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 等敏感变量
+- 子进程工作目录为工作区根目录
 
 ---
 
-## 3. Policy / Approval：Root of Trust 如何控制工具权限
+## 3. 安全模型
 
-### 3.1 三档策略
+安全分为四层：
 
-Supervisor 的策略引擎：`supervisor/policy.py`。
+1. **AI 审核节点**（`cmd_reviewer`）：在节点图中对命令做语义审核
+2. **Supervisor Policy**：硬规则拒绝 + 人类审批
+3. **环境隔离**：子进程执行时剥离敏感环境变量
+4. **路径边界**：文件读写限制在 workspace 和 `extra_roots` 内
 
-对每个 op（read/write/command/restart）给出三档决策：
+AI 审核不能替代人类审批。
+
+### 3.1 SafetyLevel
 
 - `auto`：自动允许
 - `approval_required`：需要人类审批
 - `deny`：硬拒绝
 
-默认策略文件：`data/policy.yaml`（首次启动自动生成，可由人类修改；注意该文件默认被 deny 写入，防止 AI 修改规则本身）。
+### 3.2 文件保护
 
-### 3.2 文件读写规则（glob）
+| 路径 | 策略 | 原因 |
+|---|---|---|
+| `engine/**`、`supervisor/**`、`toolbox/**`、`providers/**`、`shell/**` | 需要审批 | 核心源码 |
+| `clonoth_runtime.py`、`main.py` | 需要审批 | 入口和运行时库 |
+| `config/nodes/**`、`config/workflows/**`、`config/prompt_packs/**` | 需要审批 | 节点图配置 |
+| `config/model_routing.yaml` | 需要审批 | 模型路由 |
+| `tools/**` | 需要审批 | 脚本工具 |
+| `data/config.yaml` | 需要审批 | 运行时配置 |
+| `data/policy.yaml` | 硬拒绝 | 安全策略 |
+| `data/events.jsonl` | 硬拒绝 | 事件日志 |
+| `.env`、`**/.env` | 硬拒绝 | 密钥文件 |
+| `config/runtime.yaml` | 自动允许 | 调优参数 |
 
-`read_file` / `write_file` 使用 workspace 相对路径的 glob 匹配：
+### 3.3 extra_roots
 
-- `.env` / `**/.env` 默认 deny（防止读写 dotenv secrets）
-- `data/events.jsonl` 默认 deny（事件日志 append-only）
-- `data/policy.yaml` 默认 deny（策略文件人类专管）
-- `tools/**` 默认 approval_required（写工具必须审批）
-- `config/prompts/**` 默认 approval_required（prompt 被视为高敏）
-
-### 3.3 允许管理工作区外文件：extra_roots（受控挂载）
-
-默认情况下，`read_file` / `write_file` **只能访问 Clonoth workspace_root 目录下的文件**。
-
-如果你的部署形态是：
-- Clonoth 部署在 `/www/wwwroot/clonoth`
-- 但你希望管理同级文件 `/www/wwwroot/monitor-sku.py`
-
-可以在 `data/policy.yaml` 顶层配置：
+在 `data/policy.yaml` 中声明额外允许访问的路径：
 
 ```yaml
 extra_roots:
   - "/www/wwwroot"
 ```
 
-注意：
-- `extra_roots` 属于安全边界配置，建议只加最小必要目录。
-- 对 `extra_roots` 下的路径，Supervisor 会将默认策略从 `auto` **收紧为 `approval_required`**（除非你写了明确的规则）。
+对 `extra_roots` 下的路径，默认策略收紧为 `approval_required`。
 
-示例：允许读取该脚本（自动放行），写入仍需审批：
+### 3.4 命令硬拒绝
 
-```yaml
-read_file:
-  rules:
-    - pattern: "/www/wwwroot/monitor-sku.py"
-      decision: auto
-      reason: "manage external script"
+以下命令模式被硬拒绝：`rm -rf /`、`rm -rf ~`、`rm -rf *`、`format`、`mkfs`、`fdisk`、`dd if=/dev/zero`、`shutdown`、`reboot`。
 
-write_file:
-  rules:
-    - pattern: "/www/wwwroot/monitor-sku.py"
-      decision: approval_required
-      reason: "manage external script"
-```
+### 3.5 审批守卫
 
-### 3.4 execute_command 规则（regex allow/deny）
+所有需要 Policy 判定的工具内部统一使用 `_request_guard` 函数。流程如下：
 
-- 默认 `approval_required`
-- `auto_patterns`：例如 `git status` / `python -m compileall` 等可自动放行
-- `deny_patterns`：例如 `rm -rf`、`curl/wget`、读取环境变量等高风险命令直接拒绝
+1. 向 Supervisor 发送 `POST /v1/ops/request`，获取 Policy 判定
+2. 如果判定为 `deny`，立即返回错误
+3. 如果判定为 `approval_required`，轮询等待人类审批结果
+4. 如果判定为 `auto`，直接执行
+
+这样每个工具不需要自己处理审批等待逻辑。
 
 ---
 
-## 4. Tool Trace & Artifacts：让推理“可追溯、可复盘”
+## 4. 自进化
 
-### 4.1 tool_result 事件（摘要 + ref）
+AI 可以在人类审批下修改系统自身。
 
-Kernel 执行每次工具调用后会：
+### 4.1 能做的事
 
-1) 把完整 raw 结果写入：`data/artifacts/{task_id}/...`（用于调试/复盘）
-2) 向 Supervisor 发送 `tool_result` 事件：
-   - `summary`（简短）
-   - `ref`（artifact 相对路径）
+| 操作 | 途径 | 审批 |
+|---|---|---|
+| 创建新工具 | `create_or_update_tool` | 需要 |
+| 修改节点定义 | `write_file` → `config/nodes/*.yaml` | 需要 |
+| 修改工作流 | `write_file` → `config/workflows/*.yaml` | 需要 |
+| 修改提示词 | `write_file` → `config/prompt_packs/**` | 需要 |
+| 修改模型路由 | `write_file` → `config/model_routing.yaml` | 需要 |
+| 修改引擎源码 | `write_file` → `engine/**` 等 | 需要 |
+| 接入 MCP 服务 | `create_or_update_mcp_client` | 不需要 |
+| 调整运行参数 | `write_file` → `config/runtime.yaml` | 不需要 |
+| 重启使改动生效 | `request_restart` | 需要 |
 
-### 4.2 [CLONOTH_TOOL_TRACE] 块（喂给模型、也可用于摘要）
+### 4.2 不能做的事
 
-Supervisor 在 `session_messages()` 中，会把 `tool_result` 事件转换成一段标准化的 trace 文本（role=assistant）：
+- 修改安全策略（`data/policy.yaml`）：硬拒绝
+- 修改事件日志（`data/events.jsonl`）：硬拒绝
+- 读写密钥文件（`.env`）：硬拒绝
 
-- 以 `[CLONOTH_TOOL_TRACE v1] ... [/CLONOTH_TOOL_TRACE]` 包裹
-- 包含 `TASK: <task_id>`、工具调用名、参数摘要、结果摘要、artifact ref
+### 4.3 典型流程：创建新工具
 
-用途：
-- Kernel 的后续推理可以把这些 trace 当“可读观察”继续使用
-- Shell Orchestrator 会剥离这些 trace，避免干扰路由判断
-- Shell Responder 会收集这些 trace 来生成最终用户摘要（你现在要求的“task 结束必须过 chat AI”）
+1. AI 调用 `create_or_update_tool`，生成 `tools/xxx.py`
+2. Policy 拦截，弹出审批
+3. 人类审查脚本内容，同意
+4. AI 调用 `reload_tools` 或 `request_restart` 使工具生效
+5. AI 后续可以直接调用新工具
 
----
+### 4.4 典型流程：修改节点行为
 
-## 5. 自进化闭环：从改代码到重启回滚
-
-### 5.1 自进化的两条路径
-
-1) **生成/更新工具**（无须重启）
-   - Kernel 调用 `create_or_update_tool` 写入 `tools/*.py`
-   - 然后 `reload_tools` 生效
-
-2) **修改核心代码**（通常需要重启）
-   - Kernel 调用 `write_file` 修改 `shell/`, `kernel/`, `supervisor/` 等
-   - 通过 `request_restart(target=kernel/shell/all)` 触发重启
-
-### 5.2 request_restart 的安全流程
-
-`request_restart`（见 `kernel/meta_tools.py`）会：
-
-1) 生成 git diff 摘要（若 workspace 是 git repo）
-2) 通过 Supervisor Policy 发起 `restart` 审批（通常 approval_required）
-3) 审批通过后：
-   - 尝试 `git commit` 做 checkpoint（便于回滚）
-   - 调用 `POST /v1/admin/restart`
-
-> 建议：务必让 workspace 处于 git 管理之下（`git init && git commit`），否则 checkpoint 与 watchdog 回滚能力会降级。
-
-### 5.3 UpgradeWatchdog：失败自动回滚
-
-Supervisor 后台线程 `UpgradeWatchdog`（`supervisor/upgrade.py`）通过 marker 文件实现“候选版本探活 + 失败回滚”：
-
-- `/v1/admin/restart` 在自进化场景（带 approval_id）会写入 `data/upgrade_pending.json`
-- watchdog 轮询探活：
-  - kernel：心跳 worker_id 是否变化、进程是否存活
-  - shell：pid 是否变化
-- 超时失败：执行 `git reset --hard <rollback_head>` 并重启目标
-
-限制：
-- 如果 **Supervisor 本体** 在新版本启动阶段就直接崩溃（语法错误导致 main 无法起），watchdog 也无法运行，需人类手工回滚。
+1. AI 调用 `write_file` 修改 `config/nodes/bootstrap.executor.yaml`
+2. Policy 拦截，弹出审批
+3. 人类审查 YAML 内容，同意
+4. AI 调用 `request_restart` 重启 Engine
+5. Policy 拦截，弹出审批
+6. 人类同意重启
+7. Engine 重启后按新定义执行
 
 ---
 
-## 6. 推荐实践（给要长期跑的自进化 bot）
+## 5. Tool Trace 与 Artifacts
 
-1) **启用 git**：让 checkpoint 与 rollback 真正可用。
-2) **收紧 tools/**：默认建议对 `tools/**` 的写入保持 `approval_required`。
-3) **把 secrets 留在 env**：不要让 AI 能 `read_file` 读到 `.env`。
-4) **MCP 凭据也放到 env**：例如在 `data/mcp_clients.yaml` 中使用 `${GITHUB_TOKEN}`，而不是把 token 明文写进技能文本或聊天内容。
-5) **skill 的 description 要写清触发边界**：这直接决定 progressive disclosure 是否能稳定命中。
-6) **让最终输出走 Shell Responder**：Kernel 只做执行与草稿，减少“执行者”直接对用户输出导致的幻觉与噪音。
+工具调用完成后，系统保留：
+
+- 摘要信息（注入 AI 上下文）
+- 完整输出（超出 `engine.tool_trace.max_inline_chars` 阈值时写入 artifact 文件）
+- 标准化的 tool trace 文本块
+
+artifact 文件保存在 `data/artifacts/{run_id}/` 下，可供人工复盘。
 
 ---
 
-## 7. 相关文档
+## 6. runtime.yaml 中的相关配置
 
-- 外部 Bot 接入：`docs/bot_integration.md`
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `meta.execute_command.default_timeout_sec` | 90 | 命令执行默认超时 |
+| `meta.execute_command.max_output_chars` | 12000 | 命令输出最大字符数 |
+| `meta.git.diff_max_chars` | 600000 | restart 时 git diff 最大字符数 |
+| `meta.search.max_file_size_bytes` | 3000000 | 搜索时跳过的文件大小上限 |
+| `meta.search.max_matches` | 100 | 搜索最大匹配数 |
+| `engine.tool_trace.max_inline_chars` | 8000 | 工具输出内联显示的最大字符数 |
+| `tools.command.default_timeout_sec` | 60 | 脚本工具默认超时 |
