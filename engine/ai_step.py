@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
-from toolbox.skills_runtime import format_skill_discovery_message
+from toolbox.skills_runtime import build_skill_messages
 from providers.openai import OpenAIProvider
 
 from .context_store import load_context_snapshot, save_context_snapshot, write_context_snapshot
+from .attachments import build_multimodal_content, prepare_messages_for_llm
 from .graph import Workflow, allowed_outcomes
 from .node import Node
 from .prompt import assemble_prompt
@@ -125,21 +126,32 @@ def _persist_node_context(
     return save_context_snapshot(workspace_root, session_id, snapshot, context_id=context_id)
 
 
-def _build_resume_message(resume_data: dict[str, Any]) -> dict[str, str] | None:
+def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build resume messages from resume_data. Returns a list (possibly empty)."""
     rtype = str(resume_data.get("type") or "").strip()
     if rtype == "tool_results":
         entries = resume_data.get("tool_results")
         if not isinstance(entries, list):
             entries = resume_data.get("entries")
         if isinstance(entries, list) and entries:
-            return {"role": "assistant", "content": format_tool_trace(entries)}
-        return None
+            msgs: list[dict[str, Any]] = [{"role": "assistant", "content": format_tool_trace(entries)}]
+            # 收集工具结果中的图片附件，追加为 user 消息让 LLM 看到
+            all_atts: list[dict[str, Any]] = []
+            for e in entries:
+                atts = e.get("attachments")
+                if isinstance(atts, list):
+                    all_atts.extend(atts)
+            if all_atts:
+                msgs.append({"role": "user", "content": build_multimodal_content("以上工具执行产生了以下图片结果：", all_atts)})
+            return msgs
+        return []
 
     if rtype == "handoff_result":
         child_node_id = str(resume_data.get("child_node_id") or "")
         child_outcome = str(resume_data.get("child_outcome") or "")
         summary = str(resume_data.get("summary") or "")
         text = str(resume_data.get("text") or resume_data.get("result") or "")
+        child_attachments = resume_data.get("attachments")
         lines = [
             "下游节点已经完成。",
             f"节点：{child_node_id}",
@@ -150,9 +162,12 @@ def _build_resume_message(resume_data: dict[str, Any]) -> dict[str, str] | None:
         if text:
             lines.append("结果：")
             lines.append(text)
-        return {"role": "user", "content": "\n".join(lines).strip()}
+        content_text = "\n".join(lines).strip()
+        if isinstance(child_attachments, list) and child_attachments:
+            return [{"role": "user", "content": build_multimodal_content(content_text, child_attachments)}]
+        return [{"role": "user", "content": content_text}]
 
-    return None
+    return []
 
 
 async def run_ai_node(
@@ -170,6 +185,7 @@ async def run_ai_node(
     resume_data: dict[str, Any] | None = None,
     downstream_capabilities: str = "",
     own_tools_text: str = "",
+    attachments: list[dict[str, Any]] | None = None,
 ) -> TaskResult:
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
@@ -193,26 +209,36 @@ async def run_ai_node(
         if downstream_capabilities:
             prompt_vars["downstream"] = downstream_capabilities
         system_prompt = assemble_prompt(rctx.workspace_root, node, variables=prompt_vars)
-        skills_msg = format_skill_discovery_message(
+        skill_budget = get_int(runtime_cfg, "skills.max_budget_chars", 0, min_value=0)
+        skill_msgs = build_skill_messages(
             rctx.workspace_root,
             instruction_text=instruction,
+            history=history,
             skill_mode=node.skill_access.mode,
             skill_allow=node.skill_access.allow,
+            max_budget_chars=skill_budget,
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-        if skills_msg:
-            messages.append({"role": "system", "content": skills_msg})
+        messages.extend(skill_msgs)
         messages.extend(history)
-        ctx_lines = [f"当前节点={node.id}", f"请完成指令：{instruction}"]
-        messages.append({"role": "user", "content": "\n".join(ctx_lines)})
+        ctx_text = "\n".join([f"当前节点={node.id}", f"请完成指令：{instruction}"])
+        if attachments:
+            messages.append({"role": "user", "content": build_multimodal_content(ctx_text, attachments)})
+        else:
+            messages.append({"role": "user", "content": ctx_text})
 
     if resume_data:
-        extra = _build_resume_message(resume_data)
-        if extra is not None:
-            messages.append(extra)
+        messages.extend(_build_resume_messages(resume_data))
 
     tool_specs = _filter_tool_specs(node, registry.list_specs())
     openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
+    # ── diagnostic log ──
+    _all_names = [s["name"] for s in registry.list_specs()]
+    _filtered_names = [s["name"] for s in tool_specs]
+    print(f"[ai_step] node={node.id} tool_access.mode={node.tool_access.mode}"
+          f" allow={node.tool_access.allow} deny={node.tool_access.deny}"
+          f" registry={len(_all_names)} filtered={len(_filtered_names)}"
+          f" filtered_names={_filtered_names}", flush=True)
     outcomes = allowed_outcomes(workflow, node.id)
     if outcomes:
         openai_tools.append(_select_outcome_spec(outcomes))
@@ -227,6 +253,7 @@ async def run_ai_node(
         text_buf: _StreamBuffer | None = None
         think_buf: _StreamBuffer | None = None
         tools_arg = openai_tools if openai_tools else None
+        llm_messages = prepare_messages_for_llm(messages, rctx.workspace_root)
 
         resp = None
 
@@ -235,7 +262,7 @@ async def run_ai_node(
             think_buf = _StreamBuffer(rctx, node.id, "thinking")
             stream_task = asyncio.create_task(
                 provider.chat_stream(
-                    messages=messages,
+                    messages=llm_messages,
                     tools=tools_arg,
                     on_text=text_buf.push,
                     on_thinking=think_buf.push,
@@ -271,7 +298,7 @@ async def run_ai_node(
         else:
             # 把 LLM 调用包装成可取消的：每 0.3 秒检查一次取消状态
             llm_task = asyncio.create_task(
-                provider.chat(messages=messages, tools=tools_arg)
+                provider.chat(messages=llm_messages, tools=tools_arg)
             )
             while True:
                 done, _ = await asyncio.wait({llm_task}, timeout=0.3)

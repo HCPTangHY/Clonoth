@@ -96,11 +96,16 @@ async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, An
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, list):
-                return [
-                    {"role": str(m.get("role")), "content": str(m.get("content", ""))}
-                    for m in data
-                    if isinstance(m, dict) and m.get("role") in {"user", "assistant", "system"}
-                ]
+                result = []
+                for m in data:
+                    if not isinstance(m, dict) or m.get("role") not in {"user", "assistant", "system"}:
+                        continue
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        result.append({"role": str(m.get("role")), "content": content})
+                    else:
+                        result.append({"role": str(m.get("role")), "content": str(content)})
+                return result
     except Exception:
         pass
     return []
@@ -129,6 +134,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
     wid = worker_id or str(uuid.uuid4())
     runtime_cfg = load_runtime_config(workspace_root)
     registry = ToolRegistry(workspace_root=workspace_root, tools_dir=workspace_root / "tools")
+    _last_reload_seq = 0
 
     sup_timeout = get_float(runtime_cfg, "engine.http.client_timeout_sec", 60.0, min_value=5.0, max_value=600.0)
     llm_timeout = get_float(runtime_cfg, "providers.openai.timeout_sec", 60.0, min_value=5.0, max_value=600.0)
@@ -145,6 +151,18 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
 
         while True:
             try:
+                # 检查工具热重载信号
+                try:
+                    rr = await http.get(f"{supervisor_url}/v1/tools/reload-seq")
+                    if rr.status_code == 200:
+                        new_seq = int(rr.json().get("seq", 0))
+                        if new_seq > _last_reload_seq:
+                            _last_reload_seq = new_seq
+                            count = registry.reload()
+                            print(f"[engine] tools reloaded ({count} tools)", flush=True)
+                except Exception:
+                    pass
+
                 nr = await http.get(f"{supervisor_url}/v1/tasks/next", params={"worker_id": wid})
                 if nr.status_code == 200:
                     item = nr.json()
@@ -281,6 +299,8 @@ async def _run_node_task(
         "workflow_id": wf.id,
     })
 
+    input_attachments = input_data.get("attachments") if isinstance(input_data.get("attachments"), list) else None
+
     outcome = await run_ai_node(
         rctx=rctx,
         provider=provider,
@@ -295,6 +315,7 @@ async def _run_node_task(
         own_tools_text=own_caps,
         downstream_capabilities=downstream_caps,
         streaming=bool(node.id == wf.entry_node and get_bool(runtime_cfg, "engine.streaming", False)),
+        attachments=input_attachments,
     )
 
     await rctx.emit_event("node_completed", {
@@ -358,6 +379,9 @@ async def _run_tool_task(
             "ref": "",
         }
 
+    # 提取工具结果中的附件（如图片路径）
+    tool_attachments = result.get("attachments") if isinstance(result, dict) and isinstance(result.get("attachments"), list) else []
+
     summary = summarize_result(tool_name, result)
     fmt, raw = result_to_raw(tool_name, result)
     max_inline = 8000
@@ -382,4 +406,5 @@ async def _run_tool_task(
         "raw_inline": raw_inline,
         "truncated": truncated,
         "ref": ref,
+        "attachments": tool_attachments,
     }

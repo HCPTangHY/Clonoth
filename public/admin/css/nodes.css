@@ -1,0 +1,29 @@
+/* ═══ Node Cards (AI / workflow node) ═══ */
+.nd{position:absolute;width:200px;background:var(--bg2);border:1.5px solid var(--bd);border-radius:8px;padding:10px 12px;cursor:grab;user-select:none;transition:box-shadow .12s,border-color .12s;box-shadow:0 2px 12px rgba(0,0,0,.25);border-left:3px solid var(--pur)}
+.nd:hover{border-color:var(--ov);box-shadow:0 4px 20px rgba(0,0,0,.35)}
+.nd.sel{border-color:var(--blue)!important;box-shadow:0 0 0 2px rgba(122,162,247,.15),0 6px 24px rgba(0,0,0,.3)}
+.nd.entry{border-left-color:var(--green)!important}
+.nd.dragging{cursor:grabbing;z-index:100!important;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+.nd-head{display:flex;align-items:center;gap:5px;margin-bottom:2px}
+.nd-type{font-size:.8rem;opacity:.6}
+.nd-name{font-size:.78rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nd-id{font-size:.6rem;color:var(--dim);font-family:'JetBrains Mono',monospace;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nd-info{font-size:.66rem;color:var(--sub);margin-bottom:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nd-terms{margin-top:2px}
+.nd-term{font-size:.58rem;line-height:1.4}
+.nd-foot{display:flex;align-items:center;justify-content:space-between;margin-top:4px}
+.nd-tools{font-size:.62rem;color:var(--amber)}
+.nd-mode{font-size:.58rem;padding:1px 5px;border-radius:3px;font-weight:500}
+.nd-mode-draft{background:rgba(125,207,255,.1);color:var(--sky)}
+.nd-mode-reply{background:rgba(158,206,106,.1);color:var(--green)}
+.nd-port{position:absolute;width:10px;height:10px;border:2px solid var(--bd);background:var(--bg1);border-radius:50%;top:50%;transform:translateY(-50%);z-index:5;cursor:crosshair;transition:border-color .1s,transform .1s,background .1s}
+.nd-port:hover{border-color:var(--blue);background:rgba(122,162,247,.4);transform:translateY(-50%) scale(1.5)}
+.nd-port.snap{border-color:var(--green);background:var(--green);transform:translateY(-50%) scale(1.8)}
+.nd-port-in{left:-5px}
+.nd-port-out{right:-5px}
+.nd:hover .nd-port{border-color:var(--ov)}
+.nd.sel .nd-port{border-color:var(--blue)}
+
+/* ═══ Tool Chips (pill labels attached to AI nodes) ═══ */
+.tool-chip{position:absolute;display:flex;align-items:center;height:22px;padding:0 9px;border-radius:11px;border:1px solid rgba(160,216,160,.25);background:rgba(22,32,22,.85);color:#a0d8a0;font-size:10px;font-family:'JetBrains Mono',monospace;line-height:1;cursor:default;user-select:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 6px rgba(0,0,0,.2);transition:all .15s;z-index:3}
+.tool-chip:hover{border-color:rgba(160,216,160,.55);background:rgba(24,36,24,.95);box-shadow:0 3px 10px rgba(0,0,0,.3)}

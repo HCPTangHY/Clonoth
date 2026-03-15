@@ -18,6 +18,7 @@ class TaskResult:
     summary: str = ""
     context_ref: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    attachments: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -31,6 +32,7 @@ class TaskResult:
             "summary": self.summary,
             "context_ref": self.context_ref,
             "tool_calls": list(self.tool_calls),
+            "attachments": list(self.attachments),
         }
 
 

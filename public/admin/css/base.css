@@ -1,0 +1,9 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+:root{--bg0:#08080f;--bg1:#0f0f1a;--bg2:#151522;--bg3:#1c1c2e;--sf:#262640;--bd:#2a2a44;--ov:#3a3a58;--tx:#d4d4e8;--sub:#8888aa;--dim:#555580;--blue:#7aa2f7;--pur:#bb9af7;--green:#9ece6a;--red:#f7768e;--amber:#e0af68;--teal:#73daca;--sky:#7dcfff;--peach:#ff9e64}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg0);color:var(--tx);height:100vh;overflow:hidden;font-size:13px;line-height:1.5}
+#app{display:flex;height:100vh;overflow:hidden;align-items:stretch}
+::selection{background:var(--blue);color:#000}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--sf);border-radius:3px}

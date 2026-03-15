@@ -4,134 +4,20 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-<title>Clonoth Admin</title>
+<title>Clonoth Studio</title>
+<link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="icon" type="image/png" sizes="48x48" href="favicon-48.png">
+<link rel="icon" type="image/png" sizes="192x192" href="favicon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="favicon-180.png">
+<link rel="stylesheet" href="css/base.css">
+<link rel="stylesheet" href="css/login.css">
+<link rel="stylesheet" href="css/layout.css">
+<link rel="stylesheet" href="css/nodes.css">
+<link rel="stylesheet" href="css/panels.css">
+<link rel="stylesheet" href="css/views.css">
 <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-:root{--bg:#0b0b12;--bg1:#111119;--bg2:#171722;--bg3:#1d1d2c;--sf:#282840;--bd:#333352;--ov:#48486a;--tx:#d0d0e4;--sub:#8080a0;--dim:#555578;--blue:#7aa2f7;--green:#9ece6a;--red:#f7768e;--yel:#e0af68;--pur:#bb9af7;--teal:#73daca;--sky:#7dcfff;--peach:#ff9e64}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--tx);height:100vh;overflow:hidden;font-size:13px;line-height:1.5}
-#app{display:flex;height:100vh}
-::selection{background:var(--blue);color:#000}
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--sf);border-radius:3px}
-
-/* ═══ Login ═══ */
-.lmask{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:99999;background:var(--bg)}
-.lmask::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 50% 35%,rgba(122,162,247,.07),transparent 55%),radial-gradient(circle at 75% 75%,rgba(187,154,247,.05),transparent 45%)}
-.lbox{position:relative;width:360px;padding:44px 40px;background:var(--bg2);border:1px solid var(--bd);border-radius:14px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.5)}
-.lbox::before{content:'';position:absolute;top:-1px;left:50%;transform:translateX(-50%);width:100px;height:2px;background:linear-gradient(90deg,transparent,var(--blue),transparent)}
-.lbox h2{font-size:1.25rem;font-weight:700;margin-bottom:4px}.lbox h2 em{font-style:normal;color:var(--blue)}
-.lbox .ls{color:var(--sub);font-size:.8rem;margin-bottom:26px}
-.lbox input{width:100%;padding:11px 14px;background:var(--bg1);border:1px solid var(--bd);color:var(--tx);border-radius:8px;font-size:.88rem;text-align:center;letter-spacing:2px;margin-bottom:14px;transition:border .2s}
-.lbox input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(122,162,247,.08)}
-.lbox .le{color:var(--red);font-size:.78rem;margin-bottom:10px}
-.lbtn{width:100%;padding:11px;background:linear-gradient(135deg,var(--blue),var(--pur));color:#fff;border:none;border-radius:8px;font-size:.88rem;font-weight:600;cursor:pointer;transition:opacity .15s}
-.lbtn:hover{opacity:.88}
-.lbox .lh{margin-top:18px;font-size:.68rem;color:var(--dim);line-height:1.5}
-
-/* ═══ Sidebar ═══ */
-.side{width:200px;background:var(--bg1);border-right:1px solid var(--bd);display:flex;flex-direction:column;flex-shrink:0}
-.sbrand{padding:16px 14px;font-weight:700;font-size:.9rem;border-bottom:1px solid var(--bd)}
-.sbrand em{font-style:normal;color:var(--blue)}
-.sbrand small{display:block;font-weight:400;font-size:.65rem;color:var(--dim);margin-top:1px}
-.snav{list-style:none;padding:6px 0;flex:1}
-.snav li{padding:7px 14px;cursor:pointer;color:var(--sub);font-size:.8rem;border-left:2px solid transparent;display:flex;align-items:center;gap:7px;transition:all .1s}
-.snav li:hover{color:var(--tx);background:rgba(122,162,247,.03)}
-.snav li.on{color:var(--blue);border-left-color:var(--blue);background:rgba(122,162,247,.06);font-weight:600}
-.sfoot{padding:8px 14px;border-top:1px solid var(--bd)}
-.sfoot a{color:var(--dim);font-size:.68rem;cursor:pointer;text-decoration:none}
-.sfoot a:hover{color:var(--red)}
-
-/* ═══ Main ═══ */
-.mn{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.top{height:46px;padding:0 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--bd);background:var(--bg1);flex-shrink:0}
-.top h1{font-size:.88rem;font-weight:600}
-.pane{flex:1;overflow-y:auto;padding:20px}
-
-/* ═══ Cards ═══ */
-.card{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:12px}
-.card:hover{border-color:var(--sf)}
-.ch{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.ch h3{font-size:.85rem;font-weight:600}
-.cg{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
-.stat{text-align:center;padding:20px}
-.stat .v{font-size:1.8rem;font-weight:700;margin:4px 0}
-.stat .l{font-size:.68rem;color:var(--sub);text-transform:uppercase;letter-spacing:.5px}
-
-/* ═══ Node & WF cards ═══ */
-.ncard{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px 16px;cursor:pointer;transition:all .12s}
-.ncard:hover{border-color:var(--pur);background:var(--bg3)}
-.ncard .nt{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
-.ncard .nt h4{font-size:.85rem;font-weight:600}
-.ncard .nid{font-size:.72rem;color:var(--dim);font-family:'JetBrains Mono',monospace;margin-bottom:5px}
-.ncard .nm{display:flex;gap:6px;flex-wrap:wrap}
-.ncard .nm span{font-size:.68rem;color:var(--sub)}
-.wcard{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;transition:all .12s}
-.wcard:hover{border-color:var(--blue);background:var(--bg3)}
-.wcard .wi h4{font-size:.85rem;font-weight:600;margin-bottom:1px}
-.wcard .wi p{font-size:.72rem;color:var(--sub)}
-.wcard .wa{display:flex;gap:5px}
-
-/* ═══ Table ═══ */
-table{width:100%;border-collapse:collapse}
-thead th{text-align:left;padding:7px 10px;font-size:.68rem;text-transform:uppercase;letter-spacing:.4px;color:var(--dim);border-bottom:1px solid var(--bd);background:var(--bg1)}
-tbody td{padding:8px 10px;border-bottom:1px solid rgba(51,51,80,.25);font-size:.8rem}
-tbody tr{transition:background .08s}
-tbody tr:hover{background:rgba(122,162,247,.03)}
-
-/* ═══ Badge ═══ */
-.b{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.68rem;font-weight:500}
-.b-ai{background:rgba(187,154,247,.12);color:var(--pur)}
-.b-tool{background:rgba(224,175,104,.12);color:var(--yel)}
-.b-draft{background:rgba(125,207,255,.12);color:var(--sky)}
-.b-reply{background:rgba(158,206,106,.12);color:var(--green)}
-
-/* ═══ Buttons ═══ */
-.btn{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;border:1px solid var(--bd);border-radius:5px;cursor:pointer;font-size:.75rem;font-weight:500;color:var(--tx);background:var(--bg3);transition:all .1s;font-family:inherit}
-.btn:hover{background:var(--sf);border-color:var(--ov)}
-.bp{background:var(--blue);color:#0b0b12;border-color:var(--blue)}.bp:hover{background:#6690e0;border-color:#6690e0}
-.bd{color:var(--red);border-color:rgba(247,118,142,.25)}.bd:hover{background:rgba(247,118,142,.06)}
-.bs{padding:4px 9px;font-size:.7rem}
-.bg{display:flex;gap:5px;align-items:center}
-
-/* ═══ Tabs ═══ */
-.tabs{display:inline-flex;gap:1px;background:var(--bg1);border-radius:7px;padding:2px;border:1px solid var(--bd);margin-bottom:16px}
-.tab{padding:6px 14px;border-radius:5px;cursor:pointer;font-size:.75rem;color:var(--sub);transition:all .12s;font-weight:500}
-.tab:hover{color:var(--tx)}
-.tab.on{background:var(--blue);color:var(--bg);font-weight:600}
-
-/* ═══ Editor ═══ */
-.ew{display:flex;flex-direction:column;height:calc(100vh - 46px - 40px)}
-.et{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.et h2{font-size:.88rem;font-weight:600}
-textarea.ce{flex:1;width:100%;min-height:200px;background:var(--bg1);color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:16px 18px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:12.5px;line-height:1.7;resize:none;tab-size:2;transition:border .15s;box-shadow:inset 0 1px 4px rgba(0,0,0,.2)}
-textarea.ce:focus{outline:none;border-color:var(--blue);box-shadow:inset 0 1px 4px rgba(0,0,0,.2),0 0 0 2px rgba(122,162,247,.06)}
-.field{margin-bottom:12px}
-.field label{display:block;font-size:.75rem;color:var(--sub);margin-bottom:4px;font-weight:500}
-.field input{width:100%;padding:7px 11px;background:var(--bg1);border:1px solid var(--bd);color:var(--tx);border-radius:6px;font-size:.82rem}
-.field input:focus{outline:none;border-color:var(--blue)}
-
-/* ═══ Graph Canvas ═══ */
-#gc{border:1px solid var(--bd);border-radius:8px;overflow:hidden;background:var(--bg1);position:relative;height:calc(100vh - 46px - 100px)}
-#gc canvas{display:block;cursor:grab}
-#gc canvas.dragging{cursor:grabbing}
-
-/* ═══ Fragment list ═══ */
-.fi{display:flex;align-items:center;padding:8px 12px;border-bottom:1px solid rgba(51,51,80,.2);cursor:pointer;font-size:.82rem;font-family:'JetBrains Mono',monospace;transition:background .1s}
-.fi:hover{background:var(--bg2)}
-
-/* ═══ Toast ═══ */
-.toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;border-radius:7px;font-size:.82rem;font-weight:500;z-index:10000;opacity:0;transform:translateY(6px);transition:all .2s}
-.toast.show{opacity:1;transform:translateY(0)}
-.tok{background:var(--green);color:var(--bg)}
-.terr{background:var(--red);color:var(--bg)}
-
-/* Utility */
-.fx{display:flex;align-items:center;gap:8px}
-.mb12{margin-bottom:12px}
-</style>
+<script src="https://unpkg.com/js-yaml@4/dist/js-yaml.min.js"></script>
 </head>
 <body>
 <div id="app">
@@ -139,8 +25,9 @@ textarea.ce:focus{outline:none;border-color:var(--blue);box-shadow:inset 0 1px 4
 <!-- Login -->
 <div v-if="!authed" class="lmask">
  <div class="lbox">
-  <h2><em>Clonoth</em></h2>
-  <div class="ls">Agent Substrate 管理控制台</div>
+  <img src="logo.jpg" alt="" style="width:48px;height:48px;border-radius:10px;margin-bottom:12px">
+  <h2><em>Clonoth</em> Studio</h2>
+  <div class="ls">Agent Substrate 可视化编辑器</div>
   <div v-if="lerr" class="le">{{lerr}}</div>
   <input type="password" v-model="ltk" placeholder="管理 Token" @keyup.enter="login" autofocus>
   <button class="lbtn" @click="login">进入</button>
@@ -150,385 +37,381 @@ textarea.ce:focus{outline:none;border-color:var(--blue);box-shadow:inset 0 1px 4
 
 <template v-if="authed">
 <!-- Sidebar -->
-<div class="side">
- <div class="sbrand"><em>Clonoth</em> <small>Admin</small></div>
- <ul class="snav">
-  <li v-for="t in tabs" :key="t.id" :class="{on:tab===t.id}" @click="go(t.id)">{{t.icon}} {{t.label}}</li>
+<div class="sidebar">
+ <div class="sb-brand" style="display:flex;align-items:center;gap:10px"><img src="logo.jpg" alt="" style="width:28px;height:28px;border-radius:6px"><div><h1><em>Clonoth</em></h1><small>Studio · 可视化编辑</small></div></div>
+ <ul class="sb-nav">
+  <li v-for="t in navTabs" :key="t.id" :class="{on:view===t.id}" @click="goView(t.id)">{{t.icon}} {{t.label}}</li>
  </ul>
- <div class="sfoot"><a @click="logout">退出登录</a></div>
+ <div class="sb-scroll">
+  <template v-if="view==='canvas'">
+   <div class="sb-sec">
+    <div class="sb-stitle">工作流</div>
+    <div v-for="w in workflows" :key="w.id" :class="['sb-wf',{on:curWfId===w.id}]" @click="selectWf(w.id)" :title="w.id">{{w.name||w.id}}</div>
+    <button class="sb-add" @click="newWf">+ 新建工作流</button>
+   </div>
+   <div class="sb-sec">
+    <div class="sb-stitle">添加节点</div>
+    <div class="sb-pal">
+     <button class="sb-pal-btn" @click="addNode()">⬡ 添加节点</button>
+    </div>
+   </div>
+  </template>
+ </div>
+ <div class="sb-foot"><a @click="logout">退出登录</a></div>
 </div>
 
 <!-- Main -->
-<div class="mn">
-<div class="top"><h1>{{tabLabel}}</h1><div class="bg"><button class="btn bd bs" @click="restart">重启引擎</button></div></div>
-<div class="pane">
+<div class="main">
 
-<!-- ── Dashboard ── -->
-<div v-if="tab==='dash'">
- <div class="cg mb12">
-  <div class="card stat"><div class="l">状态</div><div class="v" style="color:var(--blue)">{{health?.status||'—'}}</div><div style="font-size:.72rem;color:var(--sub)">{{health?fmtUp(health.uptime_seconds):''}}</div></div>
-  <div class="card stat"><div class="l">会话</div><div class="v">{{adm?.sessions??'—'}}</div></div>
-  <div class="card stat"><div class="l">待审批</div><div class="v" style="color:var(--yel)">{{adm?.approvals?.pending??0}}</div></div>
-  <div class="card stat"><div class="l">运行中任务</div><div class="v" style="color:var(--green)">{{adm?.tasks?.running??0}}</div></div>
+<!-- ══ Canvas View ══ -->
+<div v-if="view==='canvas'" class="cv-wrap">
+ <div class="cv-bar">
+  <span class="cv-bar-name">{{curWf?.name||'选择一个工作流'}}</span>
+  <div class="cv-tools" v-if="curWf">
+   <button @click="zoomOut">−</button>
+   <span class="cv-zoom">{{zoomPct}}%</span>
+   <button @click="zoomIn">+</button>
+   <button @click="fitView">⊞</button>
+   <button @click="delWf" class="btn-s btn-d" style="margin-left:8px">删除</button>
+   <button class="cv-save" @click="saveAll">💾 保存</button>
+  </div>
+ </div>
+ <div class="cv-vp" ref="vpRef" :class="{grabbing:isPanning}" @mousedown="cvDown" @mousemove="cvMove" @mouseup="cvUp" @mouseleave="cvUp">
+  <div v-if="!curWf" class="cv-empty"><div class="cv-empty-inner">⬡<p>从左侧选择或新建一个工作流</p></div></div>
+  <svg v-if="curWf" class="cv-svg">
+   <defs>
+    <marker id="arr-on" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="10" markerHeight="7" orient="auto"><path d="M0 0 L10 3.5 L0 7" fill="none" stroke="#7aa2f7" stroke-width="1.2"/></marker>
+    <marker id="arr-ho" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="10" markerHeight="7" orient="auto"><path d="M0 0 L10 3.5 L0 7" fill="none" stroke="#bb9af7" stroke-width="1.2"/></marker>
+   </defs>
+   <g :transform="`translate(${panX},${panY}) scale(${zoom})`">
+    <g v-for="(c,i) in conns" :key="'e'+i">
+     <template v-if="c.type==='tool'">
+      <path :d="c.path" fill="none" stroke="rgba(160,216,160,.35)" stroke-width="1" stroke-dasharray="3 2"/>
+     </template>
+     <template v-else>
+      <path :d="c.path" fill="none" :stroke="c.type==='handoff'?'#bb9af7':'#7aa2f7'" :stroke-dasharray="c.type==='handoff'?'8 4':'none'" stroke-width="2" :marker-end="c.type==='handoff'?'url(#arr-ho)':'url(#arr-on)'" opacity="0.6"/>
+      <rect v-if="c.label" :x="c.lx-c.lw/2" :y="c.ly-8" :width="c.lw" height="16" rx="3" fill="#0f0f1a" opacity="0.85"/>
+      <text v-if="c.label" :x="c.lx" :y="c.ly+3.5" text-anchor="middle" :fill="c.type==='handoff'?'rgba(187,154,247,.8)':'rgba(122,162,247,.8)'" font-size="9.5" font-family="Inter,sans-serif" font-weight="500">{{c.label}}</text>
+     </template>
+    </g>
+    <line v-if="wireFrom" :x1="wireFrom.x" :y1="wireFrom.y" :x2="wireSnap?wireSnap.x:wireEndX" :y2="wireSnap?wireSnap.y:wireEndY" stroke="#7aa2f7" stroke-width="2" stroke-dasharray="6 3" opacity="0.7"/>
+    <circle v-if="wireSnap" :cx="wireSnap.x" :cy="wireSnap.y" r="5" fill="var(--bg1)" stroke="#9ece6a" stroke-width="2"/>
+    <g v-if="dragSnap">
+     <line :x1="dragSnap.x1" :y1="dragSnap.y1" :x2="dragSnap.x2" :y2="dragSnap.y2" stroke="#9ece6a" stroke-width="2" stroke-dasharray="5 3" opacity="0.7"/>
+     <circle :cx="dragSnap.x1" :cy="dragSnap.y1" r="5" fill="var(--bg1)" stroke="#9ece6a" stroke-width="2"/>
+     <circle :cx="dragSnap.x2" :cy="dragSnap.y2" r="5" fill="var(--bg1)" stroke="#9ece6a" stroke-width="2"/>
+    </g>
+   </g>
+  </svg>
+  <div v-if="curWf" class="cv-layer" :style="{transform:`translate(${panX}px,${panY}px) scale(${zoom})`}">
+   <div v-for="n in aiItems" :key="n.uid" :class="['nd',{sel:selUid===n.uid,entry:n.isEntry,dragging:dragUid===n.uid}]" :style="{left:n.x+'px',top:n.y+'px',zIndex:selUid===n.uid?10:1}" @mousedown.stop="ndDown($event,n)">
+    <div class="nd-port nd-port-in" @mousedown.stop.prevent="wireStart($event,n,'in')"></div>
+    <div class="nd-head">
+     <span class="nd-type">{{nodeGlyph(n)}}</span>
+     <span class="nd-name">{{n.name||n.id}}</span>
+    </div>
+    <div class="nd-id">{{n.id}}</div>
+    <div class="nd-info" v-if="n.model_route">📡 {{shortRoute(n.model_route)}}</div>
+    <div class="nd-terms" v-if="n.terms&&n.terms.length">
+     <div class="nd-term" v-for="tm in n.terms.slice(0,3)" :key="tm.name+'-'+tm.target" :style="{color:tm.target==='$reply'?'rgba(158,206,106,.6)':'rgba(247,118,142,.5)'}">{{tm.name}} → {{tm.target}}</div>
+    </div>
+    <div class="nd-foot">
+     <span class="nd-tools" @click.stop="openToolPicker(n)" style="cursor:pointer">🔧 {{(n.toolNames&&n.toolNames.length)||0}}</span>
+     <span :class="'nd-mode nd-mode-'+n.output_mode">{{n.output_mode}}</span>
+    </div>
+    <div class="nd-port nd-port-out" @mousedown.stop.prevent="wireStart($event,n,'out')"></div>
+   </div>
+   <div v-for="t in toolItems" :key="t.uid" class="tool-chip" :style="{left:t.x+'px',top:t.y+'px'}" @mousedown.stop="toolDown($event,t)">⚙ {{shortTool(t.name)}}</div>
+  </div>
+
+  <div :class="['rpbg',{show:!!editing}]" @click="closeEd"></div>
+  <div :class="['rpanel',{open:!!editing}]">
+   <template v-if="editing">
+    <div class="pn-head"><h3>节点属性</h3><button class="pn-x" @click="closeEd">✕</button></div>
+    <div class="pn-body">
+     <div class="pn-jump">
+      <button class="pn-jbtn" @click="jumpEd('basic')">基本</button>
+      <button class="pn-jbtn" @click="jumpEd('model')">模型</button>
+      <button class="pn-jbtn" @click="jumpEd('tools')">工具</button>
+      <button class="pn-jbtn" @click="jumpEd('skills')">技能</button>
+      <button class="pn-jbtn" @click="jumpEd('links')">连接</button>
+      <button class="pn-jbtn" @click="openRawEd(editing.id)">原始</button>
+     </div>
+     <div class="pn-sec" id="pn-sec-basic">
+      <div class="pn-lbl">名称</div>
+      <input class="pn-inp" v-model="editing.name">
+      <div class="pn-lbl">节点 ID</div>
+      <div class="pn-static">{{editing.id}}</div>
+      <div class="pn-lbl">节点类型</div>
+      <div class="pn-static">AI 节点</div>
+      <div class="pn-lbl">描述</div>
+      <textarea class="pn-text" v-model="editing.description"></textarea>
+     </div>
+     <div class="pn-sec" id="pn-sec-model">
+      <div class="pn-sec-t">模型与提示词</div>
+      <div class="pn-lbl">模型路由</div>
+      <div class="pn-add"><input class="pn-inp" v-model="editing.model_route"><button class="btn-add" @click="jumpToRoute" title="编辑模型路由">↗</button></div>
+      <div class="pn-lbl">提示词包</div>
+      <div class="pn-add"><input class="pn-inp" v-model="editing.prompt_pack"><button class="btn-add" @click="jumpToPack(editing.prompt_pack)" title="编辑提示词包">↗</button></div>
+      <div class="pn-lbl">Assembly</div>
+      <input class="pn-inp" v-model="editing.prompt_assembly">
+     </div>
+     <div class="pn-sec" id="pn-sec-tools">
+      <div class="pn-sec-t">工具访问</div>
+      <div class="pn-lbl">模式</div>
+      <select class="pn-inp" v-model="editing.tool_mode"><option value="none">none</option><option value="all">all</option><option value="allowlist">allowlist</option></select>
+      <template v-if="editing.tool_mode==='allowlist'">
+       <div class="pn-lbl">允许列表</div>
+       <div class="pn-tags"><span class="pn-tag" v-for="(t,i) in editing.tool_allow" :key="i">{{t}} <span class="pn-tag-x" @click="editing.tool_allow.splice(i,1)">✕</span></span></div>
+       <div class="pn-add"><input class="pn-inp-s" v-model="newTool" placeholder="工具名" @keyup.enter="addTool"><button class="btn-add" @click="addTool">+</button></div>
+      </template>
+      <template v-if="editing.tool_mode==='all'">
+       <div class="pn-lbl">禁止列表</div>
+       <div class="pn-tags"><span class="pn-tag" v-for="(t,i) in editing.tool_deny" :key="i">{{t}} <span class="pn-tag-x" @click="editing.tool_deny.splice(i,1)">✕</span></span></div>
+       <div class="pn-add"><input class="pn-inp-s" v-model="newDeny" placeholder="工具名" @keyup.enter="addDeny"><button class="btn-add" @click="addDeny">+</button></div>
+      </template>
+     </div>
+     <div class="pn-sec" id="pn-sec-skills">
+      <div class="pn-sec-t">技能访问</div>
+      <div class="pn-lbl">模式</div>
+      <select class="pn-inp" v-model="editing.skill_mode"><option value="all">all</option><option value="allowlist">allowlist</option><option value="none">none</option></select>
+      <template v-if="editing.skill_mode==='allowlist'">
+       <div class="pn-lbl">允许列表</div>
+       <div class="pn-tags"><span class="pn-tag" v-for="(s,i) in editing.skill_allow" :key="i">{{s}} <span class="pn-tag-x" @click="editing.skill_allow.splice(i,1)">✕</span></span></div>
+       <div class="pn-add"><input class="pn-inp-s" placeholder="技能名" @keyup.enter="if($event.target.value.trim()){editing.skill_allow.push($event.target.value.trim());$event.target.value=''}"><button class="btn-add" @click="">+</button></div>
+      </template>
+     </div>
+     <div class="pn-sec" id="pn-sec-output" v-if="editing.type!=='tool'">
+      <div class="pn-sec-t">输出</div>
+      <div class="pn-lbl">输出模式</div>
+      <select class="pn-inp" v-model="editing.output_mode"><option value="draft">draft</option><option value="reply">reply</option></select>
+     </div>
+     <div class="pn-sec" id="pn-sec-links">
+      <div class="pn-sec-t">连接 (工作流级)</div>
+      <div class="pn-lbl">On 事件</div>
+      <div class="pn-conn" v-for="(target,outcome) in editing.on" :key="'on-'+outcome">
+       <span class="pn-conn-k">{{outcome}}</span><span class="arr">→</span>
+       <select class="pn-inp-s" :value="target" @change="editing.on[outcome]=$event.target.value">
+        <option value="$reply">$reply</option>
+        <option value="$end">$end</option>
+        <option v-for="n in otherNodes" :key="n.id" :value="n.id">{{n.name||n.id}}</option>
+       </select>
+       <button class="pn-conn-x" @click="delete editing.on[outcome]">✕</button>
+      </div>
+      <div class="pn-add"><input class="pn-inp-s" v-model="newOnK" placeholder="outcome" @keyup.enter="addOn" style="max-width:80px"><select class="pn-inp-s" v-model="newOnV"><option value="">目标...</option><option value="$reply">$reply</option><option value="$end">$end</option><option v-for="n in otherNodes" :key="n.id" :value="n.id">{{n.name||n.id}}</option></select><button class="btn-add" @click="addOn">+</button></div>
+      <div class="pn-lbl" style="margin-top:10px">Handoffs</div>
+      <div class="pn-conn" v-for="(target,outcome) in editing.handoffs" :key="'ho-'+outcome">
+       <span class="pn-conn-k">{{outcome}}</span><span class="arr">→</span>
+       <select class="pn-inp-s" :value="target" @change="editing.handoffs[outcome]=$event.target.value">
+        <option v-for="n in otherNodes" :key="n.id" :value="n.id">{{n.name||n.id}}</option>
+       </select>
+       <button class="pn-conn-x" @click="delete editing.handoffs[outcome]">✕</button>
+      </div>
+      <div class="pn-add"><input class="pn-inp-s" v-model="newHoK" placeholder="outcome" @keyup.enter="addHo" style="max-width:80px"><select class="pn-inp-s" v-model="newHoV"><option value="">目标...</option><option v-for="n in otherNodes" :key="n.id" :value="n.id">{{n.name||n.id}}</option></select><button class="btn-add" @click="addHo">+</button></div>
+     </div>
+    </div>
+    <div class="pn-actions">
+     <label class="pn-check"><input type="checkbox" :checked="editing.isEntry" @change="setEntry($event.target.checked)"> 设为入口节点</label>
+     <div class="pn-btns">
+      <button class="btn btn-s" @click="openRawEd(editing.id)">原始编辑</button>
+      <button class="btn btn-d btn-s" @click="delNode">删除节点</button>
+      <button class="btn btn-p btn-s" @click="saveNode">保存节点</button>
+     </div>
+    </div>
+   </template>
+  </div>
+
+  <div v-if="connModal" class="conn-modal-mask" @click.self="connModal=null">
+   <div class="conn-modal">
+    <h4>创建连接</h4>
+    <div class="conn-info">{{connModal.fromId}} → {{connModal.toId}}</div>
+    <div class="conn-row">
+     <label>连接类型</label>
+     <select class="pn-inp" v-model="connModal.type"><option value="on">on（流转）</option><option value="handoff">handoff（委托）</option></select>
+    </div>
+    <div class="conn-row">
+     <label>Outcome</label>
+     <div class="conn-presets">
+      <button v-for="p in ['completed','failed','reply','handoff']" :key="p" :class="['conn-pre',{on:connModal.outcome===p}]" @click="connModal.outcome=p">{{p}}</button>
+     </div>
+     <input class="pn-inp" v-model="connModal.outcome" placeholder="选择预设或输入自定义名称" style="margin-top:6px">
+    </div>
+    <div class="conn-btns">
+     <button class="btn btn-s" @click="connModal=null">取消</button>
+     <button class="btn btn-p btn-s" @click="confirmConn">确定</button>
+    </div>
+   </div>
+  </div>
+  <div v-if="toolPicker" class="conn-modal-mask" @click.self="toolPicker=null">
+   <div class="tool-picker">
+    <div class="tp-head">
+     <h4>🔧 工具配置</h4>
+     <span class="tp-nid">{{toolPicker.nodeId}}</span>
+    </div>
+    <div class="tp-mode">
+     <label>访问模式</label>
+     <select class="pn-inp" v-model="toolPicker.mode" @change="tpModeChange">
+      <option value="none">none — 禁用所有工具</option>
+      <option value="all">all — 启用所有工具</option>
+      <option value="allowlist">allowlist — 仅启用勾选的</option>
+     </select>
+    </div>
+    <div class="tp-list" v-if="toolPicker.mode!=='none'">
+     <div class="tp-sub" v-if="toolPicker.mode==='all'">取消勾选以禁用特定工具</div>
+     <div class="tp-sub" v-else>勾选以启用特定工具</div>
+     <label class="tp-item" v-for="t in allToolNames" :key="t"><input type="checkbox" :checked="tpChecked(t)" @change="tpToggle(t,$event.target.checked)">{{t}}</label>
+    </div>
+    <div class="tp-foot">
+     <button class="btn btn-s" @click="toolPicker=null">取消</button>
+     <button class="btn btn-p btn-s" @click="saveToolPicker">保存</button>
+    </div>
+   </div>
+  </div>
+  <div v-if="rawEd" class="raw-mask">
+   <div class="raw-box">
+    <div class="raw-head">
+     <div>
+      <h3>{{rawEd.nodeId}}</h3>
+      <div class="raw-sub">完整原始编辑。左侧是节点定义。右侧是当前工作流中的节点片段。</div>
+     </div>
+     <button class="pn-x" @click="closeRawEd">✕</button>
+    </div>
+    <div class="raw-body">
+      <div class="raw-pane">
+       <h4>节点定义 YAML</h4>
+       <textarea class="raw-ta" v-model="rawEd.nodeContent" spellcheck="false"></textarea>
+       <div class="raw-help">这里可以编辑全部字段。包括 description、skills、任意扩展字段。</div>
+      </div>
+      <div class="raw-pane">
+       <h4>工作流节点片段 YAML</h4>
+       <textarea class="raw-ta" v-model="rawEd.flowContent" spellcheck="false"></textarea>
+       <div class="raw-help">这里编辑当前工作流中这个节点的 on、handoffs 等字段。</div>
+      </div>
+    </div>
+    <div class="raw-foot">
+     <label class="pn-check"><input type="checkbox" v-model="rawEd.isEntry"> 设为入口节点</label>
+     <div class="pn-btns">
+      <button class="btn btn-s" @click="closeRawEd">取消</button>
+      <button class="btn btn-p btn-s" @click="saveRawEd">保存原始内容</button>
+     </div>
+    </div>
+   </div>
+  </div>
+ </div>
+</div>
+
+<!-- ══ Dashboard ══ -->
+<div v-if="view==='dash'" class="view-pane">
+ <div class="vp-head"><h2>概览</h2><button class="btn btn-d btn-s" @click="restart">重启引擎</button></div>
+ <div class="stat-grid">
+  <div class="stat-card"><div class="sl">状态</div><div class="sv" style="color:var(--blue)">{{health?.status||'—'}}</div><div style="font-size:.7rem;color:var(--sub)">{{health?fmtUp(health.uptime_seconds):''}}</div></div>
+  <div class="stat-card"><div class="sl">会话</div><div class="sv">{{adm?.sessions??'��'}}</div></div>
+  <div class="stat-card"><div class="sl">待审批</div><div class="sv" style="color:var(--amber)">{{adm?.approvals?.pending??0}}</div></div>
+  <div class="stat-card"><div class="sl">运行中</div><div class="sv" style="color:var(--green)">{{adm?.tasks?.running??0}}</div></div>
  </div>
  <div class="card"><div class="ch"><h3>模型配置</h3></div>
   <table v-if="appCfg"><tbody>
    <tr><td style="width:120px;color:var(--sub)">Provider</td><td>{{appCfg.provider}}</td></tr>
    <tr><td style="color:var(--sub)">Base URL</td><td>{{appCfg.openai?.base_url}}</td></tr>
    <tr><td style="color:var(--sub)">Model</td><td>{{appCfg.openai?.model}}</td></tr>
-   <tr><td style="color:var(--sub)">API Key</td><td>{{appCfg.openai?.api_key}}</td></tr>
   </tbody></table>
  </div>
 </div>
 
-<!-- ── Nodes ── -->
-<div v-if="tab==='nodes'">
+<!-- ══ Prompts ══ -->
+<div v-if="view==='prompts'" class="view-pane">
  <div v-if="!ed">
-  <div class="fx mb12" style="justify-content:space-between"><span class="" style="color:var(--sub);font-size:.8rem">{{nodes.length}} 个节点</span><button class="btn bp bs" @click="nodeNew">+ 新建</button></div>
-  <div class="cg"><div class="ncard" v-for="n in nodes" :key="n.id" @click="nodeEd(n.id)">
-   <div class="nt"><h4>{{n.name||n.id}}</h4><span :class="'b b-'+n.type">{{n.type}}</span></div>
-   <div class="nid">{{n.id}}</div>
-   <div class="nm"><span>路由: {{n.model_route||'—'}}</span><span :class="'b b-'+n.output_mode">{{n.output_mode}}</span></div>
+  <div class="vp-head"><h2>提示词包</h2></div>
+  <div class="cg"><div class="card" v-for="p in packs" :key="p.id">
+   <div class="ch"><h3>{{p.name}}</h3><span class="b b-ai">{{p.id}}</span></div>
+   <p style="font-size:.75rem;color:var(--sub);margin-bottom:10px">{{p.description}}</p>
+   <div class="bg"><button class="btn btn-s" @click="pMani(p.id)">Manifest</button><button class="btn btn-s" @click="pFList(p.id)">Fragments</button></div>
   </div></div>
  </div>
- <div v-else class="ew">
-  <div class="et"><div class="fx"><button class="btn bs" @click="ed=null;loadN()">← 返回</button><h2>{{ed.isNew?'新建节点':ed.id}}</h2></div>
-   <div class="bg"><button v-if="!ed.isNew" class="btn bd bs" @click="nodeDel(ed.id)">删除</button><button class="btn bp bs" @click="nodeSave">保存</button></div></div>
-  <div class="field" v-if="ed.isNew"><label>节点 ID</label><input v-model="ed.id" placeholder="custom.my_node"></div>
-  <textarea class="ce" v-model="ed.content" spellcheck="false"></textarea>
- </div>
-</div>
-
-<!-- ── Workflows ── -->
-<div v-if="tab==='wf'">
- <div v-if="!ed">
-  <div class="fx mb12" style="justify-content:space-between"><span style="color:var(--sub);font-size:.8rem">{{wfs.length}} 个工作流</span><button class="btn bp bs" @click="wfNew">+ 新建</button></div>
-  <div style="display:flex;flex-direction:column;gap:8px">
-   <div class="wcard" v-for="w in wfs" :key="w.id" @click="graphOpen(w)">
-    <div class="wi"><h4>{{w.name||w.id}}</h4><p>{{w.id}} · 入口: {{w.entry_node}}</p></div>
-    <div class="wa"><button class="btn bs" @click.stop="wfEd(w.id)">YAML</button><button class="btn bp bs" @click.stop="graphOpen(w)">图编辑</button></div>
-   </div>
-  </div>
- </div>
- <div v-else-if="ed.type==='wf-yaml'" class="ew">
-  <div class="et"><div class="fx"><button class="btn bs" @click="ed=null;loadW()">← 返回</button><h2>{{ed.isNew?'新建工作流':ed.id}}</h2></div>
-   <div class="bg"><button v-if="!ed.isNew" class="btn bd bs" @click="wfDel(ed.id)">删除</button><button class="btn bp bs" @click="wfSave">保存</button></div></div>
-  <div class="field" v-if="ed.isNew"><label>工作流 ID</label><input v-model="ed.id" placeholder="custom.my_workflow"></div>
-  <textarea class="ce" v-model="ed.content" spellcheck="false"></textarea>
- </div>
- <div v-else-if="ed.type==='graph'" class="ew">
-  <div class="et">
-   <div class="fx"><button class="btn bs" @click="ed=null;loadW()">← 返回</button><h2 style="color:var(--blue)">{{ed.wf.name||ed.wf.id}}</h2></div>
-   <div class="bg"><button class="btn bs" @click.stop="wfEd(ed.wf.id)">YAML</button><button class="btn bp bs" @click="graphSave">保存</button></div>
-  </div>
-  <div id="gc"><canvas id="cv"></canvas></div>
- </div>
-</div>
-
-<!-- ── Prompts ── -->
-<div v-if="tab==='prompts'">
- <div v-if="!ed"><div class="cg"><div class="card" v-for="p in packs" :key="p.id">
-  <div class="ch"><h3>{{p.name}}</h3><span class="b" style="background:rgba(122,162,247,.1);color:var(--blue)">{{p.id}}</span></div>
-  <p style="font-size:.75rem;color:var(--sub);margin-bottom:10px">{{p.description}}</p>
-  <div class="bg"><button class="btn bs" @click="pMani(p.id)">Manifest</button><button class="btn bs" @click="pFList(p.id)">Fragments</button></div>
- </div></div></div>
  <div v-else-if="ed.type==='flist'">
-  <div class="et mb12"><div class="fx"><button class="btn bs" @click="ed=null">← 返回</button><h2>{{ed.pid}} / fragments</h2></div><button class="btn bp bs" @click="pFNew(ed.pid)">+ 新建</button></div>
+  <div class="et mb12"><div class="fx"><button class="btn btn-s" @click="ed=null">← 返回</button><h2>{{ed.pid}} / fragments</h2></div><button class="btn btn-p btn-s" @click="pFNew(ed.pid)">+ 新建</button></div>
   <div class="card" style="padding:0;overflow:hidden"><div class="fi" v-for="f in ed.fs" :key="f" @click="pFEd(ed.pid,f)">{{f}}</div>
    <div v-if="!ed.fs.length" style="padding:16px;text-align:center;color:var(--sub)">暂无</div></div>
  </div>
  <div v-else class="ew">
-  <div class="et"><div class="fx"><button class="btn bs" @click="pBack">← 返回</button><h2>{{pTitle()}}</h2></div>
-   <div class="bg"><button v-if="ed.type==='frag'&&!ed.isNew" class="btn bd bs" @click="pFDel(ed.pid,ed.fp)">删除</button><button class="btn bp bs" @click="pSave">保存</button></div></div>
-  <div class="field" v-if="ed.type==='frag'&&ed.isNew"><label>片段路径 (如 roles/my_role.md)</label><input v-model="ed.fp"></div>
+  <div class="et"><div class="fx"><button class="btn btn-s" @click="pBack">← 返回</button><h2>{{pTitle()}}</h2></div>
+   <div class="bg"><button v-if="ed.type==='frag'&&!ed.isNew" class="btn btn-d btn-s" @click="pFDel(ed.pid,ed.fp)">删除</button><button class="btn btn-p btn-s" @click="pSave">保存</button></div></div>
+  <div class="field" v-if="ed.type==='frag'&&ed.isNew"><label>片段路径</label><input v-model="ed.fp"></div>
   <textarea class="ce" v-model="ed.content" spellcheck="false"></textarea>
  </div>
 </div>
 
-<!-- ── Config ── -->
-<div v-if="tab==='cfg'">
+<!-- ══ Config ══ -->
+<div v-if="view==='config'" class="view-pane">
+ <div class="vp-head"><h2>配置</h2></div>
  <div class="tabs"><div v-for="c in cfgTabs" :key="c.k" :class="['tab',{on:csub===c.k}]" @click="cfgLd(c.a,c.k)">{{c.l}}</div></div>
  <div v-if="ed&&ed.type==='cfg'" class="ew">
-  <div class="et"><h2>{{cfgLbl}}</h2><button class="btn bp bs" @click="cfgSv">保存</button></div>
+  <div class="et"><h2>{{cfgLbl}}</h2><button class="btn btn-p btn-s" @click="cfgSv">保存</button></div>
   <textarea class="ce" v-model="ed.content" spellcheck="false"></textarea>
  </div>
 </div>
 
-</div></div>
+<!-- ══ Tools & MCP ══ -->
+<div v-if="view==='tools'" class="view-pane">
+ <div v-if="!toolEd&&!mcpEd">
+  <div class="vp-head"><h2>自定义工具</h2><div class="bg"><button class="btn btn-s" @click="reloadTools" :disabled="reloading">{{reloading?'重载中…':'🔄 重载工具'}}</button><button class="btn btn-p btn-s" @click="newToolEd">+ 新建工具</button></div></div>
+  <div v-if="!toolsList.length" style="color:var(--sub);font-size:.8rem">暂无自定义工具</div>
+  <div class="cg">
+   <div class="card" v-for="t in toolsList" :key="t.name">
+    <div class="ch"><h3>{{t.name}}</h3><span class="b b-ai">{{t.file}}</span></div>
+    <p style="font-size:.75rem;color:var(--sub);margin-bottom:8px">{{t.description||'无描述'}}</p>
+    <div class="bg"><button class="btn btn-s" @click="openToolEd(t.name)">编辑</button><button class="btn btn-d btn-s" @click="delTool(t.name)">删除</button></div>
+   </div>
+  </div>
+  <div style="margin-top:24px">
+   <div class="vp-head"><h2>MCP Clients</h2><button class="btn btn-s" @click="openMcpEd">编辑 YAML</button></div>
+   <div v-if="!mcpList.length" style="color:var(--sub);font-size:.8rem">暂无 MCP 配置</div>
+   <div class="cg">
+    <div class="card" v-for="m in mcpList" :key="m.id">
+     <div class="ch"><h3>{{m.id}}</h3><span class="b" style="background:rgba(115,218,202,.1);color:var(--teal)">{{m.transport||'stdio'}}</span></div>
+     <p style="font-size:.72rem;color:var(--sub)">{{m.command||m.url||''}}</p>
+    </div>
+   </div>
+  </div>
+ </div>
+ <div v-else-if="toolEd" class="ew">
+  <div class="et"><div class="fx"><button class="btn btn-s" @click="toolEd=null">← 返回</button><h2>{{toolEd.isNew?'新建工具':toolEd.name}}</h2></div>
+   <div class="bg"><button v-if="!toolEd.isNew" class="btn btn-d btn-s" @click="delTool(toolEd.name)">删除</button><button class="btn btn-p btn-s" @click="saveToolEd">保存</button></div></div>
+  <textarea class="ce" v-model="toolEd.content" spellcheck="false"></textarea>
+ </div>
+ <div v-else-if="mcpEd" class="ew">
+  <div class="et"><div class="fx"><button class="btn btn-s" @click="mcpEd=null">← 返回</button><h2>MCP Clients YAML</h2></div>
+   <button class="btn btn-p btn-s" @click="saveMcpEd">保存</button></div>
+  <textarea class="ce" v-model="mcpEd.content" spellcheck="false"></textarea>
+ </div>
+</div>
+
+<!-- ══ Skills ══ -->
+<div v-if="view==='skills'" class="view-pane">
+ <div v-if="!skillEd">
+  <div class="vp-head"><h2>技能管理</h2><button class="btn btn-p btn-s" @click="newSkillEd">+ 新建技能</button></div>
+  <div v-if="!skillsList.length" style="color:var(--sub);font-size:.8rem">暂无技能</div>
+  <div class="cg">
+   <div class="card" v-for="s in skillsList" :key="s.name">
+    <div class="ch"><h3>{{s.name}}</h3><span class="b" :style="{background:s.enabled?'rgba(158,206,106,.1)':'rgba(247,118,142,.1)',color:s.enabled?'var(--green)':'var(--red)'}">{{s.enabled?'启用':'禁用'}}</span></div>
+    <p style="font-size:.75rem;color:var(--sub);margin-bottom:4px">{{s.description||'无描述'}}</p>
+    <div v-if="s.keywords&&s.keywords.length" style="margin-bottom:6px"><span class="pn-tag" v-for="k in s.keywords" :key="k" style="margin-right:4px">{{k}}</span></div>
+    <div class="bg"><button class="btn btn-s" @click="openSkillEd(s.name)">编辑</button><button class="btn btn-d btn-s" @click="delSkill(s.name)">删除</button></div>
+   </div>
+  </div>
+ </div>
+ <div v-else class="ew">
+  <div class="et"><div class="fx"><button class="btn btn-s" @click="skillEd=null">← 返回</button><h2>{{skillEd.isNew?'新建技能':skillEd.name}}</h2></div>
+   <div class="bg"><button v-if="!skillEd.isNew" class="btn btn-d btn-s" @click="delSkill(skillEd.name)">删除</button><button class="btn btn-p btn-s" @click="saveSkillEd">保存</button></div></div>
+  <textarea class="ce" v-model="skillEd.content" spellcheck="false"></textarea>
+ </div>
+</div>
+
+</div>
 </template>
 <div :class="['toast',ttyp,{show:tshow}]">{{tmsg}}</div>
 </div>
 
-<script>
-const {createApp,ref,computed,onMounted,nextTick}=Vue;
-createApp({setup(){
-// ── Auth ──
-const authed=ref(false),ltk=ref(''),lerr=ref('');
-async function login(){lerr.value='';const t=ltk.value.trim();if(!t){lerr.value='请输入 Token';return}try{const r=await fetch('/v1/admin/auth/check',{headers:{'Authorization':'Bearer '+t}});if(!r.ok){lerr.value='Token 无效';return}localStorage.setItem('ctk',t);authed.value=true;loadD()}catch(e){lerr.value='连接失败'}}
-function logout(){localStorage.removeItem('ctk');authed.value=false;ltk.value=''}
-
-// ── Toast ──
-const tshow=ref(false),tmsg=ref(''),ttyp=ref('tok');
-function toast(m,ok=true){tmsg.value=m;ttyp.value=ok?'tok':'terr';tshow.value=true;setTimeout(()=>tshow.value=false,2200)}
-
-// ── API ──
-async function api(u,o={}){
- const tk=localStorage.getItem('ctk')||'',h={...(o.headers||{}),'Authorization':'Bearer '+tk};
- const r=await fetch(u,{...o,headers:h});
- if(r.status===401){authed.value=false;localStorage.removeItem('ctk');throw new Error('401')}
- if(!r.ok){let d='';try{d=(await r.json()).detail||''}catch(e){}toast(`错误 ${r.status} ${d}`,false);throw new Error(r.status)}
- return r.json()
-}
-
-// ── Tabs ──
-const tabs=[{id:'dash',label:'概览',icon:'◎'},{id:'nodes',label:'节点',icon:'◆'},{id:'wf',label:'工作流',icon:'⬡'},{id:'prompts',label:'提示词',icon:'✎'},{id:'cfg',label:'配置',icon:'⚙'}];
-const tab=ref('dash'),ed=ref(null);
-const tabLabel=computed(()=>(tabs.find(t=>t.id===tab.value)||{}).label||'');
-function go(t){tab.value=t;ed.value=null;if(t==='dash')loadD();if(t==='nodes')loadN();if(t==='wf')loadW();if(t==='prompts')loadP();if(t==='cfg')cfgLd('model-routing','routing')}
-
-// ── Dashboard ──
-const health=ref(null),adm=ref(null),appCfg=ref(null);
-async function loadD(){try{health.value=await api('/v1/health');adm.value=await api('/v1/admin/state');appCfg.value=await api('/v1/config')}catch(e){}}
-function fmtUp(s){if(!s)return'';const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}h${m}m`:`${m}m`}
-
-// ── Nodes ──
-const nodes=ref([]);
-async function loadN(){try{nodes.value=await api('/v1/admin/config/nodes')}catch(e){}}
-async function nodeEd(id){const d=await api(`/v1/admin/config/nodes/${id}/raw`);ed.value={type:'node',id,content:d.content,isNew:false}}
-function nodeNew(){ed.value={type:'node',id:'',content:'version: 1\nkind: node\nid: \ntype: ai\nname: ""\ndescription: ""\nmodel_route: executor_default\nprompt:\n  pack: bootstrap_cn\n  assembly: executor\ntool_access:\n  mode: none\noutput_mode: draft\n',isNew:true}}
-async function nodeSave(){const{id,content,isNew}=ed.value;if(!id)return toast('ID 不能为空',false);if(isNew)await api('/v1/admin/config/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,content})});else await api(`/v1/admin/config/nodes/${id}/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});toast('已保存');ed.value=null;loadN()}
-async function nodeDel(id){if(!confirm('确定删除 '+id+'？'))return;await api(`/v1/admin/config/nodes/${id}`,{method:'DELETE'});toast('已删除');ed.value=null;loadN()}
-
-// ── Workflows ──
-const wfs=ref([]);
-async function loadW(){try{wfs.value=await api('/v1/admin/config/workflows')}catch(e){}}
-async function wfEd(id){const d=await api(`/v1/admin/config/workflows/${id}/raw`);ed.value={type:'wf-yaml',id,content:d.content,isNew:false}}
-function wfNew(){ed.value={type:'wf-yaml',id:'',content:'version: 1\nkind: workflow\nid: \nname: ""\ndescription: ""\nentry_node: \nnodes:\n  my_node:\n    on:\n      completed: $end\n',isNew:true}}
-async function wfSave(){const{id,content,isNew}=ed.value;if(!id)return toast('ID 不能为空',false);if(isNew)await api('/v1/admin/config/workflows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,content})});else await api(`/v1/admin/config/workflows/${id}/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});toast('已保存');ed.value=null;loadW()}
-async function wfDel(id){if(!confirm('确定删除 '+id+'？'))return;await api(`/v1/admin/config/workflows/${id}`,{method:'DELETE'});toast('已删除');ed.value=null;loadW()}
-
-// ══════════ Graph Editor — Canva-style call tree ══════════
-let cvs=null,cx=null,gItems=[],gEdges=[],drag=null,pan={x:0,y:0},panStart=null,scale=1;
-const P={
- bg:'#0e0e16',
- aiFill:'#1c1c2e',aiBd:'#3d3d5c',aiTx:'#e0e0f0',
- toolFill:'#162016',toolBd:'#2d4a2d',toolTx:'#a0d8a0',
- entryAccent:'#9ece6a',hoColor:'#bb9af7',onColor:'#7aa2f7',
- endColor:'#f7768e',replyColor:'#e0af68',
- dim:'#606080',lineBg:'rgba(100,100,140,.12)'
-};
-function rr(x,y,w,h,r){
- cx.beginPath();cx.moveTo(x+r,y);cx.lineTo(x+w-r,y);cx.arcTo(x+w,y,x+w,y+r,r);
- cx.lineTo(x+w,y+h-r);cx.arcTo(x+w,y+h,x+w-r,y+h,r);cx.lineTo(x+r,y+h);
- cx.arcTo(x,y+h,x,y+h-r,r);cx.lineTo(x,y+r);cx.arcTo(x,y,x+r,y,r);cx.closePath();
-}
-
-function resolveTools(nd){
- if(!nd||!nd.tool_access)return[];
- const m=nd.tool_access.mode||'none';
- if(m==='allowlist')return(nd.tool_access.allow||[]).slice();
- if(m==='all'){
-  const ALL=['list_dir','read_file','write_file','execute_command','search_in_files',
-   'create_or_update_skill','list_skills','delete_skill','create_or_update_mcp_client',
-   'list_mcp_clients','delete_mcp_client','create_or_update_tool','reload_tools',
-   'request_restart','create_schedule','list_schedules','delete_schedule','cancel_active_tasks'];
-  const d=new Set(nd.tool_access.deny||[]);return ALL.filter(t=>!d.has(t))}
- return[];
-}
-
-// Build call-tree recursively. Same node duplicated at each call path.
-function buildTree(wf,nid,ndet,visited){
- if(!wf.nodes[nid])return null;
- const d=wf.nodes[nid],nd=ndet[nid]||{},tools=resolveTools(nd);
- const children=[],terms=[],vis2=new Set(visited);vis2.add(nid);
- if(d.handoffs)for(const k in d.handoffs){const t=d.handoffs[k];
-  if(t.startsWith('$'))terms.push({name:k,target:t,kind:'ho'});
-  else if(!vis2.has(t)){const c=buildTree(wf,t,ndet,vis2);if(c)children.push({label:k,kind:'ho',sub:c})}}
- if(d.on)for(const k in d.on){const t=d.on[k];
-  if(t.startsWith('$'))terms.push({name:k,target:t,kind:'on'});
-  else if(!vis2.has(t)){const c=buildTree(wf,t,ndet,vis2);if(c)children.push({label:k,kind:'on',sub:c})}}
- return{id:nid,label:nd.name||nid.split('.').pop(),fullId:nid,isEntry:nid===wf.entry_node,
-  type:nd.type||'ai',outMode:nd.output_mode||'draft',tools,children,terms};
-}
-
-// ═══ Radial star layout: all outputs fan out in all directions ═══
-const AI_W=190,AI_H=52,TOOL_W=120,TOOL_H=22;
-const CHILD_R=220,TOOL_R=135;
-
-function layoutRadial(t,cx0,cy0,parentAngle,depth){
- const aiItem={kind:'ai',x:cx0-AI_W/2,y:cy0-AI_H/2,w:AI_W,h:AI_H,data:t};
- gItems.push(aiItem);
- const outs=[];
- t.children.forEach(c=>{outs.push({kind:'ai',ref:c})});
- t.tools.forEach(name=>{outs.push({kind:'tool',name:name})});
- if(!outs.length)return;
- let sweep,baseAngle;
- if(depth===0){sweep=Math.PI*2;baseAngle=-Math.PI/2;}
- else{sweep=Math.min(Math.PI*1.4,Math.max(0.6,outs.length*0.45));baseAngle=parentAngle;}
- const step=sweep/outs.length;
- let angle=baseAngle-sweep/2+step/2;
- outs.forEach(o=>{
-  if(o.kind==='ai'){
-   const r=CHILD_R*Math.pow(0.85,depth);
-   const ox=cx0+r*Math.cos(angle),oy=cy0+r*Math.sin(angle);
-   const beforeLen=gItems.length;
-   layoutRadial(o.ref.sub,ox,oy,angle,depth+1);
-   const childAi=gItems.slice(beforeLen).find(it=>it.kind==='ai');
-   gEdges.push({from:aiItem,to:childAi,type:o.ref.kind,label:o.ref.label});
-  }else{
-   const r=TOOL_R*Math.pow(0.85,depth);
-   const tx=cx0+r*Math.cos(angle)-TOOL_W/2;
-   const ty=cy0+r*Math.sin(angle)-TOOL_H/2;
-   const ti={kind:'tool',x:tx,y:ty,w:TOOL_W,h:TOOL_H,label:o.name,parentAi:aiItem};
-   gItems.push(ti);
-   gEdges.push({from:aiItem,to:ti,type:'tool'});
-  }
-  angle+=step;
- });
-}
-
-async function graphOpen(w){
- let ndet={};try{const nl=await api('/v1/admin/config/nodes');nl.forEach(n=>{ndet[n.id]=n})}catch(e){}
- ed.value={type:'graph',wf:w};
- nextTick(()=>initGraph(w,ndet));
-}
-function initGraph(w,ndet){
- gItems=[];gEdges=[];pan={x:0,y:0};scale=1;
- cvs=document.getElementById('cv');const ct=document.getElementById('gc');
- cvs.width=ct.clientWidth;cvs.height=ct.clientHeight;cx=cvs.getContext('2d');
- const tree=buildTree(w,w.entry_node,ndet,new Set());
- if(!tree)return;
- layoutRadial(tree,cvs.width/2,cvs.height/2,0,0);
- cvs.onmousedown=gDown;cvs.onmousemove=gMove;cvs.onmouseup=gUp;cvs.onwheel=gWheel;
- new ResizeObserver(()=>{if(ed.value?.type==='graph'){cvs.width=ct.clientWidth;cvs.height=ct.clientHeight;gDraw()}}).observe(ct);
- gDraw();
-}
-function gHit(mx,my){const x2=(mx-pan.x)/scale,y2=(my-pan.y)/scale;
- for(let i=gItems.length-1;i>=0;i--){const it=gItems[i];if(x2>=it.x&&x2<=it.x+it.w&&y2>=it.y&&y2<=it.y+it.h)return it}return null}
-function gDown(e){const r=cvs.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
- if(e.button===1||e.shiftKey){panStart={mx,my,px:pan.x,py:pan.y};return}
- const it=gHit(mx,my);
- if(it){drag={item:it,ox:it.x-(mx-pan.x)/scale,oy:it.y-(my-pan.y)/scale}}
- else{panStart={mx,my,px:pan.x,py:pan.y}}}
-function gMove(e){const r=cvs.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
- if(panStart){pan.x=panStart.px+(mx-panStart.mx);pan.y=panStart.py+(my-panStart.my);gDraw();return}
- if(drag){drag.item.x=drag.ox+(mx-pan.x)/scale;drag.item.y=drag.oy+(my-pan.y)/scale;gDraw()}}
-function gUp(){drag=null;panStart=null}
-function gWheel(e){e.preventDefault();const d=e.deltaY>0?0.92:1.08;const ns=Math.max(0.15,Math.min(4,scale*d));
- const r=cvs.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
- pan.x=mx-(mx-pan.x)*(ns/scale);pan.y=my-(my-pan.y)*(ns/scale);scale=ns;gDraw()}
-
-function gDraw(){
- if(!cx)return;const W=cvs.width,H=cvs.height;
- cx.clearRect(0,0,W,H);
- cx.fillStyle=P.bg;cx.fillRect(0,0,W,H);
- cx.save();cx.translate(pan.x,pan.y);cx.scale(scale,scale);
-
- // ── Edges ──
- gEdges.forEach(e=>{
-  const fcx=e.from.x+e.from.w/2,fcy=e.from.y+e.from.h/2;
-  const tcx2=e.to.x+e.to.w/2,tcy2=e.to.y+e.to.h/2;
-  const ddx=tcx2-fcx,ddy=tcy2-fcy,len=Math.sqrt(ddx*ddx+ddy*ddy)||1;
-  const mx2=(fcx+tcx2)/2,my2=(fcy+tcy2)/2;
-  const off=len*0.08;
-  const cpx=mx2-ddy/len*off,cpy=my2+ddx/len*off;
-  cx.beginPath();cx.moveTo(fcx,fcy);cx.quadraticCurveTo(cpx,cpy,tcx2,tcy2);
-  if(e.type==='tool'){
-   cx.strokeStyle='rgba(160,216,160,.35)';cx.lineWidth=1;cx.setLineDash([]);
-  }else{
-   cx.strokeStyle=e.type==='ho'?P.hoColor:P.onColor;cx.lineWidth=1.5;
-   if(e.type==='ho'){cx.setLineDash([6,3])}else{cx.setLineDash([])}
-  }
-  cx.stroke();cx.setLineDash([]);
-  const ax=(tcx2-cpx),ay=(tcy2-cpy),al=Math.sqrt(ax*ax+ay*ay)||1;
-  const ux=ax/al,uy=ay/al;
-  cx.fillStyle=cx.strokeStyle;
-  cx.beginPath();cx.moveTo(tcx2,tcy2);
-  cx.lineTo(tcx2-ux*7+uy*4,tcy2-uy*7-ux*4);
-  cx.lineTo(tcx2-ux*7-uy*4,tcy2-uy*7+ux*4);cx.fill();
-  if(e.label){
-   cx.font='500 9px Inter';
-   const tw=cx.measureText(e.label).width;
-   cx.fillStyle=P.bg;rr(mx2-tw/2-4,my2-7,tw+8,14,3);cx.fill();
-   cx.fillStyle=e.type==='ho'?'rgba(187,154,247,.7)':'rgba(122,162,247,.7)';
-   cx.fillText(e.label,mx2-tw/2,my2+4);
-  }
- });
-
- // ── Tool nodes ──
- gItems.filter(it=>it.kind==='tool').forEach(t=>{
-  cx.fillStyle=P.toolFill;rr(t.x,t.y,t.w,t.h,5);cx.fill();
-  cx.strokeStyle=P.toolBd;cx.lineWidth=0.8;rr(t.x,t.y,t.w,t.h,5);cx.stroke();
-  cx.font='400 9px Inter';cx.fillStyle=P.toolTx;
-  cx.fillText('⚙ '+t.label,t.x+7,t.y+t.h/2+3,t.w-14);
- });
-
- // ── AI nodes ──
- gItems.filter(it=>it.kind==='ai').forEach(n=>{
-  const d=n.data;
-  cx.fillStyle='rgba(0,0,0,.2)';rr(n.x+2,n.y+2,n.w,n.h,8);cx.fill();
-  cx.fillStyle=P.aiFill;rr(n.x,n.y,n.w,n.h,8);cx.fill();
-  cx.strokeStyle=d.isEntry?P.entryAccent:P.aiBd;cx.lineWidth=d.isEntry?2:1;
-  rr(n.x,n.y,n.w,n.h,8);cx.stroke();
-  if(d.isEntry){cx.fillStyle=P.entryAccent;rr(n.x,n.y+6,3,n.h-12,1.5);cx.fill()}
-  cx.font='600 11px Inter';cx.fillStyle=d.isEntry?P.entryAccent:P.aiTx;
-  cx.fillText((d.isEntry?'▶ ':'')+d.label,n.x+10,n.y+18);
-  cx.font='400 8px "JetBrains Mono"';cx.fillStyle=P.dim;
-  cx.fillText(d.fullId,n.x+10,n.y+30);
-  cx.font='500 8px Inter';
-  const om=d.outMode,omColor=om==='reply'?P.entryAccent:P.dim;
-  const omW=cx.measureText(om).width+8;
-  cx.fillStyle=omColor;cx.globalAlpha=0.15;rr(n.x+n.w-omW-6,n.y+n.h-18,omW,14,3);cx.fill();
-  cx.globalAlpha=1;cx.fillStyle=omColor;cx.fillText(om,n.x+n.w-omW-2,n.y+n.h-8);
-  if(d.terms.length){
-   cx.font='400 7px Inter';
-   d.terms.forEach((tm,i)=>{
-    const tx2=n.x+8,ty2=n.y+n.h-6-((d.terms.length-1-i)*10);
-    const col=tm.target==='$reply'?P.replyColor:P.endColor;
-    cx.fillStyle=col;cx.globalAlpha=0.6;
-    cx.fillText(tm.name+' → '+tm.target,tx2,ty2);
-    cx.globalAlpha=1;
-   });
-  }
- });
-
- cx.restore();
- cx.font='10px Inter';cx.fillStyle='#444466';
- cx.fillText('━ on   ╌ handoff   ⚙ 工具   拖动=移动  Shift/中键=平移  滚轮=缩放',10,H-8);
-}
-
-async function graphSave(){
- toast('请通过 YAML 编辑工作流',false);
-}
-
-
-
-
-// ── Prompts ──
-const packs=ref([]);
-async function loadP(){try{packs.value=await api('/v1/admin/config/prompt-packs')}catch(e){}}
-async function pMani(id){const d=await api(`/v1/admin/config/prompt-packs/${id}/manifest/raw`);ed.value={type:'mani',pid:id,content:d.content}}
-async function pFList(id){const f=await api(`/v1/admin/config/prompt-packs/${id}/fragments`);ed.value={type:'flist',pid:id,fs:f}}
-async function pFEd(pid,fp){const d=await api(`/v1/admin/config/prompt-packs/${pid}/fragments/${fp}/raw`);ed.value={type:'frag',pid,fp,content:d.content,isNew:false}}
-function pFNew(pid){ed.value={type:'frag',pid,fp:'',content:'',isNew:true}}
-function pBack(){if(ed.value?.type==='frag')pFList(ed.value.pid);else ed.value=null}
-function pTitle(){const e=ed.value;if(e.type==='mani')return e.pid+' / manifest.yaml';if(e.type==='frag')return e.isNew?'新建片段':e.fp;return ''}
-async function pSave(){const e=ed.value;if(e.type==='mani'){await api(`/v1/admin/config/prompt-packs/${e.pid}/manifest/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:e.content})});toast('已保存');ed.value=null;loadP()}
- else if(e.type==='frag'){if(!e.fp)return toast('路径不能为空',false);await api(`/v1/admin/config/prompt-packs/${e.pid}/fragments/${e.fp}/raw`,{method:e.isNew?'POST':'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:e.content})});toast('已保存');pFList(e.pid)}}
-async function pFDel(pid,fp){if(!confirm('确定删除 '+fp+'？'))return;await api(`/v1/admin/config/prompt-packs/${pid}/fragments/${fp}`,{method:'DELETE'});toast('已删除');pFList(pid)}
-
-// ── Config ──
-const cfgTabs=[{k:'routing',a:'model-routing',l:'模型路由'},{k:'runtime',a:'runtime',l:'运行时'},{k:'policy',a:'policy',l:'安全策略'},{k:'schedules',a:'schedules',l:'定时调度'}];
-const csub=ref('');const cfgLbl=computed(()=>(cfgTabs.find(c=>c.k===csub.value)||{}).l||'');
-async function cfgLd(a,k){csub.value=k;const d=await api(`/v1/admin/config/${a}/raw`);ed.value={type:'cfg',a,content:d.content}}
-async function cfgSv(){await api(`/v1/admin/config/${ed.value.a}/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ed.value.content})});toast('已保存')}
-
-async function restart(){if(!confirm('确定重启引擎？'))return;await api('/v1/admin/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:'engine',reason:'Admin UI'})});toast('重启已下发');setTimeout(loadD,2000)}
-
-onMounted(()=>{const s=localStorage.getItem('ctk');if(s){ltk.value=s;login()}})
-
-return{authed,ltk,lerr,login,logout,tshow,tmsg,ttyp,tabs,tab,tabLabel,ed,go,health,adm,appCfg,loadD,fmtUp,nodes,loadN,nodeEd,nodeNew,nodeSave,nodeDel,wfs,loadW,wfEd,wfNew,wfSave,wfDel,graphOpen,graphSave,packs,loadP,pMani,pFList,pFEd,pFNew,pBack,pTitle,pSave,pFDel,cfgTabs,csub,cfgLbl,cfgLd,cfgSv,restart}
-}}).mount('#app');
-</script>
+<script src="js/app.js"></script>
 </body>
 </html>

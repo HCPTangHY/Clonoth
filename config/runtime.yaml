@@ -45,6 +45,9 @@ tools:
   command:
     default_timeout_sec: 60.0
 
+skills:
+  max_budget_chars: 0       # 0 = no limit; max total chars of skill body to inject
+
 shell:
   default_conversation_key: "cli:default"
   workflow_id: "bootstrap.default_chat"

@@ -77,6 +77,7 @@ class SupervisorState:
         self._inbound_leases: dict[int, _InboundLease] = {}
 
         self._cancelled_sessions: set[str] = set()
+        self._tools_reload_seq: int = 0
 
         self.rebuild_from_events(eventlog.events)
 
@@ -198,7 +199,8 @@ class SupervisorState:
 
     def _create_entry_task_for_inbound_locked(self, *, inbound_seq: int, session_id: str, payload: dict[str, Any]) -> Task | None:
         text = str(payload.get("text") or "").strip()
-        if not text:
+        has_attachments = isinstance(payload.get("attachments"), list) and bool(payload.get("attachments"))
+        if not text and not has_attachments:
             return None
         workflow_id = str(payload.get("workflow_id") or "").strip() or self._default_workflow_id()
         entry_node = self._entry_node_for_workflow(workflow_id)
@@ -208,6 +210,7 @@ class SupervisorState:
         self._cancelled_sessions.discard(session_id)
         # 收集当前活跃 task 摘要，注入给入口节点 AI 判断
         active_tasks_summary = self._active_tasks_summary_locked(session_id)
+        attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else None
         return self._create_task_locked(
             session_id=session_id,
             session_generation=generation,
@@ -220,6 +223,7 @@ class SupervisorState:
                 "resume_data": {},
                 "workflow_id": workflow_id,
                 "active_tasks_summary": active_tasks_summary,
+                "attachments": attachments or [],
             },
             continuation={"resume_stack": []},
             source_inbound_seq=inbound_seq,
@@ -319,6 +323,17 @@ class SupervisorState:
     def engine_seen_snapshot(self) -> tuple[datetime | None, str | None]:
         with self._lock:
             return self._engine_last_seen_at, self._engine_last_worker_id
+
+    # ---- 工具热重载信号 ----
+
+    def bump_tools_reload(self) -> int:
+        with self._lock:
+            self._tools_reload_seq += 1
+            return self._tools_reload_seq
+
+    def tools_reload_seq(self) -> int:
+        with self._lock:
+            return self._tools_reload_seq
 
     # ---- 事件回放 ----
 
@@ -723,12 +738,14 @@ class SupervisorState:
         text = str(result.get("text") or "").strip()
         summary = str(result.get("summary") or "").strip()
         resume_stack = list(task.continuation.get("resume_stack") or [])
+        result_attachments = result.get("attachments") if isinstance(result.get("attachments"), list) else None
 
         if outcome == "reply":
-            if text:
+            if text or result_attachments:
                 self.append_outbound_message(
                     session_id=task.session_id,
                     text=text,
+                    attachments=result_attachments,
                     source_inbound_seq=task.source_inbound_seq,
                 )
             return
@@ -780,16 +797,18 @@ class SupervisorState:
                     "child_outcome": outcome,
                     "summary": summary,
                     "text": text,
+                    "attachments": result_attachments or [],
                 },
                 parent_task_id=task.task_id,
             )
             return
 
         if target == "$reply":
-            if text or summary:
+            if text or summary or result_attachments:
                 self.append_outbound_message(
                     session_id=task.session_id,
                     text=text or summary,
+                    attachments=result_attachments,
                     source_inbound_seq=task.source_inbound_seq,
                 )
             return
@@ -809,13 +828,15 @@ class SupervisorState:
                         "child_outcome": outcome,
                         "summary": summary,
                         "text": text,
+                        "attachments": result_attachments or [],
                     },
                     parent_task_id=task.task_id,
                 )
-            elif text or summary:
+            elif text or summary or result_attachments:
                 self.append_outbound_message(
                     session_id=task.session_id,
                     text=text or summary,
+                    attachments=result_attachments,
                     source_inbound_seq=task.source_inbound_seq,
                 )
             return
@@ -873,6 +894,7 @@ class SupervisorState:
                 "truncated": bool(t.result.get("truncated", False)),
                 "ref": str(t.result.get("ref") or ""),
                 "summary": str(t.result.get("summary") or ""),
+                "attachments": list(t.result.get("attachments") or []) if isinstance(t.result.get("attachments"), list) else [],
             })
 
         resume_context_ref = str(task.continuation.get("resume_context_ref") or "").strip()
@@ -934,11 +956,12 @@ class SupervisorState:
         *,
         session_id: str,
         text: str,
+        attachments: list[dict[str, Any]] | None = None,
         source_inbound_seq: int | None = None,
     ) -> dict[str, Any]:
         text_clean = str(text or "").strip()
-        if not text_clean:
-            raise ValueError("empty text")
+        if not text_clean and not attachments:
+            raise ValueError("empty text and no attachments")
 
         src_seq: int | None = None
         if source_inbound_seq is not None:
@@ -965,6 +988,8 @@ class SupervisorState:
                     return {"ok": True, "deduped": True, "route": existing}
 
             payload: dict[str, Any] = {"text": text_clean}
+            if attachments:
+                payload["attachments"] = list(attachments)
             if src_seq is not None:
                 payload["source_inbound_seq"] = src_seq
 
@@ -1051,19 +1076,41 @@ class SupervisorState:
 
     def session_messages(self, *, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
         msgs: list[dict[str, Any]] = []
+        tool_records: list[str] = []
         for e in self.eventlog.events:
             if e.get("session_id") != session_id:
                 continue
             et = e.get("type")
             payload = e.get("payload") or {}
             if et == "inbound_message":
+                tool_records.clear()
                 text = payload.get("text")
                 if isinstance(text, str):
-                    msgs.append({"role": "user", "content": text})
+                    inbound_atts = payload.get("attachments")
+                    if isinstance(inbound_atts, list) and inbound_atts:
+                        from engine.attachments import build_multimodal_content
+                        msgs.append({"role": "user", "content": build_multimodal_content(text, inbound_atts)})
+                    else:
+                        msgs.append({"role": "user", "content": text})
+            elif et == "handoff_progress":
+                prog_msg = str(payload.get("message") or "")
+                if prog_msg and "[tool]" in prog_msg:
+                    tool_records.append(prog_msg)
             elif et == "outbound_message":
                 text = payload.get("text")
-                if isinstance(text, str):
-                    msgs.append({"role": "assistant", "content": text})
+                outbound_atts = payload.get("attachments")
+                if isinstance(text, str) or (isinstance(outbound_atts, list) and outbound_atts):
+                    text_str = str(text or "")
+                    if tool_records:
+                        prefix = "[实际执行的工具: " + "; ".join(tool_records) + "]\n"
+                    else:
+                        prefix = "[未调用任何工具，直接生成文本]\n"
+                    if isinstance(outbound_atts, list) and outbound_atts:
+                        from engine.attachments import build_multimodal_content
+                        msgs.append({"role": "assistant", "content": build_multimodal_content(prefix + text_str, outbound_atts)})
+                    else:
+                        msgs.append({"role": "assistant", "content": prefix + text_str})
+                    tool_records.clear()
         if limit > 0:
             msgs = msgs[-limit:]
         return msgs

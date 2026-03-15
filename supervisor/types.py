@@ -62,6 +62,7 @@ class InboundMessageOut(BaseModel):
 class OutboundMessageIn(BaseModel):
     text: str
     source_inbound_seq: int | None = None
+    attachments: list[dict[str, Any]] | None = None
 
 
 class OutboundMessageOut(BaseModel):

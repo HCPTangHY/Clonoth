@@ -73,6 +73,11 @@ def format_tool_trace(entries: list[dict[str, Any]]) -> str:
         else:
             lines.append("TOOL_RESULT_RAW: <empty>")
         lines.append(f"TOOL_RESULT_SUMMARY: {e.get('summary', '')}")
+        atts = e.get("attachments")
+        if isinstance(atts, list) and atts:
+            att_paths = [str(a.get('path', '')) for a in atts if isinstance(a, dict) and a.get('path')]
+            if att_paths:
+                lines.append(f"TOOL_RESULT_ATTACHMENTS: {', '.join(att_paths)}")
         lines.append("-")
     lines.append("[/CLONOTH_TOOL_TRACE]")
     return "\n".join(lines)

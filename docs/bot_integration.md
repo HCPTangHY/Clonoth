@@ -175,7 +175,75 @@ POST /v1/approvals/{approval_id}
 
 ---
 
-## 8. 安全与部署
+## 8. 定时任务转发
+
+Clonoth 内置了一个轻量定时调度器（`supervisor/scheduler.py`）。它每分钟扫描 `data/schedules.yaml`，匹配到 cron 时间后向 Supervisor 注入 inbound 消息，触发 Agent 工作流执行。
+  
+调度器注入的消息使用 `channel="scheduler"`，与外部 Bot 的 session 完全隔离。Bot 不会自动收到这些消息的回复。如果需要把定时任务的输出转发到聊天平台，Adapter 需要自行实现一个后台监听。
+
+### 8.1 原理
+
+```
+schedules.yaml (cron 触发)
+        ↓
+Scheduler → 注入 inbound (channel="scheduler", conversation_key="discord:频道ID")
+        ↓
+Engine 处理 → 产生 outbound_message 事件
+        ↓
+Adapter 后台轮询 GET /v1/events → 发现 outbound_message
+        ↓
+通过 session_id 查找对应的 conversation_key
+        ↓
+解析 conversation_key 前缀和频道 ID → 发送消息
+```
+
+不需要修改 Supervisor 或 Engine 的任何代码。
+
+### 8.2 schedules.yaml 配置
+
+定时任务的目标频道通过 `conversation_key` 来表达。`conversation_key` 是 Supervisor 已有的标准字段，用于标识外部会话。按照本文档 1.1 节的约定，Discord 的格式为 `discord:{channel_id}`，Telegram 的格式为 `telegram:{chat_id}`。
+
+Adapter 从事件流中读取 `conversation_key`，解析前缀判断平台、解析后缀获取目标频道 ID，不需要额外的自定义字段，也不需要读取 `schedules.yaml` 文件。
+
+```yaml
+schedules:
+  - id: daily_greeting
+    cron: "0 9 * * *"
+    enabled: true
+    text: "早上好，请汇报今天的工作计划。"
+    conversation_key: "discord:1234567890123456789"  # 直接指定目标频道
+```
+
+如果同一个 `conversation_key` 也被用户会话使用，定时任务和用户对话会共享同一个 session，上下文可以延续。如需隔离，可以使用不同的 conversation_key（如 `discord:1234567890123456789:scheduled`）。
+
+cron 为标准 5 字段格式：`分 时 日 月 星期`（星期 0=Monday）。支持 `*`、`*/step`、范围、逗号分隔。
+
+`once: true` 可用于一次性任务，触发后自动从配置中删除。
+
+### 8.3 Adapter 实现要点
+
+1. **启动时跳过历史事件。** 先调用 `GET /v1/events?after_seq=0` 获取当前最大 seq，从该值开始监听。
+
+2. **轮询全局事件流。** 使用 `GET /v1/events?after_seq={seq}&types=inbound_message,outbound_message` 拉取新事件。建议每 3 秒一次。使用 `types` 过滤可以减少无关事件的传输。
+
+3. **建立 session → conversation_key 映射。** 当事件类型为 `inbound_message` 且 `payload.channel == "scheduler"` 时，从 `payload.conversation_key` 和 `event.session_id` 建立映射关系。
+
+4. **捕获 outbound_message。** 当事件类型为 `outbound_message` 且 `session_id` 在映射表中时，读取 `payload.text`，根据映射的 `conversation_key` 解析目标频道，发送消息。
+
+5. **解析 conversation_key 获取目标频道。** 按前缀判断平台，按后缀提取频道 ID：
+   - `discord:{channel_id}` → 发到 Discord 对应频道
+   - `telegram:{chat_id}` → 发到 Telegram 对应会话
+   - 其他前缀 → 忽略或按自定义规则处理
+
+### 8.4 注意事项
+
+- 全局事件流包含所有 session 的事件。Adapter 应只处理 scheduler channel 相关的 outbound，不要重复处理用户主动发起的会话的 outbound。
+- `session_id → conversation_key` 映射是内存缓存。Adapter 重启后映射丢失，但不影响后续新触发的定时任务。已丢失映射的 outbound 会被忽略。
+- `schedules.yaml` 可以在运行时修改，Scheduler 每分钟重新加载。
+
+---
+
+## 9. 安全与部署
 
 1. 不要把 Supervisor 直接暴露到公网。`/v1/config/openai/secret` 会返回 api_key。
 2. Adapter 尽量与 Supervisor 同机部署。

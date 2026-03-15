@@ -24,6 +24,7 @@ from clonoth_runtime import (
 
 from .context import ToolContext
 from . import mcp_runtime
+from .skills_runtime import parse_skill_frontmatter
 
 
 _SENSITIVE_ENV_KEYS_UPPER = {
@@ -59,17 +60,6 @@ _RESERVED_TOOL_NAMES = {
     "list_schedules",
     "delete_schedule",
 }
-
-
-def _parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-    if not text.startswith("---\n"):
-        return {}, text
-    end = text.find("\n---\n", 4)
-    if end < 0:
-        return {}, text
-    head = text[4:end]
-    body = text[end + 5 :]
-    return (yaml.safe_load(head) or {}), body
 
 
 def _safe_subprocess_env() -> dict[str, str]:
@@ -477,6 +467,31 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     content = args.get("content")
     enabled = bool(args.get("enabled", True))
 
+    strategy = str(args.get("strategy", "")).strip().lower() or None
+    raw_keywords = args.get("keywords")
+    keywords: list[str] | None = None
+    if isinstance(raw_keywords, list):
+        keywords = [str(k).strip() for k in raw_keywords if isinstance(k, str) and str(k).strip()]
+
+    order: int | None = None
+    if args.get("order") is not None:
+        try:
+            order = int(args["order"])
+        except (TypeError, ValueError):
+            pass
+    priority: int | None = None
+    if args.get("priority") is not None:
+        try:
+            priority = int(args["priority"])
+        except (TypeError, ValueError):
+            pass
+    scan_depth: int | None = None
+    if args.get("scan_depth") is not None:
+        try:
+            scan_depth = max(0, int(args["scan_depth"]))
+        except (TypeError, ValueError):
+            pass
+
     if not name:
         return {"ok": False, "error": "empty skill name"}
     if not _SKILL_NAME_RE.fullmatch(name):
@@ -489,10 +504,20 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
             "description": description,
             "enabled": enabled,
         }
+        if strategy:
+            meta["strategy"] = strategy
+        if keywords is not None:
+            meta["keywords"] = keywords
+        if order is not None:
+            meta["order"] = order
+        if priority is not None:
+            meta["priority"] = priority
+        if scan_depth is not None:
+            meta["scan_depth"] = scan_depth
         body = description or f"Skill {name}"
         content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + body.strip() + "\n"
     else:
-        meta, body = _parse_skill_frontmatter(content)
+        meta, body = parse_skill_frontmatter(content)
         if not isinstance(meta, dict):
             meta = {}
         meta["name"] = name
@@ -501,6 +526,16 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         elif not isinstance(meta.get("description"), str):
             meta["description"] = ""
         meta["enabled"] = enabled
+        if strategy:
+            meta["strategy"] = strategy
+        if keywords is not None:
+            meta["keywords"] = keywords
+        if order is not None:
+            meta["order"] = order
+        if priority is not None:
+            meta["priority"] = priority
+        if scan_depth is not None:
+            meta["scan_depth"] = scan_depth
         content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + str(body or "").strip() + "\n"
 
     res = await write_file({"path": path, "content": content}, ctx)
@@ -519,14 +554,35 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         try:
             rel = skill_md.relative_to(ctx.workspace_root).as_posix()
             text = skill_md.read_text(encoding="utf-8")
-            meta, _body = _parse_skill_frontmatter(text)
+            meta, _body = parse_skill_frontmatter(text)
             if not isinstance(meta, dict):
                 meta = {}
+            strategy = str(meta.get("strategy") or "normal").strip().lower()
+            if strategy not in ("constant", "normal"):
+                strategy = "normal"
+            raw_kw = meta.get("keywords")
+            kw_list: list[str] = []
+            if isinstance(raw_kw, list):
+                kw_list = [str(k).strip() for k in raw_kw if isinstance(k, str) and str(k).strip()]
+            item_order = 0
+            if isinstance(meta.get("order"), (int, float)):
+                item_order = int(meta["order"])
+            item_priority = 0
+            if isinstance(meta.get("priority"), (int, float)):
+                item_priority = int(meta["priority"])
+            item_scan_depth = 0
+            if isinstance(meta.get("scan_depth"), (int, float)):
+                item_scan_depth = max(0, int(meta["scan_depth"]))
             items.append(
                 {
                     "name": str(meta.get("name") or skill_md.parent.name),
                     "description": str(meta.get("description") or ""),
                     "enabled": bool(meta.get("enabled", True)),
+                    "strategy": strategy,
+                    "keywords": kw_list,
+                    "order": item_order,
+                    "priority": item_priority,
+                    "scan_depth": item_scan_depth,
                     "path": rel,
                 }
             )

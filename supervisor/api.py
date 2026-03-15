@@ -174,6 +174,17 @@ def create_app(
         st: SupervisorState = app.state.state
         return {"cancelled": st.is_task_cancelled(task_id)}
 
+    @app.get("/v1/tools/reload-seq")
+    async def tools_reload_seq() -> dict[str, Any]:
+        st: SupervisorState = app.state.state
+        return {"seq": st.tools_reload_seq()}
+
+    @app.post("/v1/tools/reload")
+    async def tools_reload_trigger() -> dict[str, Any]:
+        st: SupervisorState = app.state.state
+        seq = st.bump_tools_reload()
+        return {"ok": True, "seq": seq}
+
     @app.post("/v1/sessions/{session_id}/outbound", response_model=OutboundMessageOut)
     async def session_outbound(session_id: str, body: OutboundMessageIn) -> OutboundMessageOut:
         st: SupervisorState = app.state.state
@@ -181,6 +192,7 @@ def create_app(
             st.append_outbound_message(
                 session_id=session_id,
                 text=str(body.text or ""),
+                attachments=body.attachments,
                 source_inbound_seq=body.source_inbound_seq,
             )
         except KeyError:

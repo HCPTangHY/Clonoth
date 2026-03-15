@@ -1,0 +1,13 @@
+/* ═══ Login ═══ */
+.lmask{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:99999;background:var(--bg0)}
+.lmask::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 50% 35%,rgba(122,162,247,.07),transparent 55%),radial-gradient(circle at 75% 75%,rgba(187,154,247,.05),transparent 45%)}
+.lbox{position:relative;width:360px;padding:44px 40px;background:var(--bg2);border:1px solid var(--bd);border-radius:14px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.lbox::before{content:'';position:absolute;top:-1px;left:50%;transform:translateX(-50%);width:100px;height:2px;background:linear-gradient(90deg,transparent,var(--blue),transparent)}
+.lbox h2{font-size:1.25rem;font-weight:700;margin-bottom:4px}.lbox h2 em{font-style:normal;color:var(--blue)}
+.lbox .ls{color:var(--sub);font-size:.8rem;margin-bottom:26px}
+.lbox input{width:100%;padding:11px 14px;background:var(--bg1);border:1px solid var(--bd);color:var(--tx);border-radius:8px;font-size:.88rem;text-align:center;letter-spacing:2px;margin-bottom:14px;transition:border .2s;font-family:inherit}
+.lbox input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(122,162,247,.08)}
+.lbox .le{color:var(--red);font-size:.78rem;margin-bottom:10px}
+.lbtn{width:100%;padding:11px;background:linear-gradient(135deg,var(--blue),var(--pur));color:#fff;border:none;border-radius:8px;font-size:.88rem;font-weight:600;cursor:pointer;transition:opacity .15s;font-family:inherit}
+.lbtn:hover{opacity:.85}
+.lbox .lh{margin-top:18px;font-size:.68rem;color:var(--dim);line-height:1.5}
