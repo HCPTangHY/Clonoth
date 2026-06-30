@@ -1,0 +1,127 @@
+# Clonoth runtime tuning config
+#
+# - 本文件可以提交到仓库。
+# - 敏感信息应放在环境变量或 data/config.yaml 中。
+
+version: 1
+
+engine:
+  max_steps: 64
+  streaming: true
+  history_limit: 80
+  poll_interval_sec: 1.0
+  max_workers: 4               # 并发 task 处理数（默认 4）
+
+  compact:
+    threshold_tokens: 256000   # prompt token 数超过此值时触发自动压缩（优先用 LLM 返回的真实值，无则按字符估算）
+    keep_recent: 6             # 压缩时保留最近的消息条数
+
+  # Child Session 隔离：dispatch 子节点使用独立 session，替代 node_contexts snapshot 机制
+  child_session:
+    ttl_hours: 24              # child session 不活跃超过此时间后过期
+    max_per_parent: 50         # 单个父 session 最多关联的子 session 数
+    # Step 2（2026-04-16）：主节点是否也走 ConversationStore，替代 node_contexts snapshot。
+    # true  = 主节点入口 task 不再注入 context_ref，history 从 data/conversations/{session_id}.jsonl 加载，
+    #        _persist_ctx 不写 snapshot，compact 直接操作 ConversationStore。
+    # false = 回退到旧 snapshot 机制（_find_last_context_ref_locked + load_context_snapshot + _persist_node_context）。
+    # 灰度切换开关；如出现回归，将此值改为 false 即可回退。
+    main_session_enabled: true
+
+  retry:
+    max_retries: 3             # LLM 调用失败时最大重试次数（0 = 不重试）
+    initial_delay_sec: 1.0     # 首次重试等待秒数
+    max_delay_sec: 30.0        # 退避等待上限秒数
+    backoff_multiplier: 2.0    # 指数退避倍数
+    # 可重试的 HTTP 状态码：429(限流) 500 502 503 504(服务端错误)
+
+  approval_poll_interval_sec: 0.5
+
+  http:
+    client_timeout_sec: 60.0
+
+  supervisor:
+    health_timeout_sec: 2.0
+    wait_poll_interval_sec: 0.5
+
+  tool_trace:
+    artifact_enabled: true
+    max_inline_chars:
+      default: 32000
+      read_file: 80000
+      grep: 50000
+      list_dir: 50000
+      execute_command: 24000
+      media: 8000
+    max_inline_chars_per_step: 120000
+    head_tail_tools:
+      - execute_command
+    tail_ratio: 0.25
+    max_progress_arg_chars: 320
+
+  # Phase 0/1 Signal System：轻量级进程内信号总线配置。
+  # bus 在 _run_node_task 中初始化，bridge 将信号写入 data/signals.jsonl。
+  signals:
+    enabled: true                # false 时 emit 零开销跳过
+    bridge_patterns: null        # null = 全部桥接；或指定 glob 列表如 ["llm.*", "tool.*"]
+
+  model: ""
+
+  tool_mode: json                   # 全局默认工具模式，节点 yaml 可覆盖 (native | json | fake_native)
+
+providers:
+  openai:
+    timeout_sec: 600.0
+
+meta:
+  execute_command:
+    default_timeout_sec: 90.0
+    max_output_chars: 12000
+    # [AutoC 2026-06-27] Why: shell commands that exceed the model-wait budget
+    # should continue under execute_command's own timeout instead of blocking the
+    # inference loop. How: ai_step waits up to threshold_sec, capped at 80% of the
+    # requested timeout_sec, then upgrades only execute_command to async delivery.
+    # Purpose: long commands report back through async_tool_result without changing
+    # the model-facing tool call shape.
+    async_upgrade:
+      enabled: true
+      threshold_sec: 60
+
+  git:
+    diff_max_chars: 600000
+
+  search:
+    max_file_size_bytes: 3000000
+    max_matches: 100
+
+tools:
+  command:
+    default_timeout_sec: 60.0
+
+skills:
+  max_budget_chars: 0       # 0 = no limit; max total chars of skill body to inject
+
+memory:
+  max_budget_chars: 0       # 0 = no limit; max total chars of memory content to inject
+
+  auto_extract:
+    enabled: true             # true = 入口节点 finish 后由 supervisor 创建记忆提取后置任务
+    node_id: "system.memory_extractor"  # 记忆提取节点 id
+    min_messages: 4           # 会话中非 system 消息少于此数时跳过
+    min_increment: 6          # 自上次提取后新增消息数达到此值才再次触发
+    idle_fallback_delay_sec: 60  # 新增消息未达到 min_increment 时，空闲此秒数后仍触发提取
+
+  dream:
+    enabled: true             # true = 启用定期记忆整理（dream）
+    cron: "0 19 * * *"         # 触发时间，北京时间凌晨 3 点（UTC 19:00）
+    node_id: "system.dream"   # 记忆整理节点 id
+    min_sessions: 0           # 距上次 dream 后至少有 N 个不同 session 活动过才触发（0 = 不检查）
+    conversation_key: "system:dream"  # dream 会话标识
+
+shell:
+  # 历史命名空间：仅保留默认入口节点配置。内置 CLI/TUI shell 已移除。
+  entry_node_id: ""
+
+supervisor:
+  process_manager:
+    stop_wait_timeout_sec: 5.0
+    engine_workers: 2

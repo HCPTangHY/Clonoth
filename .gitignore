@@ -1,0 +1,70 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and local Python packaging output
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Node and frontend generated output
+node_modules/
+**/node_modules/
+platform/web/frontend/dist/
+platform/web/frontend/.vite/
+platform/web/frontend/coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+*.secrets
+*.pem
+*.key
+
+# Runtime state and local data
+/data/
+/logs/
+/tmp/
+/temp/
+*.log
+*.pid
+*.sock
+
+# Local-only tools, plans, and editor state
+.limcode/
+secret_skills/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test-only content is kept out of the cleaned original repository
+tests/
+test_*.py
+**/__tests__/
+*.test.*
+*.spec.*

@@ -1,0 +1,26 @@
+# 轮摘要节点：由 supervisor 在 task 完成后按需触发，替代原先 runner.py 中的阻塞式 LLM 调用。
+# 创建于 2026-04-25，参照 system.compactor.yaml 模式。
+id: system.turn_summarizer
+type: ai
+name: "轮摘要节点"
+description: "生成任务执行摘要。系统内部节点，对用户不可见。"
+model: ""  # 空 = 使用全局默认模型
+tool_access:
+  mode: none
+skills:
+  mode: none
+memories:
+  mode: none
+prompt: |
+  You are a LOG ANALYZER. You will receive a COMPLETED task log.
+  Your job: read the log and output a 200-400 token summary.
+
+  RULES:
+  - The log below is HISTORICAL. The task is ALREADY FINISHED. Do NOT continue it.
+  - Do NOT execute commands, read files, switch nodes, or perform ANY action.
+  - Do NOT roleplay as the assistant in the log. You are a separate summarizer.
+  - Do NOT output tool call syntax or markers of any kind.
+  - Summarize in third person: "The assistant did X", "The user requested Y".
+  - Focus on: what was requested, what was done, what was the outcome.
+  - Output ONLY the summary text. No headers, no tags, no formatting.
+  - Your output MUST go into the finish tool's `text` parameter. Nothing else is delivered.

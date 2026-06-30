@@ -1,0 +1,177 @@
+/* This stylesheet is added to hold Tailwind CSS v4 and the Duties cream theme variables in one place.
+   It changes the Vite template defaults into a square, minimal chat shell with cream panels and dark text.
+   The purpose is to keep visual tokens reusable while allowing components to use Tailwind utility classes. */
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+@import 'tailwindcss';
+
+:root {
+  --duties-bg: #f1f0ee;
+  --duties-panel: #e8e7e5;
+  /* [2026-06-03] Add a surface token for floating child-node panels.
+     Why: Phase 2 panel markup uses bg-[var(--duties-surface)] while the theme only
+     had page and panel tokens. How: alias the new token to the existing panel color.
+     Purpose: the panel receives an explicit background without changing the palette. */
+  --duties-surface: var(--duties-panel);
+  --duties-muted: #dddcda;
+  --duties-text: #252525;
+  --duties-secondary: #4a4a4a;
+  --duties-tertiary: #6e6e73;
+  --duties-border: #ccc;
+  --duties-accent: #feaf2c;
+  /* Why: browser default scrollbars are visually heavy against the minimal Duties shell.
+     How: expose scrollbar-specific tokens derived from the existing theme palette.
+     Purpose: let Firefox and WebKit/Blink share one low-contrast, maintainable scrollbar design. */
+  --duties-scrollbar-track: transparent;
+  --duties-scrollbar-thumb: var(--duties-border);
+  --duties-scrollbar-thumb-hover: var(--duties-secondary);
+  color: var(--duties-text);
+  background: var(--duties-bg);
+  font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  /* Why: any element can become scrollable through Tailwind overflow utilities across sidebars, message panes, and logs.
+     How: apply the standards-based Firefox scrollbar controls globally while keeping the track transparent.
+     Purpose: ensure all scrollable regions inherit the Duties theme without per-component classes. */
+  scrollbar-color: var(--duties-scrollbar-thumb) var(--duties-scrollbar-track);
+  scrollbar-width: thin;
+}
+
+/* Why: Chromium, Edge, and Safari still use WebKit scrollbar pseudo-elements instead of the Firefox properties above.
+   How: style the global pseudo-elements with a narrow transparent track and a muted rounded thumb.
+   Purpose: keep the same minimal scrollbar appearance in message lists, side rails, modals, code previews, and event logs. */
+*::-webkit-scrollbar {
+  width: 0.45rem;
+  height: 0.45rem;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--duties-scrollbar-track);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--duties-scrollbar-thumb);
+  border: 0.125rem solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--duties-scrollbar-thumb-hover);
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 0;
+  background: var(--duties-bg);
+}
+
+button,
+textarea {
+  border-radius: 0;
+}
+
+::selection {
+  background: var(--duties-accent);
+  color: var(--duties-text);
+}
+
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body table,
+.markdown-body pre {
+  margin: 0 0 0.9rem;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 1.25rem;
+}
+
+.markdown-body code {
+  background: var(--duties-panel);
+  border: 1px solid var(--duties-border);
+  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  padding: 0.08rem 0.25rem;
+}
+
+.markdown-body pre {
+  overflow-x: auto;
+  background: var(--duties-panel);
+  border: 1px solid var(--duties-border);
+  padding: 1rem;
+}
+
+.markdown-body pre code {
+  display: block;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.markdown-body pre code.diff-code-block {
+  min-width: max-content;
+  white-space: pre;
+}
+
+.markdown-body pre code.diff-code-block .diff-line {
+  display: block;
+  padding: 0 0.35rem;
+}
+
+.markdown-body pre code.diff-code-block .diff-line-add {
+  background: rgba(34, 197, 94, 0.12);
+  color: rgb(21, 128, 61);
+}
+
+.markdown-body pre code.diff-code-block .diff-line-delete {
+  background: rgba(239, 68, 68, 0.12);
+  color: rgb(185, 28, 28);
+}
+
+.markdown-body pre code.diff-code-block .diff-line-hunk {
+  background: rgba(59, 130, 246, 0.12);
+  color: rgb(29, 78, 216);
+}
+
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9em;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--duties-border);
+  padding: 0.45rem 0.55rem;
+  text-align: left;
+}
+
+.markdown-body a {
+  color: var(--duties-text);
+  text-decoration: underline;
+  text-decoration-color: var(--duties-accent);
+  text-underline-offset: 0.2rem;
+}
