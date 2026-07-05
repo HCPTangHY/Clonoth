@@ -934,7 +934,7 @@ async def _deliver_async_result(
                     elif isinstance(a, str):
                         attachments.append(a)
 
-        payload: dict = {"message": preempt_text}
+        payload: dict = {"message": preempt_text, "task_id": task_id}
         if attachments:
             payload["attachment_paths"] = attachments
 
@@ -955,7 +955,7 @@ async def _deliver_async_result(
         try:
             await http.post(
                 f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-                json={"message": f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'},
+                json={"message": f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}', "task_id": task_id},
             )
         except Exception:
             pass

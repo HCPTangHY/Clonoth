@@ -1407,11 +1407,12 @@ class TaskRouterMixin:
             return None
         return task
 
-    def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
+    def inject_async_result(self, session_id: str, text: str, attachments: list | None = None, source_task_id: str = "") -> dict[str, Any]:
         """注入异步工具结果到 session。
 
-        [AutoC 2026-07-05] 根据当前 session 状态选择策略：
-        - 无 branch 模式且有 running entry task → preempt 该 task
+        [AutoC 2026-07-05] 优先按 source_task_id 精确定位发起异步工具的 task：
+        - task_id 匹配且 running → preempt 该 task（无论 branch 还是主 session）
+        - 无 branch 模式下按 session 查找 running entry task → preempt
         - 否则 → 创建 inbound（走 branch fork）
         """
         with self._lock:
@@ -1421,12 +1422,21 @@ class TaskRouterMixin:
 
             result_atts = list(attachments or [])
 
-            # [AutoC 2026-07-05] 无 branch 模式下优先 preempt running task
-            branchless_task = self._is_branchless_running_task_locked(session_id)
-            if branchless_task is not None:
-                branchless_task.preempt_requested = True
-                branchless_task.preempt_message = text
-                branchless_task.preempt_attachments = [
+            # ---- 策略 1：按 task_id 精确查找（覆盖 branch 模式） ----
+            target_task: Task | None = None
+            if source_task_id:
+                t = self.tasks.get(source_task_id)
+                if t is not None and t.status == TaskStatus.running:
+                    target_task = t
+
+            # ---- 策略 2：无 branch 模式下按 session 查找 ----
+            if target_task is None:
+                target_task = self._is_branchless_running_task_locked(session_id)
+
+            if target_task is not None:
+                target_task.preempt_requested = True
+                target_task.preempt_message = text
+                target_task.preempt_attachments = [
                     {"path": p} for p in result_atts
                 ] if result_atts else []
                 self.eventlog.append(
@@ -1434,16 +1444,16 @@ class TaskRouterMixin:
                     component="supervisor",
                     type_="preempt_requested",
                     payload={
-                        "task_id": branchless_task.task_id,
+                        "task_id": target_task.task_id,
                         "session_id": session_id,
                         "has_message": bool(text),
                         "source": "async_tool_result",
                     },
                     transient=True,
                 )
-                return {"ok": True, "strategy": "preempt"}
+                return {"ok": True, "strategy": "preempt", "task_id": target_task.task_id}
 
-            # ---- branch 模式或无 running task：创建 inbound ----
+            # ---- 策略 3：创建 inbound（branch 模式且原 task 已结束） ----
             conv_key = session_info.conversation_key
             channel = session_info.channel
             msg_id = f"async_tool_result:{session_id}"

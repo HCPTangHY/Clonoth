@@ -559,10 +559,11 @@ def create_app(
             pass
         msg = body.get("message", "")
         atts = body.get("attachment_paths", [])
+        source_task_id = str(body.get("task_id") or "").strip()
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
-        result = st.inject_async_result(session_id, text=msg, attachments=atts)
+        result = st.inject_async_result(session_id, text=msg, attachments=atts, source_task_id=source_task_id)
         if not result.get("ok"):
             raise HTTPException(status_code=500, detail=result.get("error", "unknown"))
         return result
