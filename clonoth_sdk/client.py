@@ -115,6 +115,7 @@ class ClonothClient:
         attachments: list[dict[str, Any]] | None = None,
         use_context: bool = True,
         entry_node_id: str | None = None,
+        use_branch: bool | None = None,
     ) -> InboundResult:
         """提交用户消息到 Supervisor。
 
@@ -148,6 +149,8 @@ class ClonothClient:
             payload["attachments"] = attachments
         if entry_node_id:
             payload["entry_node_id"] = entry_node_id
+        if use_branch is not None:
+            payload["use_branch"] = use_branch
 
         resp = await self._http().post(f"{self._base_url}/v1/inbound", json=payload)
         resp.raise_for_status()

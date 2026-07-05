@@ -110,20 +110,33 @@ def _format_task_messages_for_turn_summary(messages: list[Any]) -> str:
             content = str(content)
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
+            # [AutoC 2026-07-03] 只保留工具名称，不渲染完整参数 JSON。
+            # 原因：旧代码输出 `[tool_call] execute_command {"command":"..."}` 格式，
+            # 导致 summarizer LLM 复刻工具调用而非生成摘要，反复触发
+            # unauthorized tool call 直到被 zombie-reaper 收割。
+            # 做法：普通工具只记名称；finish/ask 保留 text 参数（交付内容）。
             call_lines: list[str] = []
             for call in tool_calls:
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") if isinstance(call.get("function"), dict) else {}
                 name = str(call.get("name") or function.get("name") or "").strip()
-                raw_args = call.get("arguments") if "arguments" in call else function.get("arguments", {})
-                args_text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False, default=str)
-                call_lines.append(f"[tool_call] {name} {args_text}".strip())
+                if name in ("finish", "ask"):
+                    raw_args = call.get("arguments") if "arguments" in call else function.get("arguments", {})
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = json.loads(raw_args)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    if isinstance(raw_args, dict):
+                        _text = str(raw_args.get("text") or "").strip()
+                        if _text:
+                            call_lines.append(f"[delivered via {name}] {_text[:3000]}")
+                            continue
+                    call_lines.append(f"[used tool: {name}]")
+                elif name:
+                    call_lines.append(f"[used tool: {name}]")
             if call_lines:
-                # [2026-05-07] 轮摘要输入显式渲染 assistant.tool_calls。
-                # 原因：finish 保持为真实工具轮后，assistant.content 常为空；只拼 content 会丢失最终交付参数。
-                # 做法：把工具调用名称和参数追加到摘要文本，不改动原始消息结构。
-                # 目的：turn_summarizer 能读到 finish.text，同时保留完整工具配对历史。
                 content = "\n".join(part for part in [content, *call_lines] if part)
         if len(content) > 5000:
             content = content[:5000] + "\n...[truncated]"
@@ -308,6 +321,36 @@ class TaskRouterMixin:
         action = task.result or {}
         act = str(action.get("action") or "").strip()
         route_session_id = task.session_id
+
+        # system node 失败时发通知（memory_extractor / dream 等）
+        _sys_node_id = str(task.node_id or "")
+        if _sys_node_id.startswith("system.") and act == "fail":
+            _sys_fail_reason = str((action.get("result") or {}).get("error") or action.get("error") or "").strip()
+            _sys_labels = {
+                "system.memory_extractor": "记忆提取",
+                "system.dream": "记忆整理",
+                "system.turn_summarizer": "轮摘要",
+            }
+            _sys_label = _sys_labels.get(_sys_node_id, _sys_node_id)
+            log.warning(
+                "%s node failed: task=%s error=%s",
+                _sys_label, str(task.task_id or "")[:12], _sys_fail_reason[:200] if _sys_fail_reason else "unknown",
+            )
+            _sys_notice_sid = str(task.session_id or "").strip()
+            if _sys_notice_sid:
+                self.eventlog.append(
+                    session_id=_sys_notice_sid,
+                    component="supervisor",
+                    type_="system_notice",
+                    payload={
+                        "level": "warning",
+                        "title": f"{_sys_label}失败",
+                        "text": f"{_sys_label}节点执行失败，不影响正常对话。",
+                        "subsystem": _sys_node_id,
+                        "error": _sys_fail_reason[:500] if _sys_fail_reason else None,
+                    },
+                )
+
         if act == "preempted":
             self._route_preempted_locked(task, action)
             return  # preempted 不触发记忆提取，也不 merge branch
@@ -1126,7 +1169,32 @@ class TaskRouterMixin:
         # 或内部注入都应通过 fork 分支并发处理。做法：移除 running/suspended 入口任务的
         # 自动 preempt 分支，直接创建 inbound。目的：同一 session 下多个入口分支可并行运行。
 
-        # ---- 创建 inbound → 新 branch task ----
+        # [AutoC 2026-07-05] 无 branch 模式下优先 preempt running task，避免并发写同一 ConversationStore
+        _dispatch_preempt_text = result_text
+        if result_summary:
+            _dispatch_preempt_text = f"{result_summary}\n{result_text}" if result_text else result_summary
+        branchless_task = self._is_branchless_running_task_locked(route_session_id)
+        if branchless_task is not None:
+            branchless_task.preempt_requested = True
+            branchless_task.preempt_message = _dispatch_preempt_text
+            branchless_task.preempt_attachments = list(result_atts) if result_atts else []
+            self.eventlog.append(
+                session_id=route_session_id,
+                component="supervisor",
+                type_="preempt_requested",
+                payload={
+                    "task_id": branchless_task.task_id,
+                    "session_id": route_session_id,
+                    "has_message": bool(_dispatch_preempt_text),
+                    "source": "async_dispatch_result",
+                    "child_task_id": task.task_id,
+                    "child_node_id": task.node_id,
+                },
+                transient=True,
+            )
+            return
+
+        # ---- branch 模式或无 running task：创建 inbound → 新 branch task ----
         conv_key = session_info.conversation_key
         channel = session_info.channel
         msg_id = f"async_dispatch:{task.task_id}"
@@ -1135,16 +1203,8 @@ class TaskRouterMixin:
             "channel": channel,
             "conversation_key": conv_key,
             "message_id": msg_id,
-            # [AutoC 2026-06-04] Why: payload.text must be the child node's raw finish
-            # result, not a localized notification wrapper. How: place summary and ids
-            # in sibling structured fields. Purpose: ConversationStore preserves the
-            # actual child output while renderers build their own presentation layer.
             "text": result_text,
             "summary": result_summary,
-            # [AutoC 2026-06-04] Why: dispatch callbacks need a stable structured
-            # contract after removing localized wrapper assembly. How: emit caller, child node, child
-            # task, and child session identifiers under explicit child_* names. Purpose:
-            # clients and LLM prompts no longer infer metadata from natural language.
             "message_type": "dispatch_result",
             "caller_node_id": caller_node,
             "child_node_id": task.node_id,
@@ -1154,7 +1214,6 @@ class TaskRouterMixin:
         if result_atts:
             payload["attachments"] = result_atts
 
-        # eventlog 有独立锁，不会与 self._lock 死锁
         evt = self.eventlog.append(
             session_id=route_session_id,
             component="supervisor",
@@ -1232,7 +1291,32 @@ class TaskRouterMixin:
             else None
         )
 
-        # 构造 inbound payload 并注入目标 session
+        # [AutoC 2026-07-05] 无 branch 模式下优先 preempt running task
+        _origin_preempt_text = result_text
+        if result_summary:
+            _origin_preempt_text = f"{result_summary}\n{result_text}" if result_text else result_summary
+        branchless_task = self._is_branchless_running_task_locked(target_session_id)
+        if branchless_task is not None:
+            branchless_task.preempt_requested = True
+            branchless_task.preempt_message = _origin_preempt_text
+            branchless_task.preempt_attachments = list(result_atts) if result_atts else []
+            self.eventlog.append(
+                session_id=target_session_id,
+                component="supervisor",
+                type_="preempt_requested",
+                payload={
+                    "task_id": branchless_task.task_id,
+                    "session_id": target_session_id,
+                    "has_message": bool(_origin_preempt_text),
+                    "source": "dispatch_origin_result",
+                    "child_task_id": task.task_id,
+                    "child_node_id": task.node_id,
+                },
+                transient=True,
+            )
+            return
+
+        # ---- branch 模式或无 running task：构造 inbound payload 并注入目标 session ----
         conv_key = session_info.conversation_key
         channel = session_info.channel
         msg_id = f"dispatch_origin:{task.task_id}"
@@ -1241,15 +1325,8 @@ class TaskRouterMixin:
             "channel": channel,
             "conversation_key": conv_key,
             "message_id": msg_id,
-            # [AutoC 2026-06-04] Why: payload.text must remain the raw child result in
-            # the dispatch_origin path too. How: move summary and routing information
-            # into structured fields. Purpose: frontend cards and LLM prompts can render
-            # localized context without storing it in backend payload text.
             "text": result_text,
             "summary": result_summary,
-            # [AutoC 2026-06-04] Why: task_id/node_id were ambiguous after callbacks
-            # became user-visible messages. How: emit explicit child_* metadata plus the
-            # caller id. Purpose: clients know these ids describe the completed child.
             "message_type": "dispatch_result",
             "caller_node_id": caller_node,
             "child_node_id": task.node_id,
@@ -1314,12 +1391,28 @@ class TaskRouterMixin:
         except Exception as e:
             log.warning("cleanup dispatch session %s failed: %s", _dispatch_sid[:12], e)
 
-    def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
-        """注入异步工具结果到 session，并创建新的 inbound 分支。
+    def _is_branchless_running_task_locked(self, session_id: str) -> Task | None:
+        """查找直接运行在主 session 上的 running entry task（无 branch 模式）。
 
-        [Fork/Merge 2026-05-12] 旧的 running/suspended 自动 preempt 回退被移除。
-        原因：新架构要求只有 adapter 显式 preempt API 才能抢占任务。
-        做法：异步工具结果统一创建 inbound。目的：保持入口分支并发运行。
+        [AutoC 2026-07-05] Why: 无 branch 模式下 task 直接跑在主 session 上，
+        异步回调如果再创建 inbound 会导致两个 task 并发写同一个 ConversationStore。
+        How: 查 running entry task 且 parent_session_id 为空（无 branch 标志）。
+        Purpose: 回调路径据此选择 preempt 而非 inbound。
+        """
+        task = self._find_running_entry_task_locked(session_id)
+        if task is None:
+            return None
+        # 有 branch 元数据 → 说明是 branch 模式，不需要 preempt
+        if str(task.input.get("parent_session_id") or "").strip():
+            return None
+        return task
+
+    def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
+        """注入异步工具结果到 session。
+
+        [AutoC 2026-07-05] 根据当前 session 状态选择策略：
+        - 无 branch 模式且有 running entry task → preempt 该 task
+        - 否则 → 创建 inbound（走 branch fork）
         """
         with self._lock:
             session_info = self.sessions.get(session_id)
@@ -1328,12 +1421,29 @@ class TaskRouterMixin:
 
             result_atts = list(attachments or [])
 
-            # [Fork/Merge 2026-05-12] 外部异步结果注入不再自动 preempt。
-            # 原因：preempt 语义收窄为 adapter 显式请求；内部注入应像普通 inbound 一样
-            # fork 新分支。做法：删除 running/suspended 自动抢占路径。目的：避免新 inbound
-            # 破坏正在运行的入口分支。
+            # [AutoC 2026-07-05] 无 branch 模式下优先 preempt running task
+            branchless_task = self._is_branchless_running_task_locked(session_id)
+            if branchless_task is not None:
+                branchless_task.preempt_requested = True
+                branchless_task.preempt_message = text
+                branchless_task.preempt_attachments = [
+                    {"path": p} for p in result_atts
+                ] if result_atts else []
+                self.eventlog.append(
+                    session_id=session_id,
+                    component="supervisor",
+                    type_="preempt_requested",
+                    payload={
+                        "task_id": branchless_task.task_id,
+                        "session_id": session_id,
+                        "has_message": bool(text),
+                        "source": "async_tool_result",
+                    },
+                    transient=True,
+                )
+                return {"ok": True, "strategy": "preempt"}
 
-            # ---- 创建 inbound → 新 branch task ----
+            # ---- branch 模式或无 running task：创建 inbound ----
             conv_key = session_info.conversation_key
             channel = session_info.channel
             msg_id = f"async_tool_result:{session_id}"
@@ -1683,7 +1793,26 @@ class TaskRouterMixin:
                         )
                         return
 
-        # 失败路径：静默恢复父 task
+        # 失败路径：记录错误、发通知、恢复父 task
+        _fail_sid = target_sid_for_conv or caller.session_id
+        _fail_act = act or "unknown"
+        log.warning(
+            "compact failed for session %s: compactor returned action=%s",
+            _fail_sid, _fail_act,
+        )
+        from engine.compact import record_compact_failure as _rcf
+        _rcf(_fail_sid)
+        self.eventlog.append(
+            session_id=_fail_sid,
+            component="supervisor",
+            type_="system_notice",
+            payload={
+                "level": "warning",
+                "title": "上下文压缩失败",
+                "text": f"压缩节点返回 {_fail_act}，将在下次对话时重试。",
+                "subsystem": "compact",
+            },
+        )
         self._resume_compact_parent_locked(
             caller, parent_ctx_ref, success=False,
         )
@@ -2054,17 +2183,39 @@ class TaskRouterMixin:
         snip_history 遍历全部 records 取最后一条有 summary 的。
         """
         act = str((task.result or {}).get("action") or "").strip()
+        _ts_route_sid = str(task.input.get("_target_session_id") or task.session_id or "").strip()
         if act != "finish":
+            log.warning(
+                "turn_summary: summarizer returned action=%s for task %s",
+                act or "empty", str(task.task_id or "")[:12],
+            )
+            if _ts_route_sid:
+                self.eventlog.append(
+                    session_id=_ts_route_sid,
+                    component="supervisor",
+                    type_="system_notice",
+                    payload={
+                        "level": "warning",
+                        "title": "轮摘要生成失败",
+                        "text": f"摘要节点返回 {act or 'empty'}，不影响正常对话。",
+                        "subsystem": "turn_summary",
+                    },
+                )
             return
 
         result = (task.result or {}).get("result") or {}
         summary = str(result.get("text") or "").strip()
         if not summary or len(summary) < 50:
+            log.warning(
+                "turn_summary: output too short (%d chars) for task %s",
+                len(summary), str(task.input.get("_target_task_id") or "")[:12],
+            )
             return
 
         target_task_id = str(task.input.get("_target_task_id") or "").strip()
         target_session_id = str(task.input.get("_target_session_id") or "").strip()
         if not target_task_id or not target_session_id:
+            log.warning("turn_summary: missing target_task_id or target_session_id")
             return
 
         # 回写 TaskRecord：追加一条 updated record

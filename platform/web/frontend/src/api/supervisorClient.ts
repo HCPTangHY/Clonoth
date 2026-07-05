@@ -89,6 +89,7 @@ export async function postInbound(params: {
       text: params.text,
       attachments: params.attachments ?? [],
       use_context: params.use_context ?? true,
+      use_branch: false,
       entry_node_id: params.entry_node_id,
       ...(params.provider_override ? { provider_override: params.provider_override } : {}),
       ...(params.session_id ? { session_id: params.session_id } : {}),

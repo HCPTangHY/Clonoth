@@ -67,6 +67,13 @@ class InboundMessageIn(BaseModel):
     dispatch_origin: dict[str, Any] | None = None
     dispatch_context_mode: str | None = None
     dispatch_fork_from_session: str | None = None
+    # [AutoC 2026-07-05] Why: fork/merge per inbound is unnecessary overhead for
+    # serial conversation channels (web, DM) where only one message is in flight
+    # at a time. How: let callers opt out of entry branch isolation. When False,
+    # the task runs directly on the main session without fork or merge. Purpose:
+    # reduce I/O (full history copy per message) and eliminate branch cleanup for
+    # channels that never produce concurrent inbounds.
+    use_branch: bool | None = None
     # [2026-06-16] Why: welcome page model selection had no way to reach the
     # session before the first task started. How: pass the override through the
     # inbound request so the supervisor applies it immediately after session

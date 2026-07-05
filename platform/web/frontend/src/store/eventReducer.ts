@@ -92,6 +92,7 @@ export const CHAT_EVENT_TYPE_VALUES = [
   'llm_retry',
   'node_switch',
   'preempt_injected',
+  'system_notice',
 ] as const;
 
 /** All event types handled by the chat reducer. */
@@ -208,6 +209,9 @@ export function reduceChatEvent(state: ChatState, event: SupervisorEvent): ChatS
       break;
     case 'preempt_injected':
       nextState = applyPreemptInjected(nextState, event);
+      break;
+    case 'system_notice':
+      nextState = applySystemNotice(nextState, event);
       break;
     default: {
       // [AutoC 2026-06-16] Exhaustive check for handled chat event types.
@@ -505,20 +509,12 @@ function applyOutboundMessage(state: ChatState, event: SupervisorEvent): ChatSta
 
   nextState = upsertMessage(nextState, message);
 
-  nextState = finishPendingToolExecutionsOnMessage(nextState, message, event);
-  return nextState;
-}
-
-function finishPendingToolExecutionsOnMessage(
-  state: ChatState,
-  message: WsMessage,
-  event: SupervisorEvent,
-): ChatState {
-  // [2026-06-10] Why: finish/ask pseudo-tools emit tool_call_start but may not
-  // emit tool_call_end when the task hands off to a caller chain. How: use the
-  // authoritative card/task completion signal to close any non-terminal tools.
-  // Purpose: the message no longer leaves a stale running spinner after completion.
-  let nextState = state;
+  // [2026-06-10] Terminate all pending tool executions on this card when
+  // outbound_message arrives. finish/ask pseudo-tools emit tool_call_start
+  // but NOT tool_call_end (the task may hand off to a caller chain). The
+  // outbound_message is the authoritative completion signal for the whole
+  // card. Any tool still in queued/running status is set to success+hidden
+  // so the spinner stops.
   for (const block of message.blocks) {
     if (block.kind !== 'tool') continue;
     for (const toolId of block.toolIds) {
@@ -538,6 +534,7 @@ function finishPendingToolExecutionsOnMessage(
       };
     }
   }
+
   return nextState;
 }
 
@@ -717,11 +714,17 @@ function applyTaskCompleted(state: ChatState, event: SupervisorEvent): ChatState
   // Purpose: the user knows compression finished without disrupting the active stream.
   const payload = getPayload(event);
   if (getString(payload.node_id) === COMPACTOR_NODE_ID) {
+    const compactResult = getRecord(payload.result);
+    const compactAction = compactResult ? getString(compactResult.action) : '';
+    const compactStatus = getString(payload.status);
+    const compactFailed = compactStatus === 'failed' || compactAction === 'fail';
     return appendNoticeToAssistant(nextState, event, {
-      level: 'info',
+      level: compactFailed ? 'warning' : 'info',
       title: '上下文压缩',
-      text: '对话上下文已压缩。切换会话后将加载压缩后的历史记录。',
-      eventType: 'context_compacted',
+      text: compactFailed
+        ? '上下文压缩失败，将在下次对话时重试。'
+        : '对话上下文已压缩。切换会话后将加载压缩后的历史记录。',
+      eventType: compactFailed ? 'compact_failed' : 'context_compacted',
     });
   }
 
@@ -741,10 +744,7 @@ function applyTaskCompleted(state: ChatState, event: SupervisorEvent): ChatState
       ? 'failed'
       : 'completed';
 
-  let finalState = upsertMessage(nextState, setMessageStatus(finalizeStreamingBlocks(message, event), status, event));
-  const updatedMessage = finalState.messagesById[message.id] || message;
-  finalState = finishPendingToolExecutionsOnMessage(finalState, updatedMessage, event);
-  return finalState;
+  return upsertMessage(nextState, setMessageStatus(finalizeStreamingBlocks(message, event), status, event));
 }
 
 function applyTaskCancelled(state: ChatState, event: SupervisorEvent): ChatState {
@@ -756,10 +756,7 @@ function applyTaskCancelled(state: ChatState, event: SupervisorEvent): ChatState
     return nextState;
   }
 
-  let finalState = upsertMessage(nextState, setMessageStatus(finalizeStreamingBlocks(message, event), 'cancelled', event));
-  const updatedMessage = finalState.messagesById[message.id] || message;
-  finalState = finishPendingToolExecutionsOnMessage(finalState, updatedMessage, event);
-  return finalState;
+  return upsertMessage(nextState, setMessageStatus(finalizeStreamingBlocks(message, event), 'cancelled', event));
 }
 
 function applyApprovalRequested(state: ChatState, event: SupervisorEvent): ChatState {
@@ -957,6 +954,24 @@ function applyNodeSwitch(state: ChatState, event: SupervisorEvent): ChatState {
   return appendNoticeToAssistant(state, event, {
     level: 'info',
     title: '节点切换',
+    text,
+    eventType: event.type,
+  });
+}
+
+// [AutoC 2026-07-02] Why: backend system_notice events carry structured failure
+// information from compact, turn_summary, and memory_extract subsystems. How:
+// render them as NoticeBlock in the active assistant card. Purpose: the bot and
+// user can see when background maintenance tasks fail.
+function applySystemNotice(state: ChatState, event: SupervisorEvent): ChatState {
+  const payload = getPayload(event);
+  const level = (getString(payload.level) || 'warning') as NoticeBlock['level'];
+  const title = getString(payload.title) || '系统通知';
+  const text = getString(payload.text) || '';
+  if (!text) return state;
+  return appendNoticeToAssistant(state, event, {
+    level,
+    title,
     text,
     eventType: event.type,
   });

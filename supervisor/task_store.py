@@ -306,13 +306,29 @@ class TaskStoreMixin:
                     _fork_store.fork(_fork_from, session_id)
                 except Exception as _fork_err:
                     logger.warning("dispatch fork from %s to %s failed: %s", _fork_from[:12], session_id[:12], _fork_err)
-        # [Fork/Merge 2026-05-12] 每条 inbound 都创建独立入口分支。
-        # 原因：同一主 session 的新消息不再抢占旧入口 task，而是并发运行在各自
-        # branch session 上。做法：在 supervisor 持锁期间 fork ConversationStore，
-        # 并把 fork 基准写入 task.input。目的：task 结束时能按 base_count merge 回主 session。
-        branch_session_id, fork_meta = self._create_entry_branch_locked(session_id, inbound_seq)
-        branch_base_count = int(fork_meta.get("base_count") or 0)
-        self._cancelled_sessions.discard(branch_session_id)
+        # [AutoC 2026-07-05] use_branch 决策：
+        # - dispatch 场景 → 强制 branch（并发回调必须隔离）
+        # - 其他场景由调用方显式传入 use_branch，默认 true 保持兼容
+        if payload.get("dispatch_origin"):
+            _use_branch = True
+        else:
+            _use_branch_raw = payload.get("use_branch")
+            _use_branch = bool(_use_branch_raw) if _use_branch_raw is not None else True
+
+        if _use_branch:
+            # [Fork/Merge 2026-05-12] 每条 inbound 都创建独立入口分支。
+            # 原因：同一主 session 的新消息不再抢占旧入口 task，而是并发运行在各自
+            # branch session 上。做法：在 supervisor 持锁期间 fork ConversationStore，
+            # 并把 fork 基准写入 task.input。目的：task 结束时能按 base_count merge 回主 session。
+            branch_session_id, fork_meta = self._create_entry_branch_locked(session_id, inbound_seq)
+            branch_base_count = int(fork_meta.get("base_count") or 0)
+            self._cancelled_sessions.discard(branch_session_id)
+        else:
+            # 串行模式：直接在主 session 上运行，跳过 fork/merge 开销
+            branch_session_id = session_id
+            branch_base_count = 0
+            fork_meta = {}
+
         # 收集当前活跃 task 摘要，注入给入口节点 AI 判断
         active_tasks_summary = self._active_tasks_summary_locked(session_id)
         attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else None
@@ -379,6 +395,36 @@ class TaskStoreMixin:
             if _dispatch_parent_conv_key:
                 _dispatch_origin.setdefault("parent_conversation_key", _dispatch_parent_conv_key)
 
+        # [AutoC 2026-07-05] branch 元数据：仅在 _use_branch=True 时填写。
+        # 串行模式下 parent_session_id/branch_session_id 留空，
+        # _finalize_branch_task_locked 将直接跳过 merge/cleanup。
+        if _use_branch:
+            _branch_meta = {
+                "parent_session_id": session_id,
+                "branch_session_id": branch_session_id,
+                "base_count": branch_base_count,
+                "base_last_id": str(fork_meta.get("base_last_id") or ""),
+                "fork_copied": int(fork_meta.get("copied") or 0),
+            }
+            _task_ctx_branch = {
+                "parent_session_id": session_id,
+                "branch_session_id": branch_session_id,
+                "base_count": branch_base_count,
+            }
+        else:
+            _branch_meta = {
+                "parent_session_id": "",
+                "branch_session_id": "",
+                "base_count": 0,
+                "base_last_id": "",
+                "fork_copied": 0,
+            }
+            _task_ctx_branch = {
+                "parent_session_id": "",
+                "branch_session_id": "",
+                "base_count": 0,
+            }
+
         task = self._create_task_locked(
             session_id=branch_session_id,
             session_generation=generation,
@@ -394,32 +440,18 @@ class TaskStoreMixin:
                 "schedule_id": str(payload.get("schedule_id") or ""),
                 "active_tasks_summary": active_tasks_summary,
                 "attachments": attachments or [],
-                # [Fork/Merge 2026-05-12] 入口分支元数据随 task 持久化。
-                # 原因：完成路由只拿到 Task 快照，不能依赖易失内存索引判断 merge 目标。
-                # 做法：记录 parent、branch 与 fork base_count/base_last_id。目的：finish、fail、
-                # cancel 终态都能独立完成 merge，并保持没有这些字段的旧 task 正常工作。
-                "parent_session_id": session_id,
-                "branch_session_id": branch_session_id,
-                "base_count": branch_base_count,
-                "base_last_id": str(fork_meta.get("base_last_id") or ""),
-                "fork_copied": int(fork_meta.get("copied") or 0),
+                **_branch_meta,
                 "task_context": {
                     "conversation_key": str(payload.get("conversation_key") or ""),
                     "channel": str(payload.get("channel") or ""),
                     "message_id": str(payload.get("message_id") or ""),
                     "entry_node_id": entry_node,
                     "session_id": branch_session_id,
-                    "parent_session_id": session_id,
-                    "branch_session_id": branch_session_id,
-                    "base_count": branch_base_count,
+                    **_task_ctx_branch,
                     "session_generation": generation,
                     "is_system_task": bool(payload.get("_system_task", False)),
                     "switched_from": default_node if session_override else "",
                     "use_context": use_context,
-                    # [2026-05-29 方案C第一步] 为什么：SDK 只读取 task_created
-                    # 事件的 payload.input.task_context，不能依赖后续对 Task 的补写。
-                    # 怎么改：把 dispatch 上下文模式和父频道 route key 写入
-                    # task_context。目的：子 session 映射和审批归属判断使用结构化字段。
                     "dispatch_context_mode": _dispatch_context_mode,
                     "parent_conversation_key": _dispatch_parent_conv_key,
                     "route_conversation_key": _dispatch_parent_conv_key,

@@ -351,6 +351,7 @@ async def _handle_agent_inner(
             attachments=inbound_attachments or None,
             use_context=True,
             entry_node_id=rt.entry_node_id,
+            use_branch=not is_dm,
         )
     except Exception as e:
         await message.reply(f"无法连接到 Clonoth Agent: {e}")
