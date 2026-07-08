@@ -3,6 +3,7 @@
 // message surface. How: derive header, role styling, streaming indicator, ordered block
 // rendering, and attachments from WsMessage only. Purpose: make active and historical
 // messages follow the same UI contract before the app is rewired to v2.
+import { useState, useRef, useEffect } from 'react';
 import type { MessageRole, MessageStatus, TextBlock, ToolExecution, WsMessage } from '../../types/message';
 import { useChatStore } from '../../store/chatStore';
 import { AttachmentList } from './AttachmentList';
@@ -14,6 +15,7 @@ interface MessageCardProps {
   toolsById: Record<string, ToolExecution>;
   prevRole?: WsMessage['role'];
   nextRole?: WsMessage['role'];
+  isLastUserMessage?: boolean;
 }
 
 const ROLE_LABELS: Record<Exclude<MessageRole, 'dispatch_callback'>, string> = {
@@ -92,7 +94,85 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
-export const MessageCard = ({ message, toolsById, prevRole, nextRole }: MessageCardProps) => {
+// ── User message retry / edit+retry actions ──
+function UserMessageActions({ message }: { message: WsMessage }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Extract original user text from message blocks
+  const originalText = message.blocks
+    .filter((b) => b.kind === 'text')
+    .map((b) => (b as TextBlock).text)
+    .join('\n');
+
+  useEffect(() => {
+    if (editing && textareaRef.current) {
+      textareaRef.current.focus();
+      textareaRef.current.setSelectionRange(draft.length, draft.length);
+    }
+  }, [editing]);
+
+  const doRetry = (newText?: string) => {
+    const label = newText !== undefined ? '编辑后重试将取消当前任务并截断此消息之后的所有内容，确认？' : '重试将取消当前任务并截断此消息之后的所有内容，确认？';
+    if (window.confirm(label)) {
+      useChatStore.getState().retryMessage(message.id, newText);
+      setEditing(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <div className="mt-1.5 flex flex-col gap-1.5">
+        <textarea
+          ref={textareaRef}
+          className="w-full rounded border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 text-xs text-[var(--duties-text)] focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[3rem]"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') { setEditing(false); }
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { doRetry(draft.trim() || undefined); }
+          }}
+        />
+        <div className="flex gap-2">
+          <button
+            className="text-[0.6rem] font-mono text-blue-600 hover:text-blue-800 transition-colors"
+            onClick={() => doRetry(draft.trim() || undefined)}
+          >
+            ✓ 提交重试
+          </button>
+          <button
+            className="text-[0.6rem] font-mono text-[var(--duties-tertiary)] hover:text-red-500 transition-colors"
+            onClick={() => setEditing(false)}
+          >
+            ✕ 取消
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-1.5 flex gap-2">
+      <button
+        className="text-[0.6rem] font-mono text-[var(--duties-tertiary)] hover:text-blue-600 transition-colors"
+        title="原样重试"
+        onClick={() => doRetry()}
+      >
+        ↻ 重试
+      </button>
+      <button
+        className="text-[0.6rem] font-mono text-[var(--duties-tertiary)] hover:text-blue-600 transition-colors"
+        title="编辑后重试"
+        onClick={() => { setDraft(originalText); setEditing(true); }}
+      >
+        ✎ 编辑
+      </button>
+    </div>
+  );
+}
+
+export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUserMessage }: MessageCardProps) => {
   const roleStyle = ROLE_STYLES[message.role];
   const active = isActiveStatus(message.status);
   const attachments = message.attachments ?? [];
@@ -190,6 +270,10 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole }: MessageC
         )}
 
         <AttachmentList attachments={attachments} />
+
+        {message.role === 'user' && message.status === 'completed' && message.source.inboundSeq && (
+          <UserMessageActions message={message} />
+        )}
       </div>
     </article>
   );

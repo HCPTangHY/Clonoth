@@ -1288,6 +1288,87 @@ def create_app(
             node_id=node_id or None,
         )
 
+    @app.post("/v1/sessions/{session_id}/retry")
+    async def retry_session_inbound(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """重试用户消息：取消活跃任务，截断对话到该消息之前，重新提交。"""
+        st: SupervisorState = app.state.state
+        source_seq = int(body.get("source_inbound_seq", 0) or 0)
+        if source_seq <= 0:
+            raise HTTPException(status_code=400, detail="source_inbound_seq required")
+
+        with st._lock:
+            route_session_id = st._route_session_id_for_session_locked(session_id)
+            if not route_session_id:
+                route_session_id = session_id
+            if route_session_id not in st.sessions:
+                raise HTTPException(status_code=404, detail="session not found")
+
+            inbound_data = st._inbound_events.get(source_seq)
+            if not inbound_data:
+                raise HTTPException(status_code=404, detail="inbound not found")
+            original_payload = dict(inbound_data.get("payload") or {})
+
+            # 编辑后重试：用新文本覆盖原始 payload
+            new_text = body.get("new_text")
+            if new_text is not None:
+                original_payload["text"] = str(new_text)
+
+            # 按 source_inbound_seq 找到对应的 task，用于定位截断位置
+            target_task_id = ""
+            for t in st.tasks.values():
+                if t.source_inbound_seq == source_seq:
+                    target_task_id = t.task_id
+                    break
+
+        # 取消所有活跃任务
+        st.cancel_active_tasks(route_session_id)
+
+        # 截断 ConversationStore：删除该 task 产生的消息及之后所有内容
+        from pathlib import Path
+        from engine.conversation_store import ConversationStore
+        store = ConversationStore(Path(st.workspace_root) / "data" / "conversations")
+        messages = store.load(route_session_id)
+
+        truncate_idx = len(messages)
+        if target_task_id:
+            for i, m in enumerate(messages):
+                if m.source_task_id == target_task_id:
+                    truncate_idx = i
+                    break
+
+        truncated_count = len(messages) - truncate_idx
+        if truncate_idx < len(messages):
+            store.replace_all(route_session_id, messages[:truncate_idx])
+
+        # 清理活跃的入口分支
+        with st._lock:
+            branch_ids = list(st._entry_branch_ids_for_parent_locked(route_session_id))
+        for bid in branch_ids:
+            try:
+                store.delete(bid)
+            except Exception:
+                pass
+
+        # 以原始 payload 重新提交 inbound
+        evt = st.eventlog.append(
+            session_id=route_session_id,
+            component="shell",
+            type_="inbound_message",
+            payload={
+                **{k: v for k, v in original_payload.items() if k != "session_id"},
+                "_retry_of": source_seq,
+            },
+        )
+        st.record_inbound_message_event(evt)
+        new_seq = int(evt.get("seq", 0) or 0)
+
+        return {
+            "ok": True,
+            "new_inbound_seq": new_seq,
+            "source_inbound_seq": source_seq,
+            "truncated_messages": truncated_count,
+        }
+
     @app.post("/v1/sessions/{session_id}/switch_node")
     async def session_switch_node(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """AI 或外部调用：设置/清除 session 级入口节点覆盖。"""

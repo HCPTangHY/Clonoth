@@ -14,6 +14,7 @@ import {
   listSessions,
   postInbound,
   preemptTask,
+  retryInbound,
   uploadAttachment,
 } from '../api/supervisorClient';
 import type { Attachment } from '../types/message';
@@ -611,6 +612,55 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     }));
 
     startEventPump(set, get);
+  },
+
+  retryMessage: async (messageId: string, newText?: string) => {
+    const state = get();
+    const message = state.messagesById[messageId];
+    if (!message || message.role !== 'user') return;
+    const inboundSeq = message.source.inboundSeq;
+    if (!inboundSeq) return;
+
+    const activeConversation = getActiveConversation(state);
+    const sessionId = activeConversation?.sessionId || '';
+    if (!sessionId) return;
+
+    try {
+      const result = await retryInbound(sessionId, inboundSeq, newText);
+      if (!result.ok) return;
+
+      // Remove all messages from the retried message onward in the UI
+      const conversationId = message.conversationId;
+      const order = state.messageOrderByConversation[conversationId] || [];
+      const retryIndex = order.indexOf(messageId);
+      if (retryIndex >= 0) {
+        const idsToRemove = new Set(order.slice(retryIndex));
+        set((current) => {
+          const messagesById = { ...current.messagesById };
+          for (const id of idsToRemove) delete messagesById[id];
+          const newOrder = (current.messageOrderByConversation[conversationId] || []).filter(
+            (id) => !idsToRemove.has(id),
+          );
+          const toolExecutionsById = { ...current.toolExecutionsById };
+          const toolExecutionOrder = current.toolExecutionOrder.filter((tid) => {
+            const tool = current.toolExecutionsById[tid];
+            if (tool && idsToRemove.has(tool.messageId)) {
+              delete toolExecutionsById[tid];
+              return false;
+            }
+            return true;
+          });
+          return {
+            messagesById,
+            messageOrderByConversation: { ...current.messageOrderByConversation, [conversationId]: newOrder },
+            toolExecutionsById,
+            toolExecutionOrder,
+            isGenerating: true,
+            generatingBySession: { ...current.generatingBySession, [sessionId]: true },
+          };
+        });
+      }
+    } catch {}
   },
 
   cancelCurrentTask: async () => {

@@ -87,6 +87,7 @@ export interface ChatStoreState extends ChatState {
   deleteConversation: (id: string) => void;
   renameConversation: (id: string, newTitle: string) => void;
   sendMessage: (text: string, attachments?: any[], entryNodeId?: string, providerOverride?: Record<string, unknown> | null) => Promise<void>;
+  retryMessage: (messageId: string, newText?: string) => Promise<void>;
   cancelCurrentTask: () => Promise<void>;
   preemptCurrentTask: (message: string, attachments?: Attachment[]) => Promise<void>;
   resetState: () => void;

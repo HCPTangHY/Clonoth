@@ -773,6 +773,25 @@ export async function cancelActiveTasks(sessionId: string): Promise<any> {
   return resp.json();
 }
 
+// ── Retry ──
+
+export async function retryInbound(sessionId: string, sourceInboundSeq: number, newText?: string): Promise<{
+  ok: boolean;
+  new_inbound_seq?: number;
+  source_inbound_seq?: number;
+  truncated_messages?: number;
+  error?: string;
+}> {
+  const payload: Record<string, unknown> = { source_inbound_seq: sourceInboundSeq };
+  if (newText !== undefined) payload.new_text = newText;
+  const resp = await apiFetch(`/sessions/${sessionId}/retry`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return resp.json();
+}
+
 // ── Pending approvals ──
 
 export async function getSessionPendingApprovals(sessionId: string): Promise<any[]> {
