@@ -293,19 +293,24 @@ def main() -> None:
                         elif task.lease_expires_at + _GRACE < now:
                             should_reap = True
                             reason = "lease expired"
-                        # [AutoC 2026-06-24] absolute cap: running 超过 30 分钟无论如何都回收
-                        # Why: engine worker 活着会不断续 lease，但 LLM 可能永远不响应，
-                        # 导致 task 无限挂 running。How: 基于 created_at 硬上限。
-                        # Purpose: 防止幽灵 preempt 黑洞。
-                        if not should_reap and task.created_at + _MAX_TASK_AGE < now:
+                        # [AutoC 2026-06-24 / 2026-07-10 fix] absolute cap: 仅在 worker
+                        # heartbeat 已停止时才基于 created_at 硬上限回收。
+                        # Why: worker 活着会每 60s 续 lease 并刷新 updated_at，说明 task
+                        # 仍在正常工作。之前无条件 30 分钟回收会误杀合法长任务。
+                        # How: 同时检查 created_at 超龄 AND updated_at 超过 5 分钟未刷新
+                        # （即 heartbeat 已停止）。Purpose: 只回收真正的幽灵 task。
+                        if (not should_reap
+                                and task.created_at + _MAX_TASK_AGE < now
+                                and task.updated_at + timedelta(minutes=5) < now):
                             should_reap = True
-                            reason = f"exceeded max age {_MAX_TASK_AGE}"
+                            reason = f"exceeded max age {_MAX_TASK_AGE} (heartbeat stale)"
                         if not should_reap:
                             continue
                         # [Fork/Merge 2026-05-17] skip tasks with pending approval
                         route_session_id = state._route_session_id_for_task_locked(task)
                         if task.session_id in _sessions_with_pending_approval or route_session_id in _sessions_with_pending_approval:
                             continue
+                        task.cancel_requested = True
                         task.status = TaskStatus.failed
                         task.updated_at = now
                         task.lease_expires_at = None
