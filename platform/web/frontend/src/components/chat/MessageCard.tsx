@@ -94,13 +94,13 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
-// ── User message retry / edit+retry actions ──
-function UserMessageActions({ message }: { message: WsMessage }) {
+// ponytail: user message retry/edit lives in the header row, shown on hover only.
+// upgrade path: extract into a separate file if more per-role actions are added.
+function useUserRetryEdit(message: WsMessage) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Extract original user text from message blocks
   const originalText = message.blocks
     .filter((b) => b.kind === 'text')
     .map((b) => (b as TextBlock).text)
@@ -114,62 +114,17 @@ function UserMessageActions({ message }: { message: WsMessage }) {
   }, [editing]);
 
   const doRetry = (newText?: string) => {
-    const label = newText !== undefined ? '编辑后重试将取消当前任务并截断此消息之后的所有内容，确认？' : '重试将取消当前任务并截断此消息之后的所有内容，确认？';
-    if (window.confirm(label)) {
+    if (window.confirm('将取消当前任务并截断此消息之后的所有内容，确认？')) {
       useChatStore.getState().retryMessage(message.id, newText);
       setEditing(false);
     }
   };
 
-  if (editing) {
-    return (
-      <div className="mt-1.5 flex flex-col gap-1.5">
-        <textarea
-          ref={textareaRef}
-          className="w-full rounded border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 text-xs text-[var(--duties-text)] focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[3rem]"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') { setEditing(false); }
-            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { doRetry(draft.trim() || undefined); }
-          }}
-        />
-        <div className="flex gap-2">
-          <button
-            className="text-[0.6rem] font-mono text-blue-600 hover:text-blue-800 transition-colors"
-            onClick={() => doRetry(draft.trim() || undefined)}
-          >
-            ✓ 提交重试
-          </button>
-          <button
-            className="text-[0.6rem] font-mono text-[var(--duties-tertiary)] hover:text-red-500 transition-colors"
-            onClick={() => setEditing(false)}
-          >
-            ✕ 取消
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const startEdit = () => { setDraft(originalText); setEditing(true); };
+  const cancelEdit = () => setEditing(false);
+  const submitEdit = () => doRetry(draft.trim() || undefined);
 
-  return (
-    <div className="mt-1.5 flex gap-2">
-      <button
-        className="text-[0.6rem] font-mono text-[var(--duties-tertiary)] hover:text-blue-600 transition-colors"
-        title="原样重试"
-        onClick={() => doRetry()}
-      >
-        ↻ 重试
-      </button>
-      <button
-        className="text-[0.6rem] font-mono text-[var(--duties-tertiary)] hover:text-blue-600 transition-colors"
-        title="编辑后重试"
-        onClick={() => { setDraft(originalText); setEditing(true); }}
-      >
-        ✎ 编辑
-      </button>
-    </div>
-  );
+  return { editing, draft, setDraft, textareaRef, doRetry, startEdit, cancelEdit, submitEdit };
 }
 
 export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUserMessage }: MessageCardProps) => {
@@ -210,8 +165,11 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
     ? (continuesIntoNext ? 'px-3 pt-0 pb-2 sm:px-4' : 'px-3 pt-0 pb-3 sm:px-4')
     : (continuesIntoNext ? 'px-3 pt-3 pb-2 sm:px-4' : 'px-3 py-3 sm:px-4');
 
+  const showRetry = message.role === 'user' && message.status === 'completed' && !!message.source.inboundSeq;
+  const retryEdit = useUserRetryEdit(message);
+
   return (
-    <article className={`${borderClass} ${paddingClass} ${roleStyle.row}`} data-message-id={message.id}>
+    <article className={`group/card ${borderClass} ${paddingClass} ${roleStyle.row}`} data-message-id={message.id}>
       <div className="mx-auto max-w-3xl">
         {!continuedFromPrev && (
           <header className="mb-1.5 flex flex-wrap items-center gap-2">
@@ -226,6 +184,24 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
               <span className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]">{message.source.nodeName}</span>
             )}
             {active && <span aria-label="消息正在活动" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />}
+            {showRetry && !retryEdit.editing && (
+              <span className="ml-auto flex gap-1.5 opacity-0 transition-opacity group-hover/card:opacity-100">
+                <button
+                  className="font-mono text-[0.55rem] text-[var(--duties-tertiary)] hover:text-blue-600 transition-colors"
+                  title="原样重试"
+                  onClick={() => retryEdit.doRetry()}
+                >
+                  ↻
+                </button>
+                <button
+                  className="font-mono text-[0.55rem] text-[var(--duties-tertiary)] hover:text-blue-600 transition-colors"
+                  title="编辑后重试"
+                  onClick={retryEdit.startEdit}
+                >
+                  ✎
+                </button>
+              </span>
+            )}
           </header>
         )}
 
@@ -271,8 +247,23 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
 
         <AttachmentList attachments={attachments} />
 
-        {message.role === 'user' && message.status === 'completed' && message.source.inboundSeq && (
-          <UserMessageActions message={message} />
+        {showRetry && retryEdit.editing && (
+          <div className="mt-1.5 flex flex-col gap-1.5">
+            <textarea
+              ref={retryEdit.textareaRef}
+              className="w-full rounded border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 text-xs text-[var(--duties-text)] focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[3rem]"
+              value={retryEdit.draft}
+              onChange={(e) => retryEdit.setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') retryEdit.cancelEdit();
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) retryEdit.submitEdit();
+              }}
+            />
+            <div className="flex gap-2">
+              <button className="text-[0.6rem] font-mono text-blue-600 hover:text-blue-800 transition-colors" onClick={retryEdit.submitEdit}>✓ 提交</button>
+              <button className="text-[0.6rem] font-mono text-[var(--duties-tertiary)] hover:text-red-500 transition-colors" onClick={retryEdit.cancelEdit}>✕ 取消</button>
+            </div>
+          </div>
         )}
       </div>
     </article>
