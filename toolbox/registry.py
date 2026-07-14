@@ -547,7 +547,7 @@ class ToolRegistry:
                         "cron": {"type": "string", "description": "5-field cron: minute hour day month weekday (UTC)"},
                         "text": {"type": "string", "description": "message text injected as inbound (for message type); prefix text (for script type)"},
                         "type": {"type": "string", "enum": ["message", "script"], "description": "schedule type: message (default) or script"},
-                        "command": {"type": "string", "description": "shell command to run (required for script type)"},
+                        "command": {"type": "string", "description": "shell command to run (required for script type). stdout must be a single-line JSON object with a 'text' field: {\"text\": \"message to inject\"}. Optional 'attachments' field for file paths. Empty stdout = silent skip (if silent=true) or prefix-only injection."},
                         "timeout": {"type": "integer", "description": "script timeout in seconds (default 30, script type only)"},
                         "silent": {"type": "boolean", "description": "if true, skip inbound when script stdout is empty (default true, script type only)"},
                         "conversation_key": {"type": "string", "description": "conversation key (default: scheduler:{id})"},

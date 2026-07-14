@@ -68,3 +68,4 @@ test_*.py
 **/__tests__/
 *.test.*
 *.spec.*
+tools/

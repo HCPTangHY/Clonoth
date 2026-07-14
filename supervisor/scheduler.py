@@ -234,7 +234,14 @@ class SchedulerThread:
         self._inject_inbound(sid, text, conv_key, entry_node_id)
 
     def _fire_script(self, s: dict, sid: str) -> None:
-        """type=script：执行脚本，stdout JSON 解析后注入 inbound。"""
+        """type=script：执行脚本，stdout JSON 解析后注入 inbound。
+
+        脚本 stdout 格式要求：
+        - 单行 JSON 对象，必须包含 "text" 字段：{"text": "消息内容"}
+        - 可选 "attachments" 字段：{"text": "...", "attachments": ["path/to/file"]}
+        - 空 stdout：silent=true 时静默跳过；silent=false 时仅注入 text_prefix
+        - 非零退出码或非法 JSON 均视为失败，不注入消息
+        """
         command = str(s.get("command") or "").strip()
         if not command:
             log.error(f"[scheduler] script {sid}: missing 'command' field")
