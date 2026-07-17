@@ -368,6 +368,11 @@ def main() -> None:
         log_level=args.log_level,
         access_log=access_log,
         log_config=_uvi_log_cfg,
+        # [2026-07-17] Disable protocol-level WebSocket ping. Supervisor already
+        # sends app-level heartbeat every 30s (_WS_HEARTBEAT_SEC in api.py).
+        # Uvicorn default (20s/20s) causes spurious disconnects under CPU load.
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
     )
     _uvi_server = uvicorn.Server(_uvi_config)
     _uvi_server.install_signal_handlers = lambda: None  # 禁用 uvicorn 信号捕获
