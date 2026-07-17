@@ -219,7 +219,13 @@ class ClonothClient:
             ws_url = self._base_url
         ws_url = f"{ws_url}/v1/ws"
 
-        connect_kwargs: dict[str, Any] = {"open_timeout": self._timeout}
+        connect_kwargs: dict[str, Any] = {
+            "open_timeout": self._timeout,
+            # [2026-07-17] Disable protocol-level ping. Supervisor sends app-level
+            # heartbeat every 30s; the default websockets ping_interval=20s causes
+            # spurious disconnects when the event loop is under load.
+            "ping_interval": None,
+        }
         if self._admin_token:
             # Why: deployments may protect every Supervisor endpoint with the same
             # bearer token used by HTTP. How: pass the header through websockets'
