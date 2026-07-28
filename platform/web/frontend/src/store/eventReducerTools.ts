@@ -48,7 +48,10 @@ export function applyToolPatchToAssistant(
   // the tool_call_end for a hidden control tool was leaving the message stuck
   // at 'running_tools'. How: if the tool is a terminal hidden control tool,
   // finalize the message. Purpose: finish cards stop showing a pending spinner.
-  if (toolResult.tool.hidden && toolResult.tool.control
+  // [AutoC 2026-07-28] Rejected finish/ask is visible (not hidden) and gets no
+  // outbound_message, so its card would spin at running_tools forever. Complete
+  // the card for any terminal control tool, hidden or not.
+  if (toolResult.tool.control
     && toolResult.tool.status && TERMINAL_TOOL_STATUSES.has(toolResult.tool.status)) {
     message = {
       ...setMessageStatus(message, 'completed', event),
