@@ -146,13 +146,28 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         _call_id = getattr(pseudo_call, "id", "") or ""
         _call_args = dict(pseudo_call.arguments or {})
         if not result_text:
-            _emit_pseudo_tool_result(
-                ls, pseudo_call,
+            _reject_text = (
                 f'❌ REJECTED: {terminal_name}() called with empty text. Your visible content MUST go '
                 f'in the {terminal_name} tool\'s `text` parameter, NOT in free prose outside tool calls. '
                 'Free prose is never delivered to the user. Put your actual answer/question/data '
-                f'in text and call {terminal_name} again.',
+                f'in text and call {terminal_name} again.'
             )
+            _emit_pseudo_tool_result(ls, pseudo_call, _reject_text)
+            # [AutoC 2026-07-27] Why: _emit_pseudo_tool_result only writes to ls.messages
+            # and JSONL; the live frontend never sees the rejection, leaving the tool card
+            # spinning forever. How: emit tool_call_end so the reducer can close the card.
+            # Purpose: live rendering matches history reconstruction for rejected finish.
+            await ls.rctx.emit_event("tool_call_end", {
+                "tool_call_id": _call_id,
+                "tool_name": terminal_name,
+                "status": "error",
+                "rejected": True,
+                "rejection_code": "empty_text",
+                "error": f"{terminal_name}() called with empty text",
+                "raw_inline": _reject_text,
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+            })
             return None
 
         # [AutoC 2026-06-10] Why: output_rejected needs to resume the entry node

@@ -96,21 +96,37 @@ class OpenAIProvider(BaseProvider):
     #  L3 Provider 层：消息预处理
     # ------------------------------------------------------------------
 
+    # [AutoC 2026-07-28] OpenAI chat completions 允许的顶级字段白名单。
+    # Fireworks 等严格兼容端点会拒绝 conversation_store 内部字段 (id, meta,
+    # message_type, created_at 等)。只保留 API 规范内的字段。
+    _MSG_ALLOWED_KEYS = frozenset({
+        "role", "content", "name", "tool_calls", "tool_call_id",
+        "reasoning_content",  # DeepSeek / 部分兼容端点
+        "refusal",            # OpenAI native
+    })
+
     @staticmethod
     def _prepare_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """L3: 将 L2 输出转换为 OpenAI API 最终格式。
 
-        【三层管道 L3 实现】两项职责：
-        1. 防御性剥离残留的 _ 开头内部字段（_meta, _dynamic 等），
-           正常情况下 L2 已经剥离，这里做二次保险。
-        2. Prefill Guard：如果最后一条消息是 assistant，追加一条
+        【三层管道 L3 实现】三项职责：
+        1. 白名单过滤：只保留 OpenAI chat completions 规范允许的顶级字段，
+           剥离 conversation_store 内部字段（id, meta, message_type 等）
+           以及残留的 _ 开头内部字段。
+        2. 空值清理：移除值为空字符串或 None 的可选字段，避免部分
+           严格端点报错。
+        3. Prefill Guard：如果最后一条消息是 assistant，追加一条
            user 消息，避免 Anthropic 系模型（通过 OpenAI 兼容端点
            访问时）因连续 assistant 消息报错。
         """
+        allowed = OpenAIProvider._MSG_ALLOWED_KEYS
         result: list[dict[str, Any]] = []
         for msg in messages:
-            # 剥离残留的内部字段（_ 开头的键）
-            clean = {k: v for k, v in msg.items() if not k.startswith('_')}
+            clean = {k: v for k, v in msg.items() if k in allowed and v is not None and v != ""}
+            # role 和 content 必须保留，即使 content 为空字符串
+            clean["role"] = msg.get("role", "user")
+            if "content" not in clean:
+                clean["content"] = msg.get("content", "")
             result.append(clean)
         # Prefill Guard：最后一条是 assistant 时追加 user 占位消息，
         # 防止某些 API 端点拒绝以 assistant 结尾的消息列表。
