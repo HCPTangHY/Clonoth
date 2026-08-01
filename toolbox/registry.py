@@ -681,6 +681,50 @@ class ToolRegistry:
         func = self._tool_funcs[name]
         return _ensure_tool_response_shape(await func(arguments, ctx))
 
+    async def load_remote_tools(self, supervisor_url: str) -> int:
+        """Load remote-worker tools from Supervisor and register wrappers."""
+        # [AutoC 2026-08-01] Register Supervisor-brokered remote tools as first-class
+        # ToolRegistry entries. Why: AI/tool tasks should call remote workers through
+        # the same registry path as builtin, script, and MCP tools. How: fetch the
+        # broker tool list, skip names that would override builtin or local script
+        # tools, then install a small wrapper per remote tool. Purpose: remote tools
+        # are available after startup and hot reload without changing inference code.
+        from . import remote_runtime
+
+        count = 0
+        try:
+            tools = await remote_runtime.list_remote_tools(supervisor_url)
+        except Exception:
+            logging.warning("[registry] remote tool list unavailable, skipping")
+            return 0
+
+        builtin_names = set(self._builtin_specs.keys())
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            registered_name = str(tool.get("name") or "").strip()
+            if not registered_name or registered_name in builtin_names or registered_name in self._tool_specs:
+                continue
+
+            description = str(tool.get("description") or "").strip()
+            schema = tool.get("input_schema")
+            if not isinstance(schema, dict):
+                schema = {"type": "object", "properties": {}, "required": []}
+            try:
+                timeout_sec = float(tool.get("timeout_sec") or 60.0)
+            except Exception:
+                timeout_sec = 60.0
+
+            self._tool_specs[registered_name] = {
+                "name": registered_name,
+                "description": description or registered_name,
+                "input_schema": schema,
+                "remote": tool.get("remote") if isinstance(tool.get("remote"), dict) else {},
+            }
+            self._tool_funcs[registered_name] = _make_remote_tool(registered_name, timeout_sec, supervisor_url)
+            count += 1
+        return count
+
     async def load_mcp_tools(self) -> int:
         """Scan enabled MCP clients and register their tools as first-class tools."""
         count = 0
@@ -735,6 +779,19 @@ class ToolRegistry:
                 count += 1
 
         return count
+
+
+def _make_remote_tool(registered_name: str, timeout_sec: float, supervisor_url: str) -> ToolFunc:
+    async def _call(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        # [AutoC 2026-08-01] Defer remote runtime import until execution. Why: the
+        # registry module is imported by many engine paths, but remote HTTP client
+        # code is only needed for remote tools. How: import inside the wrapper and
+        # pass the fixed registered name, timeout, and Supervisor URL. Purpose: keep
+        # remote tool calls isolated while preserving the standard ToolFunc shape.
+        from . import remote_runtime
+
+        return await remote_runtime.call_remote_tool(ctx, registered_name, args or {}, timeout_sec, supervisor_url)
+    return _call
 
 
 def _make_mcp_tool(workspace_root: Path, client_id: str, tool_name: str) -> ToolFunc:

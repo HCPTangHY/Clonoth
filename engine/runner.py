@@ -536,6 +536,13 @@ async def wait_supervisor(
 async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: str = "") -> None:
     wid = worker_id or str(uuid.uuid4())
     generation_id = str(uuid.uuid4())  # Direction 2: unique generation per engine startup
+    # [AutoC 2026-08-01] Honor CLONOTH_SUPERVISOR_URL for remote tool discovery.
+    # Why: Phase 2 remote tools are discovered through the Supervisor broker, and
+    # some deployments pass a canonical broker URL through the environment. How:
+    # prefer the env var when present while keeping the worker_loop argument as the
+    # fallback. Purpose: engine startup, task polling, and remote tools use one URL.
+    supervisor_url = os.environ.get("CLONOTH_SUPERVISOR_URL", "").strip() or supervisor_url or "http://127.0.0.1:8765"
+    supervisor_url = supervisor_url.rstrip("/")
     runtime_cfg = load_runtime_config(workspace_root)
     registry = ToolRegistry(workspace_root=workspace_root, tools_dir=workspace_root / "tools")
     _last_reload_seq = 0
@@ -571,8 +578,9 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         # Register no longer returns admin_token to avoid API-based token leakage.
 
         mcp_count = await registry.load_mcp_tools()
-        if mcp_count:
-            print(f"[engine] loaded {mcp_count} MCP tools", flush=True)
+        remote_count = await registry.load_remote_tools(supervisor_url)
+        if mcp_count or remote_count:
+            print(f"[engine] loaded {mcp_count} MCP tools, {remote_count} remote tools", flush=True)
 
         # Direction 1: graceful shutdown via signal handling
         stop_event = asyncio.Event()
@@ -611,7 +619,14 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                         if new_seq > _last_reload_seq:
                             _last_reload_seq = new_seq
                             count = registry.reload()
-                            print(f"[engine] tools reloaded ({count} tools)", flush=True)
+                            # [AutoC 2026-08-01] Reload MCP and remote tools after script reload.
+                            # Why: Supervisor bumps reload-seq when worker tool pools change, and
+                            # registry.reload() resets dynamic entries back to builtin/script tools.
+                            # How: re-run MCP discovery and remote broker discovery in the same hot
+                            # reload branch. Purpose: engine tool tables track live remote workers.
+                            mcp_count = await registry.load_mcp_tools()
+                            remote_count = await registry.load_remote_tools(supervisor_url)
+                            print(f"[engine] tools reloaded ({count} local tools, {mcp_count} MCP tools, {remote_count} remote tools)", flush=True)
                 except Exception:
                     pass
 
