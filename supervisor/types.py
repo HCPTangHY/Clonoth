@@ -340,3 +340,72 @@ class FallbacksUpdateIn(BaseModel):
 class ConfigReloadOut(BaseModel):
     ok: bool = True
     config: AppConfigPublic
+
+
+class RemoteToolInfo(BaseModel):
+    # [AutoC 2026-08-01] REST shape for tools provided by remote workers.
+    # Why: engine-side registry will discover remote tools through Supervisor HTTP
+    # rather than through the worker WebSocket. How: expose the same core fields as
+    # local tools plus a remote metadata block. Purpose: remote tools can be loaded
+    # into ToolRegistry without changing model-visible schemas later.
+    name: str
+    description: str
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    timeout_sec: float | None = None
+    remote: dict[str, Any] = Field(default_factory=dict)
+
+
+class RemoteToolsOut(BaseModel):
+    ok: bool = True
+    tools: list[RemoteToolInfo] = Field(default_factory=list)
+
+
+class RemoteCallCreateIn(BaseModel):
+    registered_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    timeout_sec: float | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class RemoteCallCreateOut(BaseModel):
+    ok: bool = True
+    call_id: str
+    worker_id: str
+    status: str
+
+
+class RemoteCallCancelIn(BaseModel):
+    reason: str = "task cancelled"
+
+
+class RemoteCallCancelOut(BaseModel):
+    ok: bool = True
+    call_id: str
+    status: str
+
+
+class RemoteCallResultOut(BaseModel):
+    ok: bool = True
+    call_id: str | None = None
+    worker_id: str | None = None
+    status: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    cancelled: bool = False
+    elapsed_ms: float | None = None
+
+
+class RemoteWorkerInfo(BaseModel):
+    connection_id: str
+    worker_id: str
+    worker_name: str = ""
+    namespace: str = ""
+    connected_at: datetime
+    last_seen_at: datetime
+    max_concurrency: int = 1
+    running_calls: int = 0
+    load: float | None = None
+    tools: list[str] = Field(default_factory=list)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    stale: bool = False

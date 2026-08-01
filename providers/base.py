@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+
+# [AutoC 2026-07-28] Anthropic 要求 tool_call id 匹配 ^[a-zA-Z0-9_-]+$。
+# 某些上游 OpenAI 兼容端点返回 "grep:9"、"shell:0" 等含冒号的 id。
+_TOOL_ID_CLEAN_RE = re.compile(r'[^a-zA-Z0-9_-]')
+
+
+def sanitize_tool_call_id(raw_id: str) -> str:
+    """将 tool_call id 中不合规的字符替换为下划线。"""
+    if not raw_id:
+        return raw_id
+    return _TOOL_ID_CLEAN_RE.sub('_', raw_id)
 
 
 @dataclass
@@ -10,6 +22,11 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+
+    def __post_init__(self):
+        # 入口防御：阻止脏 id 进入系统
+        if self.id:
+            self.id = sanitize_tool_call_id(self.id)
 
 
 @dataclass

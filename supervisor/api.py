@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import sys
 import threading
@@ -17,6 +18,13 @@ from fastapi.responses import FileResponse, Response
 
 from .config_store import ConfigStore
 from .process_manager import ProcessManager
+from .remote_workers import (
+    RemoteCallNotFound,
+    RemoteToolNotFound,
+    RemoteWorkerBusy,
+    RemoteWorkerManager,
+    RemoteWorkerUnavailable,
+)
 from .state import SupervisorState
 from .types import (
     AdminStateOut,
@@ -46,6 +54,13 @@ from .types import (
     OutboundMessageOut,
     RestartIn,
     RestartOut,
+    RemoteCallCancelIn,
+    RemoteCallCancelOut,
+    RemoteCallCreateIn,
+    RemoteCallCreateOut,
+    RemoteCallResultOut,
+    RemoteToolsOut,
+    RemoteWorkerInfo,
     Task,
     TaskCompleteIn,
     TaskKind,
@@ -56,6 +71,8 @@ from .admin_api import get_admin_token, get_web_auth, init_web_auth, verify_admi
 from engine.model import resolve_provider
 from engine.node import load_node
 
+
+logger = logging.getLogger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -195,6 +212,20 @@ _WS_HEARTBEAT_SEC = 30.0
 _WS_INITIAL_MESSAGE_TIMEOUT_SEC = 0.5
 
 _WS_MAX_EVENT_BYTES = 65_536  # 64 KiB soft cap for individual WS events
+_WORKER_WS_MAX_FRAME_BYTES = 2 * 1024 * 1024
+
+
+async def _send_worker_ws_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
+    """Send one remote-worker protocol JSON frame without changing payload fields."""
+    # [AutoC 2026-08-01] Keep worker protocol frames separate from UI event frames.
+    # Why: _send_ws_json intentionally truncates large event payloads for browsers,
+    # but workers must receive exact tool_call and cancel messages. How: serialize
+    # with a hard frame-size guard and no field rewriting. Purpose: remote tool calls
+    # stay protocol-correct while still limiting accidental oversized frames.
+    text = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(text.encode("utf-8")) > _WORKER_WS_MAX_FRAME_BYTES:
+        raise ValueError("worker websocket frame too large")
+    await websocket.send_text(text)
 
 
 async def _send_ws_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
@@ -228,6 +259,30 @@ def create_app(
     app.state.state = state
     app.state.process_manager = process_manager
     app.state.config_store = config_store
+    app.state.remote_workers = RemoteWorkerManager(
+        workspace_root=state.workspace_root,
+        eventlog=state.eventlog,
+        send_json=_send_worker_ws_json,
+        on_tools_changed=state.bump_tools_reload,
+    )
+
+    @app.on_event("startup")
+    async def _remote_workers_startup() -> None:
+        # [AutoC 2026-08-01] Start the Supervisor-side stale heartbeat reaper.
+        # Why: a worker may disappear without a clean WebSocket close. How: run the
+        # manager's background loop with FastAPI startup. Purpose: stale workers are
+        # removed and their calls fail instead of waiting forever.
+        mgr: RemoteWorkerManager = app.state.remote_workers
+        await mgr.start()
+
+    @app.on_event("shutdown")
+    async def _remote_workers_shutdown() -> None:
+        # [AutoC 2026-08-01] Stop remote worker runtime state on application shutdown.
+        # Why: background tasks and pending calls belong to this app instance. How:
+        # cancel the manager's reaper and mark connected workers offline. Purpose:
+        # tests and process restarts do not leak async tasks.
+        mgr: RemoteWorkerManager = app.state.remote_workers
+        await mgr.stop()
 
     @app.get("/v1/health", response_model=HealthOut)
     async def health() -> HealthOut:
@@ -857,6 +912,112 @@ def create_app(
                 with contextlib.suppress(Exception):
                     receive_task.result()
             st.eventlog.unsubscribe(session_id, queue)
+
+    @app.websocket("/v1/ws/worker")
+    async def worker_ws(websocket: WebSocket) -> None:
+        """Remote worker protocol WebSocket endpoint."""
+        mgr: RemoteWorkerManager = app.state.remote_workers
+        token = ""
+        auth_header = str(websocket.headers.get("authorization") or "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(websocket.query_params.get("token") or "").strip()
+
+        await websocket.accept()
+        connection_id = ""
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            hello = json.loads(raw)
+            if not isinstance(hello, dict):
+                hello = {}
+        except Exception:
+            await _send_worker_ws_json(websocket, {"type": "hello_ack", "accepted": False, "error": "invalid hello"})
+            await websocket.close(code=4003, reason="invalid hello")
+            return
+
+        ack = await mgr.register_worker(websocket=websocket, token=token, hello=hello)
+        await _send_worker_ws_json(websocket, ack)
+        if not ack.get("accepted"):
+            await websocket.close(code=4003, reason=str(ack.get("error") or "worker rejected")[:120])
+            return
+        connection_id = str(ack.get("connection_id") or "")
+
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("invalid remote worker json: connection_id=%s", connection_id)
+                    continue
+                if isinstance(message, dict):
+                    await mgr.handle_worker_message(connection_id, message)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            logger.exception("remote worker websocket failed: connection_id=%s", connection_id)
+        finally:
+            if connection_id:
+                await mgr.unregister_worker(connection_id, reason="websocket_closed")
+
+    @app.get("/v1/remote/tools", response_model=RemoteToolsOut)
+    async def remote_tools() -> RemoteToolsOut:
+        mgr: RemoteWorkerManager = app.state.remote_workers
+        return RemoteToolsOut(tools=await mgr.list_tools_async())
+
+    @app.post("/v1/remote/calls", response_model=RemoteCallCreateOut)
+    async def remote_call_create(body: RemoteCallCreateIn) -> RemoteCallCreateOut:
+        mgr: RemoteWorkerManager = app.state.remote_workers
+        try:
+            call = await mgr.create_call(
+                registered_name=body.registered_name,
+                arguments=body.arguments,
+                context=body.context,
+                timeout_sec=body.timeout_sec,
+            )
+        except RemoteToolNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RemoteWorkerBusy as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except RemoteWorkerUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return RemoteCallCreateOut(call_id=call.call_id, worker_id=call.worker_id, status=call.status)
+
+    @app.get("/v1/remote/calls/{call_id}/result", response_model=RemoteCallResultOut)
+    async def remote_call_result(call_id: str, wait_sec: float = Query(0.0, ge=0.0, le=30.0)) -> Response | RemoteCallResultOut:
+        mgr: RemoteWorkerManager = app.state.remote_workers
+        try:
+            result = await mgr.wait_call_result(call_id, wait_sec)
+        except RemoteCallNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if result is None:
+            status = await mgr.call_status(call_id)
+            return Response(
+                content=json.dumps({"ok": True, "call_id": call_id, "worker_id": status.get("worker_id"), "status": status.get("status", "running")}, ensure_ascii=False),
+                status_code=202,
+                media_type="application/json",
+            )
+        return RemoteCallResultOut.model_validate(result)
+
+    @app.post("/v1/remote/calls/{call_id}/cancel", response_model=RemoteCallCancelOut)
+    async def remote_call_cancel(call_id: str, body: RemoteCallCancelIn) -> RemoteCallCancelOut:
+        mgr: RemoteWorkerManager = app.state.remote_workers
+        reason = str(body.reason or "task cancelled")
+        try:
+            await mgr.cancel_call(call_id, reason)
+            status = await mgr.call_status(call_id)
+        except RemoteCallNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RemoteWorkerUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return RemoteCallCancelOut(call_id=call_id, status=str(status.get("status", "cancel_requested")))
+
+    @app.get("/v1/admin/remote/workers", response_model=list[RemoteWorkerInfo])
+    async def admin_remote_workers(request: Request) -> list[RemoteWorkerInfo]:
+        verify_admin_token(request)
+        mgr: RemoteWorkerManager = app.state.remote_workers
+        return [RemoteWorkerInfo.model_validate(item) for item in await mgr.list_workers()]
 
     @app.websocket("/v1/ws")
     async def global_ws(websocket: WebSocket) -> None:

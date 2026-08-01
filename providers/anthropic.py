@@ -20,7 +20,7 @@ from typing import Any, Callable, Awaitable
 
 import httpx
 
-from .base import BaseProvider, ProviderResponse, ToolCall
+from .base import BaseProvider, ProviderResponse, ToolCall, sanitize_tool_call_id
 
 log = logging.getLogger(__name__)
 
@@ -181,7 +181,7 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
                     tr_content = json.dumps(tool_result_content, ensure_ascii=False)
                 tool_results.append({
                     "type": "tool_result",
-                    "tool_use_id": tm.get("tool_call_id", ""),
+                    "tool_use_id": sanitize_tool_call_id(tm.get("tool_call_id", "")),
                     "content": tr_content,
                 })
                 i += 1
@@ -228,7 +228,7 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
                     args_parsed = {}
                 blocks.append({
                     "type": "tool_use",
-                    "id": tc.get("id", ""),
+                    "id": sanitize_tool_call_id(tc.get("id", "")),
                     "name": fn.get("name", ""),
                     "input": args_parsed,
                 })

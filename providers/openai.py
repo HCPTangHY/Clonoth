@@ -5,7 +5,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from .base import BaseProvider, ProviderResponse, ToolCall
+from .base import BaseProvider, ProviderResponse, ToolCall, sanitize_tool_call_id
 
 
 def _parse_first_json_object(raw: str) -> dict | None:
@@ -127,6 +127,14 @@ class OpenAIProvider(BaseProvider):
             clean["role"] = msg.get("role", "user")
             if "content" not in clean:
                 clean["content"] = msg.get("content", "")
+            # [AutoC 2026-07-28] 出口清洗：历史 JSONL 中可能存有含冒号的
+            # tool_call id（如 "grep:9"），在发送前统一替换为合规字符。
+            if "tool_calls" in clean and isinstance(clean["tool_calls"], list):
+                for _tc in clean["tool_calls"]:
+                    if isinstance(_tc, dict) and "id" in _tc:
+                        _tc["id"] = sanitize_tool_call_id(_tc["id"])
+            if "tool_call_id" in clean and isinstance(clean["tool_call_id"], str):
+                clean["tool_call_id"] = sanitize_tool_call_id(clean["tool_call_id"])
             result.append(clean)
         # Prefill Guard：最后一条是 assistant 时追加 user 占位消息，
         # 防止某些 API 端点拒绝以 assistant 结尾的消息列表。
