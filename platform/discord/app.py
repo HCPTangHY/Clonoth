@@ -25,7 +25,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState  # noqa: E402
 
-from .agent import ApprovalView, _start_bridge, handle_agent, handle_model_command
+from .agent import ApprovalView, BotRestartConfirmView, _start_bridge, handle_agent, handle_model_command
 from .callbacks import DiscordCallbacks
 from .context import (
     _format_member_entry,
@@ -114,6 +114,7 @@ class DiscordRuntime:
     # [2026-05-14 refactor note] callbacks.py uses this factory so ApprovalView
     # can stay in agent.py without creating a callbacks -> agent import cycle.
     approval_view_factory: Callable[[str], discord.ui.View] | None = None
+    bot_restart_view_factory: Callable[[int], discord.ui.View] | None = None
     bridge_runner: Any | None = None
     bridge_site: Any | None = None
 
@@ -146,6 +147,7 @@ def create_runtime() -> DiscordRuntime:
         history_max_len=int(os.environ.get("DISCORD_HISTORY_LEN", str(HISTORY_MAX_LEN))),
     )
     rt.approval_view_factory = lambda approval_id: ApprovalView(rt, approval_id)
+    rt.bot_restart_view_factory = lambda channel_id: BotRestartConfirmView(rt, channel_id)
     return rt
 
 

@@ -19,7 +19,7 @@ from aiohttp import web
 from clonoth_sdk import TriggerInfo
 
 from .context import _build_context_text, _build_reply_context, _ensure_channel
-from .messaging import _collect_attachments
+from .messaging import _collect_attachments, _safe_restart
 
 
 logger = logging.getLogger("discord_bot")
@@ -150,6 +150,48 @@ class ApprovalView(_SuperuserView):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="❌ 已拒绝", view=self)
+        self.stop()
+
+
+class BotRestartConfirmView(_SuperuserView):
+    """推送审批：Bot adapter 重启需要 SUPERUSER 确认。"""
+
+    def __init__(self, rt: Any, channel_id: int):
+        super().__init__(rt, timeout=120)
+        self.channel_id = channel_id
+        self.decided = False
+
+    async def on_timeout(self) -> None:
+        if self.decided:
+            return
+        self.decided = True
+        for child in self.children:
+            child.disabled = True
+        if hasattr(self, "_msg") and self._msg:
+            try:
+                await self._msg.edit(content="⏰ Bot 重启审批已超时（自动拒绝）", view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="确认重启", style=discord.ButtonStyle.danger, emoji="🔄")
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.decided:
+            return
+        self.decided = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="🔄 Bot 重启已批准，正在重启...", view=self)
+        self.stop()
+        asyncio.create_task(_safe_restart(self.rt, channel_id=self.channel_id, delay=2.0))
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.decided:
+            return
+        self.decided = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="❌ Bot 重启已取消", view=self)
         self.stop()
 
 

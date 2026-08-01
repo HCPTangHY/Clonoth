@@ -197,7 +197,13 @@ class DiscordCallbacks:
         self._last_edit_time.pop(seq, None)
 
         if should_restart:
-            asyncio.create_task(_safe_restart(self.rt, channel_id=channel_id, delay=2.0))
+            ch = msg.channel
+            if self.rt.bot_restart_view_factory:
+                view = self.rt.bot_restart_view_factory(channel_id)
+                confirm_msg = await ch.send("🔄 **Bot 重启需要管理员确认**", view=view)
+                view._msg = confirm_msg
+            else:
+                asyncio.create_task(_safe_restart(self.rt, channel_id=channel_id, delay=2.0))
 
         logger.info("send_reply ch=%s seq=%s", channel_id, seq)
 
