@@ -13,14 +13,14 @@ import httpx
 import yaml
 
 from clonoth_runtime import (
-    fetch_openai_secret,
+    fetch_llm_secret,
     get_bool,
     get_float,
     get_int,
     get_str,
     load_runtime_config,
     load_yaml_dict,
-    normalize_openai_secret,
+    normalize_llm_secret,
 )
 from providers import registry as provider_registry
 from toolbox.context import ToolContext
@@ -696,8 +696,8 @@ async def _handle_task(
     session_id = str(item.get("session_id") or "").strip()
     session_generation = int(item.get("session_generation") or 0)
 
-    cfg_raw = await fetch_openai_secret(http, sup_url)
-    api_key, base_url, default_model = normalize_openai_secret(cfg_raw)
+    cfg_raw = await fetch_llm_secret(http, sup_url)
+    api_key, base_url, default_model = normalize_llm_secret(cfg_raw)
 
     _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id))
     try:
@@ -821,8 +821,9 @@ async def _run_node_task(
     node = load_node(ws_root, node_id)
     if node is None:
         return {"action": "fail", "node_id": node_id, "error": f"节点未找到：{node_id}"}
-    if node.type == "ai" and not api_key:
-        return {"action": "fail", "node_id": node_id, "error": "OpenAI api_key 未配置。"}
+    # [AutoC 2026-08-01] api_key 检查移至 provider 构造之后。
+    # 全局 key 为空不代表最终无 key：resolve_provider 会从
+    # node.api_key / config.yaml provider section / 环境变量中取。
 
     rctx = RunContext(
         workspace_root=ws_root, supervisor_url=sup_url,
@@ -1010,6 +1011,15 @@ async def _run_node_task(
             base_url=base_url,
             provider_options=_po,
         )
+        # [AutoC 2026-08-01] 在 provider 构造之后检查实际解析出的 key。
+        # fallback 链：session_override → node.api_key → config.yaml provider section
+        # → {PREFIX}_API_KEY 环境变量 → 全局 api_key。全部为空才报错。
+        _actual_key = getattr(provider, '_api_key', None) or ''
+        if not _actual_key:
+            return {
+                "action": "fail", "node_id": node_id,
+                "error": f"LLM provider api_key 未配置（provider={rp.provider_type}, node={node_id}）。"
+            }
 
     await rctx.emit_event("node_started", {
         "task_id": task_id, "node_id": node.id,

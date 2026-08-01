@@ -89,9 +89,13 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
         "max_budget_chars": 0,
     },
     "shell": {
-        # Historical namespace: keeps the default entry node for inbound routing.
-        # The built-in CLI/TUI shell has been removed.
         "entry_node_id": "bootstrap.shell_orchestrator",
+        "http": {"client_timeout_sec": 10.0},
+        "supervisor": {
+            "health_timeout_sec": 2.0,
+            "wait_poll_interval_sec": 0.5,
+        },
+        "events_poll_interval_sec": 0.5,
     },
     "supervisor": {
         "process_manager": {
@@ -211,20 +215,28 @@ def resolve_env_ref(text: str) -> str:
     return s
 
 
-async def fetch_openai_secret(http: httpx.AsyncClient, supervisor_url: str) -> dict[str, Any]:
+async def fetch_llm_secret(http: httpx.AsyncClient, supervisor_url: str) -> dict[str, Any]:
+    """从 supervisor 获取全局 LLM provider 配置（api_key/base_url/model）。"""
     r = await http.get(f"{supervisor_url.rstrip('/')}/v1/config/openai/secret")
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, dict) else {}
 
+# 旧名别名，兼容外部调用
+fetch_openai_secret = fetch_llm_secret
 
-def normalize_openai_secret(data: dict[str, Any]) -> tuple[str, str, str]:
+
+def normalize_llm_secret(data: dict[str, Any]) -> tuple[str, str, str]:
+    """从全局配置 dict 中提取 api_key/base_url/model，支持环境变量引用。"""
     if not isinstance(data, dict):
         return "", "", ""
     api_key = resolve_env_ref(str(data.get("api_key") or "").strip())
     base_url = resolve_env_ref(str(data.get("base_url") or "").strip())
     model = resolve_env_ref(str(data.get("model") or "gpt-4o-mini").strip()) or "gpt-4o-mini"
     return api_key, base_url, model
+
+# 旧名别名，兼容外部调用
+normalize_openai_secret = normalize_llm_secret
 
 
 def load_policy_config(workspace_root: Path) -> dict[str, Any]:
