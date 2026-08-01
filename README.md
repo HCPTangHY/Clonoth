@@ -59,81 +59,126 @@ Engine 包含记忆提取、记忆存储、上下文压缩和轮次摘要相关�
 | `clonoth_sdk/` | 外部客户端 SDK，封装请求、回调、审批和事件路由。 |
 | `tools/` | 可由 Agent 调用的本地工具。 |
 | `toolbox/` | 工具运行时、注册表、MCP 和技能运行支持。 |
+| `skills/` | 技能定义，用于向模型注入领域能力和行为规则。 |
 | `plugins/` | 外部 Hook 插件目录。 |
 | `config/` | 运行时、节点、工作流和模型路由配置。 |
 | `docs/` | 架构设计、集成说明和演进文档。 |
+| `public/` | 管理界面和 Playground 静态资源。 |
+| `tests/` | 自动化测试。 |
 
 ## 快速开始
 
 ### 1. 准备环境
 
-建议使用 Python 3.11 或更高版本。若需要使用 Web 前端，还需要 Node.js 18 或更高版本，以及 npm。
-
-### 2. 单机一步部署
-
-下面的命令适合在一台机器上完成基础部署：安装 Python 依赖、准备本地配置、构建 Web 前端，并启动 Supervisor。
-
-```bash
-python3.11 -m venv .venv && \
-. .venv/bin/activate && \
-python -m pip install -U pip && \
-python -m pip install -r requirements.txt && \
-mkdir -p data && \
-( test -f data/config.yaml || cp config.example.yaml data/config.yaml ) && \
-( test -f data/policy.yaml || cp policy.example.yaml data/policy.yaml ) && \
-( cd platform/web/frontend && npm ci && npm run build ) && \
-python main.py
-```
-
-⚠️ 注意：
-
-- `requirements.txt` 只管理 Python 依赖；Web 前端依赖由 `platform/web/frontend/package-lock.json` 管理。
-- 首次部署后，需要在 `data/config.yaml` 中填写模型 Provider、base URL、API Key 和默认模型，或使用环境变量引用。
-- `data/config.yaml` 和 `data/policy.yaml` 是本地运行文件，不应提交到仓库。
-- 上面的命令会在前台运行 Supervisor。生产环境建议改用 systemd、PM2 或其他进程管理器。
-- 若只部署后端而不使用 Web 前端，可以跳过 `platform/web/frontend` 中的 npm 构建步骤。
-
-### 3. 手动分步部署
+需要 Python 3.11 或更高版本。如需 Web 前端，还需要 Node.js 18+ 和 npm。
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
-mkdir -p data
-test -f data/config.yaml || cp config.example.yaml data/config.yaml
-test -f data/policy.yaml || cp policy.example.yaml data/policy.yaml
 ```
 
-然后按本地环境修改：
+### 2. 配置环境变量
 
-- `data/config.yaml`：Provider、模型、base URL、API Key 等运行配置。
-- `data/policy.yaml`：文件读写、命令执行、重启等安全策略。
-- `config/runtime.yaml`：Engine、Supervisor、工具输出、上下文压缩等运行时参数。
+复制 `.env.example` 为 `.env`，填入 LLM Provider 的 API Key 和端点：
 
-构建 Web 前端：
+```bash
+cp .env.example .env
+```
+
+最小可运行配置只需填写三个变量：
+
+```env
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=sk-your-key-here
+OPENAI_MODEL=gpt-4o-mini
+```
+
+支持任意 OpenAI 兼容端点（本地 Ollama、代理服务等）。其他 Provider（Anthropic、DeepSeek、Gemini）的配置见 `.env.example` 中的注释。
+
+### 3. 准备运行配置
+
+```bash
+mkdir -p data
+cp config.example.yaml data/config.yaml
+cp policy.example.yaml data/policy.yaml
+```
+
+三份配置文件的职责：
+
+- **`.env`**：环境变量，存放 API Key 等敏感信息。不提交到仓库。
+- **`data/config.yaml`**：Provider 选择、模型、base URL。支持 `${ENV_VAR}` 引用环境变量。不提交到仓库。
+- **`data/policy.yaml`**：安全策略（文件读写权限、命令执行审批规则）。
+- **`config/runtime.yaml`**：Engine 运行时参数（步数限制、上下文压缩阈值、worker 数量等）。可提交到仓库。
+
+`data/config.yaml` 默认通过 `${OPENAI_BASE_URL}` 等引用 `.env` 中的变量，通常无需额外编辑。
+
+### 4. 构建 Web 前端（可选）
 
 ```bash
 cd platform/web/frontend
 npm ci
 npm run build
+cd ../../..
 ```
 
-启动服务：
+Supervisor 启动后会自动挂载 `platform/web/frontend/dist/` 到 `/web/` 路径。如果不需要 Web 界面，可跳过此步。
+
+### 5. 启动服务
 
 ```bash
-cd /path/to/Clonoth
-source .venv/bin/activate
 python main.py
 ```
 
-Supervisor 会自动挂载 `platform/web/frontend/dist/` 到 `/web/` 路径。
+Supervisor 默认监听 `127.0.0.1:8765`。可通过环境变量修改：
 
-### 4. 运行测试
+```env
+CLONOTH_HOST=0.0.0.0
+CLONOTH_PORT=8765
+```
+
+启动后访问 `http://localhost:8765/web/` 进入 Web 界面。
+
+生产环境建议使用 systemd、PM2 等进程管理器。如果使用 PM2，可参考根目录中的 `ecosystem.config.js`。
+
+### 6. 一步部署（快捷命令）
+
+以上步骤合并为一条命令：
+
+```bash
+python3.11 -m venv .venv && \
+. .venv/bin/activate && \
+python -m pip install -U pip && \
+python -m pip install -r requirements.txt && \
+cp .env.example .env && \
+mkdir -p data && \
+( test -f data/config.yaml || cp config.example.yaml data/config.yaml ) && \
+( test -f data/policy.yaml || cp policy.example.yaml data/policy.yaml ) && \
+( cd platform/web/frontend && npm ci && npm run build ) && \
+echo "编辑 .env 填入 API Key，然后运行 python main.py"
+```
+
+### 7. 运行测试
 
 ```bash
 pytest
 ```
+
+### 环境变量参考
+
+| 变量 | 用途 | 默认值 |
+| --- | --- | --- |
+| `OPENAI_BASE_URL` | 全局 LLM API 端点 | `https://api.openai.com/v1` |
+| `OPENAI_API_KEY` | 全局 LLM API Key | 无（必填） |
+| `OPENAI_MODEL` | 全局默认模型 | `gpt-4o-mini` |
+| `ANTHROPIC_API_KEY` | Anthropic Provider Key | fallback 到全局 |
+| `DEEPSEEK_API_KEY` | DeepSeek Provider Key | fallback 到全局 |
+| `GEMINI_API_KEY` | Gemini Provider Key | fallback 到全局 |
+| `CLONOTH_HOST` | Supervisor 监听地址 | `127.0.0.1` |
+| `CLONOTH_PORT` | Supervisor 监听端口 | `8765` |
+| `CLONOTH_LOG_LEVEL` | 日志级别 | `info` |
+| `CLONOTH_ADMIN_TOKEN` | Admin API 认证 token | 自动生成 |
 
 ## 详细文档
 

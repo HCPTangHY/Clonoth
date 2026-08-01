@@ -5,7 +5,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-from clonoth_runtime import get_str, load_runtime_config
+from clonoth_runtime import get_entry_node_id, get_str, load_runtime_config
 from engine.tool_step import cleanup_tool_result_artifacts
 
 from ._helpers import _now
@@ -22,7 +22,7 @@ class TaskStoreMixin:
 
     def _default_entry_node(self) -> str:
         cfg = load_runtime_config(self.workspace_root)
-        return get_str(cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip() or "bootstrap.shell_orchestrator"
+        return get_entry_node_id(cfg)
 
     def _task_terminal(self, task: Task) -> bool:
         return task.status in {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}

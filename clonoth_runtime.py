@@ -88,8 +88,12 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "skills": {
         "max_budget_chars": 0,
     },
-    "shell": {
+    "routing": {
         "entry_node_id": "bootstrap.shell_orchestrator",
+    },
+    # [deprecated] shell section 仅供 platform/shell CLI/TUI 使用。
+    # entry_node_id 已迁移到 routing.entry_node_id。
+    "shell": {
         "http": {"client_timeout_sec": 10.0},
         "supervisor": {
             "health_timeout_sec": 2.0,
@@ -147,6 +151,23 @@ def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
     merged = _deep_merge(DEFAULT_RUNTIME_CONFIG, user_cfg)
     _CACHE[key] = (mtime, merged)
     return copy.deepcopy(merged)
+
+
+def get_entry_node_id(cfg: dict[str, Any]) -> str:
+    """从 runtime config 中获取入口节点 ID。
+
+    优先级：routing.entry_node_id > shell.entry_node_id > 默认值。
+    [AutoC 2026-08-01] entry_node_id 从 shell section 迁移到 routing section，
+    此函数提供统一读取入口并兼容旧配置。
+    """
+    _default = "bootstrap.shell_orchestrator"
+    val = get_str(cfg, "routing.entry_node_id", "").strip()
+    if val:
+        return val
+    val = get_str(cfg, "shell.entry_node_id", "").strip()
+    if val:
+        return val
+    return _default
 
 
 def get_str(data: dict[str, Any], dotted_key: str, default: str = "") -> str:

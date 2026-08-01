@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
+from clonoth_runtime import get_bool, get_entry_node_id, get_int, get_str, load_runtime_config
 
 
 log = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ class MemoryExtractHandler:
             return
         workspace_root = Path(workspace_root)
         runtime_cfg = load_runtime_config(workspace_root)
-        entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
+        entry_node_id = get_entry_node_id(runtime_cfg)
         if getattr(task, "node_id", None) != entry_node_id:
             log.debug("memory_extract gate: node_id=%s != entry_node_id=%s", getattr(task, "node_id", None), entry_node_id)
             return

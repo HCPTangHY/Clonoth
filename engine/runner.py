@@ -15,6 +15,7 @@ import yaml
 from clonoth_runtime import (
     fetch_llm_secret,
     get_bool,
+    get_entry_node_id,
     get_float,
     get_int,
     get_str,
@@ -950,7 +951,7 @@ async def _run_node_task(
 
     runtime_cfg = load_runtime_config(ws_root)
     sw_info = _discover_switchable_nodes(ws_root, node.id)
-    entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
+    entry_node_id = get_entry_node_id(runtime_cfg)
 
     provider = None
     if node.type == "ai":
