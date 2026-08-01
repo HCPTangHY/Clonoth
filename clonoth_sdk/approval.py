@@ -120,7 +120,10 @@ def is_external_operation(
     """
     path_str = details.get("path", "")
     if not path_str:
-        return False
+        # Operations without a path (e.g. restart, schedule) are not
+        # workspace-internal file operations — they must require manual
+        # approval and should never be auto-approved.
+        return True
     _, _, is_ext = classify_path(workspace_root, extra_roots, path_str)
     return is_ext
 
