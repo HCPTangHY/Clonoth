@@ -229,9 +229,10 @@ class ClonothClient:
         if self._admin_token:
             # Why: deployments may protect every Supervisor endpoint with the same
             # bearer token used by HTTP. How: pass the header through websockets'
-            # extra_headers parameter. Purpose: keep WS auth behavior aligned with
-            # the shared httpx client.
-            connect_kwargs["extra_headers"] = {"Authorization": f"Bearer {self._admin_token}"}
+            # additional_headers parameter. Purpose: keep WS auth behavior aligned
+            # with the shared httpx client.
+            # websockets 14+ renamed extra_headers → additional_headers.
+            connect_kwargs["additional_headers"] = {"Authorization": f"Bearer {self._admin_token}"}
 
         async with websockets.connect(ws_url, **connect_kwargs) as ws:
             await ws.send(json.dumps({"last_seq": int(last_seq or 0)}))
