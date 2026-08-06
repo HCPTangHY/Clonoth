@@ -1831,70 +1831,101 @@ async def run_ai_node(
             _rej_line = f"reject by {_rej_from}: {_rej_reason}" if _rej_from else f"reject: {_rej_reason}"
             _finish_call_id = str(resume_data.get("_finish_tool_call_id") or "").strip()
             _finish_result_idx = -1
-            if not _finish_call_id:
-                # [AutoC 2026-06-10] Why: old suspended entry tasks may not carry
-                # runtime_state. How: scan restored conversation history for the
-                # latest finish assistant tool call. Purpose: still pair the reject
-                # tool result when the supervisor could not provide the id.
+
+            # [AutoC 2026-08-06] 判断是否为隐式 finish（hybrid free prose）。
+            # hybrid 模式下 tool_call_log 可能残留被 guard reject 的 finish 调用 id，
+            # 但实际 JSONL/messages 里没有 finish tool_call，不能走显式分支。
+            # 检测方式：在 messages 里找不到对应的 finish assistant tool_call。
+            _is_implicit_finish = True
+            if _finish_call_id:
                 for _m in reversed(messages):
                     if _m.get("role") != "assistant":
                         continue
-                    for _tc in reversed(_m.get("tool_calls") or []):
+                    for _tc in (_m.get("tool_calls") or []):
                         if not isinstance(_tc, dict):
                             continue
                         _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
+                        _tc_id = str(_tc.get("id") or "").strip()
                         _tc_name = str(_tc.get("name") or _fn.get("name") or "")
-                        if _tc_name == "finish":
-                            _finish_call_id = str(_tc.get("id") or "").strip()
+                        if _tc_name == "finish" and _tc_id == _finish_call_id:
+                            _is_implicit_finish = False
                             break
-                    if _finish_call_id:
+                    if not _is_implicit_finish:
                         break
-            if _finish_call_id:
-                for _idx in range(len(messages) - 1, -1, -1):
-                    _m = messages[_idx]
-                    if _m.get("role") != "tool":
-                        continue
-                    if str(_m.get("tool_call_id") or "").strip() != _finish_call_id:
-                        continue
-                    if str(_m.get("name") or "").strip() != "finish":
-                        continue
-                    _finish_result_idx = _idx
-                    break
-            if not _finish_call_id:
-                _finish_call_id = "finish_rejected"
-            _rej_parsed = ParsedToolCall(
-                id=_finish_call_id,
-                name="finish",
-                arguments={},
-            )
-            _rej_msg = formatter.format_tool_result(_rej_parsed, _rej_line)
-            set_message_meta(_rej_msg, MessageMeta(
-                tool_mode=getattr(node, 'tool_mode', 'fake-native'),
-                message_type="tool_result",
-            ))
-            if _finish_result_idx >= 0:
-                # [AutoC 2026-06-10] Why: the original finish already wrote an
-                # "ok" result for the same tool_call_id. How: replace that paired
-                # result instead of appending a duplicate role=tool message. Purpose:
-                # native providers keep exactly one tool result per finish call.
-                _old_msg_id = str(messages[_finish_result_idx].get("id") or "").strip()
-                messages[_finish_result_idx] = _rej_msg
-                # [AutoC 2026-06-18] Why: the in-memory replacement above does not
-                # persist to JSONL — the original "ok" stays on disk. How: use
-                # ConversationStore.update_message to overwrite the "ok" row. Purpose:
-                # finish reject is persisted like any normal tool result.
+
+            logger.info("output_rejected: from=%s reason=%s fcid=%r implicit=%s msg_count=%d",
+                     _rej_from, _rej_reason[:80], _finish_call_id, _is_implicit_finish, len(messages))
+
+            if _is_implicit_finish:
+                # Hybrid 模式隐式 finish 或无 finish call_id：
+                # 以 user 角色注入 reject，追加到 messages 末尾。
+                # reject 作为当前指令应该在动态上下文（背景信息）之后。
+                _rej_user_msg = {"role": "user", "content": _rej_line}
+                set_message_meta(_rej_user_msg, MessageMeta(
+                    message_type="output_rejected",
+                ))
+                messages.append(_rej_user_msg)
+                logger.info("output_rejected(implicit): appended user reject msg at idx=%d",
+                            len(messages) - 1)
                 _store = getattr(rctx, 'conversation_store', None)
                 _target_sid = getattr(rctx, 'child_session_id', '') or rctx.session_id
-                if _old_msg_id and _store:
+                if _store:
                     try:
-                        _store.update_message(_target_sid, _old_msg_id, _rej_msg)
-                    except Exception as _upd_exc:
-                        log.warning("output_rejected: update_message failed sid=%s msg=%s: %s",
-                                    _target_sid, _old_msg_id, _upd_exc)
-                elif not _old_msg_id:
-                    log.warning("output_rejected: msg id missing, cannot persist reject to JSONL")
+                        from engine.conversation_store import Message as _StoreMsg
+                        from datetime import datetime, timezone
+                        from uuid import uuid4
+                        _store.append(_target_sid, _StoreMsg(
+                            id=str(uuid4()),
+                            role="user",
+                            content=_rej_line,
+                            message_type="output_rejected",
+                            created_at=datetime.now(timezone.utc).isoformat(),
+                        ))
+                    except Exception as _wr_exc:
+                        logger.warning("output_rejected(implicit): append failed sid=%s: %s",
+                                    _target_sid, _wr_exc)
             else:
-                messages.append(_rej_msg)
+                # 显式 finish：找到对应的 tool_result 并替换内容。
+                if _finish_call_id:
+                    for _idx in range(len(messages) - 1, -1, -1):
+                        _m = messages[_idx]
+                        if _m.get("role") != "tool":
+                            continue
+                        if str(_m.get("tool_call_id") or "").strip() != _finish_call_id:
+                            continue
+                        if str(_m.get("name") or "").strip() != "finish":
+                            continue
+                        _finish_result_idx = _idx
+                        break
+                _rej_parsed = ParsedToolCall(
+                    id=_finish_call_id,
+                    name="finish",
+                    arguments={},
+                )
+                _rej_msg = formatter.format_tool_result(_rej_parsed, _rej_line)
+                set_message_meta(_rej_msg, MessageMeta(
+                    tool_mode=getattr(node, 'tool_mode', 'fake-native'),
+                    message_type="tool_result",
+                ))
+                if _finish_result_idx >= 0:
+                    _old_msg_id = str(messages[_finish_result_idx].get("id") or "").strip()
+                    messages[_finish_result_idx] = _rej_msg
+                    logger.info("output_rejected(explicit): replaced tool_result at idx=%d fcid=%s",
+                             _finish_result_idx, _finish_call_id)
+                    _store = getattr(rctx, 'conversation_store', None)
+                    _target_sid = getattr(rctx, 'child_session_id', '') or rctx.session_id
+                    if _old_msg_id and _store:
+                        try:
+                            _store.update_message(_target_sid, _old_msg_id, _rej_msg)
+                        except Exception as _upd_exc:
+                            logger.warning("output_rejected: update_message failed sid=%s msg=%s: %s",
+                                        _target_sid, _old_msg_id, _upd_exc)
+                    elif not _old_msg_id:
+                        logger.warning("output_rejected: msg id missing, cannot persist reject to JSONL")
+                else:
+                    messages.append(_rej_msg)
+                    logger.info("output_rejected(explicit): appended orphan tool_result fcid=%s",
+                             _finish_call_id)
         if str(resume_data.get("type") or "") == "compact_done":
             # [2026-04-24] P1.5 熔断器：压缩成功时重置失败计数
             # [AutoC 2026-05-13] Why: compaction may have targeted the parent
@@ -2123,6 +2154,8 @@ async def run_ai_node(
         _plaintext_result = await hook_registry.afire("before_response", _plaintext_ctx)
         if _plaintext_result.action is not None:
             return await _fire_task_end_hook_if_finish(ls, _plaintext_result.action, step + 1)
+        if _plaintext_result.modified:
+            continue  # hook injected retry hint, loop back to LLM
 
         # LEGACY: replaced by hook PlaintextRetryHandler.
         # action = _handle_plaintext_response(ls, resp, step)
