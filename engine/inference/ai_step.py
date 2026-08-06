@@ -560,11 +560,17 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         _shadow_write(ls, _unerr, message_type="tool_result")
 
     # 正文处理策略（JSON / Fake Native / Native 模式统一）：
-    # 工具调用伴随的自由正文不发送给用户，也不合成为 reply 工具调用。
-    # 正文通过 build_assistant_message 保留在 assistant 消息的 content 字段中，
-    # LLM 下一轮能看到自己说过的话，但用户看不到。
-    # 用户可见的输出仅通过 finish / reply 伪工具产生。
-    # 纯文本重试逻辑（_handle_plaintext_response）保留，仅覆盖「完全没有任何工具调用」的分支。
+    # 工具调用伴随的自由正文通过 build_assistant_message 保留在 assistant 消息中。
+    # [AutoC 2026-08-06] hybrid 模式下，伴随文本通过 assistant_text 事件推送给前端，
+    # 前端可以 edit 消息来显示。tool_only 模式下行为不变（不推送）。
+    _companion_text = (resp.text or "").strip()
+    if _companion_text and getattr(ls.node, 'output_mode', 'hybrid') == 'hybrid':
+        await ls.rctx.emit_event("assistant_text", {
+            "node_id": ls.node.id,
+            "task_id": ls.rctx.task_id,
+            "llm_request_id": getattr(ls.rctx, "current_llm_request_id", ""),
+            "text": _companion_text,
+        })
 
     # ---- before_tool_call hook：本轮工具调用级检查 ----
     # Phase 3 Hook System：先触发 round-level hook，再进入伪工具和真实工具处理。
@@ -1606,13 +1612,6 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
             reasoning_ended_at=getattr(ls, '_reasoning_ended_iso', '') or '',
         )
         set_message_meta(_assistant_msg, _implicit_meta)
-        if ls.tool_produced_attachments:
-            # [AutoC 2026-06-17] Why: hybrid plaintext finish bypasses finish() and
-            # therefore has no terminal tool_result row to carry final attachments.
-            # How: persist the selected/generated attachments directly on the
-            # assistant row metadata. Purpose: refreshed web history restores the
-            # same final attachment cards as the realtime outbound event.
-            _assistant_msg.setdefault("_meta", {})["attachments"] = list(ls.tool_produced_attachments)
         ls.messages.append(_assistant_msg)
         _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
 
@@ -1621,7 +1620,7 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
             action=ACTION_FINISH, node_id=ls.node.id,
             result={
                 "text": text,
-                "attachments": list(ls.tool_produced_attachments),
+                "attachments": [],  # [AutoC 2026-08-06] 隐式 finish 不自动带附件
                 "implicit_finish": True,
             },
             context_ref=ctx_ref,
@@ -1937,11 +1936,12 @@ async def run_ai_node(
         _sw_targets = [info["id"] for info in (switch_info or [])]
         openai_tools.append(_switch_node_spec(_sw_targets, switch_info, current_node_id=node.id, current_node_name=node.name))
 
-    openai_tools.append(_finish_spec())
-    # [AutoC 2026-05-31] Why: ask must be injected through the same provider tool
-    # list path as finish, including native/json formatter adaptation. How: append
-    # the ask schema immediately beside finish. Purpose: every node sees both
-    # terminal exits before workflow topology routing is implemented.
+    # [AutoC 2026-08-06] hybrid 模式下不注入 finish 工具：free prose 即隐式 finish，
+    # 模型不需要也不应该看到 finish 工具。tool_only 模式下保留原行为。
+    _output_mode = getattr(node, 'output_mode', 'hybrid')
+    if _output_mode == 'tool_only':
+        openai_tools.append(_finish_spec())
+    # [AutoC 2026-05-31] ask 在所有模式下都可用：节点需要向上游请求信息时使用。
     openai_tools.append(_ask_spec())
     openai_tools.append(_reply_spec())
     openai_tools.append(_compact_context_spec())

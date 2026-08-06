@@ -185,7 +185,7 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         raw_output_mode = str(_node_om).strip().lower()
     else:
         _rt_om = load_runtime_config(workspace_root)
-        raw_output_mode = str((_rt_om.get("engine") or {}).get("output_mode") or "tool_only").strip().lower()
+        raw_output_mode = str((_rt_om.get("engine") or {}).get("output_mode") or "hybrid").strip().lower()
     output_mode = raw_output_mode if raw_output_mode in {"tool_only", "hybrid"} else "tool_only"
 
     # [AutoC 2026-06-08] Why: Supervisor 需要从节点声明读取 finish 后的 output chain 目标。

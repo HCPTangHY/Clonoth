@@ -108,7 +108,7 @@ def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskActio
         node_id=ls.node.id,
         result={
             "text": text,
-            "attachments": list(ls.tool_produced_attachments),
+            "attachments": [],  # [AutoC 2026-08-06] 隐式 finish 不自动带附件，附件通过 intermediate_reply 显式传递
             "implicit_finish": True,
         },
         context_ref=ctx_ref,

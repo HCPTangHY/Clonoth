@@ -57,7 +57,7 @@ class FinishGuardHandler:
             )
             has_terminal = bool(terminal_name)
             has_non_reply_others = bool(real_list) or any(
-                _tool_name(call) not in (*terminal_tools, "reply") for call in pseudo_list
+                _tool_name(call) not in (*terminal_tools, "intermediate_reply") for call in pseudo_list
             )
         else:
             calls = list(ctx.tool_calls or [])
@@ -67,7 +67,7 @@ class FinishGuardHandler:
             )
             has_terminal = bool(terminal_name)
             has_non_reply_others = any(
-                _tool_name(call) not in (*terminal_tools, "reply") for call in calls
+                _tool_name(call) not in (*terminal_tools, "intermediate_reply") for call in calls
             )
 
         if not (has_terminal and has_non_reply_others):

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 # routing exists. How: include ask in the static pseudo-tool set next to finish.
 # Purpose: route ask through pseudo_handlers instead of rejecting it as an
 # unauthorized real tool.
-_PSEUDO_TOOL_NAMES = frozenset({"finish", "ask", "reply", "switch_node", "compact_context", "preempt_task"})
+_PSEUDO_TOOL_NAMES = frozenset({"finish", "ask", "intermediate_reply", "switch_node", "compact_context", "preempt_task"})
 
 # [2026-05-04] Dynamic delegate dispatch tools use a stable prefix plus target id.
 # Why: the removed aggregate dispatch tools hid delegate choices behind one
@@ -277,32 +277,28 @@ def _ask_spec() -> dict:
 
 
 def _reply_spec() -> dict:
-    """Build the reply pseudo-tool spec (non-terminating).
+    """Build the intermediate_reply pseudo-tool spec (non-terminating).
 
-    【Fix 4】description 重写：
-    - 显式声明 `text` 是 user-facing 的消息内容。
-    - 显式声明自由正文不会送达用户，只有 reply()/finish() 才会到达，
-      避免模型把想说的话写在 tool_call 之外的自由正文里。
+    [AutoC 2026-08-06] Renamed from reply to intermediate_reply.
+    Sends an interim message to the user without terminating the task.
     """
     return {
         "type": "function",
         "function": {
-            "name": "reply",
+            "name": "intermediate_reply",
             "description": (
                 "Send an interim message to the user WITHOUT terminating this node.\n\n"
                 "The node keeps running after this call — you can continue calling tools "
                 "or do more work in subsequent turns.\n\n"
                 "The `text` parameter is the message content the user will read. "
-                "Anything you want the user to see mid-task must go here. "
-                "Do NOT rely on free prose output — free prose is not delivered to the user; "
-                "only reply() and finish() reach the user.\n\n"
+                "Anything you want the user to see mid-task must go here.\n\n"
                 "When to use:\n"
                 "- You have a partial result or progress update to share, but more work remains.\n"
                 "- The user asked for multiple things and you want to respond to one "
                 "while continuing to work on the rest.\n\n"
                 "When NOT to use:\n"
-                "- You are done with all work → use finish instead.\n"
-                "- You need more information from the user → use finish instead."
+                "- You are done with all work → just say your final answer directly (free prose).\n"
+                "- You need more information from the user → use ask instead."
             ),
             "parameters": {
                 "type": "object",

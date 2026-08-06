@@ -262,7 +262,7 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
 # pseudo tools. How: dynamic dispatch history records are still detected by
 # prefix below. Purpose: keep restored history cleanup aligned with the active
 # pseudo-tool surface.
-_PSEUDO_TOOL_NAMES = {"finish", "reply", "switch_node"}
+_PSEUDO_TOOL_NAMES = {"finish", "intermediate_reply", "switch_node"}
 
 
 def _find_pseudo_history_marker(content: str) -> tuple[str, int]:

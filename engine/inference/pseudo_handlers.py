@@ -109,8 +109,8 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     """
     args = pseudo_call.arguments or {}
 
-    # reply: 非终止，发送中间消息
-    if pseudo_call.name == "reply":
+    # intermediate_reply: 非终止，发送中间消息
+    if pseudo_call.name == "intermediate_reply":
         reply_text = str(args.get("text") or "").strip()
         if reply_text:
             await ls.rctx.emit_event("intermediate_reply", {

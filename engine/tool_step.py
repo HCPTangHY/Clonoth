@@ -346,7 +346,7 @@ def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -
     if tool_name == "finish":
         text = _clip_one_line(safe_args.get("text", ""), 40)
         return _summary_line(f"完成: {text}" if text else "完成")
-    if tool_name == "reply":
+    if tool_name == "intermediate_reply":
         text = _clip_one_line(safe_args.get("text", ""), 40)
         return _summary_line(f"中间回复: {text}" if text else "中间回复")
 
