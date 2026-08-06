@@ -692,6 +692,34 @@ class EventRouter:
                 )
 
     # ------------------------------------------------------------------
+    #  assistant_text — hybrid 模式 free prose 伴随文本
+    # ------------------------------------------------------------------
+
+    async def _handle_assistant_text(self, event: Event) -> None:
+        """处理 assistant_text 事件。
+
+        hybrid 模式下，模型输出 tool calls 同时伴随的 free prose 文本。
+        匹配 trigger 后转发给适配器，用于在进度消息中滚动显示。
+        """
+        p = event.payload
+        src_seq = int(p.get("source_inbound_seq") or 0)
+        node_id = p.get("node_id", "")
+
+        if (
+            src_seq
+            and src_seq in self._state.triggers
+            and node_id == self._entry_node_id
+        ):
+            trigger = self._state.get_trigger(src_seq)
+            trigger.refresh()
+            text = strip_protocol_markers((p.get("text") or "").strip())
+            if text:
+                try:
+                    await self._cb.on_assistant_text(trigger, text)
+                except Exception as e:
+                    logger.error("on_assistant_text failed: %s", e)
+
+    # ------------------------------------------------------------------
     #  task_started — task 树映射构建
     # ------------------------------------------------------------------
 
@@ -983,8 +1011,13 @@ class EventRouter:
             appr_id, ap_session, conv_key, src_seq,
         )
 
+        # Operations that must never be auto-approved regardless of
+        # auto_approve_internal setting (they are not file operations).
+        _NEVER_AUTO_APPROVE_OPS = frozenset({"restart"})
+        force_manual = operation in _NEVER_AUTO_APPROVE_OPS
+
         # 决定是否自动放行
-        if is_external or not self._config.auto_approve_internal:
+        if force_manual or is_external or not self._config.auto_approve_internal:
             # 外部操作 或 bot 未开启自动放行 → 通知适配器展示审批 UI
             try:
                 await self._cb.show_approval_ui(
@@ -1344,6 +1377,7 @@ class EventRouter:
         "node_completed":    _handle_node_event,
         "handoff_progress":  _handle_handoff_progress,
         "stream_delta":      _handle_stream_delta,
+        "assistant_text":    _handle_assistant_text,
         "approval_requested": _handle_approval_requested,
         "task_completed":    _handle_task_lifecycle,
         "task_cancelled":    _handle_task_lifecycle,

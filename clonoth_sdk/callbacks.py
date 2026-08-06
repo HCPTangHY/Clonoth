@@ -111,6 +111,32 @@ class AdapterCallbacks(Protocol):
         """
         ...
 
+    async def on_assistant_text(
+        self,
+        trigger: TriggerInfo,
+        text: str,
+    ) -> None:
+        """工具调用伴随的 free prose 文本到达（hybrid 模式）。
+
+        触发时机：assistant_text 事件，source_inbound_seq 命中 trigger。
+        engine 在 hybrid 模式下，如果模型同时输出了 free prose 和 tool calls，
+        会把 free prose 作为 assistant_text 事件推送。
+
+        SDK 已完成：
+          - 匹配 trigger（不消费，任务仍在运行）
+          - 刷新 trigger.created_at
+          - 清理内部协议标记
+
+        适配器需要：
+          - 将文本追加到进度显示中（如 edit status_msg / log_msg）
+          - 控制显示长度，只保留最近的内容
+
+        Args:
+            trigger: 关联的触发信息（仍在 triggers 中，未被消费）。
+            text: 清理过 SDK 协议标记后的 free prose 文本。
+        """
+        ...
+
     async def send_to_channel(
         self,
         conversation_key: str,
