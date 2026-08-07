@@ -211,29 +211,37 @@ class DiscordCallbacks:
         self,
         trigger: TriggerInfo,
         text: str,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         pd = trigger.platform_data
         msg: discord.Message = pd.get("message")
         channel_id: int = pd.get("channel_id", 0)
 
-        if text:
-            text, reacts = _extract_reactions(self.rt, text)
-            for r in reacts:
-                try:
-                    await msg.add_reaction(r.strip())
-                except Exception:
-                    pass
+        dc_files = _atts_to_discord_files(self.rt, attachments or [])
+
+        if text or dc_files:
             if text:
+                text, reacts = _extract_reactions(self.rt, text)
+                for r in reacts:
+                    try:
+                        await msg.add_reaction(r.strip())
+                    except Exception:
+                        pass
+            if text or dc_files:
                 int_sent_id = None
                 try:
-                    int_sent = await _send_split_text(self.rt, msg.channel, text, reply_to=msg)
+                    int_sent = await _send_split_text(
+                        self.rt, msg.channel, text or "",
+                        reply_to=msg, files=dc_files or None,
+                    )
                     if int_sent:
                         int_sent_id = int_sent[0].id
                 except Exception:
                     pass
-                _record_bot_reply(self.rt, channel_id, text, msg_id=int_sent_id)
+                if text:
+                    _record_bot_reply(self.rt, channel_id, text, msg_id=int_sent_id)
 
-        logger.info("send_intermediate_reply ch=%s", channel_id)
+        logger.info("send_intermediate_reply ch=%s atts=%d", channel_id, len(dc_files))
 
     async def send_to_channel(
         self,

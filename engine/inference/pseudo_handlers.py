@@ -113,11 +113,17 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     if pseudo_call.name == "intermediate_reply":
         reply_text = str(args.get("text") or "").strip()
         if reply_text:
-            await ls.rctx.emit_event("intermediate_reply", {
+            # 解析附件
+            _reply_att_paths = args.get("attachment_paths") or []
+            _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root)
+            _reply_payload: dict[str, Any] = {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
                 "text": reply_text,
-            })
+            }
+            if _reply_atts:
+                _reply_payload["attachments"] = _reply_atts
+            await ls.rctx.emit_event("intermediate_reply", _reply_payload)
             _emit_pseudo_tool_result(ls, pseudo_call, "ok")
         return None
 
@@ -140,6 +146,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
 
     # ---- 终止型伪工具：finish / ask / switch_node ----
 
+    # [AutoC 2026-08-06] hybrid 模式下 finish 仍然正常执行（不拒绝）。
+    # 虽然 hybrid 模式不注入 finish 工具定义，但过渡期模型可能从历史中
+    # 学到 finish 模式。直接让它走正常 finish 路径，避免拒绝循环。
     if pseudo_call.name in ("finish", "ask"):
         terminal_name = str(pseudo_call.name or "").strip()
         result_text = str(args.get("text") or "").strip()

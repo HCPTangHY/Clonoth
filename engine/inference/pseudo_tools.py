@@ -307,6 +307,14 @@ def _reply_spec() -> dict:
                         "type": "string",
                         "description": "The message content the user will read.",
                     },
+                    "attachment_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional list of workspace-relative file paths to attach. "
+                            "Files will be sent alongside the text message."
+                        ),
+                    },
                 },
                 "required": ["text"],
             },

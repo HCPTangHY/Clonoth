@@ -653,13 +653,14 @@ class EventRouter:
             trigger = self._state.get_trigger(src_seq)
             trigger.refresh()
             text = strip_protocol_markers((p.get("text") or "").strip())
+            attachments = p.get("attachments") or []
             # 清空流式 buffer（中间回复已包含完整内容）
             main_state = self._state.get_main_state(src_seq)
             if main_state:
                 main_state.stream_parts.clear()
-            if text:
+            if text or attachments:
                 try:
-                    await self._cb.send_intermediate_reply(trigger, text)
+                    await self._cb.send_intermediate_reply(trigger, text, attachments)
                 except Exception as e:
                     logger.error("send_intermediate_reply failed: %s", e)
             return

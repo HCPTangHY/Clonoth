@@ -87,6 +87,7 @@ class AdapterCallbacks(Protocol):
         self,
         trigger: TriggerInfo,
         text: str,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         """主节点中间回复到达，发送到平台。
 
@@ -103,11 +104,13 @@ class AdapterCallbacks(Protocol):
         适配器需要：
           - 解析并处理 Bot 自定义标记
           - 发送中间回复到平台（通常 reply 到触发消息）
+          - 处理附件（如果有）
           - 记录机器人回复到频道历史缓存
 
         Args:
             trigger: 关联的触发信息（仍在 triggers 中，未被消费）。
             text: 清理过 SDK 协议标记后的中间回复文本。
+            attachments: 可选的附件列表，格式同 outbound_message。
         """
         ...
 
