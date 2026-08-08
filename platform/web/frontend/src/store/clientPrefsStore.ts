@@ -127,7 +127,6 @@ export function shouldAutoApproveTool(
   // all non-restart tools pass unless the refinement map explicitly disables them.
   // Purpose: UI badges and actual approval submission cannot drift apart.
   if (approvalLevel === 'manual') return false;
-  if (toolName === 'git_push' || toolName === 'git_push_remote') return false;
   if (approvalLevel === 'yolo') return true;
   if (toolName === 'request_restart' || toolName === 'restart') return false;
   if (Object.prototype.hasOwnProperty.call(rules, toolName) && rules[toolName] === false) return false;

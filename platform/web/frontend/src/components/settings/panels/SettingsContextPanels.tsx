@@ -170,7 +170,7 @@ export const AgentsSettingsRightPanel = () => {
       setNodeYaml(nextYaml);
       setNodeConfigForm(parseNodeConfig(nextYaml, node.id));
       window.dispatchEvent(new Event('settings:nodes-updated'));
-      setNodeMessage('节点配置已保存。');
+      setNodeMessage('节点配置已保存。变更将在下次任务创建时生效，或重载配置后立即生效。');
     } catch (error) {
       setNodeMessage(error instanceof Error ? error.message : '保存节点配置失败');
     } finally {

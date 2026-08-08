@@ -100,29 +100,36 @@ export function findOutboundReplacementTarget(state: ChatState, event: Superviso
   const order = state.messageOrderByConversation[conversationId] || [];
   const isTerminalAction = actionType === 'finish' || actionType === 'ask';
 
-  if (llmRequestId && directMessage && !isTerminalAction) {
-    // [AutoC 2026-06-16] Why: llm_request_id identifies the exact provider request,
-    // while task_id can span later cards from the same task. How: when a direct
-    // request-keyed card exists, use it before the broader task scan. Purpose: late
-    // outbound_message events finalize the correct request card.
-    return directMessage;
+  // [AutoC 2026-08-06] Why: explicit terminal actions (finish/ask tool calls) create
+  // a new card via card-break, but directMessage points to the pre-break card.
+  // Returning directMessage would finalize the OLD card while the finish card spins.
+  // However, implicit finish (hybrid free prose, no finish tool) does NOT create a
+  // new card — the streaming text IS on directMessage, so we must return it.
+  // How: check if directMessage has a finish/ask tool execution. If yes (explicit),
+  // skip early return. If no (implicit), return directMessage directly.
+  if (llmRequestId && directMessage) {
+    if (!isTerminalAction) {
+      return directMessage;
+    }
+    // Explicit finish: directMessage has a finish/ask tool → skip, scan for post-break card
+    // Implicit finish: no such tool → directMessage IS the target
+    const hasTerminalTool = directMessage.blocks.some((b) =>
+      b.kind === 'tool' && b.toolIds.some((tid) => {
+        const tool = state.toolExecutionsById[tid];
+        return tool && (tool.name === 'finish' || tool.name === 'ask');
+      })
+    );
+    if (!hasTerminalTool) {
+      return directMessage;
+    }
   }
-
-  // [2026-06-30] Why: terminal pseudo tools can split a post-stream card while
-  // keeping the same llm_request_id as the stream card. How: for finish/ask,
-  // scan newest matching cards instead of returning the direct request card.
-  // Purpose: outbound_message closes the finish/ask tool card, not the old text card.
 
   let lastMatch: WsMessage | undefined;
   for (let index = order.length - 1; index >= 0; index -= 1) {
     const message = state.messagesById[order[index]];
     if (!message || message.role !== 'assistant') continue;
 
-    const matchesTask = Boolean(taskId && (message.source.taskId === taskId || message.source.childTaskId === taskId));
-    const matchesRequest = Boolean(llmRequestId && message.source.llmRequestId === llmRequestId);
-    const matchesInbound = sourceInboundSeq !== undefined && message.source.inboundSeq === sourceInboundSeq;
-
-    if (taskId && !matchesTask && !(isTerminalAction && matchesRequest && matchesInbound)) continue;
+    if (taskId && message.source.taskId !== taskId && message.source.childTaskId !== taskId) continue;
     if (!taskId && sourceInboundSeq !== undefined && message.source.inboundSeq !== sourceInboundSeq) continue;
     if (!taskId && sourceInboundSeq === undefined && directMessage && message.id !== directMessage.id) continue;
     if (nodeId && message.source.nodeId && message.source.nodeId !== nodeId && message.source.childNodeId !== nodeId) continue;

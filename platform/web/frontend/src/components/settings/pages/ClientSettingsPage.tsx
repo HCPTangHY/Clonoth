@@ -76,7 +76,7 @@ const KNOWN_TOOL_RULES: KnownToolInfo[] = [
   { toolName: 'apply_diff', label: 'apply_diff', description: '修改现有文件。智能模式默认自动放行；后端仍会按写入策略审批敏感路径。' },
   { toolName: 'list_dir', label: 'list_dir', description: '列出目录内容。智能模式默认自动放行。' },
   { toolName: 'grep', label: 'grep', description: '搜索源码文件。智能模式默认自动放行。' },
-  { toolName: 'execute_command', label: 'execute_command', description: '执行 Shell 命令。智能模式默认自动放行，可以在这里关闭；git push 仍需手动审批。' },
+  { toolName: 'execute_command', label: 'execute_command', description: '执行 Shell 命令。智能模式默认自动放行，可以在这里关闭。' },
   { toolName: 'save_memory', label: 'save_memory', description: '保存长期记忆。智能模式默认自动放行，可以在这里关闭。' },
   { toolName: 'list_memories', label: 'list_memories', description: '列出长期记忆。智能模式默认自动放行。' },
   { toolName: 'delete_memory', label: 'delete_memory', description: '删除长期记忆。智能模式默认自动放行，可以在这里关闭。' },
@@ -126,8 +126,8 @@ const APPROVAL_LEVEL_OPTIONS: Array<{ value: ApprovalLevel; label: string; descr
   // the display labels and descriptions in a typed list used by the radio group.
   // Purpose: copy and behavior stay aligned when the settings section renders.
   { value: 'manual', label: '手动审批', description: '所有工具操作都需要手动确认。最安全。' },
-  { value: 'smart', label: '智能放行', description: '除重启和 git push 外自动放行；后端路径策略仍然生效。推荐。' },
-  { value: 'yolo', label: '全部放行', description: '包括重启在内全部自动放行；git push 仍保留手动审批。' },
+  { value: 'smart', label: '智能放行', description: '除重启外自动放行；后端路径策略仍然生效。推荐。' },
+  { value: 'yolo', label: '全部放行', description: '包括重启在内全部自动放行。' },
 ];
 
 const TITLE_OPTIONS: Array<{ value: TitleGenerationMode; label: string; description: string }> = [
@@ -382,7 +382,7 @@ export const ClientSettingsPage = () => {
               <div className="mb-3">
                 <h3 className="font-mono text-xs font-semibold text-[var(--duties-text)]">智能放行细化</h3>
                 <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
-                  Level 2 默认自动放行除重启和 git push 外的工具。展开分类后，可以关闭某个工具的自动放行。
+                  Level 2 默认自动放行除重启外的工具。展开分类后，可以关闭某个工具的自动放行。
                 </p>
               </div>
               <div className="space-y-2">

@@ -718,12 +718,19 @@ function applyTaskCompleted(state: ChatState, event: SupervisorEvent): ChatState
     const compactAction = compactResult ? getString(compactResult.action) : '';
     const compactStatus = getString(payload.status);
     const compactFailed = compactStatus === 'failed' || compactAction === 'fail';
+    // 提取具体错误信息
+    const compactError = getString(payload.error)
+      || (compactResult ? getString(compactResult.error) : '')
+      || '';
+    const compactText = compactFailed
+      ? compactError
+        ? `上下文压缩失败: ${compactError}`
+        : '上下文压缩失败，将在下次对话时重试。'
+      : '对话上下文已压缩。切换会话后将加载压缩后的历史记录。';
     return appendNoticeToAssistant(nextState, event, {
       level: compactFailed ? 'warning' : 'info',
       title: '上下文压缩',
-      text: compactFailed
-        ? '上下文压缩失败，将在下次对话时重试。'
-        : '对话上下文已压缩。切换会话后将加载压缩后的历史记录。',
+      text: compactText,
       eventType: compactFailed ? 'compact_failed' : 'context_compacted',
     });
   }

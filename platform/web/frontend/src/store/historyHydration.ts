@@ -820,7 +820,14 @@ export function hydrateStructuredHistory(
       continue;
     }
 
-    pushAssistantMessage(message, displayText, currentTools);
+    // [AutoC 2026-08-06] Detect implicit finish: assistant message with text
+    // and no tool_calls. In hybrid mode, pure free prose = implicit finish.
+    // No forward-looking needed: if the model called tools, tool_calls would
+    // be non-empty. A pure-text assistant message in JSONL means the engine
+    // accepted it as a terminal response (hybrid implicit finish).
+    const implicitFinishType: WsMessage['completionType'] | undefined =
+      displayText.trim() && toolCalls.length === 0 ? 'finish' : undefined;
+    pushAssistantMessage(message, displayText, currentTools, implicitFinishType);
   }
 
   flushDanglingAssistant();

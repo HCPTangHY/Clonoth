@@ -1,8 +1,4 @@
 // [2026-06-02] System settings page for Supervisor status and runtime controls.
-// Why: operators need one tab for health, admin state, config reload, and engine
-// restart. How: combine existing health/admin endpoints with guarded action buttons
-// and a 15-second status refresh. Purpose: high-impact system controls stay visible
-// while still requiring admin auth and restart confirmation.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { ActiveTasksModal } from '../../dashboard/ActiveTasksModal';
@@ -11,7 +7,7 @@ import { SessionBrowserModal } from '../../dashboard/SessionBrowserModal';
 import { checkHealth, getAdminState, getRuntimeRaw, reloadConfig, restartEngine, updateRuntimeRaw, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { useViewStore } from '../../../store/viewStore';
-import { parseRuntimeConfig, serializeRuntimeConfig, type RuntimeConfigFormState, type RuntimeToolMode } from '../settingsStructuredConfig';
+import { parseRuntimeConfig, serializeRuntimeConfig, type RuntimeConfigFormState, type RuntimeToolMode, type OutputMode } from '../settingsStructuredConfig';
 import { Button } from '../../common';
 import { AuthRequired, Card, PageHeader, PageShell, StatusText, countActiveTasks, formatUptime } from './settingsPagePrimitives';
 
@@ -26,6 +22,7 @@ const EMPTY_RUNTIME_FORM: RuntimeConfigFormState = {
   compact_threshold_tokens: '',
   compact_keep_recent: '',
   tool_mode: 'json',
+  output_mode: 'hybrid',
 };
 
 const Stat = ({ label, value, detail, onClick }: { label: string; value: string | number; detail?: string; onClick?: () => void }) => {
@@ -36,7 +33,7 @@ const Stat = ({ label, value, detail, onClick }: { label: string; value: string 
       {detail && <p className="mt-1 text-xs text-[var(--duties-secondary)]">{detail}</p>}
     </>
   );
-  const cls = `border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 ${onClick ? 'w-full cursor-pointer text-left transition-colors hover:bg-[var(--duties-muted)]' : ''}`;
+  const cls = `border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 ${onClick ? 'w-full -pointer text-left transition-colors hover:bg-[var(--duties-muted)]' : ''}`;
   if (onClick) {
     return <button aria-label={`查看${label}详情`} className={cls} onClick={onClick} type="button">{content}</button>;
   }
@@ -120,19 +117,11 @@ export const SystemSettingsPage = () => {
     void load();
     void loadRuntimeCommon(false);
     if (!adminToken || !isAuthenticated) return undefined;
-    // [2026-06-02] Refresh System status every 15 seconds.
-    // Why: sessions, approvals, running tasks, workers, and uptime can change while
-    // operators keep this tab open. How: run a quiet refresh without replacing the
-    // manual button with a spinner. Purpose: the status cards remain current.
     const timer = window.setInterval(() => { void load(false); }, 15000);
     return () => window.clearInterval(timer);
   }, [adminToken, isAuthenticated, load, loadRuntimeCommon]);
 
   const engineInfo = useMemo(() => {
-    // [2026-06-02] Normalize the loose engine_runtime payload for display.
-    // Why: Supervisor may report either one worker_id or a workers array. How: prefer
-    // worker_id, then join string workers, then show an explicit empty value. Purpose:
-    // the System tab remains useful across backend runtime schema variants.
     const runtime = adminState?.engine_runtime || {};
     const workerId = typeof runtime.worker_id === 'string' ? runtime.worker_id : '';
     const workers = Array.isArray(runtime.workers) ? runtime.workers.filter((item): item is string => typeof item === 'string') : [];
@@ -222,6 +211,15 @@ export const SystemSettingsPage = () => {
                   <option value="fake-native">fake-native</option>
                 </select>
                 <p className="mt-1 text-[0.65rem] leading-4 text-[var(--duties-secondary)]">控制工具调用格式，不是工具权限。</p>
+              </label>
+              <label className="block">
+                <span className={RUNTIME_LABEL_CLASS}>输出模式</span>
+                <span className={RUNTIME_PATH_CLASS}>engine.output_mode</span>
+                <select className={`${RUNTIME_INPUT_CLASS} mt-2`} onChange={(event) => updateRuntimeForm({ output_mode: event.target.value as OutputMode })} value={runtimeForm.output_mode}>
+                  <option value="hybrid">hybrid</option>
+                  <option value="tool_only">tool_only</option>
+                </select>
+                <p className="mt-1 text-[0.65rem] leading-4 text-[var(--duties-secondary)]">hybrid: free prose = 隐式 finish；tool_only: 必须调用 finish。</p>
               </label>
             </div>
             <div className="mt-3 flex flex-wrap gap-2">

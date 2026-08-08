@@ -57,6 +57,7 @@ export interface SkillFormState {
 export type NodeConfigType = 'ai' | 'tool' | 'router';
 export type ToolAccessMode = 'all' | 'allow' | 'deny' | 'none';
 export type RuntimeToolMode = 'json' | 'native' | 'fake-native';
+export type OutputMode = 'hybrid' | 'tool_only';
 
 export interface NodeConfigFormState {
   id: string;
@@ -81,6 +82,7 @@ export interface RuntimeConfigFormState {
   compact_threshold_tokens: string;
   compact_keep_recent: string;
   tool_mode: RuntimeToolMode;
+  output_mode: OutputMode;
 }
 
 // ==================== Core Helpers ====================
@@ -114,11 +116,6 @@ function str(value: any, fallback = ''): string {
 
 function normalizeToolAccessMode(value: string, fallback: ToolAccessMode = 'all'): ToolAccessMode {
   return value === 'allow' || value === 'deny' || value === 'none' || value === 'all' ? value : fallback;
-}
-
-function normalizeRuntimeToolMode(value: string, fallback: RuntimeToolMode = 'json'): RuntimeToolMode {
-  const normalized = value.trim().toLowerCase().replace('_', '-');
-  return normalized === 'json' || normalized === 'native' || normalized === 'fake-native' ? normalized : fallback;
 }
 
 function normalizeNodeConfigType(value: string): NodeConfigType {
@@ -197,6 +194,14 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
 
 // ==================== Runtime Config ====================
 
+function normalizeRuntimeToolMode(value: string, fallback: RuntimeToolMode = 'json'): RuntimeToolMode {
+  return value === 'native' || value === 'fake-native' || value === 'json' ? value : fallback;
+}
+
+function normalizeOutputMode(value: string): OutputMode {
+  return value === 'tool_only' ? 'tool_only' : 'hybrid';
+}
+
 export function parseRuntimeConfig(raw: string): RuntimeConfigFormState {
   const doc = safeLoad(raw);
   const engine = doc.engine && typeof doc.engine === 'object' && !Array.isArray(doc.engine) ? doc.engine as Record<string, any> : {};
@@ -209,15 +214,13 @@ export function parseRuntimeConfig(raw: string): RuntimeConfigFormState {
     compact_threshold_tokens: compact.threshold_tokens === undefined ? '' : String(compact.threshold_tokens),
     compact_keep_recent: compact.keep_recent === undefined ? '' : String(compact.keep_recent),
     tool_mode: normalizeRuntimeToolMode(str(engine.tool_mode, 'json')),
+    output_mode: normalizeOutputMode(str(engine.output_mode, 'hybrid')),
   };
 }
 
 function applyNumberField(target: Record<string, any>, key: string, value: string): void {
   const trimmed = value.trim();
-  if (!trimmed) {
-    delete target[key];
-    return;
-  }
+  if (!trimmed) { delete target[key]; return; }
   const parsed = Number(trimmed);
   target[key] = Number.isFinite(parsed) ? parsed : trimmed;
 }
@@ -235,8 +238,8 @@ export function serializeRuntimeConfig(raw: string, form: RuntimeConfigFormState
   engine.retry = retry;
   engine.compact = compact;
   engine.tool_mode = normalizeRuntimeToolMode(form.tool_mode);
+  engine.output_mode = normalizeOutputMode(form.output_mode);
   doc.engine = engine;
-  // Remove obsolete top-level fields written by the old partial runtime form.
   delete doc.entry_node_id;
   delete doc.tool_mode;
   delete doc.max_concurrent_tasks;

@@ -3,7 +3,7 @@
 
 import type { Attachment, ToolExecution, ToolStatus } from '../types/message';
 
-export const CONTROL_TOOL_NAMES = new Set(['finish', 'reply', 'switch_node', 'ask']);
+export const CONTROL_TOOL_NAMES = new Set(['finish', 'reply', 'intermediate_reply', 'switch_node', 'ask']);
 // [2026-06-05] Why: context_usage now drives the composer token indicator and
 // should stay visible to normal event consumers. How: leave only truly audit-only
 // handoff progress in this set. Purpose: the store can process context_usage as a

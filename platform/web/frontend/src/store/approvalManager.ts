@@ -9,21 +9,10 @@ import { decideApproval } from '../api/supervisorClient';
 import type { SupervisorEvent } from '../types/chat';
 import { shouldAutoApproveTool, useClientPrefsStore } from './clientPrefsStore';
 import { getToolNameForApprovalEvent } from './eventRouting';
-import { loadAutoApproved, saveAutoApproved, getStringValue, isRecord } from './chatTypes';
+import { loadAutoApproved, saveAutoApproved } from './chatTypes';
 import type { StoreGetter } from './chatTypes';
 
 export const autoApprovedApprovalIds: Set<string> = loadAutoApproved();
-
-const GIT_REMOTE_PUSH_PATTERN = /(?:^|[;&|()\n])\s*(?:(?:sudo|command|time)\s+)*(?:env\s+\S+\s+)*git(?:\s+(?:-[A-Za-z](?:\s+\S+)?|--[A-Za-z0-9][A-Za-z0-9-]*(?:=\S+)?))*\s+push(?:\s|$)/i;
-
-function approvalCommand(payload: Record<string, unknown>): string {
-  const details = isRecord(payload.details) ? payload.details : {};
-  return getStringValue(details.command);
-}
-
-function mustKeepManualApproval(toolName: string, payload: Record<string, unknown>): boolean {
-  return toolName === 'execute_command' && GIT_REMOTE_PUSH_PATTERN.test(approvalCommand(payload));
-}
 
 export function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGetter): void {
   // [AutoC 2026-06-16] Decide whether one approval_requested event can be auto-allowed.
@@ -39,9 +28,8 @@ export function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: Sto
 
   const state = get();
   const toolName = getToolNameForApprovalEvent(state, event);
-  if (!toolName || mustKeepManualApproval(toolName, payload)) return;
   const prefs = useClientPrefsStore.getState();
-  if (!shouldAutoApproveTool(toolName, prefs.autoApproveTools, prefs.approvalLevel)) return;
+  if (!toolName || !shouldAutoApproveTool(toolName, prefs.autoApproveTools, prefs.approvalLevel)) return;
 
   autoApprovedApprovalIds.add(approvalId);
   saveAutoApproved(autoApprovedApprovalIds);
