@@ -111,11 +111,23 @@ class DiscordCallbacks:
     def _tool_summary(tool_name: str, arguments: dict | None = None) -> str:
         """生成工具调用的简短摘要文本。"""
         name = tool_name or "unknown"
-        if arguments and isinstance(arguments, dict):
-            first_val = next((str(v)[:40] for v in arguments.values() if v), "")
-            if first_val:
-                return f"{name}({first_val})"
-        return name
+        if not arguments or not isinstance(arguments, dict):
+            return name
+        # 跳过大段代码/脚本类参数，取第一个简短参数值作为摘要
+        _skip_keys = {"code", "script", "script_content", "content", "prompt",
+                      "body", "text", "raw", "payload", "diffs", "function"}
+        hint = ""
+        for k, v in arguments.items():
+            if not v:
+                continue
+            if k.lower() in _skip_keys:
+                continue
+            s = str(v)
+            if len(s) > 60 or "\n" in s:
+                continue
+            hint = s[:40]
+            break
+        return f"{name}({hint})" if hint else name
 
     async def _get_log_channel(self) -> Any:
         """获取日志频道对象。"""
