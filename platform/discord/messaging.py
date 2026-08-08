@@ -274,39 +274,31 @@ def _format_progress_log(
             if dot_state.get("had_stream_activity"):
                 dot_state["retry_info"] = ""
 
-        # prose_lines: hybrid 模式下工具调用伴随的 free prose
-        prose_lines = dot_state.get("prose_lines") or []
-        # tool_lines: 工具执行摘要
-        tool_lines = dot_state.get("tool_lines") or []
+        # --- stream preview（thinking / text）始终显示 ---
+        thinking_pv = dot_state.get("thinking_preview", "")
+        text_pv = dot_state.get("text_preview", "")
+        preview = thinking_pv or text_pv
+        if preview:
+            if "<<<TOOL_CALL>>>" in preview or "<<<END_TOOL_CALL>>>" in preview:
+                preview = ""
+        if preview:
+            p_lines = preview.strip().split("\n")
+            p_lines = [l for l in p_lines if l.strip()][-2:]
+            if p_lines:
+                p_lines = [l[:80].replace("`", "'") for l in p_lines]
+                preview_block = "```\n" + "\n".join(p_lines) + "\n```"
 
-        activity_lines: list[str] = []
-        # 先显示 prose（最近 2 行）
+        # --- 工具摘要 + free prose（追加在 stream preview 之后） ---
+        prose_lines = dot_state.get("prose_lines") or []
+        tool_lines = dot_state.get("tool_lines") or []
+        activity_parts: list[str] = []
         for pl in prose_lines[-2:]:
-            activity_lines.append(pl.replace("`", "'")[:80])
-        # 再显示 tool 摘要（最近 4 行）
+            activity_parts.append(pl.replace("`", "'")[:80])
         for tl in tool_lines[-4:]:
             mark = "✓" if tl.get("done") and tl.get("ok") else "✗" if tl.get("done") else "…"
-            activity_lines.append(f"  {tl.get('text', '')}  {mark}")
-
-        if activity_lines:
-            preview_block = "\n".join(activity_lines)
-        else:
-            # fallback: stream preview（thinking / text）
-            thinking_pv = dot_state.get("thinking_preview", "")
-            text_pv = dot_state.get("text_preview", "")
-            preview = thinking_pv or text_pv
-            if preview:
-                # 只过滤 JSON tool_mode 的协议标记（<<<TOOL_CALL>>>）。
-                # native 模式下 thinking 内容包含工具名/参数引用是正常推理，
-                # 不应被过滤。
-                if "<<<TOOL_CALL>>>" in preview or "<<<END_TOOL_CALL>>>" in preview:
-                    preview = ""
-            if preview:
-                p_lines = preview.strip().split("\n")
-                p_lines = [l for l in p_lines if l.strip()][-2:]
-                if p_lines:
-                    p_lines = [l[:80].replace("`", "'") for l in p_lines]
-                    preview_block = "```\n" + "\n".join(p_lines) + "\n```"
+            activity_parts.append(f"  {tl.get('text', '')}  {mark}")
+        if activity_parts:
+            preview_block = (preview_block + "\n" if preview_block else "") + "\n".join(activity_parts)
 
     header = f"⏳ {prefix}:"
     parts = [header]
