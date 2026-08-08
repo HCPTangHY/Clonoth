@@ -91,6 +91,7 @@ class DiscordCallbacks:
                 "dot_step": 0, "had_stream_activity": False,
                 "thinking_start_time": time.time(),
                 "thinking_preview": "", "text_preview": "",
+                "prose_lines": [], "tool_lines": [],
             }
         return self._dot_states[seq]
 
@@ -101,8 +102,19 @@ class DiscordCallbacks:
                 "dot_step": 0, "had_stream_activity": False,
                 "thinking_start_time": 0,
                 "thinking_preview": "", "text_preview": "",
+                "prose_lines": [], "tool_lines": [],
             }
         return self._child_dot_states[task_key]
+
+    @staticmethod
+    def _tool_summary(tool_name: str, arguments: dict | None = None) -> str:
+        """生成工具调用的简短摘要文本。"""
+        name = tool_name or "unknown"
+        if arguments and isinstance(arguments, dict):
+            first_val = next((str(v)[:40] for v in arguments.values() if v), "")
+            if first_val:
+                return f"{name}({first_val})"
+        return name
 
     async def _get_log_channel(self) -> Any:
         """获取日志频道对象。"""
@@ -600,6 +612,22 @@ class DiscordCallbacks:
         logger.info("on_context_reset conv=%s reason=%s cleaned=%d",
                     conversation_key, reason, len(cleaned_triggers))
 
+    async def on_assistant_text(
+        self,
+        trigger: TriggerInfo,
+        text: str,
+    ) -> None:
+        """hybrid 模式下工具调用伴随的 free prose，追加到 dot_state 进度显示。"""
+        seq = trigger.inbound_seq
+        if seq and self.rt.session_state and seq in self.rt.session_state.triggers:
+            dot = self._get_or_create_dot_state(seq)
+            lines = dot["prose_lines"]
+            for line in text.strip().split("\n"):
+                line = line.strip()
+                if line:
+                    lines.append(line)
+            dot["prose_lines"] = lines[-4:]
+
     async def on_engine_restarted(
         self,
         payload: dict[str, Any],
@@ -718,6 +746,51 @@ class DiscordCallbacks:
                     cd["thinking_preview"] = ""
                     cd["text_preview"] = ""
                     cd["thinking_start_time"] = time.time()
+            return None
+
+        # ── tool_call_start: 记录工具开始执行 ──
+        if event.type == "tool_call_start":
+            p = event.payload
+            src_seq = int(p.get("source_inbound_seq") or 0)
+            node_id = p.get("node_id", "")
+            tool_name = p.get("tool_name", "")
+            arguments = p.get("arguments") if isinstance(p.get("arguments"), dict) else None
+            summary = self._tool_summary(tool_name, arguments)
+            entry = {"text": summary, "tool_call_id": p.get("tool_call_id", ""), "done": False, "ok": False}
+            if src_seq and self.rt.session_state and src_seq in self.rt.session_state.triggers:
+                dot = self._get_or_create_dot_state(src_seq)
+                dot["tool_lines"].append(entry)
+                dot["tool_lines"] = dot["tool_lines"][-6:]
+            if node_id and node_id != self.rt.entry_node_id:
+                task_key = p.get("task_id") or f"{node_id}:{event.session_id}"
+                if self.rt.session_state and self.rt.session_state.get_child_state(task_key):
+                    cd = self._get_or_create_child_dot_state(task_key)
+                    cd["tool_lines"].append(entry)
+                    cd["tool_lines"] = cd["tool_lines"][-6:]
+            return None
+
+        # ── tool_call_end: 标记工具执行完成 ──
+        if event.type == "tool_call_end":
+            p = event.payload
+            src_seq = int(p.get("source_inbound_seq") or 0)
+            node_id = p.get("node_id", "")
+            tc_id = p.get("tool_call_id", "")
+            status = p.get("status", "")
+            ok = status in ("success", "async_started")
+            def _mark_done(lines: list) -> None:
+                for tl in reversed(lines):
+                    if tl.get("tool_call_id") == tc_id:
+                        tl["done"] = True
+                        tl["ok"] = ok
+                        break
+            if src_seq and self.rt.session_state and src_seq in self.rt.session_state.triggers:
+                dot = self._get_or_create_dot_state(src_seq)
+                _mark_done(dot["tool_lines"])
+            if node_id and node_id != self.rt.entry_node_id:
+                task_key = p.get("task_id") or f"{node_id}:{event.session_id}"
+                if self.rt.session_state and self.rt.session_state.get_child_state(task_key):
+                    cd = self._get_or_create_child_dot_state(task_key)
+                    _mark_done(cd["tool_lines"])
             return None
 
         if event.type != "stream_delta":
