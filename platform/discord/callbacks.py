@@ -890,9 +890,20 @@ class DiscordCallbacks:
         content = p.get("content", "")
         sd_type = p.get("type", "text")
         node_id = p.get("node_id", "")
+        req_id = p.get("llm_request_id", "")
+
+        def _reset_if_new_llm(dot: dict) -> None:
+            """llm_request_id 变化时清空上一轮的工具/prose摘要。"""
+            if req_id and req_id != dot.get("_llm_req_id", ""):
+                dot["_llm_req_id"] = req_id
+                dot["tool_lines"] = []
+                dot["prose_lines"] = []
+                dot["thinking_preview"] = ""
+                dot["text_preview"] = ""
 
         if src_seq and self.rt.session_state and src_seq in self.rt.session_state.triggers:
             dot = self._get_or_create_dot_state(src_seq)
+            _reset_if_new_llm(dot)
             dot["had_stream_activity"] = True
             if not dot.get("thinking_start_time"):
                 dot["thinking_start_time"] = time.time()
@@ -909,6 +920,7 @@ class DiscordCallbacks:
             task_key = p.get("task_id") or f"{node_id}:{event.session_id}"
             if self.rt.session_state and self.rt.session_state.get_child_state(task_key):
                 cd = self._get_or_create_child_dot_state(task_key)
+                _reset_if_new_llm(cd)
                 cd["had_stream_activity"] = True
                 if not cd.get("thinking_start_time"):
                     cd["thinking_start_time"] = time.time()
