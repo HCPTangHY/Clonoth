@@ -1,6 +1,6 @@
 """Discord attachment, sending, progress, and restart helpers.
 
-[2026-05-14 refactor note] This module was split out of the legacy entry point so
+[2026-05-14 refactor note] This module was split out of ereuna_main.py so
 message output and file handling share DiscordRuntime explicitly. The functions
 avoid importing context.py to keep the requested one-way import structure.
 """
@@ -20,7 +20,7 @@ import discord  # type: ignore[import-untyped]
 
 
 _CST = datetime.timezone(datetime.timedelta(hours=8))
-logger = logging.getLogger("discord_bot")
+logger = logging.getLogger("ereuna_v2")
 
 
 _IMAGE_EXT_MAP: dict[str, str] = {
@@ -216,6 +216,7 @@ def _record_bot_reply(rt: Any, channel_id: int, text: str, *, msg_id: int | None
         "msg_id": msg_id,
         "reactions": {},
         "seq": rt.history_seq_counter,
+        "is_bot": True,
     })
     rt.history_seq_counter += 1
     if len(q) > rt.history_max_len:
@@ -273,15 +274,39 @@ def _format_progress_log(
             if dot_state.get("had_stream_activity"):
                 dot_state["retry_info"] = ""
 
-        thinking_pv = dot_state.get("thinking_preview", "")
-        text_pv = dot_state.get("text_preview", "")
-        preview = thinking_pv or text_pv
-        if preview:
-            p_lines = preview.strip().split("\n")
-            p_lines = [l for l in p_lines if l.strip()][-2:]
-            if p_lines:
-                p_lines = [l[:80].replace("`", "'") for l in p_lines]
-                preview_block = "```\n" + "\n".join(p_lines) + "\n```"
+        # prose_lines: hybrid 模式下工具调用伴随的 free prose
+        prose_lines = dot_state.get("prose_lines") or []
+        # tool_lines: 工具执行摘要
+        tool_lines = dot_state.get("tool_lines") or []
+
+        activity_lines: list[str] = []
+        # 先显示 prose（最近 2 行）
+        for pl in prose_lines[-2:]:
+            activity_lines.append(pl.replace("`", "'")[:80])
+        # 再显示 tool 摘要（最近 4 行）
+        for tl in tool_lines[-4:]:
+            mark = "✓" if tl.get("done") and tl.get("ok") else "✗" if tl.get("done") else "…"
+            activity_lines.append(f"  {tl.get('text', '')}  {mark}")
+
+        if activity_lines:
+            preview_block = "\n".join(activity_lines)
+        else:
+            # fallback: stream preview（thinking / text）
+            thinking_pv = dot_state.get("thinking_preview", "")
+            text_pv = dot_state.get("text_preview", "")
+            preview = thinking_pv or text_pv
+            if preview:
+                # 只过滤 JSON tool_mode 的协议标记（<<<TOOL_CALL>>>）。
+                # native 模式下 thinking 内容包含工具名/参数引用是正常推理，
+                # 不应被过滤。
+                if "<<<TOOL_CALL>>>" in preview or "<<<END_TOOL_CALL>>>" in preview:
+                    preview = ""
+            if preview:
+                p_lines = preview.strip().split("\n")
+                p_lines = [l for l in p_lines if l.strip()][-2:]
+                if p_lines:
+                    p_lines = [l[:80].replace("`", "'") for l in p_lines]
+                    preview_block = "```\n" + "\n".join(p_lines) + "\n```"
 
     header = f"⏳ {prefix}:"
     parts = [header]
@@ -304,9 +329,8 @@ async def _safe_restart(rt: Any, channel_id: int = 0, delay: float = 3.0) -> Non
     """延迟后通过 pm2 restart 安全重启自身。"""
     if channel_id:
         try:
-            Path(f"/tmp/clonoth_restart_notify_{rt.bridge_port}.json").write_text(
-                json.dumps({"channel_id": channel_id})
-            )
+            notify_path = Path(f"/tmp/clonoth_restart_notify_{rt.bridge_port}.json")
+            notify_path.write_text(json.dumps({"channel_id": channel_id}))
         except Exception:
             pass
     await asyncio.sleep(delay)
