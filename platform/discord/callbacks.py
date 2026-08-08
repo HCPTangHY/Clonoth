@@ -39,6 +39,89 @@ _CHANNEL_EDIT_LIMIT = 4
 _CHANNEL_EDIT_WINDOW = 5.0
 
 
+def _clip(text: str, limit: int = 80) -> str:
+    s = text.replace("\n", " ").strip()
+    return s[:limit] + "..." if len(s) > limit else s
+
+
+def _basename(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[-1] if path else ""
+
+
+def _tool_inline_summary(tool_name: str, args: dict) -> str:
+    """tool_call_start 时生成工具摘要，复用前端 ToolCallCard 的逻辑。"""
+    name = tool_name or "unknown"
+    if name == "read_file":
+        files = args.get("files") or []
+        if isinstance(files, list) and len(files) > 1:
+            return f"阅读 {len(files)} 文件"
+        p = str(args.get("path") or (files[0].get("path", "") if files and isinstance(files[0], dict) else ""))
+        if not p:
+            return "阅读"
+        fn = _basename(p)
+        sl = args.get("start_line") or args.get("startLine") or (files[0].get("startLine") if files and isinstance(files[0], dict) else None)
+        el = args.get("end_line") or args.get("endLine") or (files[0].get("endLine") if files and isinstance(files[0], dict) else None)
+        if sl and el:
+            return f"阅读 {fn} L{sl}-{el}"
+        if sl:
+            return f"阅读 {fn} L{sl}+"
+        return f"阅读 {fn}"
+    if name == "write_file":
+        p = str(args.get("path") or "")
+        return f"写入 {_basename(p)}" if p else "写入"
+    if name == "apply_diff":
+        p = str(args.get("path") or "")
+        diffs = args.get("diffs")
+        n = len(diffs) if isinstance(diffs, list) else 0
+        fn = _basename(p)
+        return f"修改 {fn} · {n} 处" if fn else "修改"
+    if name == "execute_command":
+        cmd = str(args.get("command") or "")
+        # 取第一行核心命令
+        first = cmd.split("\n")[0].split("&&")[0].split("|")[0].strip()
+        return _clip(first, 60) if first else "执行"
+    if name in ("grep", "search_in_files"):
+        q = str(args.get("query") or "")[:25]
+        return f'搜索 "{q}"' if q else "搜索"
+    if name == "list_dir":
+        p = str(args.get("path") or "")
+        paths = args.get("paths")
+        if isinstance(paths, list) and len(paths) > 1:
+            return f"列出 {len(paths)} 目录"
+        target = p or (str(paths[0]) if isinstance(paths, list) and paths else "")
+        return f"列出 {_basename(target)}/" if target else "列出"
+    if name == "save_memory":
+        return f'写入记忆 {str(args.get("id") or "")[:30]}'
+    if name == "delete_memory":
+        return f'删除记忆 {str(args.get("id") or "")[:30]}'
+    if name == "read_image":
+        p = str(args.get("image_path") or "")
+        return f"读取图片 {_basename(p)}" if p else "读取图片"
+    if name == "discord_manage":
+        port = args.get("port", "")
+        return f"Discord({port})" if port else "Discord"
+    if name.startswith("dispatch_to_") or name.startswith("dispatch:"):
+        target = name.replace("dispatch_to_", "").replace("dispatch:", "")
+        inst = str(args.get("instruction") or args.get("text") or "")[:30]
+        return f"委派 {target}: {inst}" if inst else f"委派 {target}"
+    if name.startswith("mcp_"):
+        provider = name.split("_")[1] if "_" in name else "MCP"
+        # 取第一个有意义的参数
+        for k, v in args.items():
+            if k == "params" and isinstance(v, dict):
+                for pk, pv in v.items():
+                    s = str(pv)[:30]
+                    if s:
+                        return f"{provider}: {s}"
+            elif v:
+                s = str(v)
+                if len(s) <= 40 and "\n" not in s:
+                    return f"{provider}: {s[:30]}"
+        return provider
+    # 通用 fallback
+    return name
+
+
 class DiscordCallbacks:
     """Discord 平台适配器回调实现。"""
 
@@ -107,27 +190,7 @@ class DiscordCallbacks:
             }
         return self._child_dot_states[task_key]
 
-    @staticmethod
-    def _tool_summary(tool_name: str, arguments: dict | None = None) -> str:
-        """生成工具调用的简短摘要文本。"""
-        name = tool_name or "unknown"
-        if not arguments or not isinstance(arguments, dict):
-            return name
-        # 跳过大段代码/脚本类参数，取第一个简短参数值作为摘要
-        _skip_keys = {"code", "script", "script_content", "content", "prompt",
-                      "body", "text", "raw", "payload", "diffs", "function"}
-        hint = ""
-        for k, v in arguments.items():
-            if not v:
-                continue
-            if k.lower() in _skip_keys:
-                continue
-            s = str(v)
-            if len(s) > 60 or "\n" in s:
-                continue
-            hint = s[:40]
-            break
-        return f"{name}({hint})" if hint else name
+
 
     async def _get_log_channel(self) -> Any:
         """获取日志频道对象。"""
@@ -778,7 +841,7 @@ class DiscordCallbacks:
             node_id = p.get("node_id", "")
             tool_name = p.get("tool_name", "")
             arguments = p.get("arguments") if isinstance(p.get("arguments"), dict) else None
-            summary = self._tool_summary(tool_name, arguments)
+            summary = _tool_inline_summary(tool_name, arguments or {})
             entry = {"text": summary, "tool_call_id": p.get("tool_call_id", ""), "done": False, "ok": False}
             if src_seq and self.rt.session_state and src_seq in self.rt.session_state.triggers:
                 dot = self._get_or_create_dot_state(src_seq)
@@ -800,11 +863,14 @@ class DiscordCallbacks:
             tc_id = p.get("tool_call_id", "")
             status = p.get("status", "")
             ok = status in ("success", "async_started")
+            end_summary = (p.get("summary") or "").strip()
             def _mark_done(lines: list) -> None:
                 for tl in reversed(lines):
                     if tl.get("tool_call_id") == tc_id:
                         tl["done"] = True
                         tl["ok"] = ok
+                        if end_summary:
+                            tl["text"] = _clip(end_summary, 80)
                         break
             if src_seq and self.rt.session_state and src_seq in self.rt.session_state.triggers:
                 dot = self._get_or_create_dot_state(src_seq)
