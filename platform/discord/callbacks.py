@@ -21,6 +21,7 @@ from .messaging import (
     _atts_to_discord_files,
     _extract_reactions,
     _format_progress_log,
+    _format_status_summary,
     _record_bot_reply,
     _safe_restart,
     _send_split_text,
@@ -342,42 +343,52 @@ class DiscordCallbacks:
     ) -> None:
         seq = trigger.inbound_seq
         pd = trigger.platform_data
-        ch_id = 0
-        # [2026-05-20 edit-rate-limit] Why: the new bucket is per Discord
-        # channel, not per task. How: use the DM status message channel for DMs
-        # and the configured agent log channel for group logs. Purpose: make all
-        # progress edits in the same channel share one Discord-safe budget.
+        dot_state = self._get_or_create_dot_state(seq)
+
         if trigger.is_dm:
+            # 私聊：status_msg 显示全部进度（stream preview + 工具 + 日志）
+            status_msg = pd.get("status_msg")
+            ch_id = status_msg.channel.id if status_msg else 0
+            if not self._should_edit(seq, channel_id=ch_id):
+                return
+            display = _format_progress_log(
+                "Agent 执行中", state.progress_records, dot_state=dot_state,
+            )
+            if display and status_msg:
+                try:
+                    await status_msg.edit(content=display)
+                except Exception as e:
+                    logger.error("update_progress DM edit FAILED: %s", e)
+        else:
+            # 群聊：日志频道 log_msg + 触发频道 status_msg 分开更新
+            # 1) 日志频道：stream preview + 计时器 + handoff 日志
+            log_ch_id = self.rt.agent_log_channel_id or 0
+            if log_ch_id and self._should_edit(f"log:{seq}", channel_id=log_ch_id):
+                log_display = _format_progress_log(
+                    "Agent 执行中", state.progress_records, dot_state=dot_state,
+                )
+                if log_display:
+                    try:
+                        log_msg = state.platform_data.get("log_msg")
+                        log_ch = await self._get_log_channel()
+                        if log_ch:
+                            if log_msg:
+                                await log_msg.edit(content=log_display)
+                            else:
+                                state.platform_data["log_msg"] = await log_ch.send(log_display)
+                    except Exception as e:
+                        logger.error("update_progress log edit FAILED: %s", e)
+            # 2) 触发频道：工具摘要 + free prose
             status_msg = pd.get("status_msg")
             if status_msg:
-                ch_id = status_msg.channel.id
-        else:
-            ch_id = self.rt.agent_log_channel_id or 0
-        if not self._should_edit(seq, channel_id=ch_id):
-            return
-
-        dot_state = self._get_or_create_dot_state(seq)
-        display = _format_progress_log(
-            "Agent 执行中", state.progress_records, dot_state=dot_state,
-        )
-        if not display:
-            return
-
-        try:
-            if trigger.is_dm:
-                status_msg = pd.get("status_msg")
-                if status_msg:
-                    await status_msg.edit(content=display)
-            elif self.rt.agent_log_channel_id:
-                log_msg = state.platform_data.get("log_msg")
-                log_ch = await self._get_log_channel()
-                if log_ch:
-                    if log_msg:
-                        await log_msg.edit(content=display)
-                    else:
-                        state.platform_data["log_msg"] = await log_ch.send(display)
-        except Exception as e:
-            logger.error("update_progress edit FAILED: %s", e)
+                st_ch_id = status_msg.channel.id
+                if self._should_edit(f"status:{seq}", channel_id=st_ch_id):
+                    status_display = _format_status_summary(dot_state)
+                    if status_display:
+                        try:
+                            await status_msg.edit(content=status_display)
+                        except Exception as e:
+                            logger.error("update_progress status edit FAILED: %s", e)
 
     async def create_child_progress(
         self,

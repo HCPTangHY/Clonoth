@@ -274,7 +274,7 @@ def _format_progress_log(
             if dot_state.get("had_stream_activity"):
                 dot_state["retry_info"] = ""
 
-        # --- stream preview（thinking / text）始终显示 ---
+        # --- stream preview（thinking / text）---
         thinking_pv = dot_state.get("thinking_preview", "")
         text_pv = dot_state.get("text_preview", "")
         preview = thinking_pv or text_pv
@@ -288,18 +288,6 @@ def _format_progress_log(
                 p_lines = [l[:80].replace("`", "'") for l in p_lines]
                 preview_block = "```\n" + "\n".join(p_lines) + "\n```"
 
-        # --- 工具摘要 + free prose（追加在 stream preview 之后） ---
-        prose_lines = dot_state.get("prose_lines") or []
-        tool_lines = dot_state.get("tool_lines") or []
-        activity_parts: list[str] = []
-        for pl in prose_lines[-2:]:
-            activity_parts.append(pl.replace("`", "'")[:80])
-        for tl in tool_lines[-4:]:
-            mark = "✓" if tl.get("done") and tl.get("ok") else "✗" if tl.get("done") else "…"
-            activity_parts.append(f"  {tl.get('text', '')}  {mark}")
-        if activity_parts:
-            preview_block = (preview_block + "\n" if preview_block else "") + "\n".join(activity_parts)
-
     header = f"⏳ {prefix}:"
     parts = [header]
     if anim_line:
@@ -312,6 +300,32 @@ def _format_progress_log(
         parts.append(status)
 
     text = "\n".join(parts)
+    if len(text) > 2000:
+        text = text[-2000:]
+    return text
+
+
+def _format_status_summary(dot_state: dict[str, Any] | None) -> str:
+    """渲染触发频道的处理中消息：工具摘要 + free prose，不含 stream preview。"""
+    if not dot_state:
+        return ""
+    prose_lines = dot_state.get("prose_lines") or []
+    tool_lines = dot_state.get("tool_lines") or []
+    parts: list[str] = []
+    for pl in prose_lines[-3:]:
+        parts.append(pl.replace("`", "'")[:80])
+    for tl in tool_lines[-5:]:
+        mark = "✓" if tl.get("done") and tl.get("ok") else "✗" if tl.get("done") else "…"
+        parts.append(f"  {tl.get('text', '')}  {mark}")
+    if not parts:
+        # 没有活动时显示计时器
+        start_t = dot_state.get("thinking_start_time", 0)
+        if start_t > 0:
+            elapsed = int(time.time() - start_t)
+            return f"⏳ 处理中... ⏱ {elapsed}s"
+        return "⏳ 处理中..."
+    header = "⏳ 处理中:"
+    text = header + "\n" + "\n".join(parts)
     if len(text) > 2000:
         text = text[-2000:]
     return text
