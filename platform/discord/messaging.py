@@ -316,7 +316,7 @@ def _format_status_summary(dot_state: dict[str, Any] | None) -> str:
         parts.append(pl.replace("`", "'")[:80])
     for tl in tool_lines[-5:]:
         mark = "✓" if tl.get("done") and tl.get("ok") else "✗" if tl.get("done") else "…"
-        parts.append(f"  {tl.get('text', '')}  {mark}")
+        parts.append(f"{tl.get('text', '')} {mark}")
     if not parts:
         # 没有活动时显示计时器
         start_t = dot_state.get("thinking_start_time", 0)

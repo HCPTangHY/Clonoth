@@ -863,14 +863,11 @@ class DiscordCallbacks:
             tc_id = p.get("tool_call_id", "")
             status = p.get("status", "")
             ok = status in ("success", "async_started")
-            end_summary = (p.get("summary") or "").strip()
             def _mark_done(lines: list) -> None:
                 for tl in reversed(lines):
                     if tl.get("tool_call_id") == tc_id:
                         tl["done"] = True
                         tl["ok"] = ok
-                        if end_summary:
-                            tl["text"] = _clip(end_summary, 80)
                         break
             if src_seq and self.rt.session_state and src_seq in self.rt.session_state.triggers:
                 dot = self._get_or_create_dot_state(src_seq)
