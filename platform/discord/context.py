@@ -175,6 +175,8 @@ def _build_context_text(
     # SessionState; runtime ownership only changes where the object is stored.
     wm = rt.session_state.get_high_watermark(channel_id) if rt.session_state else -1
     history_entries = [e for e in history_entries if e.get("seq", -1) > wm]
+    # 排除 Bot 自己的消息，避免群聊上下文中出现 Bot 回复
+    history_entries = [e for e in history_entries if not e.get("is_bot")]
 
     def _fmt_entry(e: dict[str, Any]) -> str:
         t = e["text"]
@@ -187,22 +189,20 @@ def _build_context_text(
 
     if history_entries:
         history_block = "\n".join(_fmt_entry(e) for e in history_entries)
-    elif wm >= 0:
-        history_block = "（无新消息）"
     else:
-        history_block = "（暂无历史）"
+        history_block = ""
 
     display_name = _get_display_name(member)
     roles = _get_role_names(member)
     role_str = f"（身份组: {', '.join(roles)}）" if roles else ""
     now_str = datetime.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
 
-    parts = [
-        f"【群聊上下文记录】\n{history_block}",
-    ]
+    parts = []
+    if history_block:
+        parts.append(f"【群聊上下文记录】\n{history_block}")
     if reply_context:
-        parts.append(f"\n【当前消息引用】\n{reply_context}")
-    parts.append(f"\n当前时间: {now_str}")
+        parts.append(f"【当前消息引用】\n{reply_context}")
+    parts.append(f"当前时间: {now_str}")
     # [2026-05-14 refactor note] The administrator marker now reads the
     # superuser set from DiscordRuntime rather than a module-level global.
     admin_tag = " ✓ADMIN" if member.id in rt.superusers else ""

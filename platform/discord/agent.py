@@ -10,6 +10,9 @@ import asyncio
 import datetime
 import json
 import logging
+import os
+import signal
+import subprocess
 import time
 from typing import Any
 
@@ -23,6 +26,43 @@ from .messaging import _collect_attachments, _safe_restart
 
 
 logger = logging.getLogger("discord_bot")
+
+
+def _kill_port_holder(port: int) -> None:
+    """尝试杀掉占用指定端口的进程。
+
+    用于解决服务器重启后旧 bot 进程残留占端口的问题。
+    只杀 python3.11 进程，避免误杀其他服务。
+    """
+    try:
+        result = subprocess.run(
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if "python" not in line:
+                continue
+            # 格式: ... users:(("python3.11",pid=27930,fd=9))
+            for part in line.split(","):
+                if part.strip().startswith("pid="):
+                    pid = int(part.strip().split("=")[1])
+                    if pid == os.getpid():
+                        continue
+                    print(f"[bridge] 杀掉占用端口 {port} 的旧进程 pid={pid}")
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(1)
+                    # 确认是否退出
+                    try:
+                        os.kill(pid, 0)
+                        print(f"[bridge] pid={pid} SIGTERM 未生效，发送 SIGKILL")
+                        os.kill(pid, signal.SIGKILL)
+                        time.sleep(0.5)
+                    except ProcessLookupError:
+                        pass  # 已退出
+                    return
+        print(f"[bridge] 未找到占用端口 {port} 的 python 进程")
+    except Exception as exc:
+        print(f"[bridge] 清理端口 {port} 占用失败: {exc}")
 
 
 class _SuperuserView(discord.ui.View):
@@ -247,11 +287,27 @@ async def _start_bridge(rt: Any) -> None:
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", rt.bridge_port)
-    await site.start()
-    rt.bridge_started = True
-    rt.bridge_runner = runner
-    rt.bridge_site = site
-    print(f"[bridge] Discord Bridge Server: http://127.0.0.1:{rt.bridge_port}")
+
+    for attempt in range(3):
+        try:
+            await site.start()
+            rt.bridge_started = True
+            rt.bridge_runner = runner
+            rt.bridge_site = site
+            print(f"[bridge] Discord Bridge Server: http://127.0.0.1:{rt.bridge_port}")
+            return
+        except OSError as exc:
+            if exc.errno != 98:  # EADDRINUSE
+                raise
+            print(f"[bridge] 端口 {rt.bridge_port} 被占用 (attempt {attempt + 1}/3)，尝试清理旧进程...")
+            _kill_port_holder(rt.bridge_port)
+            await asyncio.sleep(2)
+            # 重建 site（旧 site 在 start 失败后不可复用）
+            site = web.TCPSite(runner, "127.0.0.1", rt.bridge_port)
+
+    # 3 次都失败，记录错误但不阻塞 SDK 初始化
+    print(f"[bridge] ⚠ 端口 {rt.bridge_port} 绑定失败，Bridge 未启动。SDK 其余部分继续初始化。")
+    await runner.cleanup()
 
 
 async def handle_agent(
