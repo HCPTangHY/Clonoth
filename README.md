@@ -117,13 +117,13 @@ cp policy.example.yaml data/policy.yaml
 ### 4. 构建 Web 前端（可选）
 
 ```bash
-cd platform/web/frontend
+cd adapters/web/frontend
 npm ci
 npm run build
 cd ../../..
 ```
 
-Supervisor 启动后会自动挂载 `platform/web/frontend/dist/` 到 `/web/` 路径。如果不需要 Web 界面，可跳过此步。
+Supervisor 启动后会自动挂载 `adapters/web/frontend/dist/` 到 `/web/` 路径。如果不需要 Web 界面，可跳过此步。
 
 ### 5. 启动服务
 
@@ -155,7 +155,7 @@ cp .env.example .env && \
 mkdir -p data && \
 ( test -f data/config.yaml || cp config.example.yaml data/config.yaml ) && \
 ( test -f data/policy.yaml || cp policy.example.yaml data/policy.yaml ) && \
-( cd platform/web/frontend && npm ci && npm run build ) && \
+( cd adapters/web/frontend && npm ci && npm run build ) && \
 echo "编辑 .env 填入 API Key，然后运行 python main.py"
 ```
 

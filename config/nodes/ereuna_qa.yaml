@@ -1,0 +1,131 @@
+id: ereuna_qa
+type: script
+name: Ereuna 质检节点
+description: 检查回复中的八股词汇、乱码、并调整回复质量
+memories: none
+output: __source__
+script: |
+    # 保留八股词，仅移除日常聊天高频词（也许/好像/可能/如同/就像）
+    bagu_words = [
+        "一丝", "石子", "投入", "心湖", "Subtly", "Cố gắng",
+        "仿佛", "生理性", "不易察觉", "闪过",
+        "涟漪", "古井", "泛白", "禁忌", "弧度", "狡黠", "呜咽", "羽毛",
+        "搔刮", "压抑", "指节发白", "锁骨", "嘶吼", "野兽般", "暧昧",
+        "欲望", "小猫爪子", "弓", "屁股蛋子", "不容质疑",
+        "几不可查", "圣物", "虔诚", "信徒", "宛若神明",
+        "恶魔", "不容错辨", "不容查查", "几不可闻", "难以察觉",
+        "难以察察", "不容抗拒", "献祭", "仪式", "国王", "沙哑",
+        "温热", "灭顶", "小兽", "巨石", "巨浪",
+        "充满了惩罚性与占有欲", "狂风暴雨般的", "铺天盖地的",
+        "像溺水之人抓住浮木一般", "淬毒的刀子一样", "一颗", "两颗", "三颗盘扣",
+        "审判", "征服", "毁天灭地", "冰雹", "细若蚊呐", "麻木",
+        "屈辱", "四肢百骸", "手术刀", "cố gắng", "慵懒", "嘶哑",
+        "磁性", "深沉", "言简意赅", "支配", "占有", "乐章",
+        "简短有力", "没有说话", "凝固", "戏谑", "恼怒",
+        "侵略性", "骨节", "深渊", "почти", "陷入",
+        "木讷", "困惑", "恐惧", "绝望",
+        "眼神空洞", "毫无生气", "勾起", "嘴角什么什么弧度",
+        "若有若无", "生理性的", "弓起", "崇拜", "狂热",
+        "粗暴", "画圈", "研磨", "扣子", "鲜明的对比", "魔鬼",
+        "氤氲", "提线木偶", "潮湿季节里疯长的有毒藤蔓", "并不存在的",
+        "揉入骨血", "穿云裂石的尖叫", "甬道", "痉挛", "随之抖动",
+        "雨后青草一般的", "低笑", "长年xx的薄茧", "像根针一样扎进",
+        "水光潋滟", "subtly", "gently", "无意识的勾住",
+        "不自觉的绞在一起", "一顿", "裹挟着蜜糖", "playfully",
+        "amused", "细密的汗珠", "袅袅热气", "几乎看不见",
+        # English slop tells (theslopindex.com)
+        "delve", "nuanced", "I hope this finds you well",
+        "not hesitate", "straightforward", "It's worth noting",
+        "landscape", "underscores", "multifaceted", "comprehensive",
+        "I cannot and will not", "I need to be direct",
+        "tapestry", "reimagine", "I appreciate you sharing",
+    ]
+
+    # Check for system error messages
+    error_patterns = [
+        "模型未使用 finish 工具",
+        "裸文本不被内核认可",
+        "引擎内部错误",
+        "[Errno",
+        "Traceback",
+    ]
+
+    # Check for garbled/mojibake
+    mojibake_pattern = re.compile(r'[ðÿÞþ]{3,}|\\x[0-9a-fA-F]{2}')
+
+    found_errors = []
+    found_bagu = []
+
+    # Check error patterns
+    for pat in error_patterns:
+        if pat in text:
+            found_errors.append(pat)
+
+    # Check mojibake
+    if mojibake_pattern.search(text) or '\ufffd' in text:
+        found_errors.append("乱码/二进制字符")
+
+    # Check for [LEFT] tag — hallucinated format marker, never valid
+    if '[LEFT]' in text:
+        found_errors.append("[LEFT] 标记（幻觉格式符，请用 [SPLIT] 或 \\n 换行）")
+
+    # Check bagu words
+    for word in bagu_words:
+        if word.lower() in text.lower():
+            found_bagu.append(word)
+
+    # Check "不是...而是/，是/，更像是..." pattern
+    bushi_patterns = re.findall(r'不是.{1,20}(?:而是|[，,\s]\s*(?:更像是|更是|是)|\s+是).{1,30}', text)
+    if bushi_patterns:
+        found_bagu.append(f"不是...是...句式: {bushi_patterns[0][:40]}")
+
+    # Check "那种...的..." Claude signature pattern
+    nazhong_patterns = re.findall(r'那种.{2,15}的.{2,15}', text)
+    if len(nazhong_patterns) >= 2:
+        found_bagu.append(f"那种...的...句式({len(nazhong_patterns)}处): {nazhong_patterns[0][:30]}")
+
+    # Check excessive em-dash usage (破折号过多)
+    dash_count = text.count('——') + text.count('—')
+    if dash_count >= 4:
+        found_bagu.append(f"破折号过多({dash_count}处)")
+    elif dash_count >= 2:
+        # 2-3 is borderline, only flag if combined with other issues
+        pass
+
+    # Check "是" inverted sentence pattern (是字倒装句)
+    # Matches: X的是Y / X是Y的 at sentence start — AI loves this for cinematic slow-reveal
+    shi_patterns = re.findall(r'(?:^|[。\n])\s*[^。\n]{0,15}(?:的是.{2,15}|是.{2,15}的)[。，]', text)
+    if len(shi_patterns) >= 3:
+        found_bagu.append(f"是字倒装句过多({len(shi_patterns)}处): {shi_patterns[0].strip()[:30]}")
+    elif len(shi_patterns) >= 2:
+        # 2 is borderline, weak signal only
+        pass
+
+    # Check Discord message length limit (2000 chars per segment)
+    DC_LIMIT = 1500
+    segments = text.split('[SPLIT]')
+    oversized = []
+    for i, seg in enumerate(segments):
+        seg_stripped = seg.strip()
+        if len(seg_stripped) > DC_LIMIT:
+            oversized.append(f"第{i+1}段 {len(seg_stripped)}字符")
+
+    errors = []
+    if oversized:
+        errors.append(f"📏 超出DC长度限制({DC_LIMIT}): {', '.join(oversized)}")
+    if found_errors:
+        errors.append(f"⚠️ 系统错误词: {', '.join(found_errors[:5])}")
+    if found_bagu:
+        errors.append(f"📖 八股词 ({len(found_bagu)}个): {', '.join(found_bagu)}")
+
+    if errors:
+        lines = ["你的输出未通过质检，请修改后重新输出。不要重新回答问题，只修正以下问题："]
+        lines.extend(errors)
+        lines.append("")
+        lines.append("--- 以下是你被拒绝的原文，请在此基础上仅修改被指出的问题，严禁从头重写或复述旧内容 ---")
+        lines.append(text)
+        return reject("\n".join(lines))
+
+    return finish(text, attachments=attachments)
+
+script_timeout_sec: 10.0

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import locale
-# 2026-05-14: platform/ is now a project package, so this module aliases the
+# 2026-05-14: adapters/ is now a project directory, so this module aliases the
 # standard-library platform import explicitly. This keeps OS metadata collection
 # using the stdlib API while avoiding confusion with project-local modules.
 import platform as _stdlib_platform

@@ -5,7 +5,7 @@ NoneBot2 插件，通过 OneBot 11 协议（NapCat / go-cqhttp 等实现）将 Q
 ## 目录结构
 
 ```
-platform/onebot/
+adapters/onebot/
 ├── __init__.py       # 插件主体：消息处理、附件收集、EventRouter 回调
 ├── config.py         # 环境变量配置
 └── emoji_handler.py  # QQ 自定义表情处理（表情包名称索引）
@@ -46,7 +46,7 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 
 ### 2. 配置 NoneBot2 项目
 
-在 NoneBot2 项目中加载本插件。将 `platform/onebot/` 目录作为 NoneBot2 插件加载：
+在 NoneBot2 项目中加载本插件。将 `adapters/onebot/` 目录作为 NoneBot2 插件加载：
 
 ```python
 # bot.py 或 pyproject.toml

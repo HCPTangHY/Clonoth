@@ -5,7 +5,7 @@
 ## 目录结构
 
 ```
-platform/discord/
+adapters/discord/
 ├── app.py           # 入口：配置常量、DiscordRuntime、SDK 初始化、事件注册
 ├── main.py          # 入口（调用 app.main()）
 ├── agent.py         # Bridge Server、消息处理主逻辑、审批/取消 View
@@ -77,7 +77,7 @@ cd /path/to/clonoth
 python -m platform.discord.app
 
 # 方式二：通过兼容性入口
-python platform/discord/main.py
+python adapters/discord/main.py
 ```
 
 ### 5. systemd 服务（推荐）

@@ -91,7 +91,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "routing": {
         "entry_node_id": "bootstrap.shell_orchestrator",
     },
-    # [deprecated] shell section 仅供 platform/shell CLI/TUI 使用。
+    # [deprecated] shell section 仅供 adapters/shell CLI/TUI 使用。
     # entry_node_id 已迁移到 routing.entry_node_id。
     "shell": {
         "http": {"client_timeout_sec": 10.0},

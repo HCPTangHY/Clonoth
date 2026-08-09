@@ -22,9 +22,9 @@ pip-wheel-metadata/
 # Node and frontend generated output
 node_modules/
 **/node_modules/
-platform/web/frontend/dist/
-platform/web/frontend/.vite/
-platform/web/frontend/coverage/
+adapters/web/frontend/dist/
+adapters/web/frontend/.vite/
+adapters/web/frontend/coverage/
 *.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*

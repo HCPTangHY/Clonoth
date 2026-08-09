@@ -2,7 +2,7 @@
 
 [2026-05-14 refactor note] The production bot implementation now lives in
 platform.discord.app. This file stays small so old process managers can keep
-executing platform/discord/main.py without losing the import path setup.
+executing adapters/discord/main.py without losing the import path setup.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ os.environ.setdefault("CLONOTH_PORT", "8765")
 
 sys.path.insert(0, _REPO_ROOT)
 
-from platform.discord.app import main
+from adapters.discord.app import main
 
 
 if __name__ == "__main__":

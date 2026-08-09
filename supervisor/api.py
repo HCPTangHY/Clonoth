@@ -2144,7 +2144,7 @@ def create_app(
     from starlette.responses import RedirectResponse as _RR
 
     # [2026-05-16] Web chat frontend
-    web_dist = state.workspace_root / "platform" / "web" / "frontend" / "dist"
+    web_dist = state.workspace_root / "adapters" / "web" / "frontend" / "dist"
     web_mounted = False
     if web_dist.is_dir():
         # [2026-06-22] 反代 Host 头为 localhost 时，StaticFiles 的 307 /web→/web/
@@ -2158,9 +2158,9 @@ def create_app(
         web_mounted = True
         print(f"[web] 前端地址: http://{{host}}:{{port}}/web/", flush=True)
 
-    # Legacy admin assets are optional. If platform/admin is absent, keep /admin
+    # Legacy admin assets are optional. If adapters/admin is absent, keep /admin
     # as a stable entry point by redirecting it to the current web frontend.
-    admin_dir = state.workspace_root / "platform" / "admin"
+    admin_dir = state.workspace_root / "adapters" / "admin"
     if admin_dir.is_dir():
         @app.get("/admin")
         async def _admin_trailing_slash() -> _RR:

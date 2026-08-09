@@ -28,8 +28,8 @@ from .types import TaskStatus
 
 
 def _ensure_web_frontend(workspace_root: Path, log_func) -> None:
-    """Build platform/web/frontend/dist when dependencies are already installed."""
-    frontend_dir = workspace_root / "platform" / "web" / "frontend"
+    """Build adapters/web/frontend/dist when dependencies are already installed."""
+    frontend_dir = workspace_root / "adapters" / "web" / "frontend"
     dist_index = frontend_dir / "dist" / "index.html"
     package_json = frontend_dir / "package.json"
     node_modules = frontend_dir / "node_modules"
@@ -38,10 +38,10 @@ def _ensure_web_frontend(workspace_root: Path, log_func) -> None:
 
     npm = shutil.which("npm")
     if not npm:
-        log_func("[web] 前端 dist 不存在，且未找到 npm。请执行：cd platform/web/frontend && npm ci && npm run build")
+        log_func("[web] 前端 dist 不存在，且未找到 npm。请执行：cd adapters/web/frontend && npm ci && npm run build")
         return
     if not node_modules.is_dir():
-        log_func("[web] 前端 dist 不存在。请执行：cd platform/web/frontend && npm ci && npm run build")
+        log_func("[web] 前端 dist 不存在。请执行：cd adapters/web/frontend && npm ci && npm run build")
         return
 
     log_func("[web] 前端 dist 不存在，开始自动执行 npm run build")
@@ -57,7 +57,7 @@ def _ensure_web_frontend(workspace_root: Path, log_func) -> None:
         )
     except Exception as exc:
         log_func(f"[web] 前端自动构建失败：{exc}")
-        log_func("[web] 请手动执行：cd platform/web/frontend && npm ci && npm run build")
+        log_func("[web] 请手动执行：cd adapters/web/frontend && npm ci && npm run build")
         return
 
     if result.returncode != 0:
@@ -66,7 +66,7 @@ def _ensure_web_frontend(workspace_root: Path, log_func) -> None:
         log_func(f"[web] 前端自动构建失败，退出码 {result.returncode}")
         if tail:
             log_func(tail)
-        log_func("[web] 请手动执行：cd platform/web/frontend && npm ci && npm run build")
+        log_func("[web] 请手动执行：cd adapters/web/frontend && npm ci && npm run build")
         return
 
     log_func("[web] 前端自动构建完成")

@@ -9,7 +9,7 @@ Clonoth is a modular, multi-platform AI Agent framework designed for long-runnin
 - **Providers** (`providers/`): Pluggable LLM provider implementations (OpenAI, Anthropic, Gemini, etc.).
 - **SDK** (`clonoth_sdk/`): Client SDK for external callers — request/callback/approval/event routing.
 - **Toolbox** (`toolbox/`): Tool runtime, registry, MCP client support, skill injection.
-- **Bot Adapters** (`platform/`): Platform connectors (Discord, QQ/OneBot).
+- **Bot Adapters** (`adapters/`): Platform connectors (Discord, QQ/OneBot).
 
 ## Setup
 

@@ -5,7 +5,7 @@
 ## 目录结构
 
 ```
-platform/web/
+adapters/web/
 └── frontend/
     ├── src/
     │   ├── components/     # React 组件
@@ -31,7 +31,7 @@ platform/web/
 ### 1. 安装依赖
 
 ```bash
-cd platform/web/frontend
+cd adapters/web/frontend
 npm ci
 ```
 
@@ -68,7 +68,7 @@ npm run test:run
 
 ### 方式一：Supervisor 自动挂载（默认）
 
-Supervisor 启动时会自动检测 `platform/web/frontend/dist/` 目录。如果存在，将其挂载到 `/web/` 路径：
+Supervisor 启动时会自动检测 `adapters/web/frontend/dist/` 目录。如果存在，将其挂载到 `/web/` 路径：
 
 ```
 http://{supervisor_host}:{supervisor_port}/web/
@@ -86,7 +86,7 @@ server {
     server_name clonoth.example.com;
 
     location /web/ {
-        alias /path/to/clonoth/platform/web/frontend/dist/;
+        alias /path/to/clonoth/adapters/web/frontend/dist/;
         try_files $uri $uri/ /web/index.html;
     }
 
@@ -107,12 +107,12 @@ server {
 
 ```bash
 # 正确做法
-cd /path/to/clonoth_original/platform/web/frontend
+cd /path/to/clonoth_original/adapters/web/frontend
 npm ci
 npm run build
-rm -rf /path/to/production/platform/web/frontend/dist
-mkdir -p /path/to/production/platform/web/frontend/dist
-cp -a dist/. /path/to/production/platform/web/frontend/dist/
+rm -rf /path/to/production/adapters/web/frontend/dist
+mkdir -p /path/to/production/adapters/web/frontend/dist
+cp -a dist/. /path/to/production/adapters/web/frontend/dist/
 ```
 
 ⚠️ 注意：
