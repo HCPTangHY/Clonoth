@@ -415,6 +415,11 @@ def memory_dir(workspace_root: Path, memory_book: str = "") -> Path:
     return base
 
 
+def _effective_memory_ns(node_extra: dict, node_id: str) -> str:
+    """Resolve effective memory namespace: explicit memory_book > node_id."""
+    return str(node_extra.get("memory_book") or "").strip() or node_id
+
+
 def load_memory_catalog(
     workspace_root: Path,
     *,
@@ -1071,8 +1076,12 @@ def build_knowledge_context(
     # 为什么：持久化子节点的记忆存储在 data/memory/{memory_book}/ 下。
     # 怎么改：传 memory_book 给 load_memory_catalog，让它扫描正确的目录。
     # 目的：节点只看到自己 namespace 下的记忆条目。
-    _mb = str(node.extra.get("memory_book") or "").strip()
-    entries.extend(normalize_memory_entries(load_memory_catalog(workspace_root, memory_book=_mb)))
+    _mb = _effective_memory_ns(node.extra, node.id)
+    mem_entries = load_memory_catalog(workspace_root, memory_book=_mb)
+    if not mem_entries:
+        # ponytail: node dir empty/missing → fallback to root data/memory/
+        mem_entries = load_memory_catalog(workspace_root, memory_book="")
+    entries.extend(normalize_memory_entries(mem_entries))
 
     return build_knowledge_messages(
         workspace_root,
@@ -1410,7 +1419,8 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # 为什么：持久化子节点的记忆应写入 data/memory/{memory_book}/。
     # 怎么改：传 memory_book 给 memory_dir 来计算实际路径。
     _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
+    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
+    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
     book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
     data = _load_book(book_path)
     data.setdefault("book", book)
@@ -1462,8 +1472,12 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     # [2026-05-28] namespace 隔离：使用节点 memory_book 确定扫描目录。
     book_filter = str(args.get("book") or "").strip() or None
     _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
+    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
+    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
     mem_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
+    if not mem_dir.exists():
+        # ponytail: fallback to root
+        mem_dir = memory_dir(ctx.workspace_root, "")
     if not mem_dir.exists():
         return _tool_ok("0 memories", entries=[])
 
@@ -1505,9 +1519,16 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 
     # [2026-05-28] namespace 隔离：使用节点 memory_book 确定存储目录。
     _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
+    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
+    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
     book = str(args.get("book") or "default").strip()
     book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
+    if not book_path.exists():
+        # ponytail: fallback to root for delete
+        _fallback_path = memory_dir(ctx.workspace_root, "") / f"{book}.yaml"
+        if _fallback_path.exists():
+            book_path = _fallback_path
+            _ns_memory_book = ""
     if not book_path.exists():
         return _tool_err(f"book not found: {book}")
 
