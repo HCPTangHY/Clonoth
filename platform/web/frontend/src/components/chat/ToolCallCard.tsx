@@ -249,10 +249,7 @@ const TOOL_META_MAP: Record<string, ToolMeta> = {
   discord_manage: { icon: 'smart_toy', label: 'Discord', descTemplate: '' },
   clonoth_debug: { icon: 'bug_report', label: '调试', descTemplate: '' },
   create_agent: { icon: 'person_add', label: '创建节点', descTemplate: '' },
-  dispatch_to_scout: { icon: 'explore', label: 'Scout', descTemplate: '' },
-  dispatch_to_smith: { icon: 'engineering', label: 'Smith', descTemplate: '' },
-  dispatch_to_ereuna_coder: { icon: 'code', label: 'Coder', descTemplate: '' },
-  dispatch_to_news_reporter: { icon: 'newspaper', label: '记者', descTemplate: '' },
+
 };
 
 const DEFAULT_TOOL_META: ToolMeta = { icon: 'handyman', label: '', descTemplate: '' };
