@@ -1,6 +1,6 @@
 """Discord attachment, sending, progress, and restart helpers.
 
-[2026-05-14 refactor note] This module was split out of ereuna_main.py so
+[2026-05-14 refactor note] This module was split out of the main entry point so
 message output and file handling share DiscordRuntime explicitly. The functions
 avoid importing context.py to keep the requested one-way import structure.
 """

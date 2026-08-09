@@ -1,6 +1,6 @@
 """Clonoth Remote Worker — Computer Use (Desktop Control)
 
-Based on HCPTangHY/gemini-computer-control tool definitions.
+Based on gemini-computer-control tool definitions.
 Uses 0-1000 normalized coordinate system for resolution independence.
 
 Requirements:
