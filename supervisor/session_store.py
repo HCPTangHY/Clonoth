@@ -37,6 +37,71 @@ from ._helpers import SessionInfo, _now
 logger = logging.getLogger(__name__)
 
 
+def _session_info_to_entry(info: SessionInfo) -> dict[str, Any]:
+    """Serialize SessionInfo to a sessions.json entry dict.
+
+    Auto-serializes all dict-typed and str-typed fields beyond the fixed
+    positional ones, so adding a new field to SessionInfo automatically
+    persists it without touching this function.
+    """
+    import dataclasses as _dc
+    entry: dict[str, Any] = {
+        "session_id": info.session_id,
+        "channel": info.channel,
+        "conversation_key": info.conversation_key,
+        "created_at": info.created_at.isoformat(),
+        "updated_at": info.updated_at.isoformat() if info.updated_at else info.created_at.isoformat(),
+        "reset": False,
+        "entry_node_id": info.entry_node_id,
+    }
+    for f in _dc.fields(info):
+        if f.name in entry:
+            continue
+        val = getattr(info, f.name, None)
+        if isinstance(val, dict):
+            entry[f.name] = dict(val)
+        elif isinstance(val, str):
+            entry[f.name] = val
+    return entry
+
+
+def _session_info_from_entry(
+    sid: str,
+    entry: dict[str, Any],
+    created_at: datetime,
+    updated_at: datetime,
+) -> SessionInfo:
+    """Construct SessionInfo from a sessions.json entry.
+
+    Reads all known fields from the dict, applying type guards. Unknown fields
+    are silently ignored so adding a new SessionInfo field only requires adding
+    a default in the dataclass — this function picks it up automatically for
+    dict fields via the loop below.
+    """
+    # Fixed positional fields
+    info = SessionInfo(
+        session_id=str(entry.get("session_id") or sid),
+        channel=str(entry.get("channel") or ""),
+        conversation_key=str(entry.get("conversation_key") or ""),
+        created_at=created_at,
+        updated_at=updated_at,
+        entry_node_id=str(entry.get("entry_node_id") or ""),
+    )
+    # Auto-restore any dict-typed fields (provider_override, workspace, ...)
+    # that have a default_factory=dict on SessionInfo.
+    import dataclasses as _dc
+    for f in _dc.fields(info):
+        if f.name in ("session_id", "channel", "conversation_key",
+                      "created_at", "updated_at", "entry_node_id"):
+            continue
+        raw = entry.get(f.name)
+        if f.default_factory is dict and isinstance(raw, dict):  # type: ignore[arg-type]
+            setattr(info, f.name, dict(raw))
+        elif isinstance(f.default, str) and isinstance(raw, str):
+            setattr(info, f.name, raw)
+    return info
+
+
 class SessionStore:
     """管理 data/sessions.json 的读写。
 
@@ -141,24 +206,7 @@ class SessionStore:
                     if isinstance(updated_str, str) and updated_str
                     else created_at
                 )
-                info = SessionInfo(
-                    session_id=str(entry.get("session_id") or sid),
-                    channel=str(entry.get("channel") or ""),
-                    conversation_key=str(entry.get("conversation_key") or ""),
-                    created_at=created_at,
-                    updated_at=updated_at,
-                    # Why: older sessions.json files do not have entry_node_id.
-                    # How: normalize a missing or empty value to "" during load.
-                    # Purpose: schema extension remains backward compatible while
-                    # still restoring per-session routing when the field exists.
-                    entry_node_id=str(entry.get("entry_node_id") or ""),
-                    # [AutoC 2026-06-01] Why: provider_override is a new optional
-                    # sessions.json field. How: accept only dict values and copy
-                    # them into SessionInfo. Purpose: old rows load as empty
-                    # overrides and malformed rows cannot leak non-dict data.
-                    provider_override=dict(entry.get("provider_override") or {}) if isinstance(entry.get("provider_override"), dict) else {},
-                    workspace=dict(entry.get("workspace") or {}) if isinstance(entry.get("workspace"), dict) else {},
-                )
+                info = _session_info_from_entry(sid, entry, created_at, updated_at)
                 sessions[info.session_id] = info
                 if info.conversation_key:
                     conv_map[info.conversation_key] = info.session_id
@@ -179,28 +227,7 @@ class SessionStore:
 
     def on_session_created(self, info: SessionInfo) -> None:
         """持久化一个新创建的 session。"""
-        self._registry[info.session_id] = {
-            "session_id": info.session_id,
-            "channel": info.channel,
-            "conversation_key": info.conversation_key,
-            "created_at": info.created_at.isoformat(),
-            "updated_at": info.updated_at.isoformat() if info.updated_at else info.created_at.isoformat(),
-            "reset": False,
-            # Why: session creation can already know the desired entry node in
-            # restored or specialized flows. How: serialize the SessionInfo field
-            # beside the existing metadata. Purpose: restart recovery can route
-            # inbound callbacks without relying on volatile supervisor memory.
-            "entry_node_id": info.entry_node_id,
-            # [AutoC 2026-06-01] Why: session-scoped provider selection must
-            # survive supervisor restart. How: serialize the SessionInfo override
-            # dict beside other session metadata. Purpose: engine can recover the
-            # same provider/model choice through the supervisor API after restart.
-            "provider_override": dict(info.provider_override or {}),
-            # [AutoC 2026-08-10] Why: session workspace must survive restart too.
-            # How: serialize {name, path} beside provider_override. Purpose: engine
-            # resolves the same active workspace after supervisor restart.
-            "workspace": dict(info.workspace or {}),
-        }
+        self._registry[info.session_id] = _session_info_to_entry(info)
         self._flush()
 
     def update_provider_override(self, session_id: str, provider_override: dict[str, Any]) -> None:

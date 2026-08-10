@@ -1,8 +1,12 @@
+<div align="center">
+
+<img src="docs/assets/logo.png" width="360" />
+
 # Clonoth
 
-Clonoth 是一个模块化、可扩展的多平台 AI Agent 框架。
+</div>
 
-它面向长期运行的 Agent 服务场景，将任务调度、模型推理、平台接入、工具调用、技能注入和记忆管理拆分为相对独立的模块，便于扩展、维护和部署。
+Clonoth 是一个模块化、可扩展的多平台 AI Agent 框架。面向长期运行的 Agent 服务场景，将任务调度、模型推理、平台接入、工具调用、技能注入和记忆管理拆分为独立模块。
 
 ## 架构概览
 
