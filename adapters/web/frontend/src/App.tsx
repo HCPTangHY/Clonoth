@@ -116,6 +116,7 @@ const MainApp = () => {
       composer={view.composer?.(viewContext)}
       header={view.header(viewContext)}
       logPanel={view.rightBottom?.(viewContext)}
+      rightOverlay={view.rightOverlay?.(viewContext)}
       rightPanel={view.rightTop?.(viewContext)}
       sidebar={view.sidebar(viewContext)}
     >

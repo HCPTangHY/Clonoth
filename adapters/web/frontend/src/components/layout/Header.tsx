@@ -128,7 +128,11 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
                   openSessionConfigModal('workspace');
                 }
               }}
-              title={workspaceName ? '浏览工作区文件' : '设置工作区'}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                openSessionConfigModal('workspace');
+              }}
+              title={workspaceName ? '左键打开文件树 · 右键编辑工作区' : '设置工作区'}
             >
               <Icon name="folder" size={11} />
               {workspaceName || '设置工作区'}

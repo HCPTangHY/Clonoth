@@ -9,7 +9,8 @@ Clonoth is a modular, multi-platform AI Agent framework designed for long-runnin
 - **Providers** (`providers/`): Pluggable LLM provider implementations (OpenAI, Anthropic, Gemini, etc.).
 - **SDK** (`clonoth_sdk/`): Client SDK for external callers — request/callback/approval/event routing.
 - **Toolbox** (`toolbox/`): Tool runtime, registry, MCP client support, skill injection.
-- **Bot Adapters** (`adapters/`): Platform connectors (Discord, QQ/OneBot).
+- **Bot Adapters** (`adapters/`): Platform connectors (Discord, QQ/OneBot, Web).
+- **Remote Worker SDK** (`remote_worker_sdk/`): SDK for offloading tool execution to remote machines.
 
 ## Setup
 
@@ -89,7 +90,7 @@ Inbound message → Supervisor creates Task → Engine executes Node → Tool ca
 | `supervisor/api.py` | HTTP API endpoints (admin, inbound, tasks) |
 | `engine/runner.py` | Node execution loop, TaskRecord writing |
 | `engine/inference/ai_step.py` | Single LLM inference step |
-| `engine/inference/pseudo_handlers.py` | Built-in pseudo-tool handlers (dispatch, finish, reply, etc.) |
+| `engine/inference/pseudo_handlers.py` | Built-in pseudo-tool handlers (dispatch, finish, intermediate_reply, etc.) |
 | `engine/builtin/compact.py` | Context compaction (L1/L2/L3) |
 | `engine/turn_summary.py` | Turn-level summarization |
 | `engine/conversation_store.py` | Conversation JSONL read/write |
@@ -98,6 +99,8 @@ Inbound message → Supervisor creates Task → Engine executes Node → Tool ca
 | `config/nodes/*.yaml` | Node definitions (model, tools, personality) |
 | `data/config.yaml` | Runtime configuration |
 | `data/policy.yaml` | Approval and security policies |
+| `data/workspaces.yaml` | Workspace name → path registry |
+| `data/sessions.json` | Session persistence (workspace, provider override) |
 
 ## Commit Format
 
@@ -128,12 +131,13 @@ All changes MUST be made in the source repo (`clonoth_original/`) first:
 
 **Never edit production directories directly.**
 
-Sync scope (only these 5 directories):
+Sync scope (only these directories):
 - `engine/`
 - `supervisor/`
 - `providers/`
 - `toolbox/`
 - `clonoth_sdk/`
+- `adapters/`
 
 ## Adding New Components
 

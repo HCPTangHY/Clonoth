@@ -58,17 +58,17 @@ Engine 包含记忆提取、记忆存储、上下文压缩和轮次摘要相关�
 | 路径 | 说明 |
 | --- | --- |
 | `engine/` | AI 节点执行核心，包含推理步骤、上下文、记忆、工具调用、Hook 和系统节点。 |
-| `supervisor/` | 任务监督层，包含进程管理、任务路由、会话、审批、计划任务和管理 API。 |
+| `supervisor/` | 任务监督层，包含任务路由、会话、审批、安全策略、计划任务和管理 API。 |
 | `providers/` | 模型 Provider 实现与 Provider 注册表。 |
-| `clonoth_sdk/` | 外部客户端 SDK，封装请求、回调、审批和事件路由。 |
-| `tools/` | 可由 Agent 调用的本地工具。 |
+| `clonoth_sdk/` | 适配器层 SDK，封装事件路由、审批和回调协议。 |
+| `tools/` | 可由 Agent 调用的自定义工具。 |
 | `toolbox/` | 工具运行时、注册表、MCP 和技能运行支持。 |
 | `skills/` | 技能定义，用于向模型注入领域能力和行为规则。 |
 | `plugins/` | 外部 Hook 插件目录。 |
+| `adapters/` | 平台适配器（Discord、QQ/OneBot、Web 前端）。 |
+| `remote_worker_sdk/` | 远程 Worker SDK，用于将工具执行卸载到远程机器。 |
 | `config/` | 运行时、节点、工作流和模型路由配置。 |
 | `docs/` | 架构设计、集成说明和演进文档。 |
-| `public/` | 管理界面和 Playground 静态资源。 |
-| `tests/` | 自动化测试。 |
 
 ## 快速开始
 
@@ -188,11 +188,14 @@ pytest
 
 更多设计和集成说明见 `docs/` 目录：
 
-- [Bot 集成说明](docs/bot_integration.md)
+- [架构说明](docs/architecture.md)
+- [Bot 集成指南](docs/bot_integration.md)
+- [工具系统](docs/tools_and_evolution.md)
+- [插件系统](docs/plugin-system.md)
+- [Skill 系统](docs/skills.md)
+- [配置说明](docs/configuration.md)
 - [任务与会话架构 ADR](docs/ADR-task-session-architecture.md)
 - [Dream 与 Compact 重构 RFC](docs/RFC-dream-and-compact-redesign.md)
-- [工具系统与演进说明](docs/tools_and_evolution.md)
-- [设计文档目录](docs/design/)
 
 ## 扩展入口
 

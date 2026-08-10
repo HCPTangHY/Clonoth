@@ -60,6 +60,8 @@ import { EngineeringW400 } from '@material-symbols-svg/react/icons/engineering';
 import { EventBusyW400 } from '@material-symbols-svg/react/icons/event-busy';
 import { ExploreW400 } from '@material-symbols-svg/react/icons/explore';
 import { ExtensionW400 } from '@material-symbols-svg/react/icons/extension';
+import { KeyboardArrowDownW400 } from '@material-symbols-svg/react/icons/keyboard-arrow-down';
+import { FolderOffW400 } from '@material-symbols-svg/react/icons/folder-off';
 import { FolderOpenW400 } from '@material-symbols-svg/react/icons/folder-open';
 import { HandymanW400 } from '@material-symbols-svg/react/icons/handyman';
 import { HelpW400 } from '@material-symbols-svg/react/icons/help';
@@ -145,6 +147,8 @@ const ICON_MAP: Record<string, SvgIcon> = {
   event_busy: EventBusyW400,
   explore: ExploreW400,
   extension: ExtensionW400,
+  expand_more: KeyboardArrowDownW400,
+  folder_off: FolderOffW400,
   folder_open: FolderOpenW400,
   handyman: HandymanW400,
   help: HelpW400,

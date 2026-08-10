@@ -46,6 +46,7 @@ export interface AppViewDefinition {
   composer?: (ctx: AppViewContext) => ReactNode;
   rightTop?: (ctx: AppViewContext) => ReactNode;
   rightBottom?: (ctx: AppViewContext) => ReactNode;
+  rightOverlay?: (ctx: AppViewContext) => ReactNode;
 }
 
 const safeSessionId = (sessionId: string) => sessionId || 'no-session';
@@ -124,17 +125,11 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
         />
       );
     },
-    rightTop: (ctx) => {
+    rightTop: () => <SystemDashboard />,
+    rightBottom: () => <EventLogPanel />,
+    rightOverlay: (ctx) => {
       const overlay = useViewStore.getState().panelOverlay.right;
-      if (overlay) {
-        return resolveOverlay(overlay, ctx);
-      }
-      return <SystemDashboard />;
-    },
-    rightBottom: (ctx) => {
-      const overlay = useViewStore.getState().panelOverlay.right;
-      if (overlay) return undefined;
-      return <EventLogPanel />;
+      return overlay ? resolveOverlay(overlay, ctx) : null;
     },
   },
   settings: {

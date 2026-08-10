@@ -15,9 +15,10 @@ interface AppLayoutProps extends PropsWithChildren {
   composer?: ReactNode;
   logPanel?: ReactNode;
   rightPanel?: ReactNode;
+  rightOverlay?: ReactNode;
 }
 
-export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, children }: AppLayoutProps) => {
+export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rightOverlay, children }: AppLayoutProps) => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { rightPanelOpen, setRightPanelOpen } = useSettingsStore();
   const hasRightPanel = Boolean(logPanel || rightPanel);
@@ -135,12 +136,13 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, chi
               : 'fixed inset-y-0 right-0 z-40 w-[85vw] translate-x-full transition-transform duration-200 md:relative md:z-auto md:w-0 md:translate-x-0 md:transition-[width] md:duration-200'
           }`}
         >
+          {rightOverlay && (
+            <div className="absolute inset-0 z-10 flex flex-col overflow-hidden bg-[var(--duties-panel)]">
+              {rightOverlay}
+            </div>
+          )}
           {logPanel ? (
             <>
-              {/* [2026-06-02] Preserve the split layout only when a log panel exists.
-                  Why: chat mode still needs status plus EventLogPanel. How: keep the
-                  historical 60/40 wrappers inside this branch. Purpose: settings mode
-                  can omit logPanel without inheriting a stale 60 percent height. */}
               <div className="flex h-[60%] min-h-0 flex-shrink-0 flex-col overflow-hidden border-b border-[var(--duties-border)]">
                 {rightPanel}
               </div>
