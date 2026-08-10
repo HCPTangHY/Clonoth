@@ -313,13 +313,25 @@ def classify_path(
         except ValueError:
             pass
 
+    # Tier 1.5: workspace_root/data/ is system runtime storage (attachments,
+    # memory, conversations, temp files). Treated as workspace-level trust even
+    # when no active workspace is set, so SDK/frontend auto-approve applies.
+    _ws_root = workspace_root.resolve()
+    _data_dir = _ws_root / "data"
+    try:
+        p.relative_to(_data_dir)
+        rel = p.relative_to(_ws_root)
+        return p, rel.as_posix(), "workspace"
+    except ValueError:
+        pass
+
     # Tier 2: workspace_root + extra_roots (trusted)
-    trusted_roots = [workspace_root.resolve()]
+    trusted_roots = [_ws_root]
     trusted_roots.extend(r.resolve() for r in extra_roots)
     for r in trusted_roots:
         try:
             rel = p.relative_to(r)
-            display = rel.as_posix() if r == workspace_root.resolve() else p.as_posix()
+            display = rel.as_posix() if r == _ws_root else p.as_posix()
             return p, display, "trusted"
         except ValueError:
             continue
