@@ -17,6 +17,39 @@ import yaml
 
 from .result import hook_result
 
+
+def _build_messages_for_fallback(
+    ctx: Any,
+    fb_provider: Any,
+) -> list[dict[str, Any]]:
+    """Build properly formatted messages for a fallback provider.
+
+    Why: ctx.messages is Clonoth storage format (with _meta, _ephemeral, etc).
+    The normal call chain runs L2 formatter + prepare_messages_for_llm before
+    sending to a provider.  Fallback must do the same, using the *fallback*
+    provider instance so that provider-specific bypasses (Gemini, Responses)
+    and L3 cleaning happen correctly.
+    """
+    from engine.inference.llm_call import _build_messages_for_provider
+    from engine.attachments import prepare_messages_for_llm
+    from engine.inference.tool_format import create_tool_formatter
+
+    # Determine tool_mode from the current node (same mode the primary used)
+    node = getattr(ctx, 'node', None)
+    tool_mode = getattr(node, 'tool_mode', None) or 'fake-native'
+    formatter = create_tool_formatter(tool_mode)
+
+    # L2: role correction, control-flow sanitization, internal field stripping
+    formatted = _build_messages_for_provider(ctx.messages, formatter, fb_provider)
+
+    # Image file:// → base64 conversion
+    rctx = getattr(ctx, 'rctx', None)
+    workspace_root = getattr(rctx, 'workspace_root', None) if rctx else None
+    if workspace_root:
+        formatted = prepare_messages_for_llm(formatted, workspace_root)
+
+    return formatted
+
 logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -174,8 +207,9 @@ class FallbackProviderHandler:
                 )
 
                 t0 = time.monotonic()
+                fb_messages = _build_messages_for_fallback(ctx, fb_provider)
                 new_resp = await fb_provider.chat(
-                    messages=messages,
+                    messages=fb_messages,
                     tools=tools,
                 )
                 elapsed = round((time.monotonic() - t0) * 1000, 1)
