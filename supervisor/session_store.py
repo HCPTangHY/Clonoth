@@ -157,6 +157,7 @@ class SessionStore:
                     # them into SessionInfo. Purpose: old rows load as empty
                     # overrides and malformed rows cannot leak non-dict data.
                     provider_override=dict(entry.get("provider_override") or {}) if isinstance(entry.get("provider_override"), dict) else {},
+                    workspace=dict(entry.get("workspace") or {}) if isinstance(entry.get("workspace"), dict) else {},
                 )
                 sessions[info.session_id] = info
                 if info.conversation_key:
