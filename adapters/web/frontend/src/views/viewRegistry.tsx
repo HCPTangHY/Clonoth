@@ -16,7 +16,7 @@ import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { WorkspaceFileTree } from '../components/workspace/WorkspaceFileTree';
 import type { ConversationMeta } from '../store/chatStore';
-import { useViewStore, type ViewMode } from '../store/viewStore';
+import { useViewStore, type ViewMode, type PanelOverlayState } from '../store/viewStore';
 import type { Attachment } from '../types';
 import type { ToolExecution, WsMessage } from '../types/message';
 
@@ -49,6 +49,17 @@ export interface AppViewDefinition {
 }
 
 const safeSessionId = (sessionId: string) => sessionId || 'no-session';
+
+/** Resolve a panel overlay id to a React element. Add new overlays here. */
+function resolveOverlay(id: string, ctx: AppViewContext): ReactNode {
+  const close = () => useViewStore.getState().clearPanelOverlays();
+  switch (id) {
+    case 'files':
+      return <WorkspaceFileTree sessionId={safeSessionId(ctx.sessionId)} onClose={close} />;
+    default:
+      return null;
+  }
+}
 
 export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
   chat: {
@@ -114,19 +125,14 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
       );
     },
     rightTop: (ctx) => {
-      const overlay = useViewStore.getState().rightPanelOverlay;
-      if (overlay === 'files') {
-        return (
-          <WorkspaceFileTree
-            sessionId={safeSessionId(ctx.sessionId)}
-            onClose={() => useViewStore.getState().closeRightPanelOverlay()}
-          />
-        );
+      const overlay = useViewStore.getState().panelOverlay.right;
+      if (overlay) {
+        return resolveOverlay(overlay, ctx);
       }
       return <SystemDashboard />;
     },
     rightBottom: (ctx) => {
-      const overlay = useViewStore.getState().rightPanelOverlay;
+      const overlay = useViewStore.getState().panelOverlay.right;
       if (overlay) return undefined;
       return <EventLogPanel />;
     },

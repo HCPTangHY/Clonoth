@@ -116,14 +116,12 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
               className="inline-flex shrink-0 cursor-pointer items-center gap-0.5 rounded border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-[0.55rem] text-[var(--duties-tertiary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]"
               onClick={() => {
                 if (workspaceName) {
-                  // Open file tree in right panel
-                  const { openRightPanelOverlay, rightPanelOverlay } = useViewStore.getState();
+                  const { panelOverlay, setPanelOverlay } = useViewStore.getState();
                   const { setRightPanelOpen } = useSettingsStore.getState();
-                  if (rightPanelOverlay === 'files') {
-                    // Toggle off
-                    useViewStore.getState().closeRightPanelOverlay();
+                  if (panelOverlay.right === 'files') {
+                    setPanelOverlay('right', null);
                   } else {
-                    openRightPanelOverlay('files');
+                    setPanelOverlay('right', 'files');
                     setRightPanelOpen(true);
                   }
                 } else {

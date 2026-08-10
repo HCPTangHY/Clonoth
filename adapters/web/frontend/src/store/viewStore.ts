@@ -7,32 +7,37 @@ import { create } from 'zustand';
 
 export type ViewMode = 'chat' | 'settings';
 
-// Right panel overlay — temporarily replaces the default right panel content
-// in chat mode. Used by workspace file tree, diff preview, etc.
-export type RightPanelOverlay = 'files' | null;
+// Panel overlay — temporarily replaces the default left/right panel content.
+// id is a free-form string matched by viewRegistry; null = show default content.
+export interface PanelOverlayState {
+  left: string | null;
+  right: string | null;
+}
 
 export interface ViewState {
   viewMode: ViewMode;
   activeSettingsTab: string;
-  rightPanelOverlay: RightPanelOverlay;
+  panelOverlay: PanelOverlayState;
   openSettings: (tab?: string) => void;
   closeSettings: () => void;
   setSettingsTab: (tab: string) => void;
-  openRightPanelOverlay: (overlay: RightPanelOverlay) => void;
-  closeRightPanelOverlay: () => void;
+  setPanelOverlay: (panel: 'left' | 'right', id: string | null) => void;
+  clearPanelOverlays: () => void;
 }
 
 const DEFAULT_SETTINGS_TAB = 'general';
 
+const _emptyOverlay: PanelOverlayState = { left: null, right: null };
+
 export const useViewStore = create<ViewState>((set) => ({
   viewMode: 'chat',
   activeSettingsTab: DEFAULT_SETTINGS_TAB,
-  rightPanelOverlay: null,
+  panelOverlay: { ..._emptyOverlay },
 
   openSettings: (tab) => set({
     viewMode: 'settings',
     activeSettingsTab: tab || DEFAULT_SETTINGS_TAB,
-    rightPanelOverlay: null,
+    panelOverlay: { ..._emptyOverlay },
   }),
 
   closeSettings: () => set({
@@ -43,12 +48,12 @@ export const useViewStore = create<ViewState>((set) => ({
     activeSettingsTab: tab,
   }),
 
-  openRightPanelOverlay: (overlay) => set({
-    rightPanelOverlay: overlay,
-  }),
+  setPanelOverlay: (panel, id) => set((s) => ({
+    panelOverlay: { ...s.panelOverlay, [panel]: id },
+  })),
 
-  closeRightPanelOverlay: () => set({
-    rightPanelOverlay: null,
+  clearPanelOverlays: () => set({
+    panelOverlay: { ..._emptyOverlay },
   }),
 }));
 
