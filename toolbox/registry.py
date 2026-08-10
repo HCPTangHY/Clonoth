@@ -691,6 +691,25 @@ class ToolRegistry:
         if name not in self._tool_funcs:
             return _error_tool_response(f"tool not found: {name}")
 
+        # [AutoC 2026-08-10] 统一工具级审批：所有真实工具调用先过 supervisor policy。
+        # 伪工具（finish / intermediate_reply 等）不经过 registry，天然跳过。
+        # 内部已有路径/命令级审批的工具（read_file / write_file / execute_command
+        # 等）在 policy.yaml tools.rules 里配 auto，避免双重拦截；其余工具默认
+        # approval_required，由前端/Discord 按 trust_level（空 = 无路径）+ 用户偏好
+        # 自动批准或弹人工审批。
+        from ._common import request_guard
+        _op, _err = await request_guard(
+            ctx, "tool_call",
+            {"tool_name": name, "arguments": arguments},
+        )
+        if _err is not None:
+            return {
+                "ok": False,
+                "error": _err.get("error", "denied"),
+                "cancelled": _err.get("cancelled", False),
+                "approval_id": _err.get("approval_id"),
+            }
+
         func = self._tool_funcs[name]
         return _ensure_tool_response_shape(await func(arguments, ctx))
 

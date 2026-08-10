@@ -89,6 +89,27 @@ def _default_policy_dict() -> dict[str, Any]:
         "restart": {
             "default": "approval_required",
         },
+        # [AutoC 2026-08-10] 工具级审批：所有真实工具调用先过 policy。
+        # 伪工具（finish / intermediate_reply 等）不经过 registry，天然跳过。
+        # 内部已有路径/命令级审批的工具配 auto，避免双重拦截；
+        # 其余工具（生图、记忆、MCP 等）默认 approval_required，由前端/Discord
+        # 按 trust_level（空 = 无路径）+ 用户偏好自动批准或弹人工审批。
+        "tools": {
+            "default": "approval_required",
+            "rules": [
+                {"name": "read_file", "decision": "auto", "reason": "路径级审批在工具内部处理"},
+                {"name": "write_file", "decision": "auto", "reason": "路径级审批在工具内部处理"},
+                {"name": "apply_diff", "decision": "auto", "reason": "路径级审批在工具内部处理"},
+                {"name": "execute_command", "decision": "auto", "reason": "命令级审批在工具内部处理"},
+                {"name": "request_restart", "decision": "auto", "reason": "restart 审批在工具内部处理（强制人工）"},
+                {"name": "grep", "decision": "auto", "reason": "只读，replace 模式内部审批"},
+                {"name": "list_dir", "decision": "auto", "reason": "只读目录"},
+                {"name": "search_in_files", "decision": "auto", "reason": "只读搜索"},
+                {"name": "create_schedule", "decision": "auto", "reason": "内部 write_file 审批 data/schedules.yaml"},
+                {"name": "delete_schedule", "decision": "auto", "reason": "内部 write_file 审批 data/schedules.yaml"},
+                {"name": "delete_skill", "decision": "auto", "reason": "内部 write_file 审批 skills/**"},
+            ],
+        },
     }
 
 
@@ -124,9 +145,11 @@ class PolicyEngine:
         self._write_default: SafetyLevel = SafetyLevel.auto
         self._restart_default: SafetyLevel = SafetyLevel.approval_required
         self._command_default: SafetyLevel = SafetyLevel.approval_required
+        self._tool_default: SafetyLevel = SafetyLevel.approval_required
 
         self._read_rules: list[tuple[str, SafetyLevel, str]] = []
         self._write_rules: list[tuple[str, SafetyLevel, str]] = []
+        self._tool_rules: list[tuple[str, SafetyLevel, str]] = []
         self._approval_command_patterns: list[re.Pattern[str]] = [re.compile(_GIT_REMOTE_PUSH_PATTERN, re.IGNORECASE)]
         self._deny_command_patterns: list[re.Pattern[str]] = []
 
@@ -220,6 +243,22 @@ class PolicyEngine:
         else:
             self._restart_default = SafetyLevel.approval_required
 
+        tool_sec = self._cfg.get("tools")
+        if isinstance(tool_sec, dict):
+            self._tool_default = _to_safety_level(str(tool_sec.get("default", "approval_required")))
+            self._tool_rules = []
+            for r in (tool_sec.get("rules") if isinstance(tool_sec.get("rules"), list) else []):
+                if not isinstance(r, dict):
+                    continue
+                pat = str(r.get("name", "")).strip()
+                dec = _to_safety_level(str(r.get("decision", "deny")))
+                if not pat:
+                    continue
+                self._tool_rules.append((pat, dec, str(r.get("reason", ""))))
+        else:
+            self._tool_default = SafetyLevel.approval_required
+            self._tool_rules = []
+
     def _resolve_relpath(self, path_str: str, *, workspace: Path | None = None) -> tuple[Path | None, str, str]:
         return classify_path(self._root, self._extra_roots, path_str, workspace=workspace)
 
@@ -284,6 +323,17 @@ class PolicyEngine:
             return PolicyDecision(SafetyLevel.deny, f"restart {target} denied")
         return PolicyDecision(SafetyLevel.approval_required, f"restart {target} requires approval")
 
+    def evaluate_tool(self, *, name: str, arguments: dict[str, Any] | None = None) -> PolicyDecision:
+        """工具级审批：按工具名匹配 tools 配置段规则。"""
+        self._reload_if_needed()
+        name = str(name or "").strip()
+        if not name:
+            return PolicyDecision(SafetyLevel.deny, "empty tool name")
+        for pat, dec, reason in self._tool_rules:
+            if fnmatch.fnmatchcase(name, pat):
+                return PolicyDecision(dec, reason or f"matched tool rule: {pat}")
+        return PolicyDecision(self._tool_default, "default tool policy")
+
     def evaluate(self, *, op: str, parameters: dict[str, Any], workspace: Path | None = None) -> PolicyDecision:
         if op == "read_file":
             return self.evaluate_read_file(path=str(parameters.get("path", "")), workspace=workspace)
@@ -293,4 +343,9 @@ class PolicyEngine:
             return self.evaluate_execute_command(command=str(parameters.get("command", "")))
         if op == "restart":
             return self.evaluate_restart(target=str(parameters.get("target", "")))
+        if op == "tool_call":
+            return self.evaluate_tool(
+                name=str(parameters.get("tool_name", "")),
+                arguments=parameters.get("arguments") if isinstance(parameters.get("arguments"), dict) else None,
+            )
         return PolicyDecision(SafetyLevel.deny, f"unknown op: {op}")

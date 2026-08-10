@@ -225,7 +225,8 @@ class Approval(BaseModel):
 
 class OpRequestIn(BaseModel):
     session_id: str
-    op: Literal["read_file", "write_file", "execute_command", "restart"]
+    # read_file / write_file / execute_command / restart / tool_call（统一工具级审批）
+    op: str
     parameters: dict[str, Any] = Field(default_factory=dict)
     workspace: str | None = None  # active workspace path for trust_level classification
     # [AutoC 2026-05-31] Why: policy approvals are requested while a tool is
