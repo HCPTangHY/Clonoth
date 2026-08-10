@@ -92,7 +92,7 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
     getSessionWorkspace(sessionId, adminToken)
       .then(ws => setWorkspaceName(ws?.name || ''))
       .catch(() => setWorkspaceName(''));
-  }, [sessionId, adminToken]);
+  }, [sessionId, adminToken, setWorkspaceName]);
 
   return (
     <>

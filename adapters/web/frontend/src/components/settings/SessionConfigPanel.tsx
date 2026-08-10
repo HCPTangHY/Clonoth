@@ -360,6 +360,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       const saved = await updateSessionWorkspace(sid, adminToken, body);
       setSessionWorkspace(saved);
       setWsEdit({ name: saved?.name || '', path: saved?.path || '' });
+      useSettingsStore.getState().setSessionWorkspaceName(saved?.name || '');
       setWsMsg('已保存');
     } catch (err) {
       setWsMsg(err instanceof Error ? err.message : '保存失败');
@@ -377,6 +378,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       const cleared = await clearSessionWorkspace(sid, adminToken);
       setSessionWorkspace(cleared);
       setWsEdit({ name: '', path: '' });
+      useSettingsStore.getState().setSessionWorkspaceName('');
       setWsMsg('已清除');
     } catch (err) {
       setWsMsg(err instanceof Error ? err.message : '清除失败');

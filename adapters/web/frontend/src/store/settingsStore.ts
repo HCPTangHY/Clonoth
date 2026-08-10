@@ -41,6 +41,8 @@ interface SettingsState {
   // [2026-06-16] Model override chosen on the welcome page (no active session yet).
   // Applied to the session on first message via postInbound, then cleared.
   pendingProviderOverride: SessionProviderOverride | null;
+  // [2026-08-10] Session workspace name shared between Header badge and SessionConfigPanel.
+  sessionWorkspaceName: string;
   // [2026-06-01] Right-panel visibility remains layout state shared by Header and
   // AppLayout. Why: viewStore selects which app view is active, but the right column
   // still needs an independent collapse flag. How: keep one boolean here. Purpose:
@@ -59,6 +61,7 @@ interface SettingsState {
   setGlobalConfig: (model: string, baseUrl: string, providerModels?: Record<string, string>) => void;
   setSessionProviderOverride: (override: SessionProviderOverride | null) => void;
   setPendingProviderOverride: (override: SessionProviderOverride | null) => void;
+  setSessionWorkspaceName: (name: string) => void;
   setRightPanelOpen: (open: boolean) => void;
   setNeedsSetup: (v: boolean) => void;
 }
@@ -81,6 +84,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   providerModels: {},
   sessionProviderOverride: null,
   pendingProviderOverride: null,
+  sessionWorkspaceName: '',
   rightPanelOpen: initialRightPanelOpen(),
   needsSetup: false,
 
@@ -111,6 +115,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setGlobalConfig: (model, baseUrl, providerModels) => set({ globalModel: model, globalBaseUrl: baseUrl, providerModels: providerModels || {} }),
   setSessionProviderOverride: (override) => set({ sessionProviderOverride: override }),
   setPendingProviderOverride: (override) => set({ pendingProviderOverride: override }),
+  setSessionWorkspaceName: (name) => set({ sessionWorkspaceName: name }),
   setRightPanelOpen: (open) => set({ rightPanelOpen: open }),
   setNeedsSetup: (v) => set({ needsSetup: v }),
 }));
