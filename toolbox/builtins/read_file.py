@@ -123,7 +123,7 @@ async def _read_single_file(
         return {"path": path_str, "success": False, "error": err.get("error", "denied")}, None
 
     try:
-        p = resolve_under_allowed_roots(ctx.workspace_root, path_str)
+        p = resolve_under_allowed_roots(ctx.effective_workspace, path_str)
     except ValueError as exc:
         return {"path": path_str, "success": False, "error": str(exc)}, None
 

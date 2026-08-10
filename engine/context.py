@@ -52,6 +52,9 @@ class RunContext:
     # frontend reducers can replace the exact card that produced the request.
     current_llm_request_id: str = ""
     llm_request_index: int = 0
+    # [AutoC 2026-08-10] Session-level workspace override for file/command tools.
+    # Set by set_workspace tool; persists across LLM rounds within the same task.
+    workspace: Path | None = None
 
     def begin_llm_request(self) -> str:
         """Start a new request-scoped id for one provider call."""

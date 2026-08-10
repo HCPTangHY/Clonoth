@@ -60,7 +60,7 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
-            cwd=str(ctx.workspace_root),
+            cwd=str(ctx.effective_workspace),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=safe_subprocess_env(),

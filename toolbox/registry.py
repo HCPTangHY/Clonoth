@@ -440,6 +440,18 @@ class ToolRegistry:
                 _builtins.execute_command,
             ),
             (
+                "set_workspace",
+                "Change the working directory for file and command tools. Affects execute_command cwd, read_file/write_file/apply_diff/list_dir/grep path resolution. Persists for the session.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Absolute or workspace-relative directory path to switch to."},
+                    },
+                    "required": ["path"],
+                },
+                _builtins.set_workspace,
+            ),
+            (
                 "grep",
                 "Search file contents using pattern matching (like grep). Supports regex, glob filter, replace mode, and output_mode (content/files_only/count).",
                 {

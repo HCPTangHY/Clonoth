@@ -193,7 +193,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     #  Resolve & read file
     # ------------------------------------------------------------------
     try:
-        resolved = resolve_under_allowed_roots(ctx.workspace_root, path_str)
+        resolved = resolve_under_allowed_roots(ctx.effective_workspace, path_str)
     except ValueError as exc:
         return _apply_diff_error_response(str(exc), path_str)
 

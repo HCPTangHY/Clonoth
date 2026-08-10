@@ -144,7 +144,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     _external_paths: list[str] = []
     for _dp in dir_paths:
         try:
-            _resolved, _is_ext = resolve_and_classify(ctx.workspace_root, _dp)
+            _resolved, _is_ext = resolve_and_classify(ctx.effective_workspace, _dp)
             if _is_ext:
                 _external_paths.append(_dp)
         except ValueError:
@@ -165,7 +165,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     for dir_path in dir_paths:
         try:
-            p, _ext = resolve_and_classify(ctx.workspace_root, dir_path)
+            p, _ext = resolve_and_classify(ctx.effective_workspace, dir_path)
         except ValueError as exc:
             results.append({
                 "path": dir_path, "success": False, "error": str(exc),

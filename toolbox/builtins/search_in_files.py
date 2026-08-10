@@ -169,7 +169,7 @@ async def _do_search(
     truncated = False
     total_chars = 0
 
-    for p, rel in _collect_files(root, pattern, max_file_size, ctx.workspace_root):
+    for p, rel in _collect_files(root, pattern, max_file_size, ctx.effective_workspace):
         try:
             text = p.read_text(encoding="utf-8", errors="ignore")
         except Exception:
@@ -238,7 +238,7 @@ async def _do_replace(
     files_modified: list[str] = []
     files_processed = 0
 
-    for p, rel in _collect_files(root, pattern, max_file_size, ctx.workspace_root):
+    for p, rel in _collect_files(root, pattern, max_file_size, ctx.effective_workspace):
         try:
             text = p.read_text(encoding="utf-8", errors="ignore")
         except Exception:
@@ -322,7 +322,7 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     )
 
     try:
-        root, is_ext = resolve_and_classify(ctx.workspace_root, rel_path)
+        root, is_ext = resolve_and_classify(ctx.effective_workspace, rel_path)
     except ValueError as exc:
         return _error_response(str(exc))
     if not root.exists():

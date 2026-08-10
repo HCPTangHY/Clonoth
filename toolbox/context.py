@@ -32,6 +32,16 @@ class ToolContext:
     # merged into the matching ToolCallCard.
     tool_call_id: str = ""
     node_id: str = ""
+    # [AutoC 2026-08-10] Session-level working directory for file/command tools.
+    # Why: workspace_root is the Clonoth install dir (config, data, nodes);
+    # workspace is the project dir the AI operates on (cwd, path resolution).
+    # Defaults to workspace_root when unset. AI can change it via set_workspace.
+    workspace: Path | None = None
+
+    @property
+    def effective_workspace(self) -> Path:
+        """Return workspace if set, else workspace_root."""
+        return self.workspace if self.workspace is not None else self.workspace_root
 
     def route_session_id(self) -> str:
         """Return the user-visible session for supervisor API calls."""

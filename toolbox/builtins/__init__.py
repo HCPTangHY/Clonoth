@@ -44,6 +44,7 @@ RESERVED_TOOL_NAMES = {
     "list_memories",
     "delete_memory",
     "get_context_window",
+    "set_workspace",
 }
 
 # Convenience alias used by supervisor/admin_api.py
@@ -70,3 +71,4 @@ from .tasks import cancel_active_tasks, list_active_tasks, get_context_window  #
 # names reserved above but stop importing the removed memory-tool module.
 # Purpose: plugin metadata becomes the single registration source.
 from .apply_diff import apply_diff  # noqa: E402,F401
+from .set_workspace import set_workspace  # noqa: E402,F401
