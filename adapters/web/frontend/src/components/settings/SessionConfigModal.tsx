@@ -5,7 +5,7 @@ import { Modal } from '../common';
 
 interface SessionConfigModalProps {
   sessionId: string;
-  focus: 'node' | 'model';
+  focus: 'node' | 'model' | 'workspace';
   onClose: () => void;
 }
 
@@ -15,7 +15,7 @@ export const SessionConfigModal = ({ sessionId, focus, onClose }: SessionConfigM
       onClose={onClose}
       open={true}
       subtitle="会话编辑"
-      title={focus === 'node' ? '节点配置' : '模型配置'}
+      title={focus === 'node' ? '节点配置' : focus === 'workspace' ? '工作区配置' : '模型配置'}
     >
       <SessionConfigPanel focus={focus} sessionId={sessionId} />
     </Modal>

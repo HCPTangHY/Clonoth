@@ -5,7 +5,7 @@
 // aligned with the reducer-backed chat flow.
 import { useEffect, useState } from 'react';
 
-import { getActiveNode, getAppConfig, getNodes } from '../../api/supervisorClient';
+import { getActiveNode, getAppConfig, getNodes, getSessionWorkspace } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { Button, Icon } from '../common';
 import { SessionConfigModal } from '../settings/SessionConfigModal';
@@ -26,8 +26,9 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
   } = useSettingsStore();
   const displayNodeId = activeNodeId || entryNodeId || '';
   const activeNode = availableNodes.find(n => n.id === displayNodeId);
-  const [configModalFocus, setConfigModalFocus] = useState<'node' | 'model' | 'title' | null>(null);
+  const [configModalFocus, setConfigModalFocus] = useState<'node' | 'model' | 'workspace' | 'title' | null>(null);
   const [draftTitle, setDraftTitle] = useState(title);
+  const [workspaceName, setWorkspaceName] = useState('');
 
   // Sync draft when title prop changes from outside
   useEffect(() => { setDraftTitle(title); }, [title]);
@@ -35,7 +36,7 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
   // 后端 /active_node 返回已解析的有效模型；Header 不再自行拼 fallback。
   const displayModel = activeEffectiveModel || '(默认)';
 
-  const openSessionConfigModal = (focus: 'node' | 'model' | 'title') => {
+  const openSessionConfigModal = (focus: 'node' | 'model' | 'workspace' | 'title') => {
     if (focus === 'title') {
       setDraftTitle(title);
     }
@@ -81,6 +82,17 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
       .catch(() => {});
   }, [adminToken, availableNodes.length, setAvailableNodes]);
 
+  // Fetch session workspace name for the header badge
+  useEffect(() => {
+    if (!sessionId || sessionId === 'no-session' || !adminToken) {
+      setWorkspaceName('');
+      return;
+    }
+    getSessionWorkspace(sessionId, adminToken)
+      .then(ws => setWorkspaceName(ws?.name || ''))
+      .catch(() => setWorkspaceName(''));
+  }, [sessionId, adminToken]);
+
   return (
     <>
       <header className="px-3 py-2 sm:px-4 sm:py-3">
@@ -118,6 +130,17 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
               <span className="inline-flex items-center gap-1">
                 <Icon name="model_training" size={13} />
                 <span>{displayModel}</span>
+              </span>
+            </span>
+            <span className="text-[var(--duties-border)]">/</span>
+            <span
+              className="cursor-pointer transition-colors hover:text-[var(--duties-text)]"
+              onClick={() => openSessionConfigModal('workspace')}
+              title="工作区"
+            >
+              <span className="inline-flex items-center gap-1">
+                <Icon name="folder" size={13} />
+                <span>{workspaceName || '未设置工作区'}</span>
               </span>
             </span>
           </div>
@@ -160,8 +183,8 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
           </div>
         </div>
       )}
-      {/* Node/Model config modal */}
-      {(configModalFocus === 'node' || configModalFocus === 'model') && (
+      {/* Node/Model/Workspace config modal */}
+      {(configModalFocus === 'node' || configModalFocus === 'model' || configModalFocus === 'workspace') && (
         <SessionConfigModal
           focus={configModalFocus}
           onClose={() => setConfigModalFocus(null)}
