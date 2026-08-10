@@ -605,6 +605,50 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # Purpose: the in-memory session and sessions.json are cleared together.
         return self.set_session_provider_override(session_id, {})
 
+    def get_session_workspace(self, session_id: str) -> dict[str, Any] | None:
+        """读取 session 级工作区配置 {name, path}。"""
+        sid = (session_id or "").strip()
+        with self._lock:
+            route_sid = self._route_session_id_for_session_locked(sid)
+            info = self.sessions.get(route_sid)
+            if info is None:
+                return None
+            return dict(info.workspace or {})
+
+    def set_session_workspace(self, session_id: str, workspace: dict[str, Any]) -> dict[str, Any] | None:
+        """设置 session 级工作区配置并持久化。"""
+        sid = (session_id or "").strip()
+        clean = dict(workspace or {}) if isinstance(workspace, dict) else {}
+        # 只保留 name/path 两个字段，避免脏数据
+        name = str(clean.get("name") or "").strip()
+        path = str(clean.get("path") or "").strip() or None
+        clean = {"name": name}
+        if path:
+            clean["path"] = path
+        with self._lock:
+            route_sid = self._route_session_id_for_session_locked(sid)
+            info = self.sessions.get(route_sid)
+            if info is None:
+                return None
+            info.workspace = clean
+            self._session_store.update_workspace(route_sid, clean)
+            self.eventlog.append(
+                session_id=route_sid,
+                component="supervisor",
+                type_="workspace_updated",
+                payload={
+                    "name": name,
+                    "path": path or "",
+                    "requested_session_id": sid,
+                    "ts": _now().isoformat(),
+                },
+            )
+            return dict(clean)
+
+    def clear_session_workspace(self, session_id: str) -> dict[str, Any] | None:
+        """清除 session 级工作区配置并持久化。"""
+        return self.set_session_workspace(session_id, {})
+
     def get_session_active_node(self, session_id: str) -> dict[str, Any]:
         """获取 session 当前实际使用的入口节点。
         优先级: AI switch override > 上次 inbound 实际用的节点 > session 记录 > 全局默认"""

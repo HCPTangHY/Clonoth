@@ -746,6 +746,49 @@ export async function clearSessionProviderOverride(sessionId: string, token: str
   return resp.json();
 }
 
+export interface SessionWorkspace {
+  name?: string;
+  path?: string | null;
+}
+
+export async function getSessionWorkspace(sessionId: string, token: string): Promise<SessionWorkspace> {
+  // [2026-08-10] Fetch session-scoped workspace {name, path}.
+  // Why: the session panel must show which workspace the AI operates on. How: call
+  // the admin-protected workspace endpoint with the same bearer token. Purpose:
+  // users can see and edit the active workspace per session.
+  const resp = await apiFetch(`/sessions/${sessionId}/workspace`, { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function updateSessionWorkspace(
+  sessionId: string,
+  token: string,
+  params: SessionWorkspace,
+): Promise<SessionWorkspace> {
+  // [2026-08-10] Save session-scoped workspace.
+  // Why: set_workspace from the chat persists through supervisor; the panel needs
+  // the same direct edit path. How: PUT {name, path} to the workspace endpoint.
+  // Purpose: users can switch or bind the session workspace from the settings UI.
+  const resp = await apiFetch(`/sessions/${sessionId}/workspace`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify(params),
+  });
+  return resp.json();
+}
+
+export async function clearSessionWorkspace(sessionId: string, token: string): Promise<SessionWorkspace> {
+  // [2026-08-10] Clear session-scoped workspace.
+  // Why: the panel needs a direct way back to the default workspace_root. How:
+  // call DELETE on the same workspace resource. Purpose: unset the workspace and
+  // let all file tools fall back to workspace_root again.
+  const resp = await apiFetch(`/sessions/${sessionId}/workspace`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
 // ── Approvals ──
 
 export async function decideApproval(

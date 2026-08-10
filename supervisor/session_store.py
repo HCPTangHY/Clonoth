@@ -195,6 +195,10 @@ class SessionStore:
             # dict beside other session metadata. Purpose: engine can recover the
             # same provider/model choice through the supervisor API after restart.
             "provider_override": dict(info.provider_override or {}),
+            # [AutoC 2026-08-10] Why: session workspace must survive restart too.
+            # How: serialize {name, path} beside provider_override. Purpose: engine
+            # resolves the same active workspace after supervisor restart.
+            "workspace": dict(info.workspace or {}),
         }
         self._flush()
 
@@ -207,6 +211,13 @@ class SessionStore:
             # the in-memory registry and flush atomically. Purpose: preserve all
             # other session metadata while making the override durable.
             entry["provider_override"] = dict(provider_override or {})
+            self._flush()
+
+    def update_workspace(self, session_id: str, workspace: dict[str, Any]) -> None:
+        """更新 session 的 workspace 并落盘。"""
+        entry = self._registry.get(session_id)
+        if entry is not None:
+            entry["workspace"] = dict(workspace or {})
             self._flush()
 
     def update_entry_node(self, session_id: str, entry_node_id: str) -> None:

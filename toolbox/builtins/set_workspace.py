@@ -48,13 +48,35 @@ async def set_workspace(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
             display = ws_path.relative_to(ctx.workspace_root).as_posix()
         except ValueError:
             pass
+    else:
+        ctx.workspace = None  # abstract workspace, no path binding
+        display = None
+
+    # [AutoC 2026-08-10] Why: set_workspace must survive across turns and
+    # restarts. How: PUT the {name, path} to the supervisor session endpoint,
+    # mirroring provider_override persistence. Purpose: every later task in the
+    # session resolves the same workspace from supervisor state.
+    try:
+        route_sid = ctx.route_session_id()
+        body = {"name": ws_name, "path": ws_path.as_posix() if ws_path else None}
+        await ctx.http.put(
+            f"{ctx.supervisor_url.rstrip('/')}/v1/sessions/{route_sid}/workspace",
+            json=body,
+        )
+    except Exception as _exc:
+        return {"ok": False, "error": f"workspace set locally but persist failed: {_exc}", "data": {
+            "result": f"ERROR: {_exc}",
+            "workspace_name": ws_name,
+            "workspace_path": display,
+        }}
+
+    if display:
         return {"ok": True, "data": {
             "result": f"Workspace set: {ws_name} → {display}",
             "workspace_name": ws_name,
             "workspace_path": display,
         }}
     else:
-        ctx.workspace = None  # abstract workspace, no path binding
         return {"ok": True, "data": {
             "result": f"Workspace set: {ws_name} (no path binding)",
             "workspace_name": ws_name,

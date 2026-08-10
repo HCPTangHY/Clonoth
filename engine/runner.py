@@ -483,6 +483,25 @@ async def _fetch_session_provider_override(
     return {}
 
 
+async def _fetch_session_workspace(
+    http: httpx.AsyncClient,
+    supervisor_url: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Fetch the session-scoped workspace {name, path} from supervisor."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {}
+    try:
+        r = await http.get(f"{supervisor_url.rstrip('/')}/v1/sessions/{sid}/workspace")
+        if r.status_code == 200:
+            data = r.json()
+            return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
 async def _register_engine(
     http: httpx.AsyncClient,
     supervisor_url: str,
@@ -837,6 +856,21 @@ async def _run_node_task(
         source_inbound_seq=int(source_inbound_seq) if source_inbound_seq is not None else None,
         task_context=_build_task_context(input_data),
     )
+    # [AutoC 2026-08-10] Why: apply the durable session workspace after RunContext
+    # creation. How: fetch {name, path} from supervisor and resolve into
+    # workspace/workspace_name, defaulting to workspace_root when path is absent
+    # or invalid. Purpose: tools and memory isolation use the same session-scoped
+    # workspace each turn without re-calling set_workspace.
+    _sw_sid = child_session_id or session_id
+    _sw = await _fetch_session_workspace(http, sup_url, _sw_sid)
+    if _sw:
+        _ws_name = str(_sw.get("name") or "").strip()
+        _ws_path = str(_sw.get("path") or "").strip()
+        _ws_p = Path(_ws_path).resolve() if _ws_path else None
+        if _ws_name:
+            rctx.workspace_name = _ws_name
+        if _ws_p and _ws_p.is_dir():
+            rctx.workspace = _ws_p
     # Phase 1 (Session Conversation Store): 创建 ConversationStore 实例并挂载到 rctx。
     # ai_step 中的 _shadow_write 通过 getattr(ls.rctx, 'conversation_store', None) 访问。
     # RunContext 是非 frozen dataclass，允许动态添加属性。

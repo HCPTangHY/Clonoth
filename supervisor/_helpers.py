@@ -27,3 +27,8 @@ class SessionInfo:
     # default empty factory. Purpose: supervisor can persist and expose session
     # provider choices while old constructor call sites keep working.
     provider_override: dict = field(default_factory=dict)
+    # [AutoC 2026-08-10] Why: set_workspace must persist across turns and restarts.
+    # How: store {name, path} on SessionInfo beside provider_override, mirrored to
+    # sessions.json. Purpose: every task in the session resolves the same active
+    # workspace without re-calling set_workspace.
+    workspace: dict = field(default_factory=dict)

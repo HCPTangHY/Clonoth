@@ -8,13 +8,16 @@ import { useEffect, useMemo, useState } from 'react';
 
 import {
   clearSessionProviderOverride,
+  clearSessionWorkspace,
   getActiveNode,
   getAppConfig,
   getModelConfig,
   getNodes,
   getSessionProviderOverride,
+  getSessionWorkspace,
   switchNode,
   updateSessionProviderOverride,
+  updateSessionWorkspace,
 } from '../../api/supervisorClient';
 import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
@@ -24,7 +27,7 @@ import { Button } from '../common';
 
 interface SessionConfigPanelProps {
   sessionId: string;
-  focus?: 'default' | 'node' | 'model';
+  focus?: 'default' | 'node' | 'model' | 'workspace';
 }
 
 interface SessionModelEdit {
@@ -32,6 +35,11 @@ interface SessionModelEdit {
   model: string;
   base_url: string;
   api_key: string;
+}
+
+interface SessionWorkspaceEdit {
+  name: string;
+  path: string;
 }
 
 function getSwitchableNodes(allNodes: NodeDef[]): NodeDef[] {
@@ -153,6 +161,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
   const [modelMsg, setModelMsg] = useState('');
   const [apiKeyPresent, setApiKeyPresent] = useState(false);
   const [edit, setEdit] = useState<SessionModelEdit>({ provider: '', model: '', base_url: '', api_key: '' });
+  const [sessionWorkspace, setSessionWorkspace] = useState<{ name?: string; path?: string | null } | null>(null);
+  const [wsEdit, setWsEdit] = useState<SessionWorkspaceEdit>({ name: '', path: '' });
+  const [wsSaving, setWsSaving] = useState(false);
+  const [wsMsg, setWsMsg] = useState('');
   const connectionStatus = useChatStore((state) => state.connectionStatus);
 
   const switchableNodes = useMemo(() => getSwitchableNodes(availableNodes), [availableNodes]);
@@ -212,6 +224,15 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           .catch(() => {
             setSessionProviderOverride(null);
             setEdit({ provider: '', model: '', base_url: '', api_key: '' });
+          });
+        getSessionWorkspace(sid, adminToken)
+          .then(ws => {
+            setSessionWorkspace(ws);
+            setWsEdit({ name: ws?.name || '', path: ws?.path || '' });
+          })
+          .catch(() => {
+            setSessionWorkspace(null);
+            setWsEdit({ name: '', path: '' });
           });
       } else {
         // [2026-06-16] Welcome page: initialise the edit form from the pending override
@@ -315,6 +336,52 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       setModelMsg(err instanceof Error ? err.message : '保存失败');
     } finally {
       setModelSaving(false);
+    }
+  };
+
+  const handleSaveWorkspace = async () => {
+    setWsMsg('');
+    if (!sid) { setWsMsg('需要先创建会话'); return; }
+    if (!adminToken) { setWsMsg('需要管理员令牌'); return; }
+    setWsSaving(true);
+    try {
+      const name = wsEdit.name.trim();
+      const path = wsEdit.path.trim();
+      const body: Record<string, unknown> = {};
+      if (name) body.name = name;
+      if (path) body.path = path;
+      if (Object.keys(body).length === 0) {
+        const cleared = await clearSessionWorkspace(sid, adminToken);
+        setSessionWorkspace(cleared);
+        setWsEdit({ name: '', path: '' });
+        setWsMsg('已清除');
+        return;
+      }
+      const saved = await updateSessionWorkspace(sid, adminToken, body);
+      setSessionWorkspace(saved);
+      setWsEdit({ name: saved?.name || '', path: saved?.path || '' });
+      setWsMsg('已保存');
+    } catch (err) {
+      setWsMsg(err instanceof Error ? err.message : '保存失败');
+    } finally {
+      setWsSaving(false);
+    }
+  };
+
+  const handleClearWorkspace = async () => {
+    setWsMsg('');
+    if (!sid) { setWsMsg('需要先创建会话'); return; }
+    if (!adminToken) { setWsMsg('需要管理员令牌'); return; }
+    setWsSaving(true);
+    try {
+      const cleared = await clearSessionWorkspace(sid, adminToken);
+      setSessionWorkspace(cleared);
+      setWsEdit({ name: '', path: '' });
+      setWsMsg('已清除');
+    } catch (err) {
+      setWsMsg(err instanceof Error ? err.message : '清除失败');
+    } finally {
+      setWsSaving(false);
     }
   };
 
@@ -493,6 +560,56 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
               </Button>
               {hasSessionOverride && (
                 <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving} onClick={handleClearModel} variant="ghost">
+                  清除
+                </Button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {(focus === 'default' || focus === 'workspace') && (
+        <div className={`mt-3 border p-2.5 ${focus === 'workspace' ? 'border-[var(--duties-text)]' : 'border-[var(--duties-border)]'}`}>
+          <div className="mb-2 flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <p className="font-mono text-[0.58rem] uppercase tracking-[0.18em] text-[var(--duties-tertiary)]">工作区</p>
+              <p className="mt-1 truncate text-xs font-semibold">
+                {sessionWorkspace?.name || '未设置'}
+              </p>
+              <p className="mt-0.5 truncate font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+                {sessionWorkspace?.path || '（使用默认工作区）'}
+              </p>
+            </div>
+            <span className="flex-shrink-0 font-mono text-[0.55rem] uppercase tracking-[0.12em] text-[var(--duties-tertiary)]">
+              {sessionWorkspace?.name ? '会话' : '默认'}
+            </span>
+          </div>
+
+          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">名称</label>
+          <input
+            className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            onChange={e => setWsEdit(p => ({ ...p, name: e.target.value }))}
+            placeholder="clonoth"
+            value={wsEdit.name}
+          />
+
+          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">路径（可选）</label>
+          <input
+            className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            onChange={e => setWsEdit(p => ({ ...p, path: e.target.value }))}
+            placeholder="/path/to/project"
+            value={wsEdit.path}
+          />
+
+          {wsMsg && <p className="mb-2 text-[0.62rem] text-[var(--duties-tertiary)]">{wsMsg}</p>}
+
+          {(wsEdit.name.trim() !== '' || wsEdit.path.trim() !== '' || sessionWorkspace?.name) && (
+            <div className="flex gap-2">
+              <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={wsSaving || (!wsEdit.name.trim() && !wsEdit.path.trim())} onClick={handleSaveWorkspace} variant="primary">
+                {wsSaving ? '保存中…' : '保存'}
+              </Button>
+              {sessionWorkspace?.name && (
+                <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={wsSaving} onClick={handleClearWorkspace} variant="ghost">
                   清除
                 </Button>
               )}
