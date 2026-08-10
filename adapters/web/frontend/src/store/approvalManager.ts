@@ -29,7 +29,9 @@ export function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: Sto
 
   // Only workspace-level operations can be auto-approved.
   // 'trusted' (workspace_root, extra_roots) and 'external' always require manual review.
-  if (trustLevel !== 'workspace') return;
+  // Empty trust_level (no-path operations like execute_command) falls back to
+  // client preference below.
+  if (trustLevel === 'trusted' || trustLevel === 'external') return;
 
   const state = get();
   const toolName = getToolNameForApprovalEvent(state, event);

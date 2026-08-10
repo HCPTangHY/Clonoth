@@ -1009,10 +1009,12 @@ class EventRouter:
         # trust_level="workspace" = active working directory (highest trust).
         # trust_level="trusted"   = workspace_root or extra_roots.
         # trust_level="external"  = outside all known roots.
+        # trust_level=""          = no-path operations (execute_command etc.);
+        #                            falls back to auto_approve_internal like before.
         can_auto = (
             not force_manual
             and self._config.auto_approve_internal
-            and trust_level == "workspace"
+            and trust_level in ("", "workspace")
         )
 
         if can_auto:
