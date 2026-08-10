@@ -1137,6 +1137,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # session whose conversation_key starts with "scheduler:", convert the
         # approval-required decision into an automatic allow. Purpose: scheduled
         # maintenance tasks can continue while normal user tasks still use approval.
+        #
+        # [AutoC 2026-08-10] Why: system nodes (dream, memory_extractor, compactor,
+        # turn_summarizer) are internal maintenance tasks with no human operator
+        # watching. Their approval_requested events either route to nobody or hang
+        # forever. How: also auto-approve when node_id starts with "system.".
+        # Purpose: system nodes can use save_memory / delete_memory / etc. without
+        # blocking on approvals that will never be reviewed.
         if task_id:
             task = self.tasks.get(task_id)
             if task:
@@ -1148,6 +1155,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                         reason="auto-approved: scheduler task",
                         approval_id=None,
                     )
+        # System nodes: auto-approve regardless of conversation_key
+        if node_id and str(node_id).startswith("system."):
+            return OpRequestOut(
+                safety_level=SafetyLevel.auto,
+                reason=f"auto-approved: system node ({node_id})",
+                approval_id=None,
+            )
 
         # [AutoC 2026-05-31] Why: request_guard can now identify the active tool
         # call. How: forward that identity to create_approval. Purpose: the emitted
