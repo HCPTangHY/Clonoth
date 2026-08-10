@@ -1198,3 +1198,39 @@ export async function getSessionRunningTasks(sessionId: string): Promise<Running
 // ── Legacy compat exports ──
 
 export const sendInbound = postInbound;
+
+// ----------------------------------------------------------------
+//  Workspace file tree
+// ----------------------------------------------------------------
+
+export interface FileTreeNode {
+  name: string;
+  path: string;
+  type: 'directory' | 'file' | 'error';
+  children?: FileTreeNode[];
+  truncated?: boolean;
+  childDirs?: number;
+  childFiles?: number;
+  size?: number;
+  error?: string;
+}
+
+export interface WorkspaceTreeResponse {
+  workspace_path: string;
+  sub_path: string;
+  depth: number;
+  tree: FileTreeNode;
+}
+
+export async function getWorkspaceTree(
+  sessionId: string,
+  token: string,
+  opts: { subPath?: string; depth?: number } = {},
+): Promise<WorkspaceTreeResponse> {
+  const params = new URLSearchParams();
+  if (sessionId) params.set('session_id', sessionId);
+  if (opts.subPath) params.set('sub_path', opts.subPath);
+  if (opts.depth) params.set('depth', String(opts.depth));
+  const resp = await apiFetch(`/workspace/tree?${params}`, { headers: authHeaders(token) });
+  return resp.json();
+}

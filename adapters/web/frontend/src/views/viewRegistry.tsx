@@ -14,8 +14,9 @@ import { SettingsHeader } from '../components/settings/SettingsHeader';
 import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
+import { WorkspaceFileTree } from '../components/workspace/WorkspaceFileTree';
 import type { ConversationMeta } from '../store/chatStore';
-import type { ViewMode } from '../store/viewStore';
+import { useViewStore, type ViewMode } from '../store/viewStore';
 import type { Attachment } from '../types';
 import type { ToolExecution, WsMessage } from '../types/message';
 
@@ -112,12 +113,23 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
         />
       );
     },
-    // [2026-06-01] Keep the chat right rail focused on system status.
-    // Why: the session editor now opens from Header as an overlay modal. How:
-    // render SystemDashboard in the upper right slot for every chat view. Purpose:
-    // General operational counters remain visible while users chat.
-    rightTop: () => <SystemDashboard />,
-    rightBottom: () => <EventLogPanel />,
+    rightTop: (ctx) => {
+      const overlay = useViewStore.getState().rightPanelOverlay;
+      if (overlay === 'files') {
+        return (
+          <WorkspaceFileTree
+            sessionId={safeSessionId(ctx.sessionId)}
+            onClose={() => useViewStore.getState().closeRightPanelOverlay()}
+          />
+        );
+      }
+      return <SystemDashboard />;
+    },
+    rightBottom: (ctx) => {
+      const overlay = useViewStore.getState().rightPanelOverlay;
+      if (overlay) return undefined;
+      return <EventLogPanel />;
+    },
   },
   settings: {
     id: 'settings',

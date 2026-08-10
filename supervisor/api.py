@@ -1628,6 +1628,43 @@ def create_app(
             raise HTTPException(status_code=404, detail="session not found")
         return result
 
+    @app.get("/v1/workspace/tree")
+    async def workspace_tree(
+        request: Request,
+        session_id: str = Query("", description="Session ID to resolve workspace from"),
+        path: str = Query("", description="Workspace path override (admin only)"),
+        sub_path: str = Query("", description="Subdirectory within workspace"),
+        depth: int = Query(2, ge=1, le=10, description="Max depth (1-10)"),
+    ) -> dict[str, Any]:
+        """Get workspace file tree. Resolves workspace from session or explicit path."""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        from .workspace_tree import build_workspace_tree
+
+        # Resolve workspace path
+        ws_path: Path | None = None
+        if path:
+            ws_path = Path(path).resolve()
+        elif session_id:
+            ws = st.get_session_workspace(session_id)
+            if ws and isinstance(ws, dict) and ws.get("path"):
+                ws_path = Path(ws["path"]).resolve()
+
+        if not ws_path:
+            # Fall back to workspace_root
+            ws_path = st.workspace_root
+
+        if not ws_path.is_dir():
+            raise HTTPException(status_code=404, detail=f"workspace path not found: {ws_path}")
+
+        tree = build_workspace_tree(ws_path, sub_path=sub_path, max_depth=depth)
+        return {
+            "workspace_path": str(ws_path),
+            "sub_path": sub_path or "",
+            "depth": depth,
+            "tree": tree,
+        }
+
     @app.get("/v1/sessions/{session_id}/context_window")
     async def session_context_window(session_id: str) -> dict[str, Any]:
         """获取 session 当前上下文窗口的 token 用量信息。"""

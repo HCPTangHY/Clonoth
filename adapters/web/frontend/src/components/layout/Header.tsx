@@ -7,6 +7,7 @@ import { useEffect, useState } from 'react';
 
 import { getActiveNode, getAppConfig, getNodes, getSessionWorkspace } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
+import { useViewStore } from '../../store/viewStore';
 import { Button, Icon } from '../common';
 import { SessionConfigModal } from '../settings/SessionConfigModal';
 
@@ -113,8 +114,23 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
             </h2>
             <span
               className="inline-flex shrink-0 cursor-pointer items-center gap-0.5 rounded border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-[0.55rem] text-[var(--duties-tertiary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]"
-              onClick={() => openSessionConfigModal('workspace')}
-              title="工作区配置"
+              onClick={() => {
+                if (workspaceName) {
+                  // Open file tree in right panel
+                  const { openRightPanelOverlay, rightPanelOverlay } = useViewStore.getState();
+                  const { setRightPanelOpen } = useSettingsStore.getState();
+                  if (rightPanelOverlay === 'files') {
+                    // Toggle off
+                    useViewStore.getState().closeRightPanelOverlay();
+                  } else {
+                    openRightPanelOverlay('files');
+                    setRightPanelOpen(true);
+                  }
+                } else {
+                  openSessionConfigModal('workspace');
+                }
+              }}
+              title={workspaceName ? '浏览工作区文件' : '设置工作区'}
             >
               <Icon name="folder" size={11} />
               {workspaceName || '设置工作区'}
