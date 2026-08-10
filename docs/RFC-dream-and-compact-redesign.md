@@ -1,7 +1,19 @@
 # RFC: Dream & Compact 架构重设计
 
 > 基于 2026.4.19 讨论记录重建，交叉参考 Claude Code (CC) 源码实现。
-> 最后更新: 2026-04-24
+> 最后更新: 2026-08-10
+>
+> **实现进度（截至 2026-08）：**
+> - ✅ P0 TaskRecord 已实现（`engine/task_record.py`）
+> - ✅ P1 Microcompact 已实现（`engine/compact.py` 中的 `microcompact_messages`）
+> - ✅ P1.5 熔断器已实现（`engine/compact.py` 中的 `is_compact_circuit_open`）
+> - ✅ P2 Dream 开眼已实现（`system.dream.yaml` 已加 `execute_command` 工具权限）
+> - ✅ P3 L2 Snip Compact 已实现（`engine/builtin/compact.py` + `ai_step.py` 中的 `snip_compact`）
+> - ⬜ P2.5 Dream 四阶段 Prompt 未实现
+> - ⬜ P3 记忆提取游标+互斥 未实现
+> - ⬜ P4 Dream 门控与互斥 未实现
+> - ⬜ P5 Reactive Compact / PTL Retry 未实现
+> - ⬜ P6 Snip Compact（按 task 粒度选择性折叠）未实现
 
 ---
 

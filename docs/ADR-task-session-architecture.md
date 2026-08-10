@@ -1,8 +1,11 @@
 # ADR: Task-Session 架构决策
 
 > 日期: 2026-04-25
-> 状态: Accepted
+> 状态: Accepted（已实现）
 > 参与者: Clonoth Contributors
+>
+> 方案 B 已全部落地。`ConversationStore` 使用 `data/conversations/{session_id}.jsonl`，
+> `TaskRecord` 使用 `data/transcripts/{session_id}.jsonl`。消息通过 `source_task_id` 关联 task。
 
 ## 背景
 

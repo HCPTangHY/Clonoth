@@ -137,5 +137,6 @@ inbound → task_created → node_started → llm_call → tool_call → finish
 - `tool_mode`：工具调用格式，例如 fake-native、native 或 json。
 - `output_mode`：输出模式，例如 tool_only 或 hybrid。
 - `delegate_targets`：允许当前节点委派的目标节点列表。
+- `persistent`：是否为持久节点。持久节点拥有独立的上下文空间、独立的记忆命名空间，支持上下文压缩。
 
 节点系统把人格、能力、工具权限和模型路由放入配置层。Engine 只需要根据 `node_id` 加载配置并执行统一流程，因此新增节点通常不需要修改推理主循环代码。

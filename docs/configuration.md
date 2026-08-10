@@ -1,6 +1,6 @@
 # 配置说明
 
-本文说明 Clonoth 当前仓库中的主要配置文件：`config/runtime.yaml`、`config/model_routing.yaml`、`config/nodes/*.yaml`，以及常用环境变量。
+本文说明 Clonoth 当前仓库中的主要配置文件：`config/runtime.yaml`、`config/nodes/*.yaml`、`data/policy.yaml`，以及常用环境变量。
 
 ## runtime.yaml 结构
 
@@ -114,39 +114,17 @@ tools:
 - `stop_wait_timeout_sec`：停止等待时间。
 - `engine_workers`：引擎 worker 数量。
 
-## model_routing.yaml
+## 模型解析顺序
 
-`config/model_routing.yaml` 定义模型路由表。当前文件结构如下：
+模型和 provider 的解析层级从高到低：
 
-```yaml
-version: 1
+1. 会话级 provider override（`data/sessions.json` 中每个 session 的 `provider_override` 字段，通过 Web 前端或 API 设置）
+2. 节点配置中的 `model` / `provider` / `api_key` / `base_url` 字段
+3. `data/config.yaml` 中的全局 provider 配置
+4. 环境变量（`OPENAI_API_KEY`、`OPENAI_BASE_URL` 等）
 
-defaults:
-  provider: openai
-  fallback_model: gpt-4o-mini
+早期版本中存在的 `config/model_routing.yaml` 已移除，当前不再使用。
 
-routes:
-  route_name:
-    description: 路由说明
-    candidates:
-      - provider: openai
-        model_runtime_key: engine.model
-        fallback_to_provider_config_model: true
-        fallback_model: gpt-4o-mini
-```
-
-字段含义：
-
-- `defaults.provider`：默认 provider。
-- `defaults.fallback_model`：最终兜底模型。
-- `routes.<name>.description`：路由用途说明。
-- `candidates`：候选模型列表，按顺序尝试或选择。
-- `provider`：候选 provider 名称。
-- `model_runtime_key`：从 `runtime.yaml` 中读取模型名的路径。
-- `fallback_to_provider_config_model`：是否回退到 provider 配置中的模型。
-- `fallback_model`：该候选自己的兜底模型。
-
-需要注意：按当前代码搜索结果，Python 代码中没有直接引用 `model_routing.yaml`。当前实际模型解析主要由节点配置、`data/config.yaml` 和 `engine.model` 参与。也就是说，该文件目前更像预留或设计中的声明式路由表；如果要让它生效，需要在模型解析流程中接入。
 
 ## 节点配置
 
@@ -257,22 +235,19 @@ base_url: "$ENV{OPENAI_BASE_URL}"
 - `<PROVIDER>_API_KEY`：非 OpenAI provider 的 API key，例如 `ANTHROPIC_API_KEY`、`GEMINI_API_KEY`。
 - `<PROVIDER>_BASE_URL`：非 OpenAI provider 的 base URL，例如 `ANTHROPIC_BASE_URL`、`GEMINI_BASE_URL`。
 
-### Supervisor 和 Shell
+### Supervisor
 
 - `CLONOTH_HOST`：Supervisor 监听地址，默认 `127.0.0.1`。
 - `CLONOTH_PORT`：Supervisor 监听端口，默认 `8765`。
 - `CLONOTH_LOG_LEVEL`：日志级别，默认 `info`。
 - `CLONOTH_ACCESS_LOG`：是否启用 uvicorn access log。
-- `CLONOTH_SUPERVISOR_URL`：Engine、CLI、TUI 访问 Supervisor 的地址。
+- `CLONOTH_SUPERVISOR_URL`：Engine 访问 Supervisor 的地址。
 - `CLONOTH_WORKER_ID`：Engine worker ID。未设置时自动生成。
-- `CLONOTH_CONVERSATION_KEY`：Shell 默认会话键。
 - `CLONOTH_ADMIN_TOKEN`：Admin API 访问令牌。
-- `CLONOTH_SHELL_NEW_CONSOLE`：是否为 shell 使用新控制台。
 
 ### 自定义工具和外部服务
 
 - `GEMINI_API_KEY`：`read_image.py` 可使用。
-- `GITHUB_TOKEN`：`scan_github_keys.py` 可使用。
 - `DISCORD_BRIDGE_HOST`：`discord_manage.py` 连接 Discord Bridge 时使用，默认 `127.0.0.1`。
 
 ### MCP

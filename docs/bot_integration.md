@@ -48,7 +48,7 @@ Supervisor 负责会话、事件、审批、任务状态。Engine 负责执行�
 
 后续可能发生两类扩展：
 
-1. **节点委派**：当前节点调用 `dispatch_node`，Supervisor 创建新的下游 node task，并把当前 task 标记为 `suspended`。
+1. **节点委派**：当前节点调用 `dispatch_to_{target}`，Supervisor 创建新的下游 node task，并把当前 task 标记为 `suspended`。
 2. **节点内工具执行**：当前节点直接发起 function calling 工具调用。当前默认交互链路里，这类工具调用通常在当前 node task 内直接执行，不会额外创建一个对外公开的独立 tool task。Adapter 通过 `handoff_progress` 观察这类过程即可。
 
 同一个 session 中可以同时存在多个 task。新消息不会自动取消旧 task。入口节点的 AI 会根据上下文判断是否需要取消旧任务。
@@ -79,7 +79,7 @@ User
   -> 构建提示词与消息列表
   -> 调用 LLM
      -> 可能 finish / ask
-     -> 可能 dispatch_node 给下游节点
+     -> 可能 dispatch_to_{target} 给下游节点
      -> 可能在当前节点内直接调用工具
   -> 如果有下游节点：Supervisor 挂起 caller，创建 child task，child 完成后再恢复 caller
   -> 最终产生 outbound_message
@@ -115,14 +115,14 @@ User
    - 真正发送给模型前，会转换为 base64 data URL。
 7. **注入工具定义**
    - 注入节点允许的真实工具。
-   - 再统一注入三个伪工具：`finish`、`ask`、`dispatch_node`。
+   - 注入伪工具：`finish`、`ask`、`intermediate_reply`、`switch_node`、`compact_context`、`preempt_task`，以及每个 `delegate_targets` 目标对应的 `dispatch_to_{target}` 工具。
 8. **可选的压缩与重试**
    - 消息过长时，会先做上下文压缩。
    - LLM 返回 429 或 5xx 等临时错误时，会自动重试。
 
 ### 2.3 一个简化示例
 
-假设用户发来 `帮我看看项目结构`。入口 `bootstrap.shell_orchestrator` 通常会先构造自己的 system prompt 和用户消息，然后调用 `dispatch_node(target="bootstrap.executor", instruction="读取仓库结构并给出总结")`。执行节点 `bootstrap.executor` 会在当前 node task 内直接调用 `list_dir`、`read_file` 等工具，把工具结果追加回同一消息列表，再用 `finish` 返回结果。Supervisor 收到下游结果后，会恢复入口节点 task，把下游结果注入为 `resume_data`，最后由入口节点生成面向用户的 `outbound_message`。
+假设用户发来“帮我看看项目结构”。入口节点调用 `dispatch_to_coder(instruction="读取仓库结构并给出总结")`，编程节点在当前 node task 内直接调用 `list_dir`、`read_file` 等工具，再用 `finish` 返回结果。Supervisor 收到下游结果后恢复入口节点 task，把下游结果注入为 `resume_data`，最后由入口节点生成面向用户的 `outbound_message`。
 
 Adapter 不需要自己实现这些内部步骤。你只需要持续消费事件流。
 
@@ -149,7 +149,6 @@ Adapter 不需要自己实现这些内部步骤。你只需要持续消费事件
     }
   ],
   "use_context": true,
-  "entry_node_id": "bootstrap.shell_orchestrator"
 
 }
 ```
@@ -333,8 +332,7 @@ POST /v1/approvals/{approval_id}
 
 例如：
 
-- 普通聊天：`bootstrap.shell_orchestrator`
-- 直接进入编程助手：`bootstrap.coder`
+具体的入口节点名称由部署时配置决定。
 
 如果不传，系统使用默认入口节点。
 
@@ -427,6 +425,6 @@ cron 为标准 5 字段格式：`分 时 日 月 星期`（星期 0=Monday）。
 
 ## 9. 安全与部署
 
-1. 不要把 Supervisor 直接暴露到公网。`/v1/config/openai/secret` 会返回 api_key。
+1. 不要把 Supervisor 直接暴露到公网。部分管理端点可能返回敏感信息。
 2. Adapter 尽量与 Supervisor 同机部署。
 3. 区分用户 Bot 和管理员审批 Bot。普通用户不应看到 approval details。

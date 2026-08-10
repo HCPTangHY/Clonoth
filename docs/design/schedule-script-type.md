@@ -1,5 +1,7 @@
 # Schedule Script Type 设计文档
 
+> 状态：已实现（`supervisor/scheduler.py` 中的 `_fire_script`）
+
 ## 概述
 
 在现有 Schedule 系统基础上新增 `type: script` 调度类型。允许定时执行外部脚本，将 stdout 输出作为 inbound 消息注入 LLM 处理链路。

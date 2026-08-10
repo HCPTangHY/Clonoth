@@ -149,7 +149,7 @@ Hook 的目标是把推理循环中的横切逻辑移出 `engine/inference/ai_st
 | `PreemptChecker` | `preempt_checker` | `before_step` | 100 | 检查取消请求和软打断状态。需要注入新用户消息时，会移除旧动态上下文并重建动态 skill、memory 和附件消息。 |
 | `CompactChecker` | `compact_checker` | `before_step` | 50 | 在循环顶部执行 microcompact、闲置后的 proactive snip，并在上下文超过阈值时触发系统压缩节点。 |
 | `KnowledgeInjector` | `knowledge_inject` | `before_prompt_build` | 50 | 统一调用 skill runtime 和 memory runtime 构建静态、动态知识消息，并在需要时重建 prompt 布局。 |
-| `FinishGuardHandler` | `finish_guard` | `before_tool_call` | 100 | 拒绝 `finish()` 与其他非 `reply()` 工具在同一轮同时调用，避免任务终止后遗漏其他工具结果。 |
+| `FinishGuardHandler` | `finish_guard` | `before_tool_call` | 100 | 拒绝 `finish()` 与其他非 `intermediate_reply()` 工具在同一轮同时调用，避免任务终止后遗漏其他工具结果。 |
 | `ApprovalHandler` | `approval` | `before_tool_call` | 90 | 在真实工具执行前调用 `RunContext` 上可用的审批接口，并把审批结果归一化为 `HookResult`。 |
 | `AttachmentCollector` | `attachment_collector` | `after_tool_call` | 0 | 从真实工具结果中收集附件，写入局部附件列表和 loop state，供最终输出选择。 |
 | `UsageTracker` | `usage_tracker` | `after_llm_call` | 0 | 读取 `ProviderResponse.usage`，累加到 `RunContext.total_usage`。 |
