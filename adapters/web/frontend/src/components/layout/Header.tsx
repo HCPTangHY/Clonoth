@@ -110,39 +110,37 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
           >
             {title}
           </h2>
-          <div className="mt-1 flex flex-wrap items-center gap-1.5 font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+          <div className="mt-1 flex items-center gap-1.5 overflow-hidden font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
             <span
-              className="cursor-pointer transition-colors hover:text-[var(--duties-text)]"
+              className="inline-flex shrink-0 cursor-pointer items-center gap-1 transition-colors hover:text-[var(--duties-text)]"
               onClick={() => openSessionConfigModal('node')}
               title="切换节点"
             >
-              <span className="inline-flex items-center gap-1">
-                <Icon name="hub" size={13} />
-                <span>{activeNode?.name || displayNodeId || '选择节点'}</span>
-              </span>
+              <Icon name="hub" size={13} />
+              <span className="truncate">{activeNode?.name || displayNodeId || '选择节点'}</span>
             </span>
-            <span className="text-[var(--duties-border)]">/</span>
+            <span className="shrink-0 text-[var(--duties-border)]">/</span>
             <span
-              className="cursor-pointer transition-colors hover:text-[var(--duties-text)]"
+              className="inline-flex min-w-0 cursor-pointer items-center gap-1 transition-colors hover:text-[var(--duties-text)]"
               onClick={() => openSessionConfigModal('model')}
               title="模型配置"
             >
-              <span className="inline-flex items-center gap-1">
-                <Icon name="model_training" size={13} />
-                <span>{displayModel}</span>
-              </span>
+              <Icon name="model_training" size={13} />
+              <span className="truncate">{displayModel}</span>
             </span>
-            <span className="text-[var(--duties-border)]">/</span>
-            <span
-              className="cursor-pointer transition-colors hover:text-[var(--duties-text)]"
-              onClick={() => openSessionConfigModal('workspace')}
-              title="工作区"
-            >
-              <span className="inline-flex items-center gap-1">
-                <Icon name="folder" size={13} />
-                <span>{workspaceName || '未设置工作区'}</span>
-              </span>
-            </span>
+            {workspaceName && (
+              <>
+                <span className="shrink-0 text-[var(--duties-border)]">/</span>
+                <span
+                  className="inline-flex min-w-0 cursor-pointer items-center gap-1 transition-colors hover:text-[var(--duties-text)]"
+                  onClick={() => openSessionConfigModal('workspace')}
+                  title="工作区"
+                >
+                  <Icon name="folder" size={13} />
+                  <span className="truncate">{workspaceName}</span>
+                </span>
+              </>
+            )}
           </div>
         </div>
 
