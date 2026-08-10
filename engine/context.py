@@ -55,6 +55,7 @@ class RunContext:
     # [AutoC 2026-08-10] Session-level workspace override for file/command tools.
     # Set by set_workspace tool; persists across LLM rounds within the same task.
     workspace: Path | None = None
+    workspace_name: str = ""
 
     def begin_llm_request(self) -> str:
         """Start a new request-scoped id for one provider call."""

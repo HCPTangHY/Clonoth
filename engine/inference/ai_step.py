@@ -1085,6 +1085,7 @@ async def _execute_real_tools(
         task_id=ls.rctx.task_id,
         session_generation=ls.rctx.session_generation,
         workspace=getattr(ls.rctx, 'workspace', None),
+        workspace_name=getattr(ls.rctx, 'workspace_name', '') or '',
         # [Fork/Merge 2026-05-17] Why: real tools may call supervisor APIs while
         # their node is running on a branch session. How: pass RunContext's parent
         # route session into ToolContext. Purpose: tool events, approvals, and
@@ -1470,6 +1471,8 @@ async def _execute_real_tools(
         # back to RunContext so subsequent LLM rounds inherit the new cwd.
         if _tool_ctx.workspace is not None and _tool_ctx.workspace != getattr(ls.rctx, 'workspace', None):
             ls.rctx.workspace = _tool_ctx.workspace
+        if _tool_ctx.workspace_name and _tool_ctx.workspace_name != getattr(ls.rctx, 'workspace_name', ''):
+            ls.rctx.workspace_name = _tool_ctx.workspace_name
 
         # [硬取消-场景1] 已取消的工具结果已存入 entries（上方 append），不处理附件和进度事件，
         # 直接退出循环。未执行的后续工具被跳过（循环顶部 check_cancelled），不产生 tool_result。

@@ -420,6 +420,11 @@ def _effective_memory_ns(node_extra: dict, node_id: str) -> str:
     return str(node_extra.get("memory_book") or "").strip() or node_id
 
 
+def _workspace_memory_dir(workspace_root: Path, base_ns: str, workspace_name: str) -> Path:
+    """Return workspace-scoped memory dir: data/memory/{node_id}/@{workspace_name}/."""
+    return memory_dir(workspace_root, base_ns) / f"@{workspace_name}"
+
+
 def load_memory_catalog(
     workspace_root: Path,
     *,
@@ -1057,6 +1062,7 @@ def build_knowledge_context(
     instruction_text: str,
     history: list[dict],
     runtime_cfg: dict,
+    task_context: dict | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Return ``(skill_static, skill_dynamic, memory_static, memory_dynamic)``.
 
@@ -1077,9 +1083,24 @@ def build_knowledge_context(
     # 怎么改：传 memory_book 给 load_memory_catalog，让它扫描正确的目录。
     # 目的：节点只看到自己 namespace 下的记忆条目。
     _mb = _effective_memory_ns(node.extra, node.id)
-    mem_entries = load_memory_catalog(workspace_root, memory_book=_mb)
+    # [AutoC 2026-08-10] Workspace-scoped memory: load workspace dir first, then node dir.
+    _ws_name = str((task_context or {}).get("workspace_name") or "").strip()
+    mem_entries = []
+    if _ws_name:
+        _ws_dir = _workspace_memory_dir(workspace_root, _mb, _ws_name)
+        if _ws_dir.is_dir():
+            mem_entries.extend(load_memory_catalog(workspace_root, memory_book=f"{_mb}/@{_ws_name}"))
+    # Node-level memories (always loaded, workspace memories are additive)
+    _node_mem = load_memory_catalog(workspace_root, memory_book=_mb)
+    if _node_mem:
+        # Dedup by (book, id) — workspace entries take precedence
+        _seen = {(str(e.get("_book","")), str(e.get("id",""))) for e in mem_entries}
+        for e in _node_mem:
+            _key = (str(e.get("_book","")), str(e.get("id","")))
+            if _key not in _seen:
+                mem_entries.append(e)
     if not mem_entries:
-        # ponytail: node dir empty/missing → fallback to root data/memory/
+        # ponytail: fallback to root data/memory/
         mem_entries = load_memory_catalog(workspace_root, memory_book="")
     entries.extend(normalize_memory_entries(mem_entries))
 
@@ -1421,7 +1442,14 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     _ns_extra = getattr(ctx, "_node_extra", None) or {}
     _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
     _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
-    book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
+    # [AutoC 2026-08-10] scope: "workspace" writes to @{workspace_name}/ subdir.
+    _scope = str(args.get("scope") or "workspace").strip().lower()
+    _ws_name = str(getattr(ctx, 'workspace_name', '') or '').strip()
+    if _scope == "workspace" and _ws_name:
+        _target_ns = f"{_ns_memory_book}/@{_ws_name}"
+    else:
+        _target_ns = _ns_memory_book
+    book_path = memory_dir(ctx.workspace_root, _target_ns) / f"{book}.yaml"
     data = _load_book(book_path)
     data.setdefault("book", book)
 
@@ -1461,8 +1489,9 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     _save_book(book_path, data)
     # invalidate 时也传 memory_book，精确清除对应 namespace 的缓存
-    _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
-    return _tool_ok(f"Memory {'updated' if found else 'saved'}: {book}/{mid}", book=book, id=mid, updated=found)
+    _invalidate_cache(ctx.workspace_root, memory_book=_target_ns)
+    return _tool_ok(f"Memory {'updated' if found else 'saved'}: {book}/{mid}", book=book, id=mid, updated=found,
+                    scope=_scope, workspace=_ws_name if _scope == 'workspace' and _ws_name else None)
 
 
 async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1632,6 +1661,7 @@ PLUGIN_META["tools"] = [
                 "enabled": {"type": "boolean", "description": "Whether this entry is active. Default true."},
                 "priority": {"type": "integer", "description": "Budget priority; higher = kept first when budget exceeded."},
                 "scan_depth": {"type": "integer", "description": "Number of recent conversation rounds to scan for keywords. 0 = current message only."},
+                "scope": {"type": "string", "enum": ["workspace", "node"], "description": "Storage scope. 'workspace' (default): saved under the active workspace, isolated per-project. 'node': saved at node level, shared across all workspaces."},
             },
             "required": ["id", "content"],
         },
@@ -1698,6 +1728,7 @@ class KnowledgeInjector:
             instruction_text,
             history,
             runtime_cfg,
+            task_context={"workspace_name": getattr(ctx.rctx, 'workspace_name', '') or ''},
         )
 
         ctx.extra["skill_static_messages"] = skill_static

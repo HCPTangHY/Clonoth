@@ -441,13 +441,14 @@ class ToolRegistry:
             ),
             (
                 "set_workspace",
-                "Change the working directory for file and command tools. Affects execute_command cwd, read_file/write_file/apply_diff/list_dir/grep path resolution. Persists for the session.",
+                "Switch to a named workspace. Changes cwd for execute_command and path resolution for file tools. Also isolates memory storage. Workspace names are abstract labels; a filesystem path binding is optional.",
                 {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "Absolute or workspace-relative directory path to switch to."},
+                        "name": {"type": "string", "description": "Workspace name (e.g. 'tangqiu', 'clonoth', '闲聊'). Auto-registered if new."},
+                        "path": {"type": "string", "description": "Optional: absolute or workspace-relative directory path to bind. Updates the cwd."},
                     },
-                    "required": ["path"],
+                    "required": ["name"],
                 },
                 _builtins.set_workspace,
             ),

@@ -37,6 +37,7 @@ class ToolContext:
     # workspace is the project dir the AI operates on (cwd, path resolution).
     # Defaults to workspace_root when unset. AI can change it via set_workspace.
     workspace: Path | None = None
+    workspace_name: str = ""
 
     @property
     def effective_workspace(self) -> Path:
