@@ -1229,11 +1229,15 @@ def create_app(
                 continue
             raw = registry.get(sid) if isinstance(registry, dict) else None
             parent_sid = str(raw.get("parent_session_id") or "").strip() if isinstance(raw, dict) else ""
+            ws_name = ""
+            if isinstance(si.workspace, dict):
+                ws_name = str(si.workspace.get("name") or "").strip()
             results.append({
                 "session_id": si.session_id,
                 "conversation_key": si.conversation_key,
                 "channel": si.channel,
                 "parent_session_id": parent_sid,
+                "workspace_name": ws_name,
                 "created_at": si.created_at.isoformat() if si.created_at else "",
                 "updated_at": si.updated_at.isoformat() if si.updated_at else "",
             })

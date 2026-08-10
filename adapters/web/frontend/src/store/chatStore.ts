@@ -140,6 +140,7 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
       id: conversationId,
       sessionId: session.session_id,
       title: titleCache[conversationId] || titleFromSession(session.conversation_key, session.session_id),
+      workspaceName: session.workspace_name || undefined,
       updatedAt: session.updated_at || session.created_at || new Date().toISOString(),
     }];
   });

@@ -944,6 +944,7 @@ export interface SessionListItem {
   conversation_key: string;
   channel: string;
   parent_session_id?: string;
+  workspace_name?: string;
   created_at: string;
   updated_at: string;
 }

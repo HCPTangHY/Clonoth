@@ -99,7 +99,9 @@ export const Sidebar = ({
               >
                 <span className="block font-mono text-xs font-semibold">{conv.title}</span>
                 <span className="mt-1.5 block truncate text-[0.7rem] text-[var(--duties-tertiary)]">
-                  {conv.sessionId ? `会话 ${conv.sessionId.slice(0, 8)}` : '暂无会话'}
+                  {conv.workspaceName
+                    ? <><Icon name="folder" size={10} />{' '}{conv.workspaceName}</>
+                    : conv.sessionId ? `会话 ${conv.sessionId.slice(0, 8)}` : '暂无会话'}
                 </span>
                 <span className="mt-2 block font-mono text-[0.6rem] uppercase tracking-[0.16em] text-[var(--duties-tertiary)]">
                   {formatTime(conv.updatedAt)}

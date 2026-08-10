@@ -11,6 +11,7 @@ export interface ConversationMeta {
   id: string;
   sessionId: string;
   title: string;
+  workspaceName?: string;
   updatedAt: string;
 }
 
