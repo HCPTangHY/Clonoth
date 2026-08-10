@@ -15,16 +15,21 @@ import type { StoreGetter } from './chatTypes';
 export const autoApprovedApprovalIds: Set<string> = loadAutoApproved();
 
 export function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGetter): void {
-  // [AutoC 2026-06-16] Decide whether one approval_requested event can be auto-allowed.
-  // Why: users can opt into local auto-approval for low-risk tools, but each approval
-  // must be handled once. How: resolve the tool name from reducer state, read current
-  // client preferences, persist a de-duplication id, and roll it back if the API call
-  // fails. Purpose: auto-approval remains deterministic and separate from WebSocket
-  // event routing.
+  // [AutoC 2026-08-10] Auto-approve based on supervisor trust_level + client prefs.
+  // trust_level comes from the supervisor policy layer via the event payload.
+  // Only 'workspace' level can be auto-approved. 'trusted' and 'external' always
+  // require manual approval regardless of client preference.
   if (event.type !== 'approval_requested') return;
   const payload = event.payload || {};
   const approvalId = typeof payload.approval_id === 'string' ? payload.approval_id : '';
   if (!approvalId || autoApprovedApprovalIds.has(approvalId)) return;
+
+  // Read trust_level from supervisor policy decision
+  const trustLevel = typeof payload.trust_level === 'string' ? payload.trust_level : '';
+
+  // Only workspace-level operations can be auto-approved.
+  // 'trusted' (workspace_root, extra_roots) and 'external' always require manual review.
+  if (trustLevel !== 'workspace') return;
 
   const state = get();
   const toolName = getToolNameForApprovalEvent(state, event);
