@@ -22,6 +22,7 @@ _GIT_REMOTE_PUSH_PATTERN = r"(?:^|[;&|()\n])\s*(?:(?:sudo|command|time)\s+)*(?:e
 class PolicyDecision:
     safety_level: SafetyLevel
     reason: str
+    trust_level: str = ""  # 'workspace' | 'trusted' | 'external' | '' (non-path ops)
 
 
 def _default_policy_dict() -> dict[str, Any]:
@@ -219,8 +220,8 @@ class PolicyEngine:
         else:
             self._restart_default = SafetyLevel.approval_required
 
-    def _resolve_relpath(self, path_str: str) -> tuple[Path | None, str, bool]:
-        return classify_path(self._root, self._extra_roots, path_str)
+    def _resolve_relpath(self, path_str: str, *, workspace: Path | None = None) -> tuple[Path | None, str, str]:
+        return classify_path(self._root, self._extra_roots, path_str, workspace=workspace)
 
     @staticmethod
     def _match_rules(rel: str, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel) -> PolicyDecision:
@@ -229,25 +230,29 @@ class PolicyEngine:
                 return PolicyDecision(dec, reason or f"matched rule: {pat}")
         return PolicyDecision(default, "default policy")
 
-    def evaluate_read_file(self, *, path: str) -> PolicyDecision:
+    def evaluate_read_file(self, *, path: str, workspace: Path | None = None) -> PolicyDecision:
         self._reload_if_needed()
-        resolved, rel, is_external = self._resolve_relpath(path)
+        resolved, rel, trust_level = self._resolve_relpath(path, workspace=workspace)
         if resolved is None:
-            return PolicyDecision(SafetyLevel.deny, rel)
+            return PolicyDecision(SafetyLevel.deny, rel, trust_level="external")
         default = self._read_default
-        if is_external:
+        if trust_level == "external":
             default = SafetyLevel.approval_required
-        return self._match_rules(rel, self._read_rules, default)
+        decision = self._match_rules(rel, self._read_rules, default)
+        decision.trust_level = trust_level
+        return decision
 
-    def evaluate_write_file(self, *, path: str) -> PolicyDecision:
+    def evaluate_write_file(self, *, path: str, workspace: Path | None = None) -> PolicyDecision:
         self._reload_if_needed()
-        resolved, rel, is_external = self._resolve_relpath(path)
+        resolved, rel, trust_level = self._resolve_relpath(path, workspace=workspace)
         if resolved is None:
-            return PolicyDecision(SafetyLevel.deny, rel)
+            return PolicyDecision(SafetyLevel.deny, rel, trust_level="external")
         default = self._write_default
-        if is_external:
+        if trust_level == "external":
             default = SafetyLevel.approval_required
-        return self._match_rules(rel, self._write_rules, default)
+        decision = self._match_rules(rel, self._write_rules, default)
+        decision.trust_level = trust_level
+        return decision
 
     def evaluate_execute_command(self, *, command: str) -> PolicyDecision:
         self._reload_if_needed()
@@ -279,11 +284,11 @@ class PolicyEngine:
             return PolicyDecision(SafetyLevel.deny, f"restart {target} denied")
         return PolicyDecision(SafetyLevel.approval_required, f"restart {target} requires approval")
 
-    def evaluate(self, *, op: str, parameters: dict[str, Any]) -> PolicyDecision:
+    def evaluate(self, *, op: str, parameters: dict[str, Any], workspace: Path | None = None) -> PolicyDecision:
         if op == "read_file":
-            return self.evaluate_read_file(path=str(parameters.get("path", "")))
+            return self.evaluate_read_file(path=str(parameters.get("path", "")), workspace=workspace)
         if op == "write_file":
-            return self.evaluate_write_file(path=str(parameters.get("path", "")))
+            return self.evaluate_write_file(path=str(parameters.get("path", "")), workspace=workspace)
         if op == "execute_command":
             return self.evaluate_execute_command(command=str(parameters.get("command", "")))
         if op == "restart":

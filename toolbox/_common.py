@@ -92,25 +92,40 @@ def _load_allowed_extra_roots(workspace_root: Path) -> list[Path]:
     )
 
 
-def resolve_and_classify(workspace_root: Path, path_str: str) -> tuple[Path, bool]:
-    """Resolve path and classify as internal (False) or external (True).
+def resolve_and_classify(
+    workspace_root: Path,
+    path_str: str,
+    *,
+    workspace: Path | None = None,
+) -> tuple[Path, str]:
+    """Resolve path and classify trust level.
 
-    Returns (resolved_path, is_external).
+    Returns (resolved_path, trust_level).
+    trust_level: 'workspace' | 'trusted' | 'external'
     Raises ValueError for invalid or escaping relative paths.
     """
     extra_roots = _load_allowed_extra_roots(workspace_root)
-    resolved, display, is_external = classify_path(workspace_root, extra_roots, path_str)
+    resolved, display, trust_level = classify_path(
+        workspace_root, extra_roots, path_str, workspace=workspace,
+    )
     if resolved is None:
         raise ValueError(display)
-    return resolved, is_external
+    return resolved, trust_level
 
 
-def resolve_under_allowed_roots(workspace_root: Path, path_str: str) -> Path:
-    """Resolve path under workspace_root or policy-configured extra_roots.
+def resolve_under_allowed_roots(
+    workspace_root: Path,
+    path_str: str,
+    *,
+    workspace: Path | None = None,
+) -> Path:
+    """Resolve path under workspace, workspace_root, or policy-configured extra_roots.
 
     Allows untrusted external absolute paths (policy layer enforces approval).
     """
-    resolved, _is_external = resolve_and_classify(workspace_root, path_str)
+    resolved, _trust_level = resolve_and_classify(
+        workspace_root, path_str, workspace=workspace,
+    )
     return resolved
 
 
@@ -157,8 +172,20 @@ async def guard_external_read(
     rel_path: str,
     tool_name: str,
     reason: str = "",
+    *,
+    trust_level: str = "",
 ) -> dict[str, Any] | None:
-    """Request approval for external paths. Returns error dict or None (proceed)."""
+    """Request approval for non-workspace paths. Returns error dict or None (proceed).
+
+    If trust_level is provided, uses it directly. Otherwise falls back to is_external bool.
+    """
+    # workspace-level paths are fully trusted, skip approval
+    if trust_level == "workspace":
+        return None
+    if trust_level and trust_level != "external":
+        # trusted-level: still allow but could be gated by policy in the future
+        if not is_external:
+            return None
     if not is_external:
         return None
     _op, err = await request_guard(

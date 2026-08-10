@@ -1740,6 +1740,7 @@ def create_app(
             tool_call_id=inp.tool_call_id,
             node_id=inp.node_id,
             task_id=inp.task_id,
+            workspace=inp.workspace,
         )
 
     @app.get("/v1/admin/state", response_model=AdminStateOut)

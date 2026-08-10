@@ -986,6 +986,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         tool_call_id: str | None = None,
         node_id: str | None = None,
         task_id: str | None = None,
+        trust_level: str = "",
     ) -> Approval:
         now = _now()
         # [AutoC 2026-05-31] Why: duplicate pending approval suppression must not
@@ -1016,6 +1017,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             tool_call_id=tool_call_id,
             node_id=node_id,
             task_id=task_id,
+            trust_level=trust_level,
         )
 
         with self._lock:
@@ -1071,16 +1073,19 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         tool_call_id: str | None = None,
         node_id: str | None = None,
         task_id: str | None = None,
+        workspace: str | None = None,
     ) -> OpRequestOut:
-        decision = self.policy.evaluate(op=op, parameters=parameters)
+        _ws = Path(workspace) if workspace else None
+        decision = self.policy.evaluate(op=op, parameters=parameters, workspace=_ws)
+        _tl = decision.trust_level or ""
         if decision.safety_level == SafetyLevel.auto:
-            return OpRequestOut(safety_level=SafetyLevel.auto, reason=decision.reason, approval_id=None)
+            return OpRequestOut(safety_level=SafetyLevel.auto, reason=decision.reason, approval_id=None, trust_level=_tl)
         # [AutoC 2026-06-04] Why: hard policy denials must not be converted into
         # human approval requests. How: return SafetyLevel.deny immediately before
         # any scheduler or approval handling. Purpose: destructive or invalid
         # operations stay blocked even when they come from unattended jobs.
         if decision.safety_level == SafetyLevel.deny:
-            return OpRequestOut(safety_level=SafetyLevel.deny, reason=decision.reason, approval_id=None)
+            return OpRequestOut(safety_level=SafetyLevel.deny, reason=decision.reason, approval_id=None, trust_level=_tl)
 
         # [AutoC 2026-06-04] Why: scheduler-triggered tasks have no source inbound
         # sequence, so their approval events cannot be routed to Discord and would
@@ -1110,8 +1115,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             tool_call_id=tool_call_id,
             node_id=node_id,
             task_id=task_id,
+            trust_level=_tl,
         )
-        return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id)
+        return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id, trust_level=_tl)
 
     # ------------------------------------------------------------------ #
     #  Admin / 杂项

@@ -322,7 +322,8 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     )
 
     try:
-        root, is_ext = resolve_and_classify(ctx.effective_workspace, rel_path)
+        root, _trust = resolve_and_classify(ctx.workspace_root, rel_path, workspace=ctx.workspace)
+        is_ext = _trust == "external"
     except ValueError as exc:
         return _error_response(str(exc))
     if not root.exists():

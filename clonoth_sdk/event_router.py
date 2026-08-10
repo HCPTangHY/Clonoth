@@ -990,36 +990,39 @@ class EventRouter:
                 return
             main_state.handled_approvals.add(appr_id)
 
-        # 分类审批操作：外部 vs 内部，结合 bot 侧 auto_approve_internal 配置决定放行策略。
-        # fix: 原逻辑在 workspace_root 未配置时默认自动放行所有操作，不安全。
-        # 现改为：auto_approve 行为由 bot 侧 config.auto_approve_internal 显式控制，
-        # SDK 默认不自动放行。
         details = p.get("details") or {}
         operation = details.get("tool_name") or p.get("operation", "")
 
-        # 判断是否为外部操作
-        is_external = False
-        if self._config.workspace_root:
-            is_external = is_external_operation(
-                details, self._config.workspace_root, self._config.extra_roots,
-            )
-        else:
-            logger.warning("workspace_root not configured, treating all approvals as requiring manual review")
-            is_external = True  # 没配置 workspace_root 视为全部需要人工审批
+        # [AutoC 2026-08-10] trust_level now comes from supervisor policy via the
+        # approval_requested event payload. No more SDK-side classify_path.
+        trust_level = str(p.get("trust_level") or "").strip()
 
         logger.info(
-            "approval_requested owned: id=%s session=%s route_conv_key=%s src_seq=%s",
-            appr_id, ap_session, conv_key, src_seq,
+            "approval_requested owned: id=%s session=%s route_conv_key=%s src_seq=%s trust=%s",
+            appr_id, ap_session, conv_key, src_seq, trust_level,
         )
 
-        # Operations that must never be auto-approved regardless of
-        # auto_approve_internal setting (they are not file operations).
         _NEVER_AUTO_APPROVE_OPS = frozenset({"restart"})
         force_manual = operation in _NEVER_AUTO_APPROVE_OPS
 
-        # 决定是否自动放行
-        if force_manual or is_external or not self._config.auto_approve_internal:
-            # 外部操作 或 bot 未开启自动放行 → 通知适配器展示审批 UI
+        # Auto-approve only workspace-level ops when adapter allows it.
+        # trust_level="workspace" = active working directory (highest trust).
+        # trust_level="trusted"   = workspace_root or extra_roots.
+        # trust_level="external"  = outside all known roots.
+        can_auto = (
+            not force_manual
+            and self._config.auto_approve_internal
+            and trust_level == "workspace"
+        )
+
+        if can_auto:
+            ok = await auto_approve(self._client, appr_id)
+            status = (
+                f"✅ 自动放行: {operation}"
+                if ok
+                else f"❌ 自动放行失败: {operation}"
+            )
+        else:
             try:
                 await self._cb.show_approval_ui(
                     appr_id, operation, details,
@@ -1029,14 +1032,6 @@ class EventRouter:
             except Exception as e:
                 logger.error("show_approval_ui failed: %s", e)
             status = f"⏳ 等待审批: {operation}"
-        else:
-            # 内部操作 且 bot 开启了自动放行 → 自动放行
-            ok = await auto_approve(self._client, appr_id)
-            status = (
-                f"✅ 自动放行: {operation}"
-                if ok
-                else f"❌ 自动放行失败: {operation}"
-            )
 
         # 将审批状态追加到主任务进度记录
         if result and status:

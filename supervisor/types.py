@@ -212,6 +212,7 @@ class Approval(BaseModel):
     decided_at: datetime | None = None
     decision: Literal["allow", "deny"] | None = None
     comment: str | None = None
+    trust_level: str = ""  # 'workspace' | 'trusted' | 'external'
     # [AutoC 2026-05-31] Why: the frontend needs to merge approval state into the
     # existing ToolExecution card. How: include the provider tool_call_id and the
     # execution origin in the approval event payload. Purpose: approval_requested
@@ -226,6 +227,7 @@ class OpRequestIn(BaseModel):
     session_id: str
     op: Literal["read_file", "write_file", "execute_command", "restart"]
     parameters: dict[str, Any] = Field(default_factory=dict)
+    workspace: str | None = None  # active workspace path for trust_level classification
     # [AutoC 2026-05-31] Why: policy approvals are requested while a tool is
     # executing. How: carry optional tool_call_id/node_id/task_id through the ops
     # request. Purpose: create_approval can emit enough identity data for the web
@@ -238,6 +240,7 @@ class OpRequestIn(BaseModel):
 class OpRequestOut(BaseModel):
     safety_level: SafetyLevel
     reason: str
+    trust_level: str = ""  # 'workspace' | 'trusted' | 'external' | ''
     approval_id: str | None = None
 
 

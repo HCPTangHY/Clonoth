@@ -25,7 +25,7 @@ async def set_workspace(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     resolved_path: Path | None = None
     if path_str:
         try:
-            resolved_path, _is_ext = resolve_and_classify(ctx.workspace_root, path_str)
+            resolved_path, _trust = resolve_and_classify(ctx.workspace_root, path_str)
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "data": {"result": f"ERROR: {exc}"}}
         if not resolved_path.is_dir():

@@ -77,6 +77,7 @@ class ToolContext:
                 "tool_call_id": self.tool_call_id or "",
                 "node_id": self.node_id or getattr(self, "_node_id", "") or "",
                 "task_id": self.task_id or "",
+                "workspace": str(self.workspace) if self.workspace else None,
             },
         )
         r.raise_for_status()

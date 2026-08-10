@@ -282,46 +282,54 @@ def classify_path(
     workspace_root: Path,
     extra_roots: list[Path],
     path_str: str,
-) -> tuple[Path | None, str, bool]:
+    *,
+    workspace: Path | None = None,
+) -> tuple[Path | None, str, str]:
     """Resolve and classify a filesystem path.
 
-    Returns (resolved, display_path, is_external):
+    Returns (resolved, display_path, trust_level):
       - resolved: resolved Path, or None if invalid
       - display_path: workspace-relative posix for workspace paths,
                       absolute posix for external, or error message if invalid
-      - is_external: True for absolute paths outside workspace + extra_roots
+      - trust_level: 'workspace' | 'trusted' | 'external'
+          workspace = active working directory (highest trust)
+          trusted   = workspace_root or extra_roots (known safe)
+          external  = outside all known roots
     """
+    # Resolve path relative to effective workspace (or workspace_root as fallback)
+    resolve_base = (workspace or workspace_root).resolve()
     try:
         raw = Path(path_str)
-        p = raw.resolve() if raw.is_absolute() else (workspace_root / path_str).resolve()
+        p = raw.resolve() if raw.is_absolute() else (resolve_base / path_str).resolve()
     except Exception as e:
-        return None, f"invalid path: {e}", False
+        return None, f"invalid path: {e}", "external"
 
-    # Ensure roots are resolved for reliable comparison
-    ws = workspace_root.resolve()
-    extras = [r.resolve() for r in extra_roots]
-
-    # Tier 1: workspace
-    try:
-        rel = p.relative_to(ws)
-        return p, rel.as_posix(), False
-    except ValueError:
-        pass
-
-    # Tier 2: trusted extra_roots
-    for r in extras:
+    # Tier 1: active workspace (highest trust)
+    if workspace:
+        ws = workspace.resolve()
         try:
-            p.relative_to(r)
-            return p, p.as_posix(), False
+            rel = p.relative_to(ws)
+            return p, rel.as_posix(), "workspace"
+        except ValueError:
+            pass
+
+    # Tier 2: workspace_root + extra_roots (trusted)
+    trusted_roots = [workspace_root.resolve()]
+    trusted_roots.extend(r.resolve() for r in extra_roots)
+    for r in trusted_roots:
+        try:
+            rel = p.relative_to(r)
+            display = rel.as_posix() if r == workspace_root.resolve() else p.as_posix()
+            return p, display, "trusted"
         except ValueError:
             continue
 
-    # Tier 3: untrusted external (absolute path)
+    # Tier 3: external
     if raw.is_absolute():
-        return p, p.as_posix(), True
+        return p, p.as_posix(), "external"
 
-    # Relative path that escapes workspace — invalid
-    return None, "path escapes workspace root", False
+    # Relative path that escapes all roots — invalid
+    return None, "path escapes workspace root", "external"
 
 
 def strip_tool_trace_blocks(text: str) -> str:
