@@ -29,7 +29,7 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `CLONOTH_BASE_URL` | 否 | `http://127.0.0.1:8765` | Supervisor API 地址 |
-| `CLONOTH_WORKSPACE` | 否 | `/www/wwwroot/Clonoth` | 工作区路径，用于 SDK 导入和附件存储 |
+| `CLONOTH_WORKSPACE` | 否 | 项目根目录 | 工作区路径，用于 SDK 导入和附件存储 |
 | `CLONOTH_ENTRY_NODE` | 否 | `main` | 入口节点 ID |
 | `CLONOTH_BQBS_PATH` | 否 | 空 | QQ 自定义表情名称索引文件路径 |
 | `CLONOTH_ALLOWED_GROUPS` | 否 | 空 | 允许接入的 QQ 群号，逗号分隔。为空时允许全部群 |

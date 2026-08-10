@@ -155,7 +155,7 @@ def create_runtime() -> DiscordRuntime:
 async def _initialize_sdk(rt: DiscordRuntime) -> None:
     """Initialize SDK objects and EventRouter after Discord is ready."""
     # 读取 Supervisor admin token 用于鉴权受保护的端点（!model 等）
-    _token_path = Path(os.environ.get("CLONOTH_WORKSPACE", "/www/wwwroot/Clonoth")) / "data" / ".admin_token"
+    _token_path = Path(os.environ.get("CLONOTH_WORKSPACE", "") or CLONOTH_WORKSPACE) / "data" / ".admin_token"
     admin_token = ""
     try:
         if _token_path.exists():

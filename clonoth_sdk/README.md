@@ -49,7 +49,7 @@ Supporting modules: `BotConfig` (configuration injection), `types` (dataclasses 
 ```python
 import asyncio
 import sys
-sys.path.insert(0, "/www/wwwroot/Clonoth")
+sys.path.insert(0, "/path/to/clonoth")
 
 from clonoth_sdk import (
     BotConfig, ClonothClient, SessionState,

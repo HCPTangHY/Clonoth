@@ -20,7 +20,7 @@ SDK 边界（参见 data/sdk_refactor_plan_final.md 一、核心原则）：
 使用方式::
 
     import sys
-    sys.path.insert(0, '/www/wwwroot/Clonoth')
+    sys.path.insert(0, '/path/to/clonoth')
     from clonoth_sdk import ClonothClient, EventRouter, SessionState, BotConfig
 
     client = ClonothClient("http://127.0.0.1:8765")

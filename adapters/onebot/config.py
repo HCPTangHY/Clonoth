@@ -5,12 +5,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 # Clonoth Supervisor API 地址
 CLONOTH_BASE_URL = os.environ.get("CLONOTH_BASE_URL", "http://127.0.0.1:8765")
 
 # Clonoth 工作区根目录（用于 clonoth_sdk 导入和附件路径解析）
-CLONOTH_WORKSPACE = os.environ.get("CLONOTH_WORKSPACE", "/www/wwwroot/Clonoth")
+CLONOTH_WORKSPACE = os.environ.get("CLONOTH_WORKSPACE", "") or str(Path(__file__).resolve().parents[2])
 
 # 入口节点 ID
 ENTRY_NODE_ID = os.environ.get("CLONOTH_ENTRY_NODE", "main")
