@@ -194,8 +194,6 @@ pytest
 - [插件系统](docs/plugin-system.md)
 - [Skill 系统](docs/skills.md)
 - [配置说明](docs/configuration.md)
-- [任务与会话架构 ADR](docs/ADR-task-session-architecture.md)
-- [Dream 与 Compact 重构 RFC](docs/RFC-dream-and-compact-redesign.md)
 
 ## 扩展入口
 
