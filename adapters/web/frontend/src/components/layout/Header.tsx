@@ -103,44 +103,41 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
               should not edit the parent conversation title. How: disable the title
               click affordance while viewingChildNodeId is present. Purpose: the
               title editor remains scoped to parent conversations only. */}
-          <h2
-            className={`truncate font-mono text-sm font-semibold tracking-[-0.03em]${onTitleChange && !viewingChildNodeId ? ' cursor-pointer transition-colors hover:text-[var(--duties-text)]' : ''}`}
-            onClick={onTitleChange && !viewingChildNodeId ? () => openSessionConfigModal('title') : undefined}
-            title={onTitleChange && !viewingChildNodeId ? '点击编辑标题' : undefined}
-          >
-            {title}
-          </h2>
-          <div className="mt-1 flex items-center gap-1.5 overflow-hidden font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+          <div className="flex items-center gap-2">
+            <h2
+              className={`min-w-0 truncate font-mono text-sm font-semibold tracking-[-0.03em]${onTitleChange && !viewingChildNodeId ? ' cursor-pointer transition-colors hover:text-[var(--duties-text)]' : ''}`}
+              onClick={onTitleChange && !viewingChildNodeId ? () => openSessionConfigModal('title') : undefined}
+              title={onTitleChange && !viewingChildNodeId ? '点击编辑标题' : undefined}
+            >
+              {title}
+            </h2>
             <span
-              className="inline-flex shrink-0 cursor-pointer items-center gap-1 transition-colors hover:text-[var(--duties-text)]"
+              className="inline-flex shrink-0 cursor-pointer items-center gap-0.5 rounded border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-[0.55rem] text-[var(--duties-tertiary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]"
+              onClick={() => openSessionConfigModal('workspace')}
+              title="工作区配置"
+            >
+              <Icon name="folder" size={11} />
+              {workspaceName || '设置工作区'}
+            </span>
+          </div>
+          <div className="mt-1 flex items-center gap-1.5 font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+            <span
+              className="inline-flex cursor-pointer items-center gap-1 transition-colors hover:text-[var(--duties-text)]"
               onClick={() => openSessionConfigModal('node')}
               title="切换节点"
             >
               <Icon name="hub" size={13} />
-              <span className="truncate">{activeNode?.name || displayNodeId || '选择节点'}</span>
+              <span>{activeNode?.name || displayNodeId || '选择节点'}</span>
             </span>
-            <span className="shrink-0 text-[var(--duties-border)]">/</span>
+            <span className="text-[var(--duties-border)]">/</span>
             <span
-              className="inline-flex min-w-0 cursor-pointer items-center gap-1 transition-colors hover:text-[var(--duties-text)]"
+              className="inline-flex cursor-pointer items-center gap-1 transition-colors hover:text-[var(--duties-text)]"
               onClick={() => openSessionConfigModal('model')}
               title="模型配置"
             >
               <Icon name="model_training" size={13} />
-              <span className="truncate">{displayModel}</span>
+              <span>{displayModel}</span>
             </span>
-            {workspaceName && (
-              <>
-                <span className="shrink-0 text-[var(--duties-border)]">/</span>
-                <span
-                  className="inline-flex min-w-0 cursor-pointer items-center gap-1 transition-colors hover:text-[var(--duties-text)]"
-                  onClick={() => openSessionConfigModal('workspace')}
-                  title="工作区"
-                >
-                  <Icon name="folder" size={13} />
-                  <span className="truncate">{workspaceName}</span>
-                </span>
-              </>
-            )}
           </div>
         </div>
 

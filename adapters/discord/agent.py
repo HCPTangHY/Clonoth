@@ -310,6 +310,24 @@ async def _start_bridge(rt: Any) -> None:
     await runner.cleanup()
 
 
+def _derive_initial_workspace(message: discord.Message) -> dict[str, str] | None:
+    """Derive initial workspace name from Discord channel type.
+
+    - DM/GroupDM: dm-{user_id}  (per-user isolation)
+    - Thread/Forum post: thread-{thread_id}  (per-thread isolation)
+    - Guild text channel: guild-{guild_id}  (server-wide shared)
+    """
+    ch = message.channel
+    if isinstance(ch, (discord.DMChannel, discord.GroupChannel)):
+        return {"name": f"dm-{message.author.id}"}
+    if isinstance(ch, discord.Thread):
+        return {"name": f"thread-{ch.id}"}
+    guild = getattr(ch, "guild", None)
+    if guild:
+        return {"name": f"guild-{guild.id}"}
+    return None
+
+
 async def handle_agent(
     rt: Any,
     message: discord.Message,
@@ -463,6 +481,23 @@ async def _handle_agent_inner(
     my_inbound_seq = result.inbound_seq
 
     rt.session_state.register_session(conversation_key, session_id)
+
+    # [AutoC 2026-08-10] Auto-set workspace for new sessions based on channel type.
+    # Only sets if no workspace is already configured (existing sessions keep theirs).
+    _init_ws = _derive_initial_workspace(message)
+    if _init_ws:
+        try:
+            _ws_resp = await rt.clonoth_client._http().get(
+                f"{rt.clonoth_client._base_url}/v1/sessions/{session_id}/workspace"
+            )
+            _existing = _ws_resp.json() if _ws_resp.status_code == 200 else {}
+            if not _existing.get("name"):
+                await rt.clonoth_client._http().put(
+                    f"{rt.clonoth_client._base_url}/v1/sessions/{session_id}/workspace",
+                    json=_init_ws,
+                )
+        except Exception:
+            pass
     if my_inbound_seq:
         rt.session_state.register_watermark(my_inbound_seq, channel_id, new_wm)
 
