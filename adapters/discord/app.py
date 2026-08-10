@@ -151,27 +151,6 @@ def create_runtime() -> DiscordRuntime:
     return rt
 
 
-def _load_extra_roots(rt: DiscordRuntime) -> list[Path]:
-    """Load policy.yaml extra_roots exactly as the former on_ready block did."""
-    extra_roots: list[Path] = []
-    try:
-        policy_path = rt.workspace / "data" / "policy.yaml"
-        if policy_path.exists():
-            policy_data = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
-            if isinstance(policy_data, dict):
-                raw_roots = policy_data.get("extra_roots", [])
-                if isinstance(raw_roots, list):
-                    for item in raw_roots:
-                        if isinstance(item, str) and item.strip():
-                            p = Path(item)
-                            p = p.resolve() if p.is_absolute() else (rt.workspace / p).resolve()
-                            extra_roots.append(p)
-        if extra_roots:
-            print(f"[bot] extra_roots: {extra_roots}")
-    except Exception as exc:
-        print(f"[bot] 加载 extra_roots 失败: {exc}")
-    return extra_roots
-
 
 async def _initialize_sdk(rt: DiscordRuntime) -> None:
     """Initialize SDK objects and EventRouter after Discord is ready."""
@@ -192,32 +171,14 @@ async def _initialize_sdk(rt: DiscordRuntime) -> None:
 
     await _start_bridge(rt)
 
-    if not os.environ.get("CLONOTH_WORKSPACE"):
-        for attempt in range(10):
-            try:
-                health = await rt.clonoth_client.get_health()
-                if health.workspace_root:
-                    rt.workspace = Path(health.workspace_root)
-                    print(f"[bot] workspace_root 从 Supervisor 获取: {rt.workspace}")
-                    break
-            except Exception as e:
-                if attempt < 9:
-                    print(f"[bot] 获取 workspace_root 失败 (第 {attempt + 1} 次)，2s 后重试: {e}")
-                    await asyncio.sleep(2)
-                else:
-                    print(f"[bot] 获取 workspace_root 全部失败，使用默认值 {rt.workspace}: {e}")
-
     print(f"[bot] CLONOTH_WORKSPACE = {rt.workspace}")
     if not rt.superusers:
         print("[bot] ⚠ DISCORD_SUPERUSERS 未配置；取消任务与审批按钮已默认禁用。")
 
-    extra_roots = _load_extra_roots(rt)
     rt.bot_config = BotConfig(
         base_url=rt.base_url,
         entry_node_id=rt.entry_node_id,
         conversation_key_prefix="discord",
-        workspace_root=rt.workspace,
-        extra_roots=extra_roots,
         auto_approve_internal=True,
     )
     rt.session_state = SessionState()

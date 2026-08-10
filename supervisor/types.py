@@ -260,7 +260,6 @@ class RestartOut(BaseModel):
 class HealthOut(BaseModel):
     status: Literal["ok"] = "ok"
     run_id: str
-    workspace_root: str = ""
     started_at: datetime
     uptime_seconds: float
 

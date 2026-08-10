@@ -291,7 +291,6 @@ def create_app(
         return HealthOut(
             run_id=st.eventlog.run_id, started_at=st.started_at,
             uptime_seconds=uptime,
-            workspace_root=str(st.workspace_root),
         )
 
     @app.get("/v1/config", response_model=AppConfigPublic)

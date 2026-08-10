@@ -391,7 +391,7 @@ class AdapterCallbacks(Protocol):
     ) -> None:
         """外部操作需要人工审批，通知适配器展示审批 UI。
 
-        触发时机：approval_requested 事件，经 is_external_operation 判定为
+        触发时机：approval_requested 事件，经 trust_level 判定为
                   外部操作（操作目标在工作区外部）。
         对应 bot_adapter.py L993-1006 _process_approval_event 中的外部操作分支。
 

@@ -12,7 +12,7 @@ SDK 是纯协议层，不包含任何平台（Discord / Telegram 等）相关逻
   POST   /v1/sessions/{id}/cancel_active_tasks← CancelView fallback
   POST   /v1/tasks/{id}/preempt               ← _handle_agent_inner() Preempt V2
   GET    /v1/sessions/{id}/running_tasks      ← _handle_agent_inner() preempt 目标查找
-  GET    /v1/health                           ← on_ready() workspace_root 获取
+  GET    /v1/health                           ← 健康检查
   GET    /v1/config/openai                    ← !model show
   POST   /v1/config/openai                    ← !model set/key/url
   POST   /v1/admin/restart                    ← 重启流程
@@ -385,8 +385,7 @@ class ClonothClient:
         """查询 Supervisor 健康状态。
 
         对应 GET /v1/health。
-        提取自 bot_adapter.py on_ready() 中获取 workspace_root 的逻辑。
-        启动时可通过此方法动态获取工作区路径。
+        获取 Supervisor 健康状态。
 
         Raises:
             httpx.HTTPStatusError: Supervisor 不可达时抛出
@@ -397,7 +396,6 @@ class ClonothClient:
         return HealthInfo(
             status=d.get("status", "ok"),
             run_id=d.get("run_id", ""),
-            workspace_root=d.get("workspace_root", ""),
             started_at=str(d.get("started_at", "")),
             uptime_seconds=float(d.get("uptime_seconds", 0)),
         )

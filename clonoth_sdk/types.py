@@ -80,13 +80,9 @@ class RunningTask:
 
 @dataclass
 class HealthInfo:
-    """Supervisor 健康状态信息。
-
-    对应 GET /v1/health 返回。workspace_root 可用于启动时动态获取工作区路径。
-    """
+    """Supervisor 健康状态信息。对应 GET /v1/health 返回。"""
     status: str
     run_id: str
-    workspace_root: str
     started_at: str
     uptime_seconds: float
 

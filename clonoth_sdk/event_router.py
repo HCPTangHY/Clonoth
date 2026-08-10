@@ -30,7 +30,7 @@ import re
 import time
 from typing import Any, Awaitable, Callable
 
-from .approval import ApprovalTracker, auto_approve, is_external_operation
+from .approval import ApprovalTracker, auto_approve
 from .callbacks import AdapterCallbacks
 from .client import ClonothClient
 from .config import BotConfig
