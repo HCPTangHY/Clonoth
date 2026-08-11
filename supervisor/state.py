@@ -1155,6 +1155,19 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                         reason="auto-approved: scheduler task",
                         approval_id=None,
                     )
+                # [AutoC 2026-08-11] Why: scheduled tasks with custom
+                # conversation_key (e.g. "duck_hunt") don't start with
+                # "scheduler:" and are not owned by any adapter, so their
+                # approval events are never consumed and tasks hang forever.
+                # How: also check task.input for schedule_id. Purpose: all
+                # schedule-triggered tasks auto-approve regardless of
+                # conversation_key format.
+                if task.input.get("schedule_id"):
+                    return OpRequestOut(
+                        safety_level=SafetyLevel.auto,
+                        reason="auto-approved: scheduled task",
+                        approval_id=None,
+                    )
         # System nodes: auto-approve regardless of conversation_key
         if node_id and str(node_id).startswith("system."):
             return OpRequestOut(
