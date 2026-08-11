@@ -541,8 +541,9 @@ function applyOutboundMessage(state: ChatState, event: SupervisorEvent): ChatSta
 function applyIntermediateReply(state: ChatState, event: SupervisorEvent): ChatState {
   const payload = getPayload(event);
   const text = getString(payload.text);
+  const attachments = getAttachments(payload.attachments);
 
-  if (!text) {
+  if (!text && attachments.length === 0) {
     return state;
   }
 
@@ -556,12 +557,12 @@ function applyIntermediateReply(state: ChatState, event: SupervisorEvent): ChatS
   message = appendOrMergeTextBlock(message, event, text, 'intermediate', false);
   message = {
     ...setMessageStatus(message, 'running_tools', event),
-    // [2026-06-02] Why: MessageCard now draws reply styling from message-level
-    // completionType instead of TextBlock delivery. How: mark live intermediate
-    // reply events as reply completions while preserving their intermediate text
-    // delivery. Purpose: streaming reply cards keep the blue assistant border and
-    // user messages cannot inherit borders from TextBlockView.
     completionType: 'reply',
+    // [AutoC 2026-08-11] Why: intermediate_reply can carry attachment_paths
+    // (e.g. generated images). How: merge incoming attachments into the message
+    // the same way outbound_message does. Purpose: web UI renders intermediate
+    // reply attachments inline instead of silently dropping them.
+    ...(attachments.length > 0 ? { attachments: mergeAttachments(attachments, message.attachments || []) } : {}),
   };
 
   nextState = upsertMessage(nextState, message);
