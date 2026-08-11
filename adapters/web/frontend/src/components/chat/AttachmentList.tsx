@@ -25,17 +25,18 @@ const IMAGE_EXTENSIONS = new Set(['.apng', '.avif', '.bmp', '.gif', '.jpeg', '.j
 const ARCHIVE_EXTENSIONS = new Set(['.7z', '.gz', '.rar', '.tar', '.tgz', '.zip']);
 const TEXT_EXTENSIONS = new Set(['.csv', '.json', '.log', '.md', '.py', '.ts', '.tsx', '.txt', '.yaml', '.yml']);
 
-const BLOCKED_ATTACHMENT_PATHS = ['.env', 'data/policy.yaml', 'data/events.jsonl', 'data/.admin_token'];
+// Whitelist of servable directory prefixes — must match the backend
+// /v1/attachments/file whitelist. The endpoint is unauthenticated, so
+// only explicitly safe directories are allowed.
+const ALLOWED_ATTACHMENT_PREFIXES = ['data/attachments/', 'data/artifacts/'];
 
 function normalizeAttachmentPath(value: string | undefined): string {
   const raw = (value || '').replace(/\\/g, '/').replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
   if (!raw) return '';
-  // Block sensitive files
-  if (BLOCKED_ATTACHMENT_PATHS.some(b => raw === b || raw.endsWith('/' + b))) return '';
-  // [AutoC 2026-08-11] Allow any workspace-relative path — the backend
-  // /v1/attachments/file endpoint enforces workspace-root containment and
-  // sensitive-path blocking server-side.
-  return raw;
+  if (ALLOWED_ATTACHMENT_PREFIXES.some(prefix => raw.startsWith(prefix))) return raw;
+  // Legacy: image-only files under data/temp/
+  if (raw.startsWith('data/temp/') && /\.(apng|avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(raw.split('?')[0].split('#')[0])) return raw;
+  return '';
 }
 
 function getPathFromUrl(url: string | undefined): string {

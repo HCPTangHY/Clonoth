@@ -427,22 +427,40 @@ def create_app(
         }
 
     @app.get("/v1/attachments/file")
-    async def attachment_file(path: str = Query(..., description="Path under workspace root")) -> FileResponse:
-        """Serve a stored attachment file for the web frontend."""
+    async def attachment_file(path: str = Query(..., description="Path under allowed directories")) -> FileResponse:
+        """Serve a stored attachment file for the web frontend.
+
+        Security: this endpoint has NO authentication (public on the port).
+        Only serve files under an explicit whitelist of safe directories.
+        Never open workspace_root broadly — it contains API keys, tokens,
+        conversation history, and other secrets.
+        """
         st: SupervisorState = app.state.state
         rel_path = str(path or "").replace("\\", "/").lstrip("/").strip()
         if not rel_path:
             raise HTTPException(status_code=400, detail="empty path")
-        # Resolve target and ensure it stays under workspace_root
-        ws_root = st.workspace_root.resolve()
-        target = (ws_root / rel_path).resolve()
-        try:
-            target.relative_to(ws_root)
-        except ValueError:
+
+        # Whitelist of servable directory prefixes (relative to workspace_root).
+        # Each entry maps to the resolved root used for path-traversal checks.
+        image_exts = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
+        ws = st.workspace_root
+        allowed_root: Path | None = None
+
+        if rel_path.startswith("data/attachments/"):
+            allowed_root = (ws / "data" / "attachments").resolve()
+        elif rel_path.startswith("data/artifacts/"):
+            allowed_root = (ws / "data" / "artifacts").resolve()
+        elif rel_path.startswith("data/temp/") and Path(rel_path).suffix.lower() in image_exts:
+            # Legacy image tools stored generated files under data/temp.
+            allowed_root = (ws / "data" / "temp").resolve()
+
+        if allowed_root is None:
             raise HTTPException(status_code=403, detail="attachment path not allowed")
-        # Block sensitive paths
-        _blocked = (".env", "data/policy.yaml", "data/events.jsonl", "data/.admin_token")
-        if any(rel_path == b or rel_path.endswith("/" + b) for b in _blocked):
+
+        target = (ws / rel_path).resolve()
+        try:
+            target.relative_to(allowed_root)
+        except ValueError:
             raise HTTPException(status_code=403, detail="attachment path not allowed")
         if not target.is_file():
             raise HTTPException(status_code=404, detail="attachment not found")

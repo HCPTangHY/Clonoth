@@ -28,13 +28,20 @@ from ..conversation_store import MessageType
 #  怎么做：保留路径到 attachment dict 的转换函数，删除旧分支调用。
 #  目的：让动态 dispatch 的附件行为保持不变。
 # ---------------------------------------------------------------------------
+import shutil as _shutil
+import uuid as _uuid
+
+
 def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
     """Convert file paths to attachment dicts for dispatch.
 
-    Accepts both workspace-relative and absolute paths.  Absolute paths are
-    normalised to workspace-relative when they fall under workspace_root so
-    that the web frontend can serve them via /v1/attachments/file.
+    Accepts both workspace-relative and absolute paths.  Files outside the
+    whitelisted serving directories (data/attachments/, data/artifacts/) are
+    copied into data/attachments/ so the unauthenticated /v1/attachments/file
+    endpoint can serve them safely without opening the whole workspace.
     """
+    # Prefixes the web frontend + supervisor API whitelist will serve.
+    _SERVABLE_PREFIXES = ("data/attachments/", "data/artifacts/", "data/temp/")
     result = []
     ws_resolved = workspace_root.resolve()
     for p in paths:
@@ -45,16 +52,27 @@ def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
         full = full.resolve()
         if not full.exists():
             continue
-        # Normalise to workspace-relative when possible
+        # Try to make workspace-relative
         try:
             rel = str(full.relative_to(ws_resolved))
         except ValueError:
-            rel = p_str  # outside workspace — keep as-is
+            rel = None  # outside workspace
+        # If already in a servable prefix, use directly
+        if rel and any(rel.startswith(pfx) for pfx in _SERVABLE_PREFIXES):
+            serve_path = rel
+        else:
+            # Copy into data/attachments/ so the file can be served
+            att_dir = workspace_root / "data" / "attachments" / "tool_output"
+            att_dir.mkdir(parents=True, exist_ok=True)
+            dest_name = f"{_uuid.uuid4().hex[:8]}_{full.name}"
+            dest = att_dir / dest_name
+            _shutil.copy2(str(full), str(dest))
+            serve_path = f"data/attachments/tool_output/{dest_name}"
         mime = _mimetypes.guess_type(str(full))[0] or "application/octet-stream"
         att_type = "image" if mime.startswith("image/") else "file"
         result.append({
             "type": att_type,
-            "path": rel,
+            "path": serve_path,
             "mime_type": mime,
             "name": full.name,
         })
