@@ -18,6 +18,7 @@ export type RenderableAttachment = {
 interface AttachmentListProps {
   attachments: readonly RenderableAttachment[];
   variant?: 'message' | 'composer';
+  sessionId?: string;
   onRemove?: (index: number) => void;
 }
 
@@ -59,15 +60,20 @@ export function getAttachmentName(attachment: RenderableAttachment): string {
 }
 
 /** Build the API path (not a direct href — must be fetched with auth). */
-function getAttachmentApiPath(attachment: RenderableAttachment): string | undefined {
+function getAttachmentApiPath(attachment: RenderableAttachment, sessionId?: string): string | undefined {
   const url = (attachment.url || '').trim();
-  // blob/data URLs are already local — use directly
-  if (url && /^(blob:|data:)/i.test(url)) return undefined; // handled separately
-  // External URLs are not served by our API
+  if (url && /^(blob:|data:)/i.test(url)) return undefined;
   if (url && /^https?:\/\//i.test(url)) return undefined;
-  const path = normalizeAttachmentPath(attachment.path) || getPathFromUrl(url);
-  if (path) return `/v1/attachments/file?path=${encodeURIComponent(path)}`;
-  return undefined;
+  // Try whitelist-normalised path first, then fall back to raw path
+  // (workspace/trusted files may not match the whitelist prefixes but
+  // the backend will classify them via session workspace + extra_roots).
+  const normPath = normalizeAttachmentPath(attachment.path) || getPathFromUrl(url);
+  const rawPath = (attachment.path || '').replace(/\\/g, '/').replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
+  const servePath = normPath || rawPath;
+  if (!servePath) return undefined;
+  let apiPath = `/v1/attachments/file?path=${encodeURIComponent(servePath)}`;
+  if (sessionId) apiPath += `&session_id=${encodeURIComponent(sessionId)}`;
+  return apiPath;
 }
 
 /** Return a direct URL that needs no fetch (blob, data, external). */
@@ -134,10 +140,10 @@ async function fetchBlobUrl(apiPath: string, token: string): Promise<string> {
 }
 
 // ── Per-attachment hook ─────────────────────────────────────────────────
-function useAuthenticatedUrl(attachment: RenderableAttachment): { url: string | undefined; loading: boolean } {
+function useAuthenticatedUrl(attachment: RenderableAttachment, sessionId?: string): { url: string | undefined; loading: boolean } {
   const adminToken = useSettingsStore(s => s.adminToken);
   const directUrl = getDirectUrl(attachment);
-  const apiPath = getAttachmentApiPath(attachment);
+  const apiPath = getAttachmentApiPath(attachment, sessionId);
   const [blobUrl, setBlobUrl] = useState<string | undefined>(() => {
     // Synchronous cache hit avoids flicker on re-render
     if (apiPath && blobCache.has(apiPath)) return blobCache.get(apiPath);
@@ -169,16 +175,18 @@ function AttachmentItem({
   attachment,
   index,
   isComposer,
+  sessionId,
   onRemove,
 }: {
   attachment: RenderableAttachment;
   index: number;
   isComposer: boolean;
+  sessionId?: string;
   onRemove?: (index: number) => void;
 }) {
   const name = getAttachmentName(attachment);
   const meta = getAttachmentMeta(attachment);
-  const { url, loading } = useAuthenticatedUrl(attachment);
+  const { url, loading } = useAuthenticatedUrl(attachment, isComposer ? undefined : sessionId);
   const isImage = isImageAttachment(attachment);
 
   const removeButton = onRemove ? (
@@ -251,7 +259,7 @@ function AttachmentItem({
 }
 
 // ── List component ──────────────────────────────────────────────────────
-export function AttachmentList({ attachments, variant = 'message', onRemove }: AttachmentListProps) {
+export function AttachmentList({ attachments, variant = 'message', sessionId, onRemove }: AttachmentListProps) {
   if (attachments.length === 0) return null;
 
   const isComposer = variant === 'composer';
@@ -265,6 +273,7 @@ export function AttachmentList({ attachments, variant = 'message', onRemove }: A
           attachment={attachment}
           index={index}
           isComposer={isComposer}
+          sessionId={sessionId}
           onRemove={onRemove}
         />
       ))}

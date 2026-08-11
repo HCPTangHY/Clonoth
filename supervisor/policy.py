@@ -141,6 +141,12 @@ class PolicyEngine:
 
         self._extra_roots: list[Path] = []
 
+    @property
+    def extra_roots(self) -> list[Path]:
+        """Public read access for attachment trust resolution."""
+        self._reload_if_needed()
+        return list(self._extra_roots)
+
         self._read_default: SafetyLevel = SafetyLevel.auto
         self._write_default: SafetyLevel = SafetyLevel.auto
         self._restart_default: SafetyLevel = SafetyLevel.approval_required

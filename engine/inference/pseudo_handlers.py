@@ -32,16 +32,27 @@ import shutil as _shutil
 import uuid as _uuid
 
 
-def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
+def _paths_to_attachments(
+    paths: list,
+    workspace_root: Path,
+    *,
+    session_workspace: Path | None = None,
+) -> list[dict]:
     """Convert file paths to attachment dicts for dispatch.
 
-    Accepts both workspace-relative and absolute paths.  Files outside the
-    whitelisted serving directories (data/attachments/, data/artifacts/) are
-    copied into data/attachments/ so the unauthenticated /v1/attachments/file
-    endpoint can serve them safely without opening the whole workspace.
+    Accepts workspace-relative and absolute paths.  Uses classify_path to
+    determine trust level:
+      - workspace / trusted: store the path as-is (backend serves via
+        session workspace trust resolution)
+      - external: copy into data/attachments/tool_output/ so the
+        authenticated endpoint can serve from a safe directory
     """
-    # Prefixes the web frontend + supervisor API whitelist will serve.
-    _SERVABLE_PREFIXES = ("data/attachments/", "data/artifacts/", "data/temp/")
+    from clonoth_runtime import classify_path as _classify, parse_extra_roots, load_yaml_dict
+
+    _policy_path = workspace_root / "data" / "policy.yaml"
+    _policy_cfg = load_yaml_dict(_policy_path) if _policy_path.exists() else {}
+    _extra_roots = parse_extra_roots(workspace_root, _policy_cfg.get("extra_roots"))
+
     result = []
     ws_resolved = workspace_root.resolve()
     for p in paths:
@@ -52,22 +63,24 @@ def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
         full = full.resolve()
         if not full.exists():
             continue
-        # Try to make workspace-relative
-        try:
-            rel = str(full.relative_to(ws_resolved))
-        except ValueError:
-            rel = None  # outside workspace
-        # If already in a servable prefix, use directly
-        if rel and any(rel.startswith(pfx) for pfx in _SERVABLE_PREFIXES):
-            serve_path = rel
+
+        _, _, trust = _classify(
+            workspace_root, _extra_roots, str(full),
+            workspace=session_workspace,
+        )
+
+        if trust in ("workspace", "trusted"):
+            # Store as absolute path; backend resolves trust at serve time
+            serve_path = str(full)
         else:
-            # Copy into data/attachments/ so the file can be served
+            # External: copy to safe directory
             att_dir = workspace_root / "data" / "attachments" / "tool_output"
             att_dir.mkdir(parents=True, exist_ok=True)
             dest_name = f"{_uuid.uuid4().hex[:8]}_{full.name}"
             dest = att_dir / dest_name
             _shutil.copy2(str(full), str(dest))
             serve_path = f"data/attachments/tool_output/{dest_name}"
+
         mime = _mimetypes.guess_type(str(full))[0] or "application/octet-stream"
         att_type = "image" if mime.startswith("image/") else "file"
         result.append({
@@ -145,7 +158,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         if reply_text:
             # 解析附件
             _reply_att_paths = args.get("attachment_paths") or []
-            _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root)
+            _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root, session_workspace=ls.rctx.workspace)
             _reply_payload: dict[str, Any] = {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
@@ -488,7 +501,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         ctx_mode = "accumulate"
     ctx_key = str(args.get("context_key") or "").strip() or None
     attachment_paths = args.get("attachment_paths") or []
-    attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)
+    attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root, session_workspace=ls.rctx.workspace)
 
     # [AutoC 2026-06-06] Why: persistent nodes (like Smith, Scout) are designed
     # to accumulate context across tasks, but callers can accidentally pass

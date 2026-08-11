@@ -427,43 +427,69 @@ def create_app(
         }
 
     @app.get("/v1/attachments/file")
-    async def attachment_file(path: str = Query(..., description="Path under allowed directories"), request: Request = None) -> FileResponse:
-        """Serve a stored attachment file for the web frontend.
+    async def attachment_file(
+        path: str = Query(..., description="Path to serve"),
+        session_id: str = Query("", description="Session ID for workspace trust resolution"),
+        request: Request = None,
+    ) -> FileResponse:
+        """Serve a file for the web frontend.
 
-        Security: requires admin token authentication (same as other admin
-        endpoints). The frontend fetches via JS with Authorization header
-        and converts to blob URLs for rendering.
+        Security: requires admin token.  Trust resolution uses the session's
+        workspace + policy extra_roots via classify_path:
+          - workspace / trusted paths: served directly
+          - external paths: rejected
+        When no session_id is provided, falls back to a fixed safe-directory
+        whitelist (data/attachments/, data/artifacts/, data/temp/ images).
         """
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        rel_path = str(path or "").replace("\\", "/").lstrip("/").strip()
-        if not rel_path:
+        raw_path = str(path or "").replace("\\", "/").strip()
+        if not raw_path:
             raise HTTPException(status_code=400, detail="empty path")
 
-        # Whitelist of servable directory prefixes (relative to workspace_root).
-        # Each entry maps to the resolved root used for path-traversal checks.
+        # ── Resolve the file ──
+        ws_root = st.workspace_root.resolve()
+        # Handle absolute paths: resolve directly
+        if raw_path.startswith("/"):
+            target = Path(raw_path).resolve()
+        else:
+            target = (ws_root / raw_path.lstrip("/")).resolve()
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="attachment not found")
+
+        # ── Trust check via classify_path ──
+        session_workspace: Path | None = None
+        if session_id:
+            ws_info = st.get_session_workspace(session_id.strip())
+            if ws_info and ws_info.get("path"):
+                session_workspace = Path(ws_info["path"])
+
+        from clonoth_runtime import classify_path as _classify
+        _, _, trust_level = _classify(
+            st.workspace_root,
+            st.policy.extra_roots,
+            str(target),
+            workspace=session_workspace,
+        )
+        if trust_level in ("workspace", "trusted"):
+            return FileResponse(str(target))
+
+        # ── Fallback: fixed safe-directory whitelist for paths without session ──
+        rel_path = raw_path.lstrip("/")
         image_exts = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
-        ws = st.workspace_root
         allowed_root: Path | None = None
-
         if rel_path.startswith("data/attachments/"):
-            allowed_root = (ws / "data" / "attachments").resolve()
+            allowed_root = (ws_root / "data" / "attachments").resolve()
         elif rel_path.startswith("data/artifacts/"):
-            allowed_root = (ws / "data" / "artifacts").resolve()
+            allowed_root = (ws_root / "data" / "artifacts").resolve()
         elif rel_path.startswith("data/temp/") and Path(rel_path).suffix.lower() in image_exts:
-            # Legacy image tools stored generated files under data/temp.
-            allowed_root = (ws / "data" / "temp").resolve()
-
+            allowed_root = (ws_root / "data" / "temp").resolve()
         if allowed_root is None:
-            raise HTTPException(status_code=403, detail="attachment path not allowed")
-
-        target = (ws / rel_path).resolve()
+            raise HTTPException(status_code=403, detail="path outside trusted workspace")
         try:
             target.relative_to(allowed_root)
         except ValueError:
-            raise HTTPException(status_code=403, detail="attachment path not allowed")
-        if not target.is_file():
-            raise HTTPException(status_code=404, detail="attachment not found")
+            raise HTTPException(status_code=403, detail="path outside trusted workspace")
         return FileResponse(str(target))
 
     @app.post("/v1/inbound", response_model=InboundMessageOut)

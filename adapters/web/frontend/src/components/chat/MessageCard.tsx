@@ -245,7 +245,7 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
           </button>
         )}
 
-        <AttachmentList attachments={attachments} />
+        <AttachmentList attachments={attachments} sessionId={message.sessionId} />
 
         {showRetry && retryEdit.editing && (
           <div className="mt-1.5 flex flex-col gap-1.5">
