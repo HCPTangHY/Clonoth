@@ -26,19 +26,11 @@ const IMAGE_EXTENSIONS = new Set(['.apng', '.avif', '.bmp', '.gif', '.jpeg', '.j
 const ARCHIVE_EXTENSIONS = new Set(['.7z', '.gz', '.rar', '.tar', '.tgz', '.zip']);
 const TEXT_EXTENSIONS = new Set(['.csv', '.json', '.log', '.md', '.py', '.ts', '.tsx', '.txt', '.yaml', '.yml']);
 
-const ALLOWED_ATTACHMENT_PREFIXES = ['data/attachments/', 'data/artifacts/'];
-
-function normalizeAttachmentPath(value: string | undefined): string {
-  const raw = (value || '').replace(/\\/g, '/').replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
-  if (!raw) return '';
-  if (ALLOWED_ATTACHMENT_PREFIXES.some(prefix => raw.startsWith(prefix))) return raw;
-  if (raw.startsWith('data/temp/') && /\.(apng|avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(raw.split('?')[0].split('#')[0])) return raw;
-  return '';
-}
-
-function getPathFromUrl(url: string | undefined): string {
-  if (!url) return '';
-  return normalizeAttachmentPath(url);
+/** Clean up a path value — strip file:// prefix, normalise slashes.
+ *  No whitelist filtering: access control is enforced server-side
+ *  by /v1/sessions/{id}/file (workspace containment + data/ check). */
+function cleanPath(value: string | undefined): string {
+  return (value || '').replace(/\\/g, '/').replace(/^file:\/\//, '').trim();
 }
 
 function getExtension(value: string): string {
@@ -54,26 +46,20 @@ function safeDecodeURIComponent(value: string): string {
 export function getAttachmentName(attachment: RenderableAttachment): string {
   const explicit = (attachment.name || '').trim();
   if (explicit) return explicit;
-  const path = normalizeAttachmentPath(attachment.path) || getPathFromUrl(attachment.url);
+  const path = cleanPath(attachment.path) || cleanPath(attachment.url);
   if (path) return safeDecodeURIComponent(path.split('/').pop() || '附件');
   return '附件';
 }
 
-/** Build the API path (not a direct href — must be fetched with auth). */
+/** Build the API path for fetching a file through the session endpoint. */
 function getAttachmentApiPath(attachment: RenderableAttachment, sessionId?: string): string | undefined {
   const url = (attachment.url || '').trim();
   if (url && /^(blob:|data:)/i.test(url)) return undefined;
   if (url && /^https?:\/\//i.test(url)) return undefined;
-  // Try whitelist-normalised path first, then fall back to raw path
-  // (workspace/trusted files may not match the whitelist prefixes but
-  // the backend will classify them via session workspace + extra_roots).
-  const normPath = normalizeAttachmentPath(attachment.path) || getPathFromUrl(url);
-  const rawPath = (attachment.path || '').replace(/\\/g, '/').replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
-  const servePath = normPath || rawPath;
+  const servePath = cleanPath(attachment.path) || cleanPath(url);
   if (!servePath) return undefined;
-  let apiPath = `/v1/attachments/file?path=${encodeURIComponent(servePath)}`;
-  if (sessionId) apiPath += `&session_id=${encodeURIComponent(sessionId)}`;
-  return apiPath;
+  const sid = sessionId || '_default';
+  return `/v1/sessions/${encodeURIComponent(sid)}/file?path=${encodeURIComponent(servePath)}`;
 }
 
 /** Return a direct URL that needs no fetch (blob, data, external). */
@@ -87,7 +73,7 @@ export function isImageAttachment(attachment: RenderableAttachment): boolean {
   if (attachment.type === 'image') return true;
   if ((attachment.mime_type || '').toLowerCase().startsWith('image/')) return true;
   const name = getAttachmentName(attachment);
-  const path = normalizeAttachmentPath(attachment.path) || getPathFromUrl(attachment.url);
+  const path = cleanPath(attachment.path) || cleanPath(attachment.url);
   return IMAGE_EXTENSIONS.has(getExtension(name)) || IMAGE_EXTENSIONS.has(getExtension(path));
 }
 

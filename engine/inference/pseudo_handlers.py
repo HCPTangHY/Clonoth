@@ -28,33 +28,15 @@ from ..conversation_store import MessageType
 #  怎么做：保留路径到 attachment dict 的转换函数，删除旧分支调用。
 #  目的：让动态 dispatch 的附件行为保持不变。
 # ---------------------------------------------------------------------------
-import shutil as _shutil
-import uuid as _uuid
 
-
-def _paths_to_attachments(
-    paths: list,
-    workspace_root: Path,
-    *,
-    session_workspace: Path | None = None,
-) -> list[dict]:
+def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
     """Convert file paths to attachment dicts for dispatch.
 
-    Accepts workspace-relative and absolute paths.  Uses classify_path to
-    determine trust level:
-      - workspace / trusted: store the path as-is (backend serves via
-        session workspace trust resolution)
-      - external: copy into data/attachments/tool_output/ so the
-        authenticated endpoint can serve from a safe directory
+    Accepts workspace-relative and absolute paths.  Stores the path as-is;
+    the serving endpoint (/v1/sessions/{id}/file) enforces access control
+    based on the session's workspace directory.
     """
-    from clonoth_runtime import classify_path as _classify, parse_extra_roots, load_yaml_dict
-
-    _policy_path = workspace_root / "data" / "policy.yaml"
-    _policy_cfg = load_yaml_dict(_policy_path) if _policy_path.exists() else {}
-    _extra_roots = parse_extra_roots(workspace_root, _policy_cfg.get("extra_roots"))
-
     result = []
-    ws_resolved = workspace_root.resolve()
     for p in paths:
         p_str = str(p).strip()
         if not p_str:
@@ -63,29 +45,11 @@ def _paths_to_attachments(
         full = full.resolve()
         if not full.exists():
             continue
-
-        _, _, trust = _classify(
-            workspace_root, _extra_roots, str(full),
-            workspace=session_workspace,
-        )
-
-        if trust in ("workspace", "trusted"):
-            # Store as absolute path; backend resolves trust at serve time
-            serve_path = str(full)
-        else:
-            # External: copy to safe directory
-            att_dir = workspace_root / "data" / "attachments" / "tool_output"
-            att_dir.mkdir(parents=True, exist_ok=True)
-            dest_name = f"{_uuid.uuid4().hex[:8]}_{full.name}"
-            dest = att_dir / dest_name
-            _shutil.copy2(str(full), str(dest))
-            serve_path = f"data/attachments/tool_output/{dest_name}"
-
         mime = _mimetypes.guess_type(str(full))[0] or "application/octet-stream"
         att_type = "image" if mime.startswith("image/") else "file"
         result.append({
             "type": att_type,
-            "path": serve_path,
+            "path": str(full),
             "mime_type": mime,
             "name": full.name,
         })
@@ -158,7 +122,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         if reply_text:
             # 解析附件
             _reply_att_paths = args.get("attachment_paths") or []
-            _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root, session_workspace=ls.rctx.workspace)
+            _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root)
             _reply_payload: dict[str, Any] = {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
@@ -501,7 +465,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         ctx_mode = "accumulate"
     ctx_key = str(args.get("context_key") or "").strip() or None
     attachment_paths = args.get("attachment_paths") or []
-    attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root, session_workspace=ls.rctx.workspace)
+    attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)
 
     # [AutoC 2026-06-06] Why: persistent nodes (like Smith, Scout) are designed
     # to accumulate context across tasks, but callers can accidentally pass

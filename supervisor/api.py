@@ -426,20 +426,23 @@ def create_app(
             "type": "image" if mime_type.startswith("image/") else "file",
         }
 
-    @app.get("/v1/attachments/file")
-    async def attachment_file(
-        path: str = Query(..., description="Path to serve"),
-        session_id: str = Query("", description="Session ID for workspace trust resolution"),
+    @app.get("/v1/sessions/{session_id}/file")
+    async def session_file(
+        session_id: str,
+        path: str = Query(..., description="File path (workspace-relative or absolute)"),
         request: Request = None,
     ) -> FileResponse:
-        """Serve a file for the web frontend.
+        """Serve a file scoped to a session's workspace.
 
-        Security: requires admin token.  Trust resolution uses the session's
-        workspace + policy extra_roots via classify_path:
-          - workspace / trusted paths: served directly
-          - external paths: rejected
-        When no session_id is provided, falls back to a fixed safe-directory
-        whitelist (data/attachments/, data/artifacts/, data/temp/ images).
+        Security model:
+          1. Admin token required (same as other session endpoints).
+          2. The file must be inside the session's workspace directory,
+             OR inside workspace_root/data/ (attachments, artifacts, temp).
+          3. Paths outside both scopes are rejected with 403.
+
+        This is the single file-serving endpoint for the web frontend and
+        future IDE plugins. Files are resolved relative to the session's
+        workspace; absolute paths are also accepted but still checked.
         """
         verify_admin_token(request)
         st: SupervisorState = app.state.state
@@ -447,50 +450,51 @@ def create_app(
         if not raw_path:
             raise HTTPException(status_code=400, detail="empty path")
 
-        # ── Resolve the file ──
+        # ── Resolve session workspace ──
         ws_root = st.workspace_root.resolve()
-        # Handle absolute paths: resolve directly
+        session_workspace: Path | None = None
+        ws_info = st.get_session_workspace(session_id.strip())
+        if ws_info and ws_info.get("path"):
+            session_workspace = Path(ws_info["path"]).resolve()
+
+        # ── Resolve file path ──
+        resolve_base = session_workspace or ws_root
         if raw_path.startswith("/"):
             target = Path(raw_path).resolve()
         else:
-            target = (ws_root / raw_path.lstrip("/")).resolve()
+            target = (resolve_base / raw_path).resolve()
         if not target.is_file():
-            raise HTTPException(status_code=404, detail="attachment not found")
+            raise HTTPException(status_code=404, detail="file not found")
 
-        # ── Trust check via classify_path ──
-        session_workspace: Path | None = None
-        if session_id:
-            ws_info = st.get_session_workspace(session_id.strip())
-            if ws_info and ws_info.get("path"):
-                session_workspace = Path(ws_info["path"])
+        # ── Access check: session workspace ──
+        if session_workspace:
+            try:
+                target.relative_to(session_workspace)
+                return FileResponse(str(target))
+            except ValueError:
+                pass
 
-        from clonoth_runtime import classify_path as _classify
-        _, _, trust_level = _classify(
-            st.workspace_root,
-            st.policy.extra_roots,
-            str(target),
-            workspace=session_workspace,
-        )
-        if trust_level in ("workspace", "trusted"):
-            return FileResponse(str(target))
-
-        # ── Fallback: fixed safe-directory whitelist for paths without session ──
-        rel_path = raw_path.lstrip("/")
-        image_exts = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
-        allowed_root: Path | None = None
-        if rel_path.startswith("data/attachments/"):
-            allowed_root = (ws_root / "data" / "attachments").resolve()
-        elif rel_path.startswith("data/artifacts/"):
-            allowed_root = (ws_root / "data" / "artifacts").resolve()
-        elif rel_path.startswith("data/temp/") and Path(rel_path).suffix.lower() in image_exts:
-            allowed_root = (ws_root / "data" / "temp").resolve()
-        if allowed_root is None:
-            raise HTTPException(status_code=403, detail="path outside trusted workspace")
+        # ── Access check: data/ safe directories (always allowed) ──
+        _data_dir = (ws_root / "data").resolve()
         try:
-            target.relative_to(allowed_root)
+            target.relative_to(_data_dir)
+            return FileResponse(str(target))
         except ValueError:
-            raise HTTPException(status_code=403, detail="path outside trusted workspace")
-        return FileResponse(str(target))
+            pass
+
+        raise HTTPException(status_code=403, detail="file outside session workspace")
+
+    # Legacy redirect: old /v1/attachments/file → new session endpoint
+    @app.get("/v1/attachments/file")
+    async def attachment_file_legacy(
+        path: str = Query(...),
+        session_id: str = Query(""),
+        request: Request = None,
+    ) -> FileResponse:
+        """Legacy endpoint — redirects to /v1/sessions/{session_id}/file."""
+        verify_admin_token(request)
+        sid = session_id.strip() or "_default"
+        return await session_file(sid, path=path, request=request)
 
     @app.post("/v1/inbound", response_model=InboundMessageOut)
     async def inbound(msg: InboundMessageIn, request: Request) -> InboundMessageOut:
