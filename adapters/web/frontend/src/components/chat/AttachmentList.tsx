@@ -1,10 +1,10 @@
 // [AutoC 2026-06-17] Shared attachment renderer for chat messages and composer previews.
-// Why: inbound user files, outbound tool images, and pasted local files all share the
-// same metadata shape but used to render through separate ad-hoc snippets. How: keep
-// URL resolution, image detection, file labels, and remove buttons in one component.
-// Purpose: live messages, refreshed history, and local drafts show attachments the
-// same way.
+// [AutoC 2026-08-11] Rewritten to fetch attachments via authenticated JS requests
+// instead of bare <img src> / <a href>.  The backend /v1/attachments/file now
+// requires admin token, so we fetch → blob URL for rendering and downloads.
+import { useEffect, useState } from 'react';
 import { Icon } from '../common';
+import { useSettingsStore } from '../../store/settingsStore';
 
 export type RenderableAttachment = {
   name?: string;
@@ -25,16 +25,12 @@ const IMAGE_EXTENSIONS = new Set(['.apng', '.avif', '.bmp', '.gif', '.jpeg', '.j
 const ARCHIVE_EXTENSIONS = new Set(['.7z', '.gz', '.rar', '.tar', '.tgz', '.zip']);
 const TEXT_EXTENSIONS = new Set(['.csv', '.json', '.log', '.md', '.py', '.ts', '.tsx', '.txt', '.yaml', '.yml']);
 
-// Whitelist of servable directory prefixes — must match the backend
-// /v1/attachments/file whitelist. The endpoint is unauthenticated, so
-// only explicitly safe directories are allowed.
 const ALLOWED_ATTACHMENT_PREFIXES = ['data/attachments/', 'data/artifacts/'];
 
 function normalizeAttachmentPath(value: string | undefined): string {
   const raw = (value || '').replace(/\\/g, '/').replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
   if (!raw) return '';
   if (ALLOWED_ATTACHMENT_PREFIXES.some(prefix => raw.startsWith(prefix))) return raw;
-  // Legacy: image-only files under data/temp/
   if (raw.startsWith('data/temp/') && /\.(apng|avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(raw.split('?')[0].split('#')[0])) return raw;
   return '';
 }
@@ -62,14 +58,23 @@ export function getAttachmentName(attachment: RenderableAttachment): string {
   return '附件';
 }
 
-export function getAttachmentHref(attachment: RenderableAttachment): string | undefined {
+/** Build the API path (not a direct href — must be fetched with auth). */
+function getAttachmentApiPath(attachment: RenderableAttachment): string | undefined {
   const url = (attachment.url || '').trim();
-  if (url && (/^(blob:|data:|https?:\/\/)/i.test(url) || url.startsWith('/v1/attachments/file'))) {
-    return url;
-  }
+  // blob/data URLs are already local — use directly
+  if (url && /^(blob:|data:)/i.test(url)) return undefined; // handled separately
+  // External URLs are not served by our API
+  if (url && /^https?:\/\//i.test(url)) return undefined;
   const path = normalizeAttachmentPath(attachment.path) || getPathFromUrl(url);
   if (path) return `/v1/attachments/file?path=${encodeURIComponent(path)}`;
-  return url || undefined;
+  return undefined;
+}
+
+/** Return a direct URL that needs no fetch (blob, data, external). */
+function getDirectUrl(attachment: RenderableAttachment): string | undefined {
+  const url = (attachment.url || '').trim();
+  if (url && /^(blob:|data:|https?:\/\/)/i.test(url)) return url;
+  return undefined;
 }
 
 export function isImageAttachment(attachment: RenderableAttachment): boolean {
@@ -78,6 +83,11 @@ export function isImageAttachment(attachment: RenderableAttachment): boolean {
   const name = getAttachmentName(attachment);
   const path = normalizeAttachmentPath(attachment.path) || getPathFromUrl(attachment.url);
   return IMAGE_EXTENSIONS.has(getExtension(name)) || IMAGE_EXTENSIONS.has(getExtension(path));
+}
+
+// Re-export for external consumers that only need the href (e.g. history hydration)
+export function getAttachmentHref(attachment: RenderableAttachment): string | undefined {
+  return getDirectUrl(attachment) || getAttachmentApiPath(attachment);
 }
 
 function getFileIcon(attachment: RenderableAttachment): string {
@@ -107,70 +117,157 @@ function getAttachmentMeta(attachment: RenderableAttachment): string {
   return size || mime;
 }
 
-export function AttachmentList({ attachments, variant = 'message', onRemove }: AttachmentListProps) {
-  if (attachments.length === 0) return null;
+// ── Blob cache (module-level, survives re-renders) ──────────────────────
+const blobCache = new Map<string, string>();
 
-  const isComposer = variant === 'composer';
+async function fetchBlobUrl(apiPath: string, token: string): Promise<string> {
+  const cached = blobCache.get(apiPath);
+  if (cached) return cached;
+  const resp = await fetch(apiPath, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) throw new Error(`${resp.status}`);
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  blobCache.set(apiPath, url);
+  return url;
+}
+
+// ── Per-attachment hook ─────────────────────────────────────────────────
+function useAuthenticatedUrl(attachment: RenderableAttachment): { url: string | undefined; loading: boolean } {
+  const adminToken = useSettingsStore(s => s.adminToken);
+  const directUrl = getDirectUrl(attachment);
+  const apiPath = getAttachmentApiPath(attachment);
+  const [blobUrl, setBlobUrl] = useState<string | undefined>(() => {
+    // Synchronous cache hit avoids flicker on re-render
+    if (apiPath && blobCache.has(apiPath)) return blobCache.get(apiPath);
+    return undefined;
+  });
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (directUrl || !apiPath || !adminToken) return;
+    if (blobCache.has(apiPath)) {
+      setBlobUrl(blobCache.get(apiPath));
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    fetchBlobUrl(apiPath, adminToken).then(
+      url => { if (!cancelled) { setBlobUrl(url); setLoading(false); } },
+      () => { if (!cancelled) setLoading(false); },
+    );
+    return () => { cancelled = true; };
+  }, [directUrl, apiPath, adminToken]);
+
+  if (directUrl) return { url: directUrl, loading: false };
+  return { url: blobUrl, loading };
+}
+
+// ── Single attachment item ──────────────────────────────────────────────
+function AttachmentItem({
+  attachment,
+  index,
+  isComposer,
+  onRemove,
+}: {
+  attachment: RenderableAttachment;
+  index: number;
+  isComposer: boolean;
+  onRemove?: (index: number) => void;
+}) {
+  const name = getAttachmentName(attachment);
+  const meta = getAttachmentMeta(attachment);
+  const { url, loading } = useAuthenticatedUrl(attachment);
+  const isImage = isImageAttachment(attachment);
+
+  const removeButton = onRemove ? (
+    <button
+      aria-label={`移除附件 ${name}`}
+      className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-sm bg-black/60 text-white opacity-90 transition-opacity hover:opacity-100"
+      onClick={() => onRemove(index)}
+      type="button"
+    >
+      <Icon name="close" size={14} />
+    </button>
+  ) : null;
+
   const imageClass = isComposer
     ? 'h-20 w-20 object-cover'
     : 'max-h-72 max-w-full rounded-sm object-contain';
   const imageShellClass = isComposer
     ? 'group relative overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-panel)]'
     : 'group relative inline-block overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-panel)]';
+
+  if (isImage) {
+    if (loading) {
+      return (
+        <figure className={imageShellClass} title={name}>
+          <div className={`${isComposer ? 'h-20 w-20' : 'h-32 w-32'} flex items-center justify-center text-[var(--duties-tertiary)]`}>
+            <Icon name="hourglass_empty" size={20} />
+          </div>
+          <figcaption className="max-w-56 truncate px-2 py-1 text-[0.68rem] text-[var(--duties-secondary)]">{name}</figcaption>
+        </figure>
+      );
+    }
+    if (url) {
+      const image = <img alt={name} className={imageClass} loading="lazy" src={url} />;
+      return (
+        <figure className={imageShellClass} title={meta ? `${name} · ${meta}` : name}>
+          {isComposer ? image : <a href={url} rel="noopener noreferrer" target="_blank">{image}</a>}
+          {removeButton}
+          <figcaption className="max-w-56 truncate px-2 py-1 text-[0.68rem] text-[var(--duties-secondary)]">
+            <span>{name}</span>
+            {meta && <span className="text-[var(--duties-tertiary)]"> · {meta}</span>}
+          </figcaption>
+        </figure>
+      );
+    }
+  }
+
+  // File attachment (non-image, or image without URL)
+  const fileInner = (
+    <>
+      <Icon name={loading ? 'hourglass_empty' : getFileIcon(attachment)} size={18} />
+      <span className="min-w-0 flex-1 truncate">{name}</span>
+      {meta && <span className="shrink-0 text-[var(--duties-tertiary)]">{meta}</span>}
+    </>
+  );
+  const fileClass = `relative inline-flex ${isComposer ? 'max-w-72' : 'max-w-full'} items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2 py-1.5 text-xs text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)] ${onRemove ? 'pr-8' : ''}`;
+
+  if (url && !onRemove) {
+    return (
+      <a className={fileClass} download={name} href={url} rel="noopener noreferrer" target="_blank" title={meta ? `${name} · ${meta}` : name}>
+        {fileInner}
+      </a>
+    );
+  }
+  return (
+    <div className={`${fileClass} ${url ? '' : loading ? '' : 'opacity-75'}`} title={meta ? `${name} · ${meta}` : name}>
+      {fileInner}
+      {removeButton}
+    </div>
+  );
+}
+
+// ── List component ──────────────────────────────────────────────────────
+export function AttachmentList({ attachments, variant = 'message', onRemove }: AttachmentListProps) {
+  if (attachments.length === 0) return null;
+
+  const isComposer = variant === 'composer';
   const listClass = isComposer ? 'mb-2 flex flex-wrap gap-2' : 'mt-2 flex flex-wrap gap-2';
 
   return (
     <div className={listClass}>
-      {attachments.map((attachment, index) => {
-        const name = getAttachmentName(attachment);
-        const meta = getAttachmentMeta(attachment);
-        const href = getAttachmentHref(attachment);
-        const key = `${name}-${attachment.path || attachment.url || index}`;
-        const removeButton = onRemove ? (
-          <button
-            aria-label={`移除附件 ${name}`}
-            className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-sm bg-black/60 text-white opacity-90 transition-opacity hover:opacity-100"
-            onClick={() => onRemove(index)}
-            type="button"
-          >
-            <Icon name="close" size={14} />
-          </button>
-        ) : null;
-
-        if (isImageAttachment(attachment) && href) {
-          const image = <img alt={name} className={imageClass} loading="lazy" src={href} />;
-          return (
-            <figure key={key} className={imageShellClass} title={meta ? `${name} · ${meta}` : name}>
-              {isComposer ? image : <a href={href} rel="noopener noreferrer" target="_blank">{image}</a>}
-              {removeButton}
-              <figcaption className="max-w-56 truncate px-2 py-1 text-[0.68rem] text-[var(--duties-secondary)]">
-                <span>{name}</span>
-                {meta && <span className="text-[var(--duties-tertiary)]"> · {meta}</span>}
-              </figcaption>
-            </figure>
-          );
-        }
-
-        const fileInner = (
-          <>
-            <Icon name={getFileIcon(attachment)} size={18} />
-            <span className="min-w-0 flex-1 truncate">{name}</span>
-            {meta && <span className="shrink-0 text-[var(--duties-tertiary)]">{meta}</span>}
-          </>
-        );
-        const fileClass = `relative inline-flex ${isComposer ? 'max-w-72' : 'max-w-full'} items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2 py-1.5 text-xs text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)] ${onRemove ? 'pr-8' : ''}`;
-
-        return href && !onRemove ? (
-          <a key={key} className={fileClass} download={name} href={href} rel="noopener noreferrer" target="_blank" title={meta ? `${name} · ${meta}` : name}>
-            {fileInner}
-          </a>
-        ) : (
-          <div key={key} className={`${fileClass} ${href ? '' : 'opacity-75'}`} title={meta ? `${name} · ${meta}` : name}>
-            {fileInner}
-            {removeButton}
-          </div>
-        );
-      })}
+      {attachments.map((attachment, index) => (
+        <AttachmentItem
+          key={`${getAttachmentName(attachment)}-${attachment.path || attachment.url || index}`}
+          attachment={attachment}
+          index={index}
+          isComposer={isComposer}
+          onRemove={onRemove}
+        />
+      ))}
     </div>
   );
 }

@@ -427,14 +427,14 @@ def create_app(
         }
 
     @app.get("/v1/attachments/file")
-    async def attachment_file(path: str = Query(..., description="Path under allowed directories")) -> FileResponse:
+    async def attachment_file(path: str = Query(..., description="Path under allowed directories"), request: Request = None) -> FileResponse:
         """Serve a stored attachment file for the web frontend.
 
-        Security: this endpoint has NO authentication (public on the port).
-        Only serve files under an explicit whitelist of safe directories.
-        Never open workspace_root broadly — it contains API keys, tokens,
-        conversation history, and other secrets.
+        Security: requires admin token authentication (same as other admin
+        endpoints). The frontend fetches via JS with Authorization header
+        and converts to blob URLs for rendering.
         """
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         rel_path = str(path or "").replace("\\", "/").lstrip("/").strip()
         if not rel_path:
