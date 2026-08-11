@@ -89,20 +89,23 @@ class DeepSeekProvider(OpenAIProvider):
         # Prepare messages: strip internal fields, prefill guard
         prepared = self._prepare_messages(messages)
 
-        # DeepSeek-specific: preserve reasoning_content in assistant messages
-        # that contain tool_calls (required by API for multi-turn reasoning)
+        # DeepSeek thinking mode requires reasoning_content on every
+        # assistant message that carries tool_calls.  History from other
+        # providers (Claude, GPT) may lack the field.  Pad with "" so the
+        # API doesn't reject the request.
         final_messages = []
         for msg in prepared:
             if msg.get("role") == "assistant":
                 clean_msg = {"role": "assistant"}
                 if msg.get("content") is not None:
                     clean_msg["content"] = msg["content"]
-                # Pass through reasoning_content if present (needed for tool call chains)
                 if msg.get("reasoning_content"):
                     clean_msg["reasoning_content"] = msg["reasoning_content"]
-                # Pass through tool_calls if present
                 if msg.get("tool_calls"):
                     clean_msg["tool_calls"] = msg["tool_calls"]
+                    # Pad missing reasoning_content for thinking mode
+                    if self._thinking and "reasoning_content" not in clean_msg:
+                        clean_msg["reasoning_content"] = ""
                 final_messages.append(clean_msg)
             else:
                 final_messages.append(msg)
