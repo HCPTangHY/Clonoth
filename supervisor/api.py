@@ -427,25 +427,22 @@ def create_app(
         }
 
     @app.get("/v1/attachments/file")
-    async def attachment_file(path: str = Query(..., description="Path under data/attachments/ or legacy image under data/temp/")) -> FileResponse:
+    async def attachment_file(path: str = Query(..., description="Path under workspace root")) -> FileResponse:
         """Serve a stored attachment file for the web frontend."""
         st: SupervisorState = app.state.state
         rel_path = str(path or "").replace("\\", "/").lstrip("/").strip()
-        image_exts = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
-        if rel_path.startswith("data/attachments/"):
-            root = (st.workspace_root / "data" / "attachments").resolve()
-        elif rel_path.startswith("data/temp/") and Path(rel_path).suffix.lower() in image_exts:
-            # [AutoC 2026-06-17] Legacy image tools persisted generated files under
-            # data/temp before attachment normalization copied them into
-            # data/attachments. Allow image files only; other temp files remain
-            # blocked. Purpose: old refreshed history can render generated pictures.
-            root = (st.workspace_root / "data" / "temp").resolve()
-        else:
-            raise HTTPException(status_code=403, detail="attachment path not allowed")
-        target = (st.workspace_root / rel_path).resolve()
+        if not rel_path:
+            raise HTTPException(status_code=400, detail="empty path")
+        # Resolve target and ensure it stays under workspace_root
+        ws_root = st.workspace_root.resolve()
+        target = (ws_root / rel_path).resolve()
         try:
-            target.relative_to(root)
+            target.relative_to(ws_root)
         except ValueError:
+            raise HTTPException(status_code=403, detail="attachment path not allowed")
+        # Block sensitive paths
+        _blocked = (".env", "data/policy.yaml", "data/events.jsonl", "data/.admin_token")
+        if any(rel_path == b or rel_path.endswith("/" + b) for b in _blocked):
             raise HTTPException(status_code=403, detail="attachment path not allowed")
         if not target.is_file():
             raise HTTPException(status_code=404, detail="attachment not found")

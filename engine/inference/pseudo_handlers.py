@@ -29,20 +29,32 @@ from ..conversation_store import MessageType
 #  目的：让动态 dispatch 的附件行为保持不变。
 # ---------------------------------------------------------------------------
 def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
-    """Convert workspace-relative file paths to attachment dicts for dispatch."""
+    """Convert file paths to attachment dicts for dispatch.
+
+    Accepts both workspace-relative and absolute paths.  Absolute paths are
+    normalised to workspace-relative when they fall under workspace_root so
+    that the web frontend can serve them via /v1/attachments/file.
+    """
     result = []
+    ws_resolved = workspace_root.resolve()
     for p in paths:
         p_str = str(p).strip()
         if not p_str:
             continue
-        full = workspace_root / p_str
+        full = Path(p_str) if Path(p_str).is_absolute() else workspace_root / p_str
+        full = full.resolve()
         if not full.exists():
             continue
+        # Normalise to workspace-relative when possible
+        try:
+            rel = str(full.relative_to(ws_resolved))
+        except ValueError:
+            rel = p_str  # outside workspace — keep as-is
         mime = _mimetypes.guess_type(str(full))[0] or "application/octet-stream"
         att_type = "image" if mime.startswith("image/") else "file"
         result.append({
             "type": att_type,
-            "path": p_str,
+            "path": rel,
             "mime_type": mime,
             "name": full.name,
         })

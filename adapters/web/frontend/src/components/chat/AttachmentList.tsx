@@ -25,15 +25,17 @@ const IMAGE_EXTENSIONS = new Set(['.apng', '.avif', '.bmp', '.gif', '.jpeg', '.j
 const ARCHIVE_EXTENSIONS = new Set(['.7z', '.gz', '.rar', '.tar', '.tgz', '.zip']);
 const TEXT_EXTENSIONS = new Set(['.csv', '.json', '.log', '.md', '.py', '.ts', '.tsx', '.txt', '.yaml', '.yml']);
 
+const BLOCKED_ATTACHMENT_PATHS = ['.env', 'data/policy.yaml', 'data/events.jsonl', 'data/.admin_token'];
+
 function normalizeAttachmentPath(value: string | undefined): string {
   const raw = (value || '').replace(/\\/g, '/').replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
-  if (raw.startsWith('data/attachments/')) return raw;
-  // [AutoC 2026-06-17] Legacy generated-image rows stored paths under data/temp
-  // before media tools were normalized into data/attachments. Keep serving only
-  // image-like temp files so refreshed old history can show those pictures without
-  // making arbitrary data/temp documents downloadable from the attachment UI.
-  if (raw.startsWith('data/temp/') && /\.(apng|avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(raw.split('?')[0].split('#')[0])) return raw;
-  return '';
+  if (!raw) return '';
+  // Block sensitive files
+  if (BLOCKED_ATTACHMENT_PATHS.some(b => raw === b || raw.endsWith('/' + b))) return '';
+  // [AutoC 2026-08-11] Allow any workspace-relative path — the backend
+  // /v1/attachments/file endpoint enforces workspace-root containment and
+  // sensitive-path blocking server-side.
+  return raw;
 }
 
 function getPathFromUrl(url: string | undefined): string {
