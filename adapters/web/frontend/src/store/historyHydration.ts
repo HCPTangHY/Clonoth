@@ -137,7 +137,10 @@ function getHistoryAttachmentName(path: string, fallback = '附件'): string {
 }
 
 function normalizeHistoryAttachmentPath(value: unknown): Attachment | null {
-  const path = getHistoryString(value).replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
+  // Strip file:// prefix but preserve leading / for absolute paths —
+  // the backend /v1/sessions/{id}/file resolves absolutes and checks
+  // workspace containment.
+  const path = getHistoryString(value).replace(/^file:\/\//, '').trim();
   if (!path) return null;
   const imageLike = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(path);
   return {
@@ -151,7 +154,7 @@ function normalizeHistoryAttachmentPath(value: unknown): Attachment | null {
 function normalizeHistoryAttachmentItem(value: unknown): Attachment | null {
   if (typeof value === 'string') return normalizeHistoryAttachmentPath(value);
   if (!isRecord(value)) return null;
-  const path = getHistoryString(value.path).replace(/^file:\/\//, '').replace(/^\/+/, '');
+  const path = getHistoryString(value.path).replace(/^file:\/\//, '').trim();
   const url = getHistoryString(value.url) || undefined;
   const name = getHistoryString(value.name) || getHistoryAttachmentName(path || url || '', '附件');
   const mimeType = getHistoryString(value.mime_type) || undefined;
