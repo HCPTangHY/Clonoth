@@ -653,6 +653,7 @@ export function hydrateStructuredHistory(
       ...tool,
       eventIds: [`history:${sessionId}:${messageId}:tool:${tool.index ?? 0}`],
     })));
+    const _stored = nextState.messagesById[messageId];
     rememberHydratedHistoryMessage(historyEventId, messageId);
     resetAccumulatedAssistant();
   };
@@ -819,6 +820,7 @@ export function hydrateStructuredHistory(
       const ctName = controlText.toolName;
       const ctType: WsMessage['completionType'] =
         ctName === 'finish' ? 'finish' : ctName === 'ask' ? 'ask' : (ctName === 'reply' || ctName === 'intermediate_reply') ? 'reply' : undefined;
+      const _dbgAtts = normalizeHistoryAttachments(message);
       pushAssistantMessage(message, controlText.text, currentTools, ctType);
       continue;
     }

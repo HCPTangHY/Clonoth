@@ -11,6 +11,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { TextBlock, ToolExecution, WsMessage } from '../../types/message';
 import { Icon } from '../common';
 import { MessageCard } from './MessageCard';
+import { AttachmentList } from './AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
 import { BLOCK_STACK_CLASS } from './renderingConstants';
 
@@ -186,7 +187,7 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
       )}
 
       {/* Finish text blocks: always visible, no gap with fold above */}
-      {hasCompletion && completionTextBlocks.length > 0 && completionContext && (
+      {hasCompletion && lastCard && (completionTextBlocks.length > 0 || (lastCard.attachments && lastCard.attachments.length > 0)) && completionContext && (
         <article className="border-b border-[var(--duties-border)] bg-[var(--duties-panel)] px-3 pt-0 pb-3 sm:px-4">
           <div className="mx-auto max-w-3xl">
             <div className={BLOCK_STACK_CLASS}>
@@ -199,6 +200,9 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
                 />
               ))}
             </div>
+            {lastCard.attachments && lastCard.attachments.length > 0 && (
+              <AttachmentList attachments={lastCard.attachments} sessionId={lastCard.sessionId} />
+            )}
           </div>
         </article>
       )}
