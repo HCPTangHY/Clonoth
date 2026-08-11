@@ -815,7 +815,7 @@ export function hydrateStructuredHistory(
       flushDanglingAssistant();
       const ctName = controlText.toolName;
       const ctType: WsMessage['completionType'] =
-        ctName === 'finish' ? 'finish' : ctName === 'ask' ? 'ask' : ctName === 'reply' ? 'reply' : undefined;
+        ctName === 'finish' ? 'finish' : ctName === 'ask' ? 'ask' : (ctName === 'reply' || ctName === 'intermediate_reply') ? 'reply' : undefined;
       pushAssistantMessage(message, controlText.text, currentTools, ctType);
       continue;
     }

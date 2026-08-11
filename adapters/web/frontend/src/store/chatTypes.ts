@@ -134,7 +134,7 @@ export type HistoryThinkingSegment = {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-export const CONTROL_TOOL_NAMES = new Set(['finish', 'reply', 'switch_node', 'ask']);
+export const CONTROL_TOOL_NAMES = new Set(['finish', 'reply', 'intermediate_reply', 'switch_node', 'ask']);
 export const INTERNAL_USER_MESSAGE_TYPES = new Set(['tool_result', 'tool_result_attachment', 'system', 'summary', 'compact_request']);
 export const TERMINAL_TASK_EVENTS = new Set(['task_completed', 'task_cancelled', 'task_failed']);
 export const CHILD_NODE_ACTIVE_STATUSES = new Set<ChildNodeStatus>(['running', 'awaiting_approval']);
