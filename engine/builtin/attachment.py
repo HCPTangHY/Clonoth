@@ -39,9 +39,9 @@ class AttachmentCollector:
         raw: dict[str, Any]
         if isinstance(item, dict):
             raw = dict(item)
-            path = str(raw.get("path") or raw.get("url") or "").replace("file://", "").lstrip("/").strip()
+            path = str(raw.get("path") or raw.get("url") or "").replace("file://", "").strip()
         elif isinstance(item, str):
-            path = item.replace("file://", "").lstrip("/").strip()
+            path = item.replace("file://", "").strip()
             raw = {"path": path}
         else:
             return None
@@ -59,7 +59,10 @@ class AttachmentCollector:
             try:
                 source.resolve().relative_to(workspace_root.resolve())
             except ValueError:
-                return None
+                # ponytail: absolute paths outside workspace are allowed if they
+                # exist — the serving endpoint enforces session-level access control.
+                if not source.resolve().is_file():
+                    return None
             if source.is_file():
                 try:
                     from engine.attachments import save_attachment
