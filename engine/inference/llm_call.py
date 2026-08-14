@@ -318,8 +318,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     "has_text": text_buf.flushed_any,
                     "has_reasoning": think_buf.flushed_any,
                 })
-            if resp.ok and resp.tool_calls:
-                ls.use_stream = False
         else:
             # ---- 非流式调用（可取消） ----
             llm_task = asyncio.create_task(
