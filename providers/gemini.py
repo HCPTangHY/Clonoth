@@ -489,7 +489,9 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
     Recursively clean nested 'properties' and 'items'.
     """
     # Keys that Gemini's schema validator rejects
-    UNSUPPORTED = {"additionalProperties", "default", "$schema", "$id", "$ref", "$defs", "definitions"}
+    UNSUPPORTED = {"additionalProperties", "default", "$schema", "$id", "$ref", "$defs", "definitions",
+                    "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength",
+                    "minItems", "maxItems", "pattern", "uniqueItems"}
     cleaned: dict[str, Any] = {}
     for k, v in schema.items():
         if k in UNSUPPORTED:
