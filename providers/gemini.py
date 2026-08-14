@@ -485,22 +485,29 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Clean a JSON Schema for Gemini compatibility.
 
     Gemini's function-calling schema support is stricter than OpenAI's.
-    Remove unsupported keys like 'additionalProperties', 'default', '$schema'.
-    Recursively clean nested 'properties' and 'items'.
+    Strategy:
+    - Drop unsupported keywords outright.
+    - Convert exclusiveMinimum/exclusiveMaximum to minimum/maximum (widen
+      exclusive bound to inclusive, keep the tighter value when both exist).
+    - Recursively clean nested 'properties', 'items', and composition arrays.
     """
-    # Keys that Gemini's schema validator rejects
-    UNSUPPORTED = {"additionalProperties", "default", "$schema", "$id", "$ref", "$defs", "definitions",
-                    "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength",
-                    "minItems", "maxItems", "pattern", "uniqueItems"}
+    # Keywords Gemini's OpenAPI-3.0 subset does not accept at all
+    DROP = {"additionalProperties", "default", "$schema", "$id", "$ref",
+            "$defs", "definitions", "multipleOf", "uniqueItems",
+            "patternProperties", "propertyNames", "const",
+            "oneOf", "allOf", "not", "if", "then", "else"}
+    # exclusiveMinimum/exclusiveMaximum: convert, not drop
+    exc_min = schema.get("exclusiveMinimum")
+    exc_max = schema.get("exclusiveMaximum")
     cleaned: dict[str, Any] = {}
     for k, v in schema.items():
-        if k in UNSUPPORTED:
+        if k in DROP or k in ("exclusiveMinimum", "exclusiveMaximum"):
             continue
         if k == "properties" and isinstance(v, dict):
             cleaned[k] = {pk: _clean_schema(pv) if isinstance(pv, dict) else pv for pk, pv in v.items()}
         elif k == "items" and isinstance(v, dict):
             cleaned[k] = _clean_schema(v)
-        elif k in ("anyOf", "oneOf", "allOf") and isinstance(v, list):
+        elif k in ("anyOf",) and isinstance(v, list):
             cleaned[k] = [_clean_schema(item) if isinstance(item, dict) else item for item in v]
         elif k == "enum" and isinstance(v, list):
             # [2026-05-06] Gemini rejects empty enum members in function schemas.
@@ -523,6 +530,13 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
                 cleaned[k] = enum_values
         else:
             cleaned[k] = v
+    # Widen exclusive bounds to inclusive (Gemini has no exclusive bound)
+    if isinstance(exc_min, (int, float)):
+        cur = cleaned.get("minimum")
+        cleaned["minimum"] = max(cur, exc_min) if isinstance(cur, (int, float)) else exc_min
+    if isinstance(exc_max, (int, float)):
+        cur = cleaned.get("maximum")
+        cleaned["maximum"] = min(cur, exc_max) if isinstance(cur, (int, float)) else exc_max
     return cleaned
 
 
