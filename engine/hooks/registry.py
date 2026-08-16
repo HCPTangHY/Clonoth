@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import inspect
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from .types import HookResult
 
@@ -50,14 +51,70 @@ class HookRegistry:
         # be visible after startup. How: keep one normalized dict per plugin name.
         # Purpose: expose loaded plugin information without changing handler execution.
         self._loaded_plugins: list[dict] = []
+        # Why: every registration must leave a matching undo operation so a plugin
+        # can be unloaded without human recall of what it touched. How: register()
+        # returns a disposer and, while a loader is inside collecting(name), the
+        # disposer is archived under that plugin. Purpose: unloading a plugin is
+        # "call its disposers in reverse order", not "remember what it changed".
+        self._plugin_disposers: dict[str, list[Callable[[], None]]] = {}
+        self._collecting_stack: list[str] = []
 
-    def register(self, hook_point: str, handler: Any, priority: int | None = None) -> None:
-        """Register one handler to a hook point.
+    @contextmanager
+    def collecting(self, plugin_name: str) -> Iterator[None]:
+        """Attribute register() disposers created inside the block to one plugin."""
+        name = (plugin_name or "").strip()
+        if not name:
+            yield
+            return
+        self._collecting_stack.append(name)
+        try:
+            yield
+        finally:
+            self._collecting_stack.pop()
+
+    def add_plugin_disposer(self, plugin_name: str, disposer: Callable[[], None]) -> None:
+        """Archive an externally created disposer under a plugin name."""
+        name = (plugin_name or "").strip()
+        if not name or not callable(disposer):
+            return
+        self._plugin_disposers.setdefault(name, []).append(disposer)
+
+    def unload_plugin(self, plugin_name: str) -> dict[str, Any]:
+        """Undo every registration owned by one plugin, in reverse order.
+
+        Why: plugin hot-unload must not rely on knowing what a plugin registered.
+        How: pop the archived disposer list, call each entry last-in-first-out,
+        and drop the plugin metadata record. Purpose: make unload a mechanical
+        operation with per-disposer error isolation.
+        """
+        name = (plugin_name or "").strip()
+        disposers = self._plugin_disposers.pop(name, [])
+        errors: list[str] = []
+        for dispose in reversed(disposers):
+            try:
+                dispose()
+            except Exception as exc:
+                logger.warning("Disposer for plugin %s failed: %s", name, exc)
+                errors.append(str(exc))
+        removed_meta = False
+        for index, plugin in enumerate(self._loaded_plugins):
+            if plugin.get("name") == name:
+                self._loaded_plugins.pop(index)
+                removed_meta = True
+                break
+        return {"plugin": name, "disposed": len(disposers), "removed_meta": removed_meta, "errors": errors}
+
+    def register(self, hook_point: str, handler: Any, priority: int | None = None) -> Callable[[], None]:
+        """Register one handler to a hook point and return its disposer.
 
         Why: engine handlers are objects with .handle(ctx), while supervisor
         handlers are bound methods. How: normalize both forms to a callable and
         derive name/priority from the handler or its bound instance. Purpose: make
         repeated auto-discovery idempotent across all built-in hook points.
+
+        The returned disposer removes only this exact registration: it matches on
+        both handler name and callback identity, so a later same-name replacement
+        is not accidentally removed by an earlier disposer.
         """
         point = _normalize_hook_point(hook_point)
         callback = _handler_callback(handler)
@@ -65,8 +122,21 @@ class HookRegistry:
         resolved_priority = _handler_priority(handler, priority)
         handlers = self._hooks.setdefault(point, [])
         handlers[:] = [entry for entry in handlers if entry.name != name]
-        handlers.append(_RegisteredHook(priority=resolved_priority, name=name, callback=callback))
-        handlers.sort(key=lambda entry: entry.priority, reverse=True)
+        entry = _RegisteredHook(priority=resolved_priority, name=name, callback=callback)
+        handlers.append(entry)
+        handlers.sort(key=lambda item: item.priority, reverse=True)
+
+        def _dispose() -> None:
+            current = self._hooks.get(point)
+            if not current:
+                return
+            current[:] = [item for item in current if not (item.name == name and item.callback == callback)]
+            if not current:
+                self._hooks.pop(point, None)
+
+        if self._collecting_stack:
+            self._plugin_disposers.setdefault(self._collecting_stack[-1], []).append(_dispose)
+        return _dispose
 
     def unregister(self, hook_point: str, handler_name: str) -> bool:
         """Remove a handler by name and report whether anything changed."""

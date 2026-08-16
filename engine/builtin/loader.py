@@ -90,10 +90,30 @@ def auto_discover_and_register(
             handlers[handler_name] = instance
             loaded.add(handler_name)
             priority = meta.get("priority", getattr(instance, "priority", None))
-            for hook_point, method_name in _iter_hook_points(meta):
-                method = getattr(instance, method_name)
-                registry.register(str(hook_point), method, priority=priority)
-            _register_declared_tools(module_name, meta, tool_registry)
+            # Why: every registration a plugin makes must be reversible. How:
+            # run hook registration inside collecting(handler_name) so the
+            # registry archives each returned disposer under this plugin, then
+            # attach tool disposers and the optional teardown() hook to the same
+            # ledger. Purpose: unload_plugin(handler_name) undoes the whole load.
+            collecting = getattr(registry, "collecting", None)
+            if callable(collecting):
+                with collecting(handler_name):
+                    for hook_point, method_name in _iter_hook_points(meta):
+                        method = getattr(instance, method_name)
+                        registry.register(str(hook_point), method, priority=priority)
+            else:
+                for hook_point, method_name in _iter_hook_points(meta):
+                    method = getattr(instance, method_name)
+                    registry.register(str(hook_point), method, priority=priority)
+            for dispose in _register_declared_tools(module_name, meta, tool_registry):
+                add_disposer = getattr(registry, "add_plugin_disposer", None)
+                if callable(add_disposer):
+                    add_disposer(handler_name, dispose)
+            teardown = getattr(instance, "teardown", None)
+            if callable(teardown):
+                add_disposer = getattr(registry, "add_plugin_disposer", None)
+                if callable(add_disposer):
+                    add_disposer(handler_name, teardown)
             _register_meta(registry, py_file, meta, handler_name)
         except Exception as exc:
             logger.error("Failed to load built-in hook %s: %s", module_name, exc, exc_info=True)
@@ -154,17 +174,19 @@ def _instantiate_handler(module: Any, meta: dict[str, Any]) -> Any:
     return cls()
 
 
-def _register_declared_tools(module_name: str, meta: dict[str, Any], tool_registry: "ToolRegistry | None") -> None:
+def _register_declared_tools(module_name: str, meta: dict[str, Any], tool_registry: "ToolRegistry | None") -> list[Any]:
     """Register PLUGIN_META.tools declarations into the provided ToolRegistry."""
     # Why: built-in plugins can now own their tool implementations and schemas.
     # How: when a ToolRegistry is provided, validate each metadata declaration and
     # pass it through register_builtin_tool(). Purpose: remove hard-coded knowledge
     # tools from toolbox.registry.py while keeping loader failures localized.
+    # Returns the disposers produced by registration so the caller can archive
+    # them in the plugin ledger.
     raw_tools = meta.get("tools")
     if raw_tools is None:
-        return
+        return []
     if tool_registry is None:
-        return
+        return []
     if not isinstance(raw_tools, list):
         raise ValueError(f"{module_name} PLUGIN_META.tools must be a list")
 
@@ -172,6 +194,7 @@ def _register_declared_tools(module_name: str, meta: dict[str, Any], tool_regist
     if not callable(register_builtin_tool):
         raise TypeError("tool_registry must provide register_builtin_tool")
 
+    disposers: list[Any] = []
     for tool in raw_tools:
         if not isinstance(tool, dict):
             raise ValueError(f"{module_name} has invalid tool declaration: {tool!r}")
@@ -185,7 +208,10 @@ def _register_declared_tools(module_name: str, meta: dict[str, Any], tool_regist
             raise ValueError(f"{module_name}.{name} input_schema must be a dict")
         if not callable(func):
             raise ValueError(f"{module_name}.{name} func must be callable")
-        register_builtin_tool(name, description, input_schema, func)
+        dispose = register_builtin_tool(name, description, input_schema, func)
+        if callable(dispose):
+            disposers.append(dispose)
+    return disposers
 
 
 def _iter_hook_points(meta: dict[str, Any]) -> list[tuple[str, str]]:

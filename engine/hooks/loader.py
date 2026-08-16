@@ -120,11 +120,19 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path) -> int
                 cls = getattr(module, class_name)
                 instance = cls()
                 priority = raw_meta.get("priority", getattr(instance, "priority", None))
-                for item in raw_meta["hook_points"]:
-                    if isinstance(item, (tuple, list)) and len(item) == 2:
-                        hook_point, method_name = str(item[0]).strip(), str(item[1]).strip()
-                        method = getattr(instance, method_name)
-                        hook_registry.register(hook_point, method, priority=priority)
+                # Why: registrations made during load must be reversible. How:
+                # wrap them in collecting(name) so the registry archives each
+                # returned disposer under this plugin; teardown() joins the same
+                # ledger. Purpose: unload_plugin(name) undoes the whole load.
+                with hook_registry.collecting(meta["name"]):
+                    for item in raw_meta["hook_points"]:
+                        if isinstance(item, (tuple, list)) and len(item) == 2:
+                            hook_point, method_name = str(item[0]).strip(), str(item[1]).strip()
+                            method = getattr(instance, method_name)
+                            hook_registry.register(hook_point, method, priority=priority)
+                teardown = getattr(instance, "teardown", None)
+                if callable(teardown):
+                    hook_registry.add_plugin_disposer(meta["name"], teardown)
                 hook_registry.register_plugin_meta(meta)
                 count += 1
                 logger.info(
@@ -141,7 +149,8 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path) -> int
                     meta["name"], meta["version"], py_file.name,
                 )
                 continue
-            register(hook_registry)
+            with hook_registry.collecting(meta["name"]):
+                register(hook_registry)
             hook_registry.register_plugin_meta(meta)
             count += 1
             logger.info(

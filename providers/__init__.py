@@ -4,6 +4,7 @@ import importlib
 import inspect
 import pkgutil
 from pathlib import Path
+from typing import Callable
 
 from .base import BaseProvider, ProviderResponse, ToolCall
 
@@ -17,8 +18,12 @@ class ProviderRegistry:
         # 目的：新增 provider 时只需新增 providers/*.py，不再修改 engine if-elif 路由。
         self._registry: dict[str, type[BaseProvider]] = {}
 
-    def register(self, name: str, cls: type[BaseProvider]) -> None:
-        """Register a provider class by its public provider name."""
+    def register(self, name: str, cls: type[BaseProvider]) -> Callable[[], None]:
+        """Register a provider class by its public provider name.
+
+        Returns a disposer that removes only this exact registration; a later
+        same-name replacement is protected by the identity check.
+        """
         provider_name = (name or "").strip().lower()
         if not provider_name:
             raise ValueError("provider name is empty")
@@ -28,6 +33,12 @@ class ProviderRegistry:
         # 原因：测试和热重载可能重新导入模块；做法：同名 key 覆盖为最新类；
         # 目的：保持注册操作幂等，避免重复发现导致启动失败。
         self._registry[provider_name] = cls
+
+        def _dispose() -> None:
+            if self._registry.get(provider_name) is cls:
+                self._registry.pop(provider_name, None)
+
+        return _dispose
 
     def get(self, name: str) -> type[BaseProvider] | None:
         """Return the registered provider class for ``name`` if present."""

@@ -293,13 +293,20 @@ class ToolRegistry:
 
         self.reload()
 
-    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc) -> None:
-        """Register one builtin tool declared by a built-in plugin."""
-        # Why: some built-in tools now live with their owning plugin instead of
-        # the central registry table. How: install the spec and callable into the
-        # active maps and, when available, into the builtin snapshots used by
-        # reload(). Purpose: plugin-owned builtin tools remain visible after tools
-        # hot-reload and cannot be overridden by external script tools.
+    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc) -> Callable[[], None]:
+        """Register one builtin tool declared by a built-in plugin.
+
+        Why: some built-in tools now live with their owning plugin instead of
+        the central registry table. How: install the spec and callable into the
+        active maps and, when available, into the builtin snapshots used by
+        reload(). Purpose: plugin-owned builtin tools remain visible after tools
+        hot-reload and cannot be overridden by external script tools.
+
+        Returns a disposer that removes only this exact registration: the
+        identity check on func prevents an earlier disposer from removing a
+        later same-name replacement. Disposal also drops the builtin snapshots
+        so a later reload() cannot resurrect the removed tool.
+        """
         clean_name = str(name or "").strip()
         if not clean_name:
             raise ValueError("builtin tool name is required")
@@ -323,6 +330,23 @@ class ToolRegistry:
             self._builtin_specs[clean_name] = spec
         if hasattr(self, "_builtin_funcs"):
             self._builtin_funcs[clean_name] = func
+
+        def _dispose() -> None:
+            self._remove_builtin_tool(clean_name, func)
+
+        return _dispose
+
+    def _remove_builtin_tool(self, name: str, func: ToolFunc) -> bool:
+        """Remove one builtin tool only when it is still the registered callable."""
+        if self._tool_funcs.get(name) is not func:
+            return False
+        self._tool_specs.pop(name, None)
+        self._tool_funcs.pop(name, None)
+        if hasattr(self, "_builtin_specs"):
+            self._builtin_specs.pop(name, None)
+        if hasattr(self, "_builtin_funcs"):
+            self._builtin_funcs.pop(name, None)
+        return True
 
     def _load_builtin_meta_tools(self) -> None:
         builtins: list[tuple[str, str, dict[str, Any], ToolFunc]] = [
