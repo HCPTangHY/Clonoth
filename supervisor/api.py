@@ -266,6 +266,36 @@ def create_app(
         on_tools_changed=state.bump_tools_reload,
     )
 
+    # ── Global auth middleware ──────────────────────────────────────────
+    # [AutoC 2026-08-16] Why: many /v1/ endpoints were unprotected, exposing
+    # message injection (/v1/inbound), config leaks (/v1/config), session
+    # enumeration (/v1/sessions), and engine internals to unauthenticated
+    # callers on the public internet. How: a single middleware requires
+    # admin token (Bearer or JWT) for ALL /v1/ HTTP routes. Individual
+    # endpoint-level verify_admin_token calls remain as defense-in-depth.
+    # Purpose: close the entire unauthenticated API attack surface at once
+    # without modifying 40+ endpoint signatures.
+    # Paths that must remain accessible without credentials (pre-login).
+    _AUTH_EXEMPT_PATHS = {
+        "/v1/admin/auth/status",
+        "/v1/admin/auth/setup",
+        "/v1/admin/auth/login",
+        "/v1/health",
+    }
+
+    @app.middleware("http")
+    async def _auth_middleware(request: Request, call_next):
+        if request.url.path.startswith("/v1/") and request.url.path not in _AUTH_EXEMPT_PATHS:
+            try:
+                verify_admin_token(request)
+            except HTTPException:
+                return Response(
+                    content=json.dumps({"detail": "Unauthorized"}),
+                    status_code=401,
+                    media_type="application/json",
+                )
+        return await call_next(request)
+
     @app.on_event("startup")
     async def _remote_workers_startup() -> None:
         # [AutoC 2026-08-01] Start the Supervisor-side stale heartbeat reaper.
@@ -876,6 +906,19 @@ def create_app(
     @app.websocket("/v1/sessions/{session_id}/ws")
     async def session_ws(websocket: WebSocket, session_id: str) -> None:
         """Stream durable EventLog rows for one session over WebSocket."""
+        # [AutoC 2026-08-16] WS auth: verify admin token before accepting.
+        _ws_auth = str(websocket.headers.get("authorization") or "")
+        _ws_token = _ws_auth[7:].strip() if _ws_auth.lower().startswith("bearer ") else ""
+        if not _ws_token:
+            _ws_token = str(websocket.query_params.get("token") or "").strip()
+        _admin = get_admin_token()
+        _jwt_ok = False
+        _wa = get_web_auth()
+        if _wa and _wa.available and _wa.setup_completed and _ws_token:
+            _jwt_ok = _wa.verify_jwt(_ws_token) is not None
+        if not _jwt_ok and _ws_token != _admin:
+            await websocket.close(code=4003, reason="unauthorized")
+            return
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             await websocket.close(code=4004, reason="session not found")
@@ -1066,6 +1109,19 @@ def create_app(
     @app.websocket("/v1/ws")
     async def global_ws(websocket: WebSocket) -> None:
         """Stream durable EventLog rows for all sessions over WebSocket."""
+        # [AutoC 2026-08-16] WS auth: verify admin token before accepting.
+        _ws_auth = str(websocket.headers.get("authorization") or "")
+        _ws_token = _ws_auth[7:].strip() if _ws_auth.lower().startswith("bearer ") else ""
+        if not _ws_token:
+            _ws_token = str(websocket.query_params.get("token") or "").strip()
+        _admin = get_admin_token()
+        _jwt_ok = False
+        _wa = get_web_auth()
+        if _wa and _wa.available and _wa.setup_completed and _ws_token:
+            _jwt_ok = _wa.verify_jwt(_ws_token) is not None
+        if not _jwt_ok and _ws_token != _admin:
+            await websocket.close(code=4003, reason="unauthorized")
+            return
         st: SupervisorState = app.state.state
         await websocket.accept()
 
