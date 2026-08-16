@@ -5,8 +5,23 @@ const API = '/v1';
 
 // ── Helper ──
 
+/**
+ * Low-level fetch with auto-injected auth and API prefix.
+ * Does NOT throw on !ok — callers decide how to handle errors.
+ */
+function _fetch(path: string, init?: RequestInit): Promise<Response> {
+  const token = getStoredAdminToken();
+  if (token) {
+    const merged = { ...init };
+    merged.headers = { ...authHeaders(token), ...(merged.headers || {}) };
+    init = merged;
+  }
+  return fetch(`${API}${path}`, init);
+}
+
+/** Authenticated fetch that throws on non-ok responses. */
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  const resp = await fetch(`${API}${path}`, init);
+  const resp = await _fetch(path, init);
   if (!resp.ok) {
     let detail = '';
     try { const j = await resp.json(); detail = j.detail || ''; } catch { /* ignore */ }
@@ -51,8 +66,8 @@ export async function uploadAttachment(
 ): Promise<UploadedAttachment> {
   const form = new FormData();
   form.append('file', file);
-  const resp = await fetch(
-    `${API}/attachments/upload?conversation_key=${encodeURIComponent(conversationKey)}`,
+  const resp = await _fetch(
+    `/attachments/upload?conversation_key=${encodeURIComponent(conversationKey)}`,
     { method: 'POST', body: form },
   );
   if (!resp.ok) {
@@ -127,7 +142,8 @@ export function connectGlobalWS(
   disconnectGlobalWS();
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${wsProtocol}//${window.location.host}/v1/ws`;
+  const _wsToken = getStoredAdminToken();
+  const wsUrl = `${wsProtocol}//${window.location.host}/v1/ws${_wsToken ? `?token=${encodeURIComponent(_wsToken)}` : ''}`;
   const ws = new WebSocket(wsUrl);
   _globalWs = ws;
 
@@ -344,28 +360,17 @@ export async function getAdminState(token: string): Promise<AdminState> {
   return resp.json();
 }
 
-export async function fetchActiveTasks(token = ''): Promise<ActiveTask[]> {
-  // [AutoC 2026-06-04] Why: the System dashboard task count now opens a detail
-  // modal. How: call the new protected summary endpoint with the same bearer-token
-  // helper used by other admin APIs. Purpose: task monitoring stays independent of
-  // chatStore and does not duplicate request construction in UI components.
-  const init = token ? { headers: authHeaders(token) } : undefined;
-  const resp = await fetch(`${API}/admin/tasks/active`, init);
+export async function fetchActiveTasks(_token = ''): Promise<ActiveTask[]> {
+  // Auth is auto-injected by _fetch from stored token.
+  const resp = await _fetch('/admin/tasks/active');
   if (!resp.ok) throw new Error(`Failed to fetch active tasks: ${resp.status}`);
   return resp.json();
 }
 
-export async function cancelTask(adminToken: string, taskId: string): Promise<void> {
-  // [AutoC 2026-06-04] Why: ActiveTasksModal cancels one task at a time, while the
-  // existing cancelActiveTasks helper targets an entire session. How: call the
-  // public single-task endpoint and still include admin context headers for future
-  // backend hardening. Purpose: row-level cancel buttons remain precise and safe.
-  const headers = adminToken
-    ? { ...authHeaders(adminToken), 'X-Admin-Token': adminToken }
-    : {};
-  const resp = await fetch(`${API}/tasks/${encodeURIComponent(taskId)}/cancel`, {
+export async function cancelTask(_adminToken: string, taskId: string): Promise<void> {
+  // Auth is auto-injected by _fetch from stored token.
+  const resp = await _fetch(`/tasks/${encodeURIComponent(taskId)}/cancel`, {
     method: 'POST',
-    headers,
   });
   if (!resp.ok) throw new Error(`Cancel failed: ${resp.status}`);
 }
@@ -839,7 +844,7 @@ export async function retryInbound(sessionId: string, sourceInboundSeq: number, 
 
 export async function getSessionPendingApprovals(sessionId: string): Promise<any[]> {
   try {
-    const resp = await fetch(`${API}/sessions/${sessionId}/pending_approvals`);
+    const resp = await _fetch(`/sessions/${sessionId}/pending_approvals`);
     if (!resp.ok) return [];
     return resp.json();
   } catch {
@@ -953,7 +958,7 @@ export async function listSessions(channel = 'web', limit = 50): Promise<Session
   try {
     const params = new URLSearchParams({ limit: String(limit) });
     if (channel) params.set('channel', channel);
-    const resp = await fetch(`${API}/sessions?${params.toString()}`);
+    const resp = await _fetch(`/sessions?${params.toString()}`);
     if (!resp.ok) return [];
     return resp.json();
   } catch {
@@ -1012,11 +1017,7 @@ export async function deleteSession(sessionId: string): Promise<{ ok: boolean }>
     // Why: deleting a session removes server and conversation-store state. How: build
     // the DELETE request with Authorization only when the settings token is present.
     // Purpose: keep unauthenticated deletion blocked without emitting an empty token.
-    const _token = getStoredAdminToken();
-    const resp = await fetch(`${API}/sessions/${sessionId}`, {
-      method: 'DELETE',
-      ...(_token ? { headers: authHeaders(_token) } : {}),
-    });
+    const resp = await _fetch(`/sessions/${sessionId}`, { method: 'DELETE' });
     if (!resp.ok) return { ok: false };
     return resp.json();
   } catch {
@@ -1028,7 +1029,7 @@ export async function deleteSession(sessionId: string): Promise<{ ok: boolean }>
 
 export async function getSessionMessages(sessionId: string, limit = 200): Promise<{ role: string; content: string }[]> {
   try {
-    const resp = await fetch(`${API}/sessions/${sessionId}/messages?limit=${limit}`);
+    const resp = await _fetch(`/sessions/${sessionId}/messages?limit=${limit}`);
     if (!resp.ok) return [];
     return resp.json();
   } catch {
@@ -1147,9 +1148,9 @@ export async function getSessionHistoryPage(
   sessionId: string, limit = 0, offset = 0, taskId?: string,
 ): Promise<HistoryPageResponse> {
   try {
-    let url = `${API}/sessions/${sessionId}/history?limit=${limit}&offset=${offset}`;
-    if (taskId) url += `&task_id=${encodeURIComponent(taskId)}`;
-    const resp = await fetch(url);
+    let path = `/sessions/${sessionId}/history?limit=${limit}&offset=${offset}`;
+    if (taskId) path += `&task_id=${encodeURIComponent(taskId)}`;
+    const resp = await _fetch(path);
     if (!resp.ok) return { messages: [], total: 0, has_more: false };
     const data = await resp.json();
     // Support both old (array) and new (object with messages) response formats
@@ -1166,7 +1167,7 @@ export async function getSessionChildren(sessionId: string): Promise<ChildSessio
     // while /history only returns messages. How: call the dedicated read-only endpoint
     // and tolerate missing older backends by returning an empty array. Purpose: the web
     // app can be deployed independently while still restoring childNodes when possible.
-    const resp = await fetch(`${API}/sessions/${sessionId}/children`);
+    const resp = await _fetch(`/sessions/${sessionId}/children`);
     if (!resp.ok) return [];
     return resp.json();
   } catch {
@@ -1187,7 +1188,7 @@ export interface RunningTaskInfo {
 
 export async function getSessionRunningTasks(sessionId: string): Promise<RunningTaskInfo[]> {
   try {
-    const resp = await fetch(`${API}/sessions/${sessionId}/running_tasks`);
+    const resp = await _fetch(`/sessions/${sessionId}/running_tasks`);
     if (!resp.ok) return [];
     const data = await resp.json();
     return data.tasks || [];

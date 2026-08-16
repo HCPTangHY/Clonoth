@@ -226,13 +226,14 @@ class ClonothClient:
             # spurious disconnects when the event loop is under load.
             "ping_interval": None,
         }
-        if self._admin_token:
+        _ws_token = self._resolve_admin_token()
+        if _ws_token:
             # Why: deployments may protect every Supervisor endpoint with the same
             # bearer token used by HTTP. How: pass the header through websockets'
-            # additional_headers parameter. Purpose: keep WS auth behavior aligned
-            # with the shared httpx client.
+            # additional_headers parameter using the dynamically resolved token so
+            # WS reconnects pick up a rotated token after supervisor restart.
             # websockets 14+ renamed extra_headers → additional_headers.
-            connect_kwargs["additional_headers"] = {"Authorization": f"Bearer {self._admin_token}"}
+            connect_kwargs["additional_headers"] = {"Authorization": f"Bearer {_ws_token}"}
 
         async with websockets.connect(ws_url, **connect_kwargs) as ws:
             await ws.send(json.dumps({"last_seq": int(last_seq or 0)}))
