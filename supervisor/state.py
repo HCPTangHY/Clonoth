@@ -106,7 +106,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # the returned instances for diagnostics and existing tests. Purpose:
         # preserve handler-owned timer/cursor state while removing cyclic imports
         # and hard-coded registration.
-        _builtin_handlers = auto_discover_and_register(self.hook_registry)
+        from engine.context import EngineContext
+
+        _supervisor_ctx = EngineContext(hooks=self.hook_registry)
+        _builtin_handlers = auto_discover_and_register(self.hook_registry, context=_supervisor_ctx)
         # Why: the Clonoth runtime may temporarily run with a reduced built-in
         # handler set while features are being rolled out. How: keep optional
         # references with dict.get instead of indexing. Purpose: synchronizing
@@ -117,7 +120,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # External plugins: same mechanism as engine, scan plugins/ directory
         from engine.hooks.loader import load_external_plugins
         _plugins_dir = workspace_root / "plugins"
-        _ext_count = load_external_plugins(self.hook_registry, _plugins_dir)
+        _ext_count = load_external_plugins(self.hook_registry, _plugins_dir, context=_supervisor_ctx)
         if _ext_count:
             logger.info("Loaded %d external plugin(s) for supervisor hooks", _ext_count)
 

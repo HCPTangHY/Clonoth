@@ -13,8 +13,10 @@ import importlib.util
 import logging
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 from .registry import HookRegistry
+from ..context import accepts_context
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,21 @@ def _is_enabled_python_plugin(path: Path) -> bool:
     return path.suffix == ".py"
 
 
+def _is_plugin_package(path: Path) -> bool:
+    """Return whether one directory entry is a directory-style plugin.
+
+    Why: a plugin that needs internal modules should not be forced into one
+    file. How: a directory with __init__.py is one plugin; its PLUGIN_META and
+    entry live in __init__.py while internal modules stay private. Purpose:
+    keep the one-plugin-one-entry rule while allowing internal splitting.
+    """
+    if not path.is_dir():
+        return False
+    if path.name.startswith(("_", ".")):
+        return False
+    return (path / "__init__.py").is_file()
+
+
 def _load_module_from_path(py_file: Path) -> ModuleType:
     """Import a plugin module from an arbitrary file path."""
     # Why: external plugins live in the workspace plugins/ directory, not in an
@@ -87,38 +104,65 @@ def _load_module_from_path(py_file: Path) -> ModuleType:
     return module
 
 
-def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path) -> int:
+def _load_package_from_dir(plugin_dir: Path) -> ModuleType:
+    """Import a directory-style plugin as a package rooted at its __init__.py."""
+    # Why: directory plugins may use relative imports between internal modules.
+    # How: register the package in sys.modules with submodule_search_locations
+    # before exec so `from .catalog import x` resolves. Purpose: make internal
+    # splitting work exactly like a normal installed package.
+    import sys
+
+    module_name = f"clonoth_external_plugin_{plugin_dir.name}"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        plugin_dir / "__init__.py",
+        submodule_search_locations=[str(plugin_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot create import spec for {plugin_dir}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path, context: Any = None) -> int:
     """Load enabled external hook plugins from plugins_dir.
 
     Supports two registration modes (checked in order):
     1. PLUGIN_META auto-discovery — same mechanism as engine/builtin.
     2. Legacy register() function — backward compatible with older plugins.
 
-    Args:
-        hook_registry: Registry that each plugin's register() function receives.
-        plugins_dir: Directory containing drop-in plugin .py files.
+    Each entry may be a single .py file or a directory with __init__.py
+    (one plugin, one entry; internal splitting stays private to the plugin).
+
+    When ``context`` (an EngineContext) is provided, handler classes whose
+    __init__ takes an argument receive it, and legacy register() functions
+    whose first parameter is named ctx/context/engine_ctx receive it instead
+    of the bare hook registry.
 
     Returns:
-        Number of plugin files loaded successfully.
+        Number of plugin entries loaded successfully.
     """
     count = 0
     plugins_dir = Path(plugins_dir)
     if not plugins_dir.is_dir():
         return count
 
-    for py_file in sorted(plugins_dir.iterdir()):
-        if not _is_enabled_python_plugin(py_file):
+    for entry in sorted(plugins_dir.iterdir()):
+        is_package = _is_plugin_package(entry)
+        if not is_package and not _is_enabled_python_plugin(entry):
             continue
         try:
-            module = _load_module_from_path(py_file)
-            meta = _normalize_plugin_meta(py_file, getattr(module, "PLUGIN_META", {}))
+            module = _load_package_from_dir(entry) if is_package else _load_module_from_path(entry)
+            meta = _normalize_plugin_meta(entry, getattr(module, "PLUGIN_META", {}))
 
             # Mode 1: PLUGIN_META with handler_class + hook_points
             raw_meta = getattr(module, "PLUGIN_META", None)
             if isinstance(raw_meta, dict) and raw_meta.get("handler_class") and raw_meta.get("hook_points"):
                 class_name = str(raw_meta["handler_class"]).strip()
                 cls = getattr(module, class_name)
-                instance = cls()
+                instance = cls(context) if context is not None and accepts_context(cls) else cls()
                 priority = raw_meta.get("priority", getattr(instance, "priority", None))
                 # Why: registrations made during load must be reversible. How:
                 # wrap them in collecting(name) so the registry archives each
@@ -137,7 +181,7 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path) -> int
                 count += 1
                 logger.info(
                     "Loaded external plugin (PLUGIN_META): %s %s (%s)",
-                    meta["name"], meta["version"], py_file.name,
+                    meta["name"], meta["version"], entry.name,
                 )
                 continue
 
@@ -146,17 +190,39 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path) -> int
             if not callable(register):
                 logger.warning(
                     "Plugin %s %s (%s) has no PLUGIN_META or register(), skipped",
-                    meta["name"], meta["version"], py_file.name,
+                    meta["name"], meta["version"], entry.name,
                 )
                 continue
             with hook_registry.collecting(meta["name"]):
-                register(hook_registry)
+                register(_legacy_register_argument(register, hook_registry, context))
             hook_registry.register_plugin_meta(meta)
             count += 1
             logger.info(
                 "Loaded external plugin (legacy): %s %s (%s)",
-                meta["name"], meta["version"], py_file.name,
+                meta["name"], meta["version"], entry.name,
             )
         except Exception as exc:
-            logger.error("Failed to load plugin %s: %s", py_file.name, exc, exc_info=True)
+            logger.error("Failed to load plugin %s: %s", entry.name, exc, exc_info=True)
     return count
+
+
+def _legacy_register_argument(register: Any, hook_registry: HookRegistry, context: Any) -> Any:
+    """Choose what a legacy register() function receives.
+
+    Why: old plugins declare register(hook_registry); new ones may declare
+    register(ctx) to reach every registration surface. How: when a context is
+    available and the first parameter is named ctx/context/engine_ctx, pass the
+    EngineContext; otherwise pass the hook registry as before. Purpose: adopt
+    the new entry point without touching existing plugin files.
+    """
+    if context is None:
+        return hook_registry
+    import inspect
+
+    try:
+        params = list(inspect.signature(register).parameters.values())
+    except (TypeError, ValueError):
+        return hook_registry
+    if params and params[0].name in {"ctx", "context", "engine_ctx"}:
+        return context
+    return hook_registry

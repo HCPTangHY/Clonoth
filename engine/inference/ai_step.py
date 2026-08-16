@@ -1726,12 +1726,22 @@ async def run_ai_node(
     # ToolRegistry into discovery so plugin-owned tools are registered before the
     # model-visible tool list is built. Purpose: keep hook and tool registration
     # in one plugin discovery pass.
-    auto_discover_and_register(hook_registry, tool_registry=registry)
+    from ..context import EngineContext
+    from providers import registry as _provider_registry
+    from .prompt_sections import prompt_section_registry as _prompt_sections
+
+    _engine_ctx = EngineContext(
+        hooks=hook_registry,
+        tools=registry,
+        providers=_provider_registry,
+        prompt_sections=_prompt_sections,
+    )
+    auto_discover_and_register(hook_registry, tool_registry=registry, context=_engine_ctx)
     # Phase 3 External Hook Plugins：每次进入 AI 节点时扫描工作区 plugins/。
     # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。
     # 做法：调用幂等的外部插件加载器；HookRegistry 会按 handler.name 替换旧实例。
     # 目的：启动时自动发现插件，同时避免重复注册和单个插件失败影响引擎启动。
-    load_external_plugins(hook_registry, rctx.workspace_root / "plugins")
+    load_external_plugins(hook_registry, rctx.workspace_root / "plugins", context=_engine_ctx)
 
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)

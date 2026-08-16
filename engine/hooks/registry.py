@@ -10,6 +10,32 @@ from .types import HookResult
 
 logger = logging.getLogger(__name__)
 
+# Why: hook points were string literals scattered across call sites, so neither
+# plugin authors nor reviewers could enumerate them or learn their contracts.
+# How: one table documents each point's trigger position, the data available in
+# ctx.extra, and what a handler may do; register() warns on undeclared points.
+# Purpose: make the hook point set auditable; adding a point means adding one
+# entry here plus one fire/afire call at the trigger site.
+HOOK_POINTS: dict[str, str] = {
+    # ---- engine inference (async afire) ----
+    "before_prompt_build": (
+        "初始 messages 组装完成后、发送 LLM 前触发。"
+        "extra: runtime_cfg/instruction_text/history/attachments/system_prompt。"
+        "handler 可重建 ctx.messages；返回 action 非空则终止任务。"
+    ),
+    "before_step": "每轮推理开始前触发。extra: step 序号等。返回 action 可终止。",
+    "after_llm_call": "LLM 返回后触发。extra: response/usage。可读取用量做统计。",
+    "before_tool_call": "工具执行前触发。extra: tool_name/arguments。返回 block 可拒绝执行。",
+    "after_tool_call": "工具执行后触发。extra: tool_name/result。可改写结果。",
+    "before_response": "纯文本回复发出前触发。extra: text。可修改或拦截。",
+    "on_task_end": "任务正常结束时触发。extra: result/status。用于收尾与统计。",
+    "on_task_error": "任务异常时触发。extra: error/traceback。用于错误快照。",
+    # ---- supervisor (sync fire) ----
+    "on_inbound_message": "外部消息进入路由前触发。extra: message/conversation_key。可改写或阻断。",
+    "on_schedule_tick": "定时任务触发时触发。extra: schedule_id/task。",
+    "on_entry_task_complete": "入口任务完成时触发。用于结果回收与子任务编排。",
+}
+
 
 def _copy_plugin_meta(meta: dict) -> dict:
     """Copy plugin metadata without assuming every extra value is deep-copyable."""
@@ -117,6 +143,11 @@ class HookRegistry:
         is not accidentally removed by an earlier disposer.
         """
         point = _normalize_hook_point(hook_point)
+        if point not in HOOK_POINTS:
+            # Why: undeclared points are usually typos or zombie extension spots.
+            # How: warn but still register, so experimental points stay possible.
+            # Purpose: surface drift early without breaking dynamic use cases.
+            logger.warning("Hook point %r is not declared in HOOK_POINTS", point)
         callback = _handler_callback(handler)
         name = _handler_name(handler)
         resolved_priority = _handler_priority(handler, priority)

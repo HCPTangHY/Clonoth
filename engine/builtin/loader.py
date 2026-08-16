@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..context import accepts_context
+
 if TYPE_CHECKING:
     from toolbox.registry import ToolRegistry
 
@@ -21,6 +23,7 @@ def auto_discover_and_register(
     package: str = "engine.builtin",
     directory: Path | None = None,
     tool_registry: "ToolRegistry | None" = None,
+    context: Any = None,
 ) -> dict[str, Any]:
     """Scan built-in handler modules and register PLUGIN_META declarations.
 
@@ -85,7 +88,7 @@ def auto_discover_and_register(
                 )
                 continue
         try:
-            instance = _instantiate_handler(module, meta)
+            instance = _instantiate_handler(module, meta, context)
             handler_name = str(getattr(instance, "name", "") or py_file.stem)
             handlers[handler_name] = instance
             loaded.add(handler_name)
@@ -162,15 +165,21 @@ def _should_skip(py_file: Path) -> bool:
     return py_file.name.startswith("_")
 
 
-def _instantiate_handler(module: Any, meta: dict[str, Any]) -> Any:
-    """Instantiate the handler class named by PLUGIN_META."""
-    # Why: each handler module owns its class name through metadata. How: look up
-    # handler_class and call it without arguments. Purpose: keep registration
-    # declarative while preserving handler-owned state such as timers and cursors.
+def _instantiate_handler(module: Any, meta: dict[str, Any], context: Any = None) -> Any:
+    """Instantiate the handler class named by PLUGIN_META.
+
+    Why: plugins need one stable object to reach every registration surface.
+    How: when the handler __init__ declares parameters beyond self and a context
+    is provided, pass the EngineContext; parameterless handlers keep the old
+    zero-argument construction. Purpose: introduce ctx injection without
+    breaking any existing handler class.
+    """
     class_name = str(meta.get("handler_class") or "").strip()
     if not class_name:
         raise ValueError("PLUGIN_META.handler_class is required")
     cls = getattr(module, class_name)
+    if context is not None and accepts_context(cls):
+        return cls(context)
     return cls()
 
 
