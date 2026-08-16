@@ -4,10 +4,30 @@ from pathlib import Path
 from typing import Any
 
 from .dynamic_context import _load_dynamic_context_vars
+from .prompt_sections import PromptSectionContext, prompt_section_registry
 from ..attachments import build_multimodal_content
 from ..node import Node
 from ..prompt import assemble_prompt
 from clonoth_runtime import get_int
+
+
+def _registry_static_messages(
+    section_context: PromptSectionContext | None,
+) -> list[dict[str, Any]]:
+    """Render registered static sections into cache-friendly pre-history messages."""
+    if section_context is None:
+        return []
+    return [
+        {"role": "user", "content": text, "_section": True}
+        for text in prompt_section_registry.render_scope("static", section_context)
+    ]
+
+
+def _registry_dynamic_parts(section_context: PromptSectionContext | None) -> list[str]:
+    """Render registered dynamic sections into per-turn dynamic content parts."""
+    if section_context is None:
+        return []
+    return prompt_section_registry.render_scope("dynamic", section_context)
 
 
 def _conversational_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -48,6 +68,7 @@ def assemble_messages_with_injections(
     skill_dynamic: list[dict[str, Any]] | None = None,
     memory_static: list[dict[str, Any]] | None = None,
     memory_dynamic: list[dict[str, Any]] | None = None,
+    section_context: PromptSectionContext | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Lay out prompt messages using precomputed skill and memory injections.
 
@@ -62,6 +83,12 @@ def assemble_messages_with_injections(
     skill_dynamic = list(skill_dynamic or [])
     memory_static = list(memory_static or [])
     memory_dynamic = list(memory_dynamic or [])
+    # Why: prompt sections are a plugin-facing contribution surface. How: render
+    # the registry after plugin-provided static lists so built-in ordering is
+    # unchanged when nothing is registered. Purpose: sections extend the prompt
+    # without replacing the existing injection layout.
+    section_static = _registry_static_messages(section_context)
+    section_dynamic = _registry_dynamic_parts(section_context)
 
     # ---- Prompt cache friendly layout ----
     # Detect block list mode: assemble_prompt returns blocks with {role: history}
@@ -104,6 +131,7 @@ def assemble_messages_with_injections(
         # Skill/memory static (cache-friendly, before history)
         messages.extend(skill_static)
         messages.extend(memory_static)
+        messages.extend(section_static)
 
         # --- Conversation history ---
         messages.extend(history)
@@ -128,6 +156,7 @@ def assemble_messages_with_injections(
         for _dm in memory_dynamic:
             if _dm.get("content"):
                 _dynamic_parts.append(_dm["content"])
+        _dynamic_parts.extend(section_dynamic)
         if _dynamic_parts:
             messages.append({
                 "role": "user",
@@ -170,6 +199,7 @@ def assemble_messages_with_injections(
             messages.append(system_prompt[0])  # static part
         messages.extend(skill_static)
         messages.extend(memory_static)
+        messages.extend(section_static)
 
         # --- history ---
         messages.extend(history)
@@ -196,6 +226,7 @@ def assemble_messages_with_injections(
         for _dm in memory_dynamic:
             if _dm.get("content"):
                 _dynamic_parts_s.append(_dm["content"])
+        _dynamic_parts_s.extend(section_dynamic)
         if _dynamic_parts_s:
             messages.append({
                 "role": "user",
@@ -251,6 +282,16 @@ def assemble_initial_messages(
     # ordering without importing injection logic in the inference layer.
     skill_static, skill_dynamic = [], []
     memory_static, memory_dynamic = [], []
+    section_context = PromptSectionContext(
+        workspace_root=workspace_root,
+        node=node,
+        session_id=session_id,
+        history=history,
+        instruction=instruction,
+        task_context=dict(task_context or {}),
+    )
+    section_static = _registry_static_messages(section_context)
+    section_dynamic = _registry_dynamic_parts(section_context)
 
     # ---- Prompt cache friendly layout ----
     # Detect block list mode: assemble_prompt returns blocks with {role: history}
@@ -293,6 +334,7 @@ def assemble_initial_messages(
         # Skill/memory static (cache-friendly, before history)
         messages.extend(skill_static)
         messages.extend(memory_static)
+        messages.extend(section_static)
 
         # --- Conversation history ---
         messages.extend(history)
@@ -317,6 +359,7 @@ def assemble_initial_messages(
         for _dm in memory_dynamic:
             if _dm.get("content"):
                 _dynamic_parts.append(_dm["content"])
+        _dynamic_parts.extend(section_dynamic)
         if _dynamic_parts:
             messages.append({
                 "role": "user",
@@ -359,6 +402,7 @@ def assemble_initial_messages(
             messages.append(system_prompt[0])  # static part
         messages.extend(skill_static)
         messages.extend(memory_static)
+        messages.extend(section_static)
 
         # --- history ---
         messages.extend(history)
@@ -385,6 +429,7 @@ def assemble_initial_messages(
         for _dm in memory_dynamic:
             if _dm.get("content"):
                 _dynamic_parts_s.append(_dm["content"])
+        _dynamic_parts_s.extend(section_dynamic)
         if _dynamic_parts_s:
             messages.append({
                 "role": "user",

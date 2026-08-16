@@ -1751,6 +1751,7 @@ def _rebuild_prompt_messages(ctx: Any) -> None:
     Purpose: preserve the existing prompt layout while removing the old modules.
     """
     from engine.inference.message_assembly import assemble_messages_with_injections
+    from engine.inference.prompt_sections import PromptSectionContext
 
     rebuilt, is_block_mode = assemble_messages_with_injections(
         workspace_root=ctx.rctx.workspace_root,
@@ -1762,6 +1763,14 @@ def _rebuild_prompt_messages(ctx: Any) -> None:
         skill_dynamic=list(ctx.extra.get("skill_dynamic_messages") or []),
         memory_static=list(ctx.extra.get("memory_static_messages") or []),
         memory_dynamic=list(ctx.extra.get("memory_dynamic_messages") or []),
+        section_context=PromptSectionContext(
+            workspace_root=ctx.rctx.workspace_root,
+            node=ctx.node,
+            session_id=str(getattr(ctx.rctx, "session_id", "") or ""),
+            history=list(ctx.extra.get("history") or []),
+            instruction=str(ctx.extra.get("instruction_text") or ""),
+            task_context=dict(getattr(ctx.rctx, "task_context", None) or {}),
+        ),
     )
     ctx.messages[:] = rebuilt
     ctx.extra["is_block_mode"] = is_block_mode
