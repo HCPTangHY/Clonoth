@@ -981,7 +981,6 @@ async def _startup() -> None:
         base_url=CLONOTH_BASE_URL,
         entry_node_id=ENTRY_NODE_ID,
         conversation_key_prefix="qq_group",
-        workspace_root=Path(CLONOTH_WORKSPACE),
         # 2026-05-03 修改原因：TangQiu QQ 侧不展示审批控件。本轮要求
         # 审批默认放行，所以打开 SDK 的内部操作自动审批开关，目的是避免
         # 内部工具调用停在等待审批状态。
