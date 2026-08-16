@@ -861,7 +861,7 @@ async def _run_node_task(
     # workspace/workspace_name, defaulting to workspace_root when path is absent
     # or invalid. Purpose: tools and memory isolation use the same session-scoped
     # workspace each turn without re-calling set_workspace.
-    _sw_sid = child_session_id or session_id
+    _sw_sid = str(input_data.get("child_session_id") or "").strip() or session_id
     _sw = await _fetch_session_workspace(http, sup_url, _sw_sid)
     if _sw:
         _ws_name = str(_sw.get("name") or "").strip()
