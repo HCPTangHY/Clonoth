@@ -965,7 +965,15 @@ async def _startup() -> None:
         return
 
     _bqbs = load_bqbs(BQBS_PATH)
-    _client = ClonothClient(CLONOTH_BASE_URL)
+    _token_path = Path(CLONOTH_WORKSPACE) / "data" / ".admin_token"
+    _admin_token = ""
+    try:
+        if _token_path.exists():
+            _admin_token = _token_path.read_text().strip()
+            logger.info("admin_token loaded from %s", _token_path)
+    except Exception as exc:
+        logger.warning("读取 admin_token 失败: %s", exc)
+    _client = ClonothClient(CLONOTH_BASE_URL, admin_token=_admin_token, admin_token_path=str(_token_path))
     _session_state = SessionState()
     _callbacks = TangQiuCallbacks()
 
