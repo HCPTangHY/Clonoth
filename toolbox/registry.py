@@ -334,7 +334,19 @@ class ToolRegistry:
         def _dispose() -> None:
             self._remove_builtin_tool(clean_name, func)
 
+        # Why: tool disposers must join the same per-plugin ledger as hooks so
+        # unload_plugin() undoes every surface a plugin touched. How: when a
+        # ledger is attached (via Contributions.mount) and a loader collecting
+        # block is active, record here. Purpose: delete the loader's manual
+        # bridging of tool disposers.
+        ledger = getattr(self, "_disposal_ledger", None)
+        if ledger is not None:
+            ledger.record(_dispose)
         return _dispose
+
+    def set_disposal_ledger(self, ledger: Any) -> None:
+        """Attach the shared disposal ledger (see engine/registry_core.py)."""
+        self._disposal_ledger = ledger
 
     def _remove_builtin_tool(self, name: str, func: ToolFunc) -> bool:
         """Remove one builtin tool only when it is still the registered callable."""

@@ -92,7 +92,17 @@ class PromptSectionRegistry:
             if entry is not None and entry.render is render:
                 self._sections.pop(clean_name, None)
 
+        # Why: section disposers join the shared per-plugin ledger like hooks
+        # and tools. How: record when a ledger is attached and a loader
+        # collecting block is active. Purpose: one unload undoes all surfaces.
+        ledger = getattr(self, "_disposal_ledger", None)
+        if ledger is not None:
+            ledger.record(_dispose)
         return _dispose
+
+    def set_disposal_ledger(self, ledger: Any) -> None:
+        """Attach the shared disposal ledger (see engine/registry_core.py)."""
+        self._disposal_ledger = ledger
 
     def list_sections(self, scope: str | None = None) -> list[dict[str, Any]]:
         """List registered sections in render order (order asc, name asc)."""

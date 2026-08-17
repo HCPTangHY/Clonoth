@@ -1731,11 +1731,16 @@ async def run_ai_node(
     from .prompt_sections import prompt_section_registry as _prompt_sections
 
     _engine_ctx = EngineContext(
-        hooks=hook_registry,
-        tools=registry,
         providers=_provider_registry,
-        prompt_sections=_prompt_sections,
+        hooks=hook_registry,
     )
+    # Why: declarative faces (prompt sections, tools) live behind
+    # ctx.contributions, mounted by name. How: mount before plugin discovery so
+    # the shared disposal ledger is wired into each face before plugins register
+    # on them. Purpose: plugin registrations on any surface are attributed and
+    # unloadable through one ledger.
+    _engine_ctx.contributions.mount("prompt_sections", _prompt_sections)
+    _engine_ctx.contributions.mount("tools", registry)
     auto_discover_and_register(hook_registry, tool_registry=registry, context=_engine_ctx)
     # Phase 3 External Hook Plugins：每次进入 AI 节点时扫描工作区 plugins/。
     # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。

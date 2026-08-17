@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import inspect
 import logging
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 from .types import HookResult
+from ..registry_core import DisposalLedger
 
 logger = logging.getLogger(__name__)
 
@@ -78,32 +78,20 @@ class HookRegistry:
         # Purpose: expose loaded plugin information without changing handler execution.
         self._loaded_plugins: list[dict] = []
         # Why: every registration must leave a matching undo operation so a plugin
-        # can be unloaded without human recall of what it touched. How: register()
-        # returns a disposer and, while a loader is inside collecting(name), the
-        # disposer is archived under that plugin. Purpose: unloading a plugin is
-        # "call its disposers in reverse order", not "remember what it changed".
-        self._plugin_disposers: dict[str, list[Callable[[], None]]] = {}
-        self._collecting_stack: list[str] = []
+        # can be unloaded without human recall of what it touched. How: disposers
+        # are archived in the shared DisposalLedger (engine/registry_core.py);
+        # while a loader is inside collecting(name), each register() records its
+        # disposer under that plugin. Purpose: unloading a plugin is "call its
+        # disposers in reverse order", not "remember what it changed".
+        self._ledger = DisposalLedger()
 
-    @contextmanager
-    def collecting(self, plugin_name: str) -> Iterator[None]:
+    def collecting(self, plugin_name: str) -> Any:
         """Attribute register() disposers created inside the block to one plugin."""
-        name = (plugin_name or "").strip()
-        if not name:
-            yield
-            return
-        self._collecting_stack.append(name)
-        try:
-            yield
-        finally:
-            self._collecting_stack.pop()
+        return self._ledger.collecting(plugin_name)
 
     def add_plugin_disposer(self, plugin_name: str, disposer: Callable[[], None]) -> None:
         """Archive an externally created disposer under a plugin name."""
-        name = (plugin_name or "").strip()
-        if not name or not callable(disposer):
-            return
-        self._plugin_disposers.setdefault(name, []).append(disposer)
+        self._ledger.add(plugin_name, disposer)
 
     def unload_plugin(self, plugin_name: str) -> dict[str, Any]:
         """Undo every registration owned by one plugin, in reverse order.
@@ -114,21 +102,15 @@ class HookRegistry:
         operation with per-disposer error isolation.
         """
         name = (plugin_name or "").strip()
-        disposers = self._plugin_disposers.pop(name, [])
-        errors: list[str] = []
-        for dispose in reversed(disposers):
-            try:
-                dispose()
-            except Exception as exc:
-                logger.warning("Disposer for plugin %s failed: %s", name, exc)
-                errors.append(str(exc))
+        result = self._ledger.unload(name)
         removed_meta = False
         for index, plugin in enumerate(self._loaded_plugins):
             if plugin.get("name") == name:
                 self._loaded_plugins.pop(index)
                 removed_meta = True
                 break
-        return {"plugin": name, "disposed": len(disposers), "removed_meta": removed_meta, "errors": errors}
+        result["removed_meta"] = removed_meta
+        return result
 
     def register(self, hook_point: str, handler: Any, priority: int | None = None) -> Callable[[], None]:
         """Register one handler to a hook point and return its disposer.
@@ -165,8 +147,7 @@ class HookRegistry:
             if not current:
                 self._hooks.pop(point, None)
 
-        if self._collecting_stack:
-            self._plugin_disposers.setdefault(self._collecting_stack[-1], []).append(_dispose)
+        self._ledger.record(_dispose)
         return _dispose
 
     def unregister(self, hook_point: str, handler_name: str) -> bool:

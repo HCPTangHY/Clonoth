@@ -4,7 +4,7 @@ import importlib
 import inspect
 import pkgutil
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .base import BaseProvider, ProviderResponse, ToolCall
 
@@ -38,7 +38,17 @@ class ProviderRegistry:
             if self._registry.get(provider_name) is cls:
                 self._registry.pop(provider_name, None)
 
+        # Why: provider disposers join the shared per-plugin ledger like hooks
+        # and tools. How: record when a ledger is attached and a loader
+        # collecting block is active. Purpose: one unload undoes all surfaces.
+        ledger = getattr(self, "_disposal_ledger", None)
+        if ledger is not None:
+            ledger.record(_dispose)
         return _dispose
+
+    def set_disposal_ledger(self, ledger: Any) -> None:
+        """Attach the shared disposal ledger (see engine/registry_core.py)."""
+        self._disposal_ledger = ledger
 
     def get(self, name: str) -> type[BaseProvider] | None:
         """Return the registered provider class for ``name`` if present."""

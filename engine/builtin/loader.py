@@ -94,24 +94,23 @@ def auto_discover_and_register(
             loaded.add(handler_name)
             priority = meta.get("priority", getattr(instance, "priority", None))
             # Why: every registration a plugin makes must be reversible. How:
-            # run hook registration inside collecting(handler_name) so the
-            # registry archives each returned disposer under this plugin, then
-            # attach tool disposers and the optional teardown() hook to the same
-            # ledger. Purpose: unload_plugin(handler_name) undoes the whole load.
+            # run hook and tool registration inside collecting(handler_name) so
+            # the shared disposal ledger (engine/registry_core.py) archives each
+            # returned disposer under this plugin; the optional teardown() hook
+            # joins the same ledger. Purpose: unload_plugin(handler_name) undoes
+            # the whole load across every registration surface.
             collecting = getattr(registry, "collecting", None)
             if callable(collecting):
                 with collecting(handler_name):
                     for hook_point, method_name in _iter_hook_points(meta):
                         method = getattr(instance, method_name)
                         registry.register(str(hook_point), method, priority=priority)
+                    _register_declared_tools(module_name, meta, tool_registry)
             else:
                 for hook_point, method_name in _iter_hook_points(meta):
                     method = getattr(instance, method_name)
                     registry.register(str(hook_point), method, priority=priority)
-            for dispose in _register_declared_tools(module_name, meta, tool_registry):
-                add_disposer = getattr(registry, "add_plugin_disposer", None)
-                if callable(add_disposer):
-                    add_disposer(handler_name, dispose)
+                _register_declared_tools(module_name, meta, tool_registry)
             teardown = getattr(instance, "teardown", None)
             if callable(teardown):
                 add_disposer = getattr(registry, "add_plugin_disposer", None)
