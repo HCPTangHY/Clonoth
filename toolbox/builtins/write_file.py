@@ -28,7 +28,12 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         error_text = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
         return {"ok": False, "error": error_text, "data": {"result": f"ERROR: {error_text}"}, "cancelled": bool(isinstance(err, dict) and err.get("cancelled"))}
 
+    if not path.strip():
+        return {"ok": False, "error": "empty path", "data": {"result": "ERROR: empty path"}}
+
     p = resolve_under_allowed_roots(ctx.workspace_root, path, workspace=ctx.workspace)
+    if p.is_dir():
+        return {"ok": False, "error": f"path is a directory: {path}", "data": {"result": f"ERROR: path is a directory: {path}"}}
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     byte_count = len(content.encode("utf-8"))
