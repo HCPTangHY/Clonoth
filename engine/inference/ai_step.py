@@ -1728,7 +1728,7 @@ async def run_ai_node(
     # in one plugin discovery pass.
     from ..context import EngineContext
     from providers import registry as _provider_registry
-    from .prompt_sections import prompt_section_registry as _prompt_sections
+    from engine.faces.prompt_sections import prompt_section_registry as _prompt_sections
 
     _engine_ctx = EngineContext(
         providers=_provider_registry,

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .dynamic_context import _load_dynamic_context_vars
-from .prompt_sections import PromptSectionContext, prompt_section_registry
+from engine.faces.prompt_sections import PromptSectionContext, prompt_section_registry
 from ..attachments import build_multimodal_content
 from ..node import Node
 from ..prompt import assemble_prompt
