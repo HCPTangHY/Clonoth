@@ -18,7 +18,7 @@ from .types import SafetyLevel
 _GIT_REMOTE_PUSH_PATTERN = r"(?:^|[;&|()\n])\s*(?:(?:sudo|command|time)\s+)*(?:env\s+\S+\s+)*git(?:\s+(?:-[A-Za-z](?:\s+\S+)?|--[A-Za-z0-9][A-Za-z0-9-]*(?:=\S+)?))*\s+push(?:\s|$)"
 
 
-@dataclass(frozen=True)
+@dataclass
 class PolicyDecision:
     safety_level: SafetyLevel
     reason: str
