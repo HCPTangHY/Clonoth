@@ -15,10 +15,117 @@ the engine process.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
+import httpx
+
+from engine.signals import Signal, get_bus
 from .registry_core import DisposalLedger
+
+
+@dataclass
+class RunContext:
+    """单个 task 执行片段的运行上下文。"""
+
+    workspace_root: Path
+    supervisor_url: str
+    session_id: str
+    worker_id: str
+    http: httpx.AsyncClient
+    llm_http: httpx.AsyncClient
+    parent_session_id: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    default_model: str = "gpt-4o-mini"
+    user_text: str = ""
+    task_id: str = ""
+    session_generation: int = 0
+    source_inbound_seq: int | None = None
+    task_context: dict = field(default_factory=dict)
+    child_session_id: str = ""
+    tool_call_log: list = field(default_factory=list)
+    total_usage: dict = field(default_factory=dict)
+    first_shadow_message_id: str = ""
+    last_shadow_message_id: str = ""
+    completed_steps: int = 0
+    current_llm_request_id: str = ""
+    llm_request_index: int = 0
+    workspace: Path | None = None
+    workspace_name: str = ""
+
+    def begin_llm_request(self) -> str:
+        self.llm_request_index += 1
+        base = self.task_id or self.session_id or "llm"
+        self.current_llm_request_id = f"{base}:llm:{self.llm_request_index}:{uuid.uuid4().hex[:8]}"
+        return self.current_llm_request_id
+
+    @property
+    def is_system_task(self) -> bool:
+        return bool((self.task_context or {}).get("is_system_task"))
+
+    async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self.source_inbound_seq is not None:
+            payload.setdefault("source_inbound_seq", self.source_inbound_seq)
+        if self.is_system_task:
+            payload.setdefault("is_system_task", True)
+        if self.current_llm_request_id:
+            payload.setdefault("llm_request_id", self.current_llm_request_id)
+        route_session_id = self.parent_session_id or self.session_id
+        if self.parent_session_id and self.parent_session_id != self.session_id:
+            payload.setdefault("parent_session_id", self.parent_session_id)
+            payload.setdefault("branch_session_id", self.session_id)
+        get_bus().emit(Signal(name=event_type, payload=dict(payload)))
+        try:
+            await self.http.post(
+                f"{self.supervisor_url}/v1/sessions/{route_session_id}/events",
+                json={"type": event_type, "payload": payload},
+            )
+        except Exception:
+            pass
+
+    async def check_cancelled(self) -> bool:
+        try:
+            if self.task_id:
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled",
+                    timeout=2.0,
+                )
+                if r.status_code == 200:
+                    return bool(r.json().get("cancelled", False))
+            else:
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled",
+                    timeout=2.0,
+                )
+                if r.status_code == 200:
+                    return bool(r.json().get("cancelled", False))
+        except Exception:
+            pass
+        return False
+
+    async def check_preempted(self) -> dict:
+        try:
+            if self.task_id:
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempted"
+                )
+                if r.status_code == 200:
+                    return r.json()
+        except Exception:
+            pass
+        return {"preempted": False, "message": "", "attachments": []}
+
+    async def consume_preempt(self) -> None:
+        try:
+            if self.task_id:
+                await self.http.post(
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed"
+                )
+        except Exception:
+            pass
 
 
 class Contributions:
