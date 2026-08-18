@@ -23,7 +23,6 @@ from .pseudo_tools import (
     _to_openai_tools,
     _filter_tool_specs,
 )
-from .dynamic_context import _load_dynamic_context_vars, _format_context_vars_block
 from .resume_builder import _build_resume_messages
 from .loop_state import _LoopState, _persist_ctx, _short
 from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
@@ -210,27 +209,6 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
 #  推理循环子函数
 # ---------------------------------------------------------------------------
 
-async def _check_preempt_and_cancel(ls: _LoopState, step: int) -> TaskAction | None:
-    """循环顶部：取消检查 + preempt 检查。返回 TaskAction 则退出循环。"""
-    if await ls.rctx.check_cancelled():
-        await ls.rctx.emit_event("cancel_acknowledged", {
-            "node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step,
-        })
-        return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
-
-    if not ls.preempt_after_step and ls.preempt_inject_info is None:
-        _pi = await ls.rctx.check_preempted()
-        if _pi.get("preempted"):
-            if _pi.get("message"):
-                ls.preempt_inject_info = _pi
-            else:
-                ls.preempt_after_step = True
-                await ls.rctx.emit_event("preempt_acknowledged", {
-                    "node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step,
-                })
-    return None
-
-
 def _compact_target_session_id(ls: _LoopState) -> str:
     """Return the durable session that automatic compact should rewrite."""
     # [2026-05-27] Why: child sessions (accumulate 模式的子节点) 的历史独立存储在自己的
@@ -383,76 +361,6 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
             "node_id": ls.node.id, "step": step, "error": str(compact_err),
         })
     return None
-
-
-def _estimate_context_tokens(ls: _LoopState) -> int:
-    """估算当前上下文的真实 token 数。
-
-    方案 B：优先使用 last_prompt_tokens + last_completion_tokens（LLM 真实报告值）。
-    如果没有（如 compact 恢复后），遍历 messages 累加每条消息的 token 数：
-    - assistant 消息优先读 _meta.usage.completion_tokens
-    - 其他消息用 char-based 估算（len / 3）
-    """
-    # 优先用 LLM 真实报告的 usage（最准确）
-    if ls.last_usage:
-        pt = ls.last_usage.get("prompt_tokens", 0) or 0
-        ct = ls.last_usage.get("completion_tokens", 0) or 0
-        if pt > 0:
-            return pt + ct
-
-    # Fallback: 逐条消息估算
-    total = 0
-    for m in ls.messages:
-        if m.get("_dynamic") or m.get("_ephemeral"):
-            continue
-        meta = m.get("_meta", {})
-        if isinstance(meta, dict):
-            usage = meta.get("usage", {})
-            if isinstance(usage, dict):
-                ct = usage.get("completion_tokens", 0)
-                if ct and isinstance(ct, int) and ct > 0:
-                    total += ct
-                    continue
-        # char-based fallback
-        content = m.get("content", "")
-        if isinstance(content, str):
-            total += len(content) // 3
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    total += len(part["text"]) // 3
-    return total
-
-
-def _update_dynamic_vars(ls: _LoopState) -> None:
-    """每步更新 dynamic context 变量（beijing_time, context_utilization 等）。"""
-    _estimated_tokens = _estimate_context_tokens(ls)
-    _dyn_vars = _load_dynamic_context_vars(
-        ls.rctx.workspace_root,
-        task_context=ls.rctx.task_context,
-        session_id=ls.rctx.session_id,
-        node_id=ls.node.id,
-        prompt_tokens=_estimated_tokens,
-        compact_threshold=ls.compact_threshold,
-    )
-    if not _dyn_vars:
-        return
-    _vars_text = _format_context_vars_block(_dyn_vars)
-    if not _vars_text:
-        return
-    for _msg in ls.messages:
-        if _msg.get("_dynamic"):
-            _old = _msg.get("content", "")
-            _s = _old.find("\n\n[CONTEXT_VARS]\n")
-            if _s >= 0:
-                _e = _old.find("\n[/CONTEXT_VARS]", _s)
-                if _e >= 0:
-                    _msg["content"] = _old[:_s] + _vars_text + _old[_e + len("\n[/CONTEXT_VARS]"):]
-                else:
-                    _msg["content"] = _old[:_s] + _vars_text
-            else:
-                _msg["content"] = _old + _vars_text
-            break
 
 
 # ---------------------------------------------------------------------------
@@ -2064,15 +1972,6 @@ async def run_ai_node(
             return _step_result.action
         if _step_result.skip_step:
             continue
-
-        # LEGACY: replaced by hook PreemptChecker and CompactChecker.
-        # Why: inference core should only keep the before_step trigger point for
-        # preempt and compact behavior. How: the old direct preempt injection path
-        # was removed, while compact fallback helpers remain unused for comparison.
-        # Purpose: avoid knowledge injection imports in this loop while keeping the
-        # migrated execution order visible.
-
-        # _update_dynamic_vars(ls)  # Disabled to prevent intra-task prompt cache invalidation
 
         result = await _call_llm_with_retry(ls, step)
         if isinstance(result, TaskAction):
