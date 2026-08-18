@@ -22,6 +22,7 @@ HOOK_POINTS: dict[str, str] = {
         "初始 messages 组装完成后、发送 LLM 前触发。"
         "extra: runtime_cfg/instruction_text/history/attachments/system_prompt。"
         "handler 可重建 ctx.messages；返回 action 非空则终止任务。"
+        "注意：向 prompt 贡献内容应优先用 prompt_sections 声明型注册面。"
     ),
     "before_step": "每轮推理开始前触发。extra: step 序号等。返回 action 可终止。",
     "after_llm_call": "LLM 返回后触发。extra: response/usage。可读取用量做统计。",

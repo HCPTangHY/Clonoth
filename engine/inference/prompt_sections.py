@@ -23,8 +23,11 @@ logger = logging.getLogger(__name__)
 
 SCOPES = ("static", "dynamic")
 
-# render(ctx) -> str | None; None or empty string means "nothing this turn".
-SectionRender = Callable[["PromptSectionContext"], "str | None"]
+# render(ctx) -> None | str | list[str | dict]; None or empty means "nothing
+# this turn". Strings become content text; dicts are already message-shaped
+# (role/content/...) and pass through so a section can control message
+# boundaries (e.g. knowledge static emits separate system messages).
+SectionRender = Callable[["PromptSectionContext"], "None | str | list"]
 
 
 @dataclass
@@ -37,6 +40,12 @@ class PromptSectionContext:
     history: list[dict[str, Any]] = field(default_factory=list)
     instruction: str = ""
     task_context: dict[str, Any] = field(default_factory=dict)
+    # Why: section providers such as knowledge_inject read budgets from runtime
+    # config and isolate memory by workspace. How: carry both on the context
+    # instead of letting providers reach into global state. Purpose: keep the
+    # declarative surface self-contained.
+    runtime_cfg: dict[str, Any] = field(default_factory=dict)
+    workspace_name: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -115,19 +124,59 @@ class PromptSectionRegistry:
         ]
 
     def render_scope(self, scope: str, ctx: PromptSectionContext) -> list[str]:
-        """Render all sections of one scope in order; failures are isolated."""
+        """Render all sections of one scope in order as plain text parts.
+
+        Dict-shaped returns contribute their content text; use render_messages
+        when message boundaries matter (static scope). Failures are isolated.
+        """
         parts: list[str] = []
+        for item in self._render_items(scope, ctx):
+            if isinstance(item, dict):
+                text = str(item.get("content") or "")
+                if text.strip():
+                    parts.append(text.strip())
+            elif isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+        return parts
+
+    def render_messages(self, scope: str, ctx: PromptSectionContext) -> list[dict[str, Any]]:
+        """Render all sections of one scope in order as message dicts.
+
+        Why: static sections like knowledge injection own their message shape
+        (separate system messages per block). How: dict returns pass through
+        with a _section marker; plain strings wrap into user messages as
+        before. Purpose: one render pass serves both content-string and
+        message-boundary use cases.
+        """
+        messages: list[dict[str, Any]] = []
+        for item in self._render_items(scope, ctx):
+            if isinstance(item, dict):
+                if str(item.get("content") or "").strip():
+                    msg = dict(item)
+                    msg["_section"] = True
+                    messages.append(msg)
+            elif isinstance(item, str) and item.strip():
+                messages.append({"role": "user", "content": item.strip(), "_section": True})
+        return messages
+
+    def _render_items(self, scope: str, ctx: PromptSectionContext) -> list[Any]:
+        """Call each section render of one scope and flatten list returns."""
+        items: list[Any] = []
         for section in sorted(self._sections.values(), key=lambda s: (s.order, s.name)):
             if section.scope != scope:
                 continue
             try:
-                text = section.render(ctx)
+                result = section.render(ctx)
             except Exception as exc:
                 logger.warning("Prompt section %r render failed: %s", section.name, exc)
                 continue
-            if isinstance(text, str) and text.strip():
-                parts.append(text.strip())
-        return parts
+            if result is None:
+                continue
+            if isinstance(result, list):
+                items.extend(result)
+            else:
+                items.append(result)
+        return items
 
 
 # Why: prompt assembly runs in the engine process and needs one shared registry.

@@ -88,29 +88,32 @@ def auto_discover_and_register(
                 )
                 continue
         try:
-            instance = _instantiate_handler(module, meta, context)
-            handler_name = str(getattr(instance, "name", "") or py_file.stem)
-            handlers[handler_name] = instance
-            loaded.add(handler_name)
-            priority = meta.get("priority", getattr(instance, "priority", None))
-            # Why: every registration a plugin makes must be reversible. How:
-            # run hook and tool registration inside collecting(handler_name) so
-            # the shared disposal ledger (engine/registry_core.py) archives each
-            # returned disposer under this plugin; the optional teardown() hook
-            # joins the same ledger. Purpose: unload_plugin(handler_name) undoes
-            # the whole load across every registration surface.
+            # Why: every registration a plugin makes must be reversible, including
+            # registrations done in __init__ (e.g. prompt sections). How: run
+            # instantiation, hook registration, and tool registration inside
+            # collecting(handler_name) so the shared disposal ledger archives
+            # each returned disposer under this plugin. Purpose:
+            # unload_plugin(handler_name) undoes the whole load across every
+            # registration surface.
             collecting = getattr(registry, "collecting", None)
             if callable(collecting):
                 with collecting(handler_name):
+                    instance = _instantiate_handler(module, meta, context)
+                    priority = meta.get("priority", getattr(instance, "priority", None))
                     for hook_point, method_name in _iter_hook_points(meta):
                         method = getattr(instance, method_name)
                         registry.register(str(hook_point), method, priority=priority)
                     _register_declared_tools(module_name, meta, tool_registry)
             else:
+                instance = _instantiate_handler(module, meta, context)
+                priority = meta.get("priority", getattr(instance, "priority", None))
                 for hook_point, method_name in _iter_hook_points(meta):
                     method = getattr(instance, method_name)
                     registry.register(str(hook_point), method, priority=priority)
                 _register_declared_tools(module_name, meta, tool_registry)
+            handler_name = str(getattr(instance, "name", "") or py_file.stem)
+            handlers[handler_name] = instance
+            loaded.add(handler_name)
             teardown = getattr(instance, "teardown", None)
             if callable(teardown):
                 add_disposer = getattr(registry, "add_plugin_disposer", None)

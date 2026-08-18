@@ -7,7 +7,7 @@ from engine.attachments import build_multimodal_content
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
-from .knowledge_inject import build_knowledge_context
+from engine.inference.message_assembly import rebuild_dynamic_context
 from engine.protocol import ACTION_CANCELLED, TaskAction
 
 
@@ -87,47 +87,23 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     new_instruction = ls.preempt_inject_info.get("message", "")
     new_attachments = ls.preempt_inject_info.get("attachments", [])
 
-    ls.messages = [m for m in ls.messages if not m.get("_dynamic")]
-    ctx.messages = ls.messages
-
-    from engine.inference.message_assembly import _conversational_history
-
-    scan_history = _conversational_history(ls.history)
-    # Why: built-in preempt handling must use the same knowledge boundary as
-    # initial prompt assembly. How: call build_knowledge_context, then discard
-    # static blocks because this reinjection path historically used only dynamic
-    # skill and memory blocks. Purpose: preserve preempt prompt placement while
-    # removing direct builder imports from this handler.
-    skill_static, skill_dynamic, memory_static, memory_dynamic = build_knowledge_context(
-        ls.rctx.workspace_root,
-        ls.node,
-        new_instruction,
-        scan_history,
-        ls.runtime_cfg,
+    # Why: dynamic context (skills, memory) must be refreshed for the new
+    # instruction. How: the shared assembly helper drops old _dynamic messages
+    # and re-renders all dynamic-scope prompt sections in place. Purpose: the
+    # preempt handler no longer imports the knowledge plugin or duplicates the
+    # block/string prefix logic.
+    rebuild_dynamic_context(
+        ls.messages,
+        workspace_root=ls.rctx.workspace_root,
+        node=ls.node,
+        runtime_cfg=ls.runtime_cfg,
+        history=ls.history,
+        instruction=new_instruction,
+        is_block_mode=ls.is_block_mode,
+        system_prompt=ls.system_prompt,
+        session_id=getattr(ls.rctx, "session_id", "") or "",
+        workspace_name=getattr(ls.rctx, "workspace_name", "") or "",
     )
-    _ = (skill_static, memory_static)
-
-    dynamic_parts: list[str] = []
-    if not ls.is_block_mode and len(ls.system_prompt) >= 2 and ls.system_prompt[1].get("content"):
-        dynamic_parts.append(ls.system_prompt[1]["content"])
-    for dynamic_msg in skill_dynamic:
-        if dynamic_msg.get("content"):
-            dynamic_parts.append(dynamic_msg["content"])
-    for dynamic_msg in memory_dynamic:
-        if dynamic_msg.get("content"):
-            dynamic_parts.append(dynamic_msg["content"])
-
-    if dynamic_parts:
-        dynamic_prefix = (
-            "以下是本轮动态上下文，每轮可能变化。\n\n"
-            if ls.is_block_mode
-            else "以下是本轮动态上下文信息，每轮可能变化。如与当前任务无关可忽略，继续之前的工作即可。\n\n"
-        )
-        ls.messages.append({
-            "role": "user",
-            "content": dynamic_prefix + "\n\n".join(dynamic_parts),
-            "_dynamic": True,
-        })
 
     if new_attachments:
         ls.messages.append({

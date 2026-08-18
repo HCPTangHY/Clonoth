@@ -159,24 +159,26 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path, contex
 
             # Mode 1: PLUGIN_META with handler_class + hook_points
             raw_meta = getattr(module, "PLUGIN_META", None)
-            if isinstance(raw_meta, dict) and raw_meta.get("handler_class") and raw_meta.get("hook_points"):
+            if isinstance(raw_meta, dict) and raw_meta.get("handler_class") and isinstance(raw_meta.get("hook_points"), list):
                 class_name = str(raw_meta["handler_class"]).strip()
                 cls = getattr(module, class_name)
-                instance = cls(context) if context is not None and accepts_context(cls) else cls()
-                priority = raw_meta.get("priority", getattr(instance, "priority", None))
-                # Why: registrations made during load must be reversible. How:
-                # wrap them in collecting(name) so the registry archives each
-                # returned disposer under this plugin; teardown() joins the same
-                # ledger. Purpose: unload_plugin(name) undoes the whole load.
+                # Why: registrations made during load must be reversible,
+                # including registrations done in __init__ (e.g. prompt
+                # sections). How: instantiate and register inside
+                # collecting(name) so the ledger archives each disposer under
+                # this plugin; teardown() joins the same ledger. Purpose:
+                # unload_plugin(name) undoes the whole load.
                 with hook_registry.collecting(meta["name"]):
+                    instance = cls(context) if context is not None and accepts_context(cls) else cls()
+                    priority = raw_meta.get("priority", getattr(instance, "priority", None))
                     for item in raw_meta["hook_points"]:
                         if isinstance(item, (tuple, list)) and len(item) == 2:
                             hook_point, method_name = str(item[0]).strip(), str(item[1]).strip()
                             method = getattr(instance, method_name)
                             hook_registry.register(hook_point, method, priority=priority)
-                teardown = getattr(instance, "teardown", None)
-                if callable(teardown):
-                    hook_registry.add_plugin_disposer(meta["name"], teardown)
+                    teardown = getattr(instance, "teardown", None)
+                    if callable(teardown):
+                        hook_registry.add_plugin_disposer(meta["name"], teardown)
                 hook_registry.register_plugin_meta(meta)
                 count += 1
                 logger.info(

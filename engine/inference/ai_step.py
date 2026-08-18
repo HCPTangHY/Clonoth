@@ -1807,16 +1807,17 @@ async def run_ai_node(
             task_context=rctx.task_context,
             session_id=rctx.session_id,
             attachments=attachments,
+            workspace_name=getattr(rctx, 'workspace_name', '') or '',
         )
         _assembled_fresh = True
 
     if _assembled_fresh:
         # Phase 3 Hook System：初始 messages 完成后始终触发 before_prompt_build。
-        # Why: the skeleton returned above intentionally contains no skill or
-        # memory blocks, so the hook is the single place that may add them. How:
+        # Why: knowledge injection is now declarative (prompt sections rendered
+        # during assembly), so this hook only serves procedural handlers. How:
         # pass the rendered system prompt, history, instruction, and attachments
-        # through HookContext.extra and request an in-place rebuild. Purpose: keep
-        # zero behavior drift while removing knowledge injection from inference.
+        # through HookContext.extra. Purpose: keep the interception point while
+        # prompt content comes from registered sections.
         _prompt_ctx = HookContext(
             messages=messages,
             tools=[],
@@ -1830,17 +1831,11 @@ async def run_ai_node(
                 "history": history,
                 "attachments": attachments,
                 "system_prompt": system_prompt,
-                # Why: the initial message list is now only a prompt skeleton.
-                # How: always request hook-side rebuild when before_prompt_build
-                # runs. Purpose: ensure knowledge injection is handled solely by
-                # hook handlers, not by the inference loop.
-                "apply_injection": True,
             },
         )
         _prompt_result = await hook_registry.afire("before_prompt_build", _prompt_ctx)
         if _prompt_result.action is not None:
             return _prompt_result.action
-        _is_block_mode = bool(_prompt_ctx.extra.get("is_block_mode", _is_block_mode))
 
     # ---- 追加恢复消息 ----
     formatter = create_tool_formatter(node.tool_mode)

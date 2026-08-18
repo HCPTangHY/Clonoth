@@ -17,10 +17,7 @@ def _registry_static_messages(
     """Render registered static sections into cache-friendly pre-history messages."""
     if section_context is None:
         return []
-    return [
-        {"role": "user", "content": text, "_section": True}
-        for text in prompt_section_registry.render_scope("static", section_context)
-    ]
+    return prompt_section_registry.render_messages("static", section_context)
 
 
 def _registry_dynamic_parts(section_context: PromptSectionContext | None) -> list[str]:
@@ -30,7 +27,7 @@ def _registry_dynamic_parts(section_context: PromptSectionContext | None) -> lis
     return prompt_section_registry.render_scope("dynamic", section_context)
 
 
-def _conversational_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def conversational_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter history to only real conversation messages for keyword scanning.
 
     Excludes:
@@ -256,6 +253,7 @@ def assemble_initial_messages(
     task_context: dict[str, Any] | None = None,
     session_id: str = "",
     attachments: list[dict[str, Any]] | None = None,
+    workspace_name: str = "",
 ) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]]]:
     """构建初始 messages 数组。
 
@@ -289,6 +287,8 @@ def assemble_initial_messages(
         history=history,
         instruction=instruction,
         task_context=dict(task_context or {}),
+        runtime_cfg=runtime_cfg,
+        workspace_name=workspace_name,
     )
     section_static = _registry_static_messages(section_context)
     section_dynamic = _registry_dynamic_parts(section_context)
@@ -447,3 +447,56 @@ def assemble_initial_messages(
             messages.append({"role": "user", "content": instruction})
 
     return messages, _is_block_mode, system_prompt
+
+
+def rebuild_dynamic_context(
+    messages: list[dict[str, Any]],
+    *,
+    workspace_root: Path,
+    node: Node,
+    runtime_cfg: dict[str, Any],
+    history: list[dict[str, Any]],
+    instruction: str,
+    is_block_mode: bool,
+    system_prompt: list[dict[str, Any]],
+    session_id: str = "",
+    workspace_name: str = "",
+    task_context: dict[str, Any] | None = None,
+) -> None:
+    """Rebuild the ``_dynamic`` message in an existing prompt, in place.
+
+    Why: when a preempt message arrives mid-task, the per-turn dynamic context
+    must be refreshed for the new instruction. How: drop old ``_dynamic``
+    messages, render all dynamic-scope prompt sections (knowledge injection
+    included), and append one rebuilt dynamic message using the same prefix
+    rules as initial assembly. Purpose: callers such as the preempt handler no
+    longer import injection plugins directly or duplicate the block/string
+    branch logic.
+    """
+    messages[:] = [m for m in messages if not m.get("_dynamic")]
+    section_context = PromptSectionContext(
+        workspace_root=workspace_root,
+        node=node,
+        session_id=session_id,
+        history=history,
+        instruction=instruction,
+        task_context=dict(task_context or {}),
+        runtime_cfg=runtime_cfg,
+        workspace_name=workspace_name,
+    )
+    parts: list[str] = []
+    if not is_block_mode and len(system_prompt) >= 2 and system_prompt[1].get("content"):
+        parts.append(system_prompt[1]["content"])
+    parts.extend(prompt_section_registry.render_scope("dynamic", section_context))
+    if not parts:
+        return
+    prefix = (
+        "以下是本轮动态上下文，每轮可能变化。\n\n"
+        if is_block_mode
+        else "以下是本轮动态上下文信息，每轮可能变化。如与当前任务无关可忽略，继续之前的工作即可。\n\n"
+    )
+    messages.append({
+        "role": "user",
+        "content": prefix + "\n\n".join(parts),
+        "_dynamic": True,
+    })

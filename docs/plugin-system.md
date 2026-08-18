@@ -103,7 +103,7 @@ Hook 的目标是把推理循环中的横切逻辑移出 `engine/inference/ai_st
 
 | hook point | 常见 extra 字段 |
 | --- | --- |
-| `before_prompt_build` | `runtime_cfg`、`instruction_text`、`history`、`attachments`、`system_prompt`、`apply_injection` |
+| `before_prompt_build` | `runtime_cfg`、`instruction_text`、`history`、`attachments`、`system_prompt` |
 | `before_step` | `loop_state`、`step_count` |
 | `before_tool_call` | 整轮检查时有 `pseudo_calls`、`real_tool_calls`；单个真实工具检查时有 `real_tool_calls` |
 | `after_tool_call` | `loop_state`、`tool_result`、`tool_attachments` |
@@ -131,7 +131,7 @@ Hook 的目标是把推理循环中的横切逻辑移出 `engine/inference/ai_st
 
 | hook point | 触发时机 | 典型用途 |
 | --- | --- | --- |
-| `before_prompt_build` | 初始 messages 组装完成后，工具定义注入前。 | 注入 skill、memory 或其他提示词材料。 |
+| `before_prompt_build` | 初始 messages 组装完成后，工具定义注入前。 | 过程性拦截或重建 messages；向 prompt 贡献内容应优先使用 prompt sections。 |
 | `before_step` | 每次推理循环顶部，调用 LLM 之前。 | 检查取消、处理 preempt、执行上下文压缩。 |
 | `before_tool_call` | 工具调用处理前。当前既有整轮工具调用检查，也有单个真实工具执行前检查。 | finish 并列调用保护、审批、工具策略检查。 |
 | `after_tool_call` | 真实工具返回后，工具结果写回模型前。 | 收集附件、记录工具副作用。 |
@@ -146,9 +146,9 @@ Hook 的目标是把推理循环中的横切逻辑移出 `engine/inference/ai_st
 
 | handler 类 | name | hook point | priority | 说明 |
 | --- | --- | --- | ---: | --- |
-| `PreemptChecker` | `preempt_checker` | `before_step` | 100 | 检查取消请求和软打断状态。需要注入新用户消息时，会移除旧动态上下文并重建动态 skill、memory 和附件消息。 |
+| `PreemptChecker` | `preempt_checker` | `before_step` | 100 | 检查取消请求和软打断状态。需要注入新用户消息时，调用 `rebuild_dynamic_context` 重建动态上下文（经 prompt sections）并追加新消息。 |
 | `CompactChecker` | `compact_checker` | `before_step` | 50 | 在循环顶部执行 microcompact、闲置后的 proactive snip，并在上下文超过阈值时触发系统压缩节点。 |
-| `KnowledgeInjector` | `knowledge_inject` | `before_prompt_build` | 50 | 统一调用 skill runtime 和 memory runtime 构建静态、动态知识消息，并在需要时重建 prompt 布局。 |
+| `KnowledgeInjector` | `knowledge_inject` | 无（声明型） | 50 | 在 `__init__` 中通过 `ctx.contributions.prompt_sections` 注册 `knowledge_static` / `knowledge_dynamic` 两个 section，统一构建 skill、memory 的静态与动态注入内容；同时提供六个 skill/memory CRUD 工具。 |
 | `FinishGuardHandler` | `finish_guard` | `before_tool_call` | 100 | 拒绝 `finish()` 与其他非 `intermediate_reply()` 工具在同一轮同时调用，避免任务终止后遗漏其他工具结果。 |
 | `ApprovalHandler` | `approval` | `before_tool_call` | 90 | 在真实工具执行前调用 `RunContext` 上可用的审批接口，并把审批结果归一化为 `HookResult`。 |
 | `AttachmentCollector` | `attachment_collector` | `after_tool_call` | 0 | 从真实工具结果中收集附件，写入局部附件列表和 loop state，供最终输出选择。 |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import threading
@@ -11,24 +12,21 @@ import yaml
 
 from clonoth_runtime import get_int
 from engine.node import Node
+from engine.inference.message_assembly import conversational_history
 from toolbox._common import request_guard, resolve_under_allowed_roots
 from toolbox.builtins import SKILL_NAME_RE
 from toolbox.context import ToolContext
 
-# Why: engine.builtin handlers must not depend on the hook package after relocation.
-# How: return a local HookResult-compatible shape instead. Purpose: avoid
-# cycles while keeping the existing hook registry duck-typed.
-from .result import hook_result
+logger = logging.getLogger(__name__)
 
 
-# Why: skill and memory injection now share one before_prompt_build handler.
-# How: declare one metadata entry with the higher previous priority. Purpose:
-# preserve hook discovery while removing the old two-step injector chain.
+# Why: skill and memory injection are now declarative prompt sections instead
+# of a before_prompt_build rebuild handler. How: PLUGIN_META declares no hook
+# points; the handler class registers its sections on the prompt_sections face
+# at construction. Purpose: the plugin contributes content; the core assembles.
 PLUGIN_META = {
     "handler_class": "KnowledgeInjector",
-    "hook_points": [
-        ("before_prompt_build", "handle"),
-    ],
+    "hook_points": [],
     "priority": 50,
     # Why: the six skill and memory CRUD tools now belong to the knowledge
     # plugin rather than toolbox.registry.py. How: the concrete declarations are
@@ -529,7 +527,17 @@ def load_memory_catalog(
 # [2026-05-24] _update_last_hit_bg REMOVED.
 # Was: full yaml.safe_load + safe_dump of 660KB+ files per LLM call.
 # Replaced by: _record_hits() → in-memory dict → periodic JSON flush.
-    _MemoryCache.invalidate(workspace_root)
+
+
+def invalidate_memory_cache(workspace_root: Path, *, memory_book: str = "") -> None:
+    """Public cache invalidation for external callers such as memory_extract.
+
+    Why: memory_extract previously reached into the private _MemoryCache class
+    across the plugin boundary. How: expose one module-level function.
+    Purpose: extracted memories are visible to the next prompt build without
+    leaking the cache class.
+    """
+    _MemoryCache.invalidate(workspace_root, memory_book=memory_book)
 
 
 def build_memory_messages(
@@ -1695,82 +1703,72 @@ PLUGIN_META["tools"] = [
 ]
 
 class KnowledgeInjector:
-    """Glue handler for skill and memory prompt injection."""
+    """Declarative skill and memory prompt sections.
+
+    Why: knowledge injection no longer rebuilds the whole prompt inside a
+    before_prompt_build hook; it declares content and the assembler places it.
+    How: __init__ receives the EngineContext and registers one static and one
+    dynamic section on the prompt_sections face; both renders share one cached
+    pipeline run per turn. Purpose: the plugin declares what to contribute, the
+    core owns where it lands.
+    """
 
     name = "knowledge_inject"
     priority = 50
 
-    async def handle(self, ctx: Any) -> Any | None:
-        """Build skill and memory messages, then optionally rebuild the prompt.
+    def __init__(self, ctx: Any) -> None:
+        self._cache_key: tuple | None = None
+        self._cache_val: tuple | None = None
+        sections = ctx.contributions.get("prompt_sections") if ctx is not None else None
+        if sections is None:
+            logger.warning("knowledge_inject: prompt_sections face not mounted; injection disabled")
+            return
+        # Why: order 50 keeps knowledge content ahead of later sections. How:
+        # static scope lands before history (cache-friendly), dynamic before
+        # the instruction (per-turn). Purpose: preserve the historical prompt
+        # layout after moving off the rebuild hook.
+        sections.register_section("knowledge_static", self.render_static, order=50, scope="static")
+        sections.register_section("knowledge_dynamic", self.render_dynamic, order=50, scope="dynamic")
 
-        Why: the previous separate skill and memory prompt hooks duplicated glue
-        and filtered conversation history separately. How: filter history once, call
-        the unified knowledge builder with either independent or global budgets,
-        and store the same ctx.extra keys as before. Purpose: unify ownership
-        without changing prompt content, order, labels, or downstream contracts.
-        """
-        if ctx.node is None or ctx.rctx is None:
+    def _compute(self, sctx: Any) -> tuple | None:
+        """Run the unified pipeline once per turn, cached by turn fingerprint."""
+        if sctx.node is None:
             return None
-
-        from engine.inference.message_assembly import _conversational_history
-
-        runtime_cfg = ctx.extra.get("runtime_cfg") or {}
-        instruction_text = str(ctx.extra.get("instruction_text") or "")
-        history = _conversational_history(ctx.extra.get("history") or [])
-
-        # Why: this hook and the inference/preempt paths must share one builder
-        # boundary. How: delegate to build_knowledge_context after filtering the
-        # same conversation history as before. Purpose: remove duplicated builder
-        # calls without changing ctx.extra keys or prompt layout.
-        skill_static, skill_dynamic, memory_static, memory_dynamic = build_knowledge_context(
-            ctx.rctx.workspace_root,
-            ctx.node,
-            instruction_text,
-            history,
-            runtime_cfg,
-            task_context={"workspace_name": getattr(ctx.rctx, 'workspace_name', '') or ''},
+        key = (
+            str(sctx.workspace_root),
+            sctx.node.id,
+            sctx.instruction,
+            id(sctx.history),
+            len(sctx.history),
         )
+        if self._cache_key == key and self._cache_val is not None:
+            return self._cache_val
+        result = build_knowledge_context(
+            sctx.workspace_root,
+            sctx.node,
+            sctx.instruction,
+            conversational_history(sctx.history),
+            sctx.runtime_cfg,
+            task_context={"workspace_name": sctx.workspace_name},
+        )
+        self._cache_key = key
+        self._cache_val = result
+        return result
 
-        ctx.extra["skill_static_messages"] = skill_static
-        ctx.extra["skill_dynamic_messages"] = skill_dynamic
-        ctx.extra["memory_static_messages"] = memory_static
-        ctx.extra["memory_dynamic_messages"] = memory_dynamic
+    def render_static(self, sctx: Any) -> list[dict[str, Any]] | None:
+        """Contribute skill/memory constant blocks as separate system messages."""
+        result = self._compute(sctx)
+        if result is None:
+            return None
+        skill_static, _skill_dynamic, memory_static, _memory_dynamic = result
+        msgs = [m for m in (*skill_static, *memory_static) if m.get("content")]
+        return msgs or None
 
-        if ctx.extra.get("apply_injection"):
-            _rebuild_prompt_messages(ctx)
-            return hook_result(modified=True)
-        return hook_result(modified=bool(skill_static or skill_dynamic or memory_static or memory_dynamic))
-
-
-def _rebuild_prompt_messages(ctx: Any) -> None:
-    """Rebuild ctx.messages with all prompt injections currently in ctx.extra.
-
-    Why: the previous prompt rebuild helper was shared by both knowledge paths and
-    had to survive the merge. How: keep the same assemble_messages_with_injections
-    call in the unified module and read the unchanged ctx.extra key names.
-    Purpose: preserve the existing prompt layout while removing the old modules.
-    """
-    from engine.inference.message_assembly import assemble_messages_with_injections
-    from engine.inference.prompt_sections import PromptSectionContext
-
-    rebuilt, is_block_mode = assemble_messages_with_injections(
-        workspace_root=ctx.rctx.workspace_root,
-        system_prompt=list(ctx.extra.get("system_prompt") or []),
-        history=list(ctx.extra.get("history") or []),
-        instruction=str(ctx.extra.get("instruction_text") or ""),
-        attachments=ctx.extra.get("attachments"),
-        skill_static=list(ctx.extra.get("skill_static_messages") or []),
-        skill_dynamic=list(ctx.extra.get("skill_dynamic_messages") or []),
-        memory_static=list(ctx.extra.get("memory_static_messages") or []),
-        memory_dynamic=list(ctx.extra.get("memory_dynamic_messages") or []),
-        section_context=PromptSectionContext(
-            workspace_root=ctx.rctx.workspace_root,
-            node=ctx.node,
-            session_id=str(getattr(ctx.rctx, "session_id", "") or ""),
-            history=list(ctx.extra.get("history") or []),
-            instruction=str(ctx.extra.get("instruction_text") or ""),
-            task_context=dict(getattr(ctx.rctx, "task_context", None) or {}),
-        ),
-    )
-    ctx.messages[:] = rebuilt
-    ctx.extra["is_block_mode"] = is_block_mode
+    def render_dynamic(self, sctx: Any) -> list[str] | None:
+        """Contribute skill/memory active and index blocks as dynamic text parts."""
+        result = self._compute(sctx)
+        if result is None:
+            return None
+        _skill_static, skill_dynamic, _memory_static, memory_dynamic = result
+        parts = [str(m["content"]) for m in (*skill_dynamic, *memory_dynamic) if m.get("content")]
+        return parts or None
