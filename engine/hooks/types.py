@@ -47,6 +47,13 @@ class HookResult:
     reason: str = ""
     error_message: str = ""
     modified: bool = False
+    # [AutoC 2026-08-19] Why: content-contributing hooks (after_tool_call) need to
+    # replace derived presentation fields of a tool result without stopping the
+    # chain. How: handlers return a partial dict here; the registry merges overrides
+    # across handlers key by key and the fire site applies the merged value.
+    # Purpose: policy handlers can rewrite what the model sees while remaining
+    # non-terminal and composable with other handlers on the same point.
+    result_override: Any = None
 
 
 class Handler(ABC):

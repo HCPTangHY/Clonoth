@@ -27,7 +27,13 @@ HOOK_POINTS: dict[str, str] = {
     "before_step": "每轮推理开始前触发。extra: step 序号等。返回 action 可终止。",
     "after_llm_call": "LLM 返回后触发。extra: response/usage。可读取用量做统计。",
     "before_tool_call": "工具执行前触发。extra: tool_name/arguments。返回 block 可拒绝执行。",
-    "after_tool_call": "工具执行后触发。extra: tool_name/result。可改写结果。",
+    "after_tool_call": (
+        "每个同步真实工具执行后、结构化格式化之后、事件与 entry 写回之前触发。"
+        "extra: loop_state/tool_name/tool_args/tool_result/raw_inline/step_inline_state/"
+        "call_index/tool_attachments。handler 可通过 result_override={raw_inline,"
+        "truncated,ref} 改写模型可见的 inline 文本与截断元数据（spill 策略），"
+        "或收集附件；返回 action 终止任务。"
+    ),
     "before_response": "纯文本回复发出前触发。extra: text。可修改或拦截。",
     "on_task_end": "任务正常结束时触发。extra: result/status。用于收尾与统计。",
     "on_task_error": "任务异常时触发。extra: error/traceback。用于错误快照。",
@@ -194,18 +200,21 @@ class HookRegistry:
         supervisor code async.
         """
         modified = False
+        merged_override: dict | None = None
         for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
             try:
                 result = entry.callback(ctx)
                 if inspect.isawaitable(result):
                     _close_awaitable(result)
                     raise RuntimeError("async hook handler registered on sync fire(); use afire()")
-                stop_result, modified = _process_hook_result(result, modified)
+                stop_result, modified, merged_override = _process_hook_result(
+                    result, modified, merged_override,
+                )
                 if stop_result is not None:
                     return stop_result
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
-        return HookResult(modified=modified)
+        return HookResult(modified=modified, result_override=merged_override)
 
     async def afire(self, hook_point: str, ctx: Any) -> HookResult:
         """Asynchronously run handlers for one hook point."""
@@ -213,17 +222,20 @@ class HookRegistry:
         # How: call each normalized callback and await awaitable results. Purpose:
         # keep engine control-flow semantics while sharing registration with sync hooks.
         modified = False
+        merged_override: dict | None = None
         for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
             try:
                 result = entry.callback(ctx)
                 if inspect.isawaitable(result):
                     result = await result
-                stop_result, modified = _process_hook_result(result, modified)
+                stop_result, modified, merged_override = _process_hook_result(
+                    result, modified, merged_override,
+                )
                 if stop_result is not None:
                     return stop_result
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
-        return HookResult(modified=modified)
+        return HookResult(modified=modified, result_override=merged_override)
 
     def list_hooks(self) -> dict[str, list[str]]:
         """Return registered hook points and handler names."""
@@ -294,21 +306,35 @@ def _handler_priority(handler: Any, priority: int | None) -> int:
     return 100
 
 
-def _process_hook_result(result: Any, modified: bool) -> tuple[Any | None, bool]:
+def _process_hook_result(
+    result: Any, modified: bool, merged_override: dict | None,
+) -> tuple[Any | None, bool, dict | None]:
     """Apply shared hook-result chain rules."""
     # Why: sync and async fire must stop on the same result shapes. How: use duck
     # typing for HookResult-compatible objects and aggregate non-terminal mutation.
     # Purpose: support engine.builtin.result.HookResultLike without importing it here.
     if result is None:
-        return None, modified
+        return None, modified, merged_override
     result_modified = bool(getattr(result, "modified", False))
     modified = modified or result_modified
+    # [AutoC 2026-08-19] Why: result overrides from several non-terminal handlers
+    # must all survive the chain. How: merge dict-shaped overrides key by key
+    # (later handlers win per key) and never stop the chain on an override alone.
+    # Purpose: spill policy and future result-processing handlers stay composable.
+    override = getattr(result, "result_override", None)
+    if isinstance(override, dict) and override:
+        if merged_override is None:
+            merged_override = dict(override)
+        else:
+            merged_override.update(override)
     should_stop = bool(getattr(result, "block", False) or getattr(result, "skip_step", False) or getattr(result, "action", None) is not None)
     if should_stop:
         if modified and not result_modified and hasattr(result, "modified"):
             result.modified = True
-        return result, modified
-    return None, modified
+        if merged_override is not None and hasattr(result, "result_override"):
+            result.result_override = merged_override
+        return result, modified, merged_override
+    return None, modified, merged_override
 
 
 def _close_awaitable(value: Any) -> None:

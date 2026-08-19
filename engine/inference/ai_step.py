@@ -54,13 +54,13 @@ from ..protocol import (
     ACTION_PREEMPTED,
 )
 from ..tool_step import (
-    artifact_enabled,
+    # [AutoC 2026-08-19] artifact_enabled / get_tool_step_inline_budget / write_artifact
+    # 随 spill 策略迁入 engine/builtin/spill_policy.py；此处仅保留结构化
+    # 格式化与兑底截断所需的最小导入。
     get_tool_inline_limit,
-    get_tool_step_inline_budget,
     result_to_raw,
     summarize_result,
     truncate_tool_result,
-    write_artifact,
 )
 # [2026-04-24] P1.5 熔断器：压缩成功后重置熔断计数。
 # 压缩决策逻辑已整体迁入 engine/builtin/compact.py（CompactChecker 插件），
@@ -517,8 +517,12 @@ async def _execute_real_tools(
     # keep a shared inline character budget and shrink later tool results once earlier
     # ones have consumed it. Purpose: the combined tool-result messages remain bounded
     # while every truncated result still points to a task-scoped artifact.
-    _step_inline_budget = get_tool_step_inline_budget(ls.runtime_cfg)
-    _step_inline_used = 0
+    # [AutoC 2026-08-19] Why: per-step inline budget arithmetic now lives in the
+    # spill policy plugin. How: keep one mutable state dict that the handler reads
+    # to shrink each call's limit and that this loop updates after applying the
+    # override (single writer). Purpose: the loop owns one number, the policy owns
+    # every decision that produces it.
+    _step_inline_state: dict[str, int] = {"used": 0}
 
     await ls.rctx.emit_event("handoff_progress", {
         "message": f"[{ls.node.id}] 执行 {len(real_tool_calls)} 个工具",
@@ -859,21 +863,53 @@ async def _execute_real_tools(
         _t_raw_inline = _t_raw
         _t_truncated = False
         _t_ref = ""
-        if isinstance(_t_raw, str):
-            # [AutoC 2026-06-08] Why: tool results can be much larger than the model
-            # context, but hard truncation previously discarded the omitted content.
-            # How: use per-tool runtime limits, write the full text to a task artifact
-            # before truncating, and respect a shared per-step inline budget. Purpose:
-            # the prompt gets bounded text plus a read_file or grep recovery path.
-            _limit = get_tool_inline_limit(_t_name, ls.runtime_cfg)
-            if _step_inline_used >= _step_inline_budget:
-                _limit = min(_limit, get_tool_inline_limit("media", ls.runtime_cfg))
-            elif _step_inline_used + _limit > _step_inline_budget:
-                _limit = max(1, _step_inline_budget - _step_inline_used)
-            if artifact_enabled(ls.runtime_cfg) and len(_t_raw) > _limit:
-                _t_ref = write_artifact(ls.rctx.workspace_root, ls.rctx.task_id, step, len(_tool_entries), _t_name, str(_rtc.get("id") or ""), _t_raw)
-            _t_raw_inline, _t_truncated = truncate_tool_result(_t_name, _t_raw, _limit, _t_ref, config=ls.runtime_cfg)
-            _step_inline_used += len(_t_raw_inline)
+
+        # [AutoC 2026-08-19] Why: how large a tool result may enter the prompt is
+        # policy, not loop mechanics. How: fire after_tool_call once per synchronous
+        # call — the spill policy handler bounds the inline text (per-tool limit,
+        # per-step budget, artifact spill) and the attachment collector normalizes
+        # attachments in the same chain — then apply the merged result_override.
+        # Purpose: the bounding strategy lives in a plugin and can be replaced or
+        # unloaded without touching the inference loop.
+        _tool_atts_start = len(_tool_atts)
+        _after_ctx = HookContext(
+            messages=ls.messages,
+            tools=ls.openai_tools,
+            node=ls.node,
+            provider=ls.provider,
+            rctx=ls.rctx,
+            step=step,
+            tool_call=_current_tool_call,
+            tool_calls=_hook_real_tool_calls,
+            extra={
+                "loop_state": ls,
+                "tool_name": _t_name,
+                "tool_args": _t_args,
+                "tool_result": _t_result,
+                "raw_inline": _t_raw,
+                "tool_attachments": _tool_atts,
+                "step_inline_state": _step_inline_state,
+                "call_index": len(_tool_entries),
+            },
+        )
+        _after_result = await hook_registry.afire("after_tool_call", _after_ctx)
+        if _after_result.action is not None:
+            return _after_result.action
+        if isinstance(_after_result.result_override, dict):
+            _ov = _after_result.result_override
+            if "raw_inline" in _ov:
+                _t_raw_inline = _ov["raw_inline"]
+            _t_truncated = bool(_ov.get("truncated", _t_truncated))
+            _t_ref = str(_ov.get("ref") or "")
+        elif isinstance(_t_raw, str):
+            # 兑底：spill 策略插件未干预（未加载或被卸载）时保留最小逐工具截断，
+            # 防止超大结果无界进入 prompt。
+            _fallback_limit = get_tool_inline_limit(_t_name, ls.runtime_cfg)
+            _t_raw_inline, _t_truncated = truncate_tool_result(
+                _t_name, _t_raw, _fallback_limit, "", config=ls.runtime_cfg,
+            )
+        if isinstance(_t_raw_inline, str):
+            _step_inline_state["used"] = _step_inline_state.get("used", 0) + len(_t_raw_inline)
 
         _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1) if "_tool_t0" in dir() else None
         _tool_entries.append({
@@ -886,7 +922,7 @@ async def _execute_real_tools(
             "ref": _t_ref,
             "summary": _t_summary,
             "elapsed_ms": _t_elapsed_ms,
-            "attachments": [],
+            "attachments": list(_tool_atts[_tool_atts_start:]),
             # [AutoC 2026-06-15] Why: shadow write only persists raw_inline text,
             # losing structured fields (appliedCount, returncode, etc.) that the
             # frontend needs for result suffix rendering. How: carry the original
@@ -926,41 +962,11 @@ async def _execute_real_tools(
         if _tool_ctx.workspace_name and _tool_ctx.workspace_name != getattr(ls.rctx, 'workspace_name', ''):
             ls.rctx.workspace_name = _tool_ctx.workspace_name
 
-        # [硬取消-场景1] 已取消的工具结果已存入 entries（上方 append），不处理附件和进度事件，
-        # 直接退出循环。未执行的后续工具被跳过（循环顶部 check_cancelled），不产生 tool_result。
+        # [硬取消-场景1] 已取消的工具结果已存入 entries（上方 append），附件收集已在
+        # after_tool_call 同点完成，此处仅跳过进度事件并退出循环。未执行的后续工具被
+        # 跳过（循环顶部 check_cancelled），不产生 tool_result。
         if _t_cancelled:
             break
-
-        # Phase 3 Hook System：工具附件收集交给 AttachmentCollector。
-        # 原因：附件收集是 after_tool_call 的副作用，不应散落在真实工具执行主体中。
-        # 做法：传入原始工具结果、局部附件列表和 loop state，由 handler 统一扩展。
-        # 目的：保持最终附件选择和多模态结果提示不变。
-        _tool_atts_start = len(_tool_atts)
-        _attachment_ctx = HookContext(
-            messages=ls.messages,
-            tools=ls.openai_tools,
-            node=ls.node,
-            provider=ls.provider,
-            rctx=ls.rctx,
-            step=step,
-            tool_call=_current_tool_call,
-            extra={
-                "loop_state": ls,
-                "tool_result": _t_result,
-                "tool_attachments": _tool_atts,
-            },
-        )
-        _attachment_result = await hook_registry.afire("after_tool_call", _attachment_ctx)
-        if _attachment_result.action is not None:
-            return _attachment_result.action
-        if _tool_entries:
-            _tool_entries[-1]["attachments"] = list(_tool_atts[_tool_atts_start:])
-
-        # LEGACY: replaced by hook AttachmentCollector.
-        # if isinstance(_t_result, dict) and isinstance(_t_result.get("attachments"), list):
-        #     _tool_atts.extend(_t_result["attachments"])
-        #     ls.collected_attachments.extend(_t_result["attachments"])
-        #     ls.tool_produced_attachments.extend(_t_result["attachments"])
 
         await ls.rctx.emit_event("handoff_progress", {
             "message": f"[{ls.node.id}] {_t_name}: {_t_summary}",

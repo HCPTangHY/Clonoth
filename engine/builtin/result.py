@@ -21,6 +21,7 @@ class HookResultLike:
     reason: str = ""
     error_message: str = ""
     modified: bool = False
+    result_override: Any = None
 
 
 def hook_result(
@@ -31,6 +32,7 @@ def hook_result(
     reason: str = "",
     error_message: str = "",
     modified: bool = False,
+    result_override: Any = None,
 ) -> HookResultLike:
     """Build a HookResult-compatible object without hook-package imports.
 
@@ -46,4 +48,5 @@ def hook_result(
         reason=reason,
         error_message=error_message,
         modified=modified,
+        result_override=result_override,
     )
