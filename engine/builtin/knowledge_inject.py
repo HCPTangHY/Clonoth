@@ -1716,7 +1716,7 @@ class KnowledgeInjector:
     name = "knowledge_inject"
     priority = 50
 
-    def __init__(self, ctx: Any) -> None:
+    def __init__(self, ctx: Any = None) -> None:
         self._cache_key: tuple | None = None
         self._cache_val: tuple | None = None
         sections = ctx.contributions.get("prompt_sections") if ctx is not None else None
