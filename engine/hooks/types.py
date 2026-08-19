@@ -54,6 +54,13 @@ class HookResult:
     # Purpose: policy handlers can rewrite what the model sees while remaining
     # non-terminal and composable with other handlers on the same point.
     result_override: Any = None
+    # [AutoC 2026-08-19] Why: scheduling hooks (execute_tool) need to replace how
+    # a tool is executed, not just its derived text. How: handlers supply an
+    # awaitable (or ready value) that resolves the tool result or an
+    # async_started marker; the registry adopts the first non-None execution.
+    # Purpose: execution strategies (async dispatch, adaptive upgrade, timeouts)
+    # are plugins, not loop code.
+    execution: Any = None
 
 
 class Handler(ABC):

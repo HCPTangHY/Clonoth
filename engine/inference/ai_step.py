@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import asyncio
+import inspect
 import logging
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -25,17 +24,9 @@ from .resume_builder import _build_resume_messages
 from .loop_state import _LoopState, _persist_ctx, _short
 from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
 from .pseudo_handlers import _handle_pseudo_tool
-# 异步工具生命周期（启动、跟踪、结果投递）已抽入独立模块。
-# _async_tool_tasks 与本模块共享同一字典引用，原地修改对两侧均可见。
-from .async_tools import (
-    _async_tool_tasks,
-    _cleanup_async_tracker,
-    _snapshot_tool_context,
-    _execute_command_async_upgrade_threshold,
-    _execute_registry_tool_with_span,
-    _deliver_started_async_task,
-    _run_async_tool,
-)
+# [AutoC 2026-08-19] 执行策略（async_mode 分流、execute_command 自适应升级）已迁入
+# engine/builtin/async_scheduler.py；循环仅保留默认同步执行入口与 execute_tool 触发。
+from .async_tools import _execute_registry_tool_with_span
 
 from ..context_store import load_context_snapshot
 from ..attachments import build_multimodal_content
@@ -161,6 +152,22 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
         ls.rctx.last_shadow_message_id = msg_id
     except Exception:
         pass  # best-effort, never break main flow
+
+
+def _close_execution(execution: Any) -> None:
+    """Close an un-awaited execution from a terminated execute_tool chain.
+
+    Why: a handler may supply an execution awaitable and a later handler may end
+    the chain with an action, leaving the coroutine un-awaited. How: close
+    coroutine-like values best-effort. Purpose: avoid un-awaited coroutine
+    warnings without changing terminal semantics.
+    """
+    close = getattr(execution, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -630,82 +637,108 @@ async def _execute_real_tools(
             })
             continue
 
-        # [2026-04-23] 异步工具分流：查询 spec 判断该工具是否为 async_mode。
-        # 若是，则在后台 asyncio.Task 中执行，不阻塞当前推理循环，
-        # 结果通过 preempt API 异步回传。从 commit 7d10197 恢复。
+        # [AutoC 2026-08-19] 执行策略迁移：async_mode 分流与 execute_command 自适应
+        # 升级已迁入 engine/builtin/async_scheduler.py（execute_tool 策略点）。
+        # 此处仅读取 spec 供 hook extra 与后续格式化使用。
         _spec = ls.registry.get_spec(_t_name)
-        _is_async = _spec.get("async_mode", False) if _spec else False
 
-        if _is_async:
-            # [WS tool result fields 2026-05-19] Why: tool_call_end now exposes
-            # elapsed_ms for both synchronous and async-started tools. How: capture
-            # a monotonic timestamp before the lifecycle start event is emitted.
-            # Purpose: downstream WebSocket consumers can show one consistent
-            # duration field without depending on SignalBus internals.
-            _tool_t0 = time.monotonic()
-            # [WS tool events 2026-05-17] Why: WebSocket clients need structured
-            # tool lifecycle events in the durable EventLog, not only localized
-            # handoff_progress text. How: emit a non-transient start event before
-            # the async tool is scheduled. Purpose: reconnecting clients can replay
-            # the tool start through the existing EventLog catch-up path.
-            await ls.rctx.emit_event("tool_call_start", {
-                "node_id": ls.node.id,
-                "task_id": ls.rctx.task_id,
-                "tool_call_id": _rtc.get("id", ""),
+        # [AutoC 2026-08-19] Why: how a tool runs — awaited synchronously, dispatched
+        # to a background task, or adaptively upgraded — is scheduling policy, not
+        # loop mechanics. How: emit the structured start event, fire execute_tool,
+        # and let a handler supply an execution (awaitable or ready value) that
+        # resolves either the tool result or an async_started marker; with no
+        # handler the loop awaits the default registry execution. Purpose: the
+        # strategies live in engine/builtin/async_scheduler.py and are replaceable
+        # without touching the loop.
+        _tool_t0 = time.monotonic()
+        # [WS tool events 2026-05-17] Why: WebSocket clients need structured
+        # tool lifecycle events in the durable EventLog. How: emit a non-transient
+        # start event before any execution strategy runs. Purpose: reconnecting
+        # clients can replay the tool start through the EventLog catch-up path.
+        await ls.rctx.emit_event("tool_call_start", {
+            "node_id": ls.node.id,
+            "task_id": ls.rctx.task_id,
+            "tool_call_id": _rtc.get("id", ""),
+            "tool_name": _t_name,
+            "arguments": _t_args,
+        })
+        _exec_ctx = HookContext(
+            messages=ls.messages,
+            tools=ls.openai_tools,
+            node=ls.node,
+            provider=ls.provider,
+            rctx=ls.rctx,
+            step=step,
+            tool_call=_current_tool_call,
+            tool_calls=_hook_real_tool_calls,
+            extra={
+                "loop_state": ls,
                 "tool_name": _t_name,
-                "arguments": _t_args,
-            })
-            _cleanup_async_tracker()
-            _async_id = uuid.uuid4().hex[:8]
-            _async_tool_tasks[_async_id] = {
-                "tool_name": _t_name,
-                "status": "running",
-                "started_at": _tool_t0,
-                "task_id": ls.rctx.task_id,
-            }
-            # [AutoC 2026-06-27] Why: the loop reuses _tool_ctx and rewrites
-            # tool_call_id for later calls. How: pass a snapshot to the background
-            # async task. Purpose: callback artifacts and approvals keep the current
-            # tool call identity.
-            _async_tool_ctx = _snapshot_tool_context(_tool_ctx)
-            asyncio.create_task(
-                _run_async_tool(
-                    registry=ls.registry,
-                    http=ls.rctx.http,
-                    supervisor_url=ls.rctx.supervisor_url,
-                    task_id=ls.rctx.task_id,
-                    # [Fork/Merge 2026-05-12] Route async callbacks through the parent session.
-                    # Why: ls.rctx.session_id may be an entry branch used only for runtime history.
-                    # How: prefer parent_session_id and fall back to session_id for old tasks.
-                    # Purpose: async tool results create follow-up inbound messages in the SDK-visible session.
-                    session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
-                    tool_name=_t_name,
-                    tool_args=_t_args,
-                    tool_ctx=_async_tool_ctx,
-                    async_tool_id=_async_id,
-                    runtime_cfg=ls.runtime_cfg,
-                    step=step,
-                    index=len(_tool_entries),
-                    tool_call_id=str(_rtc.get("id") or _async_id),
-                ),
-                name=f"async_tool_{_t_name}_{_async_id}",
+                "tool_args": _t_args,
+                "tool_ctx": _tool_ctx,
+                "spec": _spec if isinstance(_spec, dict) else {},
+                "call_index": len(_tool_entries),
+                "t0": _tool_t0,
+            },
+        )
+        _exec_result = await hook_registry.afire("execute_tool", _exec_ctx)
+        if _exec_result.action is not None:
+            _close_execution(getattr(_exec_result, "execution", None))
+            return _exec_result.action
+        if _exec_result.block or _exec_result.skip_step:
+            # 此点不承担授权（是否执行由 before_tool_call 决定），但保留
+            # block/skip 语义：start 事件已发出，补 blocked 结束事件维持
+            # 生命周期配对，然后跳过该工具。
+            _blocked_msg = (
+                _exec_result.error_message
+                or _exec_result.reason
+                or "Tool call blocked by execute_tool hook."
             )
-            _async_summary = f"异步执行已启动 (id: {_async_id})，结果将通过 preempt 自动回传"
-            # [WS tool result fields 2026-05-19] Why: async-started calls have no
-            # final tool result yet, but clients still need the same result schema.
-            # How: define the same local variables used by the synchronous branch,
-            # with result=None and the immediate placeholder text as raw_inline.
-            # Purpose: tool_call_end consumers can parse sync and async lifecycle
-            # events without special-casing missing keys.
-            _t_result = None
-            _t_fmt = "text"
-            _t_raw_inline = f'\u23f3 Async tool "{_t_name}" started (id: {_async_id}). Result will be delivered via preempt when ready.'
-            _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1) if "_tool_t0" in dir() else None
+            _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1)
             _tool_entries.append({
                 "id": _rtc.get("id", ""),
                 "name": _t_name,
                 "args": _t_args,
-                "format": _t_fmt,
+                "format": "text",
+                "raw_inline": _blocked_msg,
+                "truncated": False,
+                "ref": "",
+                "summary": _blocked_msg[:200],
+                "elapsed_ms": _t_elapsed_ms,
+                "attachments": [],
+            })
+            await ls.rctx.emit_event("tool_call_end", {
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+                "tool_call_id": _rtc.get("id", ""),
+                "tool_name": _t_name,
+                "status": "blocked",
+                "summary": _blocked_msg[:200],
+                "result": None,
+                "raw_inline": _blocked_msg,
+                "format": "text",
+                "elapsed_ms": _t_elapsed_ms,
+            })
+            continue
+        _execution = getattr(_exec_result, "execution", None)
+        if _execution is None:
+            _t_result = await _execute_registry_tool_with_span(ls.registry, _t_name, _t_args, _tool_ctx)
+        elif inspect.isawaitable(_execution):
+            _t_result = await _execution
+        else:
+            _t_result = _execution
+
+        if isinstance(_t_result, dict) and _t_result.get("async_started"):
+            # 执行策略选择后台运行：写占位 entry，发 async_started 结束事件，
+            # 真实结果由策略插件通过 preempt 异步回传。
+            _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1)
+            _async_summary = str(_t_result.get("summary") or "")
+            _t_raw_inline = str(_t_result.get("raw_inline") or "")
+            _tool_entries.append({
+                "id": _rtc.get("id", ""),
+                "name": _t_name,
+                "args": _t_args,
+                "format": "text",
                 "raw_inline": _t_raw_inline,
                 "truncated": False,
                 "ref": "",
@@ -725,123 +758,17 @@ async def _execute_real_tools(
                 "tool_name": _t_name,
                 "status": "async_started",
                 "summary": _async_summary,
-                "result": _t_result,
+                "result": None,
                 "raw_inline": _t_raw_inline,
-                "format": _t_fmt,
+                "format": "text",
                 "elapsed_ms": _t_elapsed_ms,
             })
             await ls.rctx.emit_event("handoff_progress", {
-                "message": f"[{ls.node.id}] {_t_name}: 异步执行已启动",
+                "message": f"[{ls.node.id}] {_t_name}: {str(_t_result.get('handoff_message') or _async_summary)}",
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
             })
             continue
-
-        # ---- 同步工具：阻塞等待执行完成（原有逻辑）----
-        # [WS tool result fields 2026-05-19] Why: tool_call_end should include the
-        # tool execution duration. How: capture a monotonic start timestamp before
-        # emitting the structured start event and running the registry call. Purpose:
-        # expose elapsed_ms without changing SignalBus span behavior.
-        _tool_t0 = time.monotonic()
-        # [WS tool events 2026-05-17] Why: handoff_progress remains for legacy
-        # consumers, but the web UI needs structured lifecycle data. How: emit a
-        # durable tool_call_start immediately before the SignalBus span. Purpose:
-        # the EventLog can replay the exact tool name, call id, and arguments.
-        await ls.rctx.emit_event("tool_call_start", {
-            "node_id": ls.node.id,
-            "task_id": ls.rctx.task_id,
-            "tool_call_id": _rtc.get("id", ""),
-            "tool_name": _t_name,
-            "arguments": _t_args,
-        })
-        # Phase 2 Signal: tool.call span 包裹每个工具的执行过程。
-        # 自动发射 tool.call.start（含工具名和参数摘要）和 tool.call.end（含 elapsed_ms 和 error）。
-        # span 是同步 contextmanager，在 async 函数中直接 with 即可。
-        _adaptive_threshold = _execute_command_async_upgrade_threshold(_t_name, _t_args, ls.runtime_cfg)
-        if _adaptive_threshold is not None:
-            # [AutoC 2026-06-27] Why: execute_command may run longer than the model
-            # should wait, but its own timeout_sec must remain the hard kill limit.
-            # How: start the normal registry execution with a ToolContext snapshot,
-            # wait only until the effective threshold, then deliver the same task in
-            # the background if it is still pending. Purpose: the model receives an
-            # immediate tool result placeholder while the subprocess keeps running.
-            _exec_tool_ctx = _snapshot_tool_context(_tool_ctx)
-            _exec_task = asyncio.create_task(
-                _execute_registry_tool_with_span(ls.registry, _t_name, _t_args, _exec_tool_ctx),
-                name=f"execute_command_adaptive_{str(_rtc.get('id') or '')[:24] or 'call'}",
-            )
-            _done, _pending = await asyncio.wait({_exec_task}, timeout=float(_adaptive_threshold))
-            if _exec_task not in _done:
-                _cleanup_async_tracker()
-                _async_id = uuid.uuid4().hex[:8]
-                _async_tool_tasks[_async_id] = {
-                    "tool_name": _t_name,
-                    "status": "running",
-                    "started_at": _tool_t0,
-                    "task_id": ls.rctx.task_id,
-                    "upgraded_from": "sync_timeout",
-                }
-                asyncio.create_task(
-                    _deliver_started_async_task(
-                        _exec_task,
-                        registry=ls.registry,
-                        http=ls.rctx.http,
-                        supervisor_url=ls.rctx.supervisor_url,
-                        task_id=ls.rctx.task_id,
-                        session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
-                        tool_name=_t_name,
-                        tool_args=_t_args,
-                        tool_ctx=_exec_tool_ctx,
-                        async_tool_id=_async_id,
-                        started_at=_tool_t0,
-                        runtime_cfg=ls.runtime_cfg,
-                        step=step,
-                        index=len(_tool_entries),
-                        tool_call_id=str(_rtc.get("id") or _async_id),
-                    ),
-                    name=f"async_upgrade_{_t_name}_{_async_id}",
-                )
-                _async_summary = f"执行超过 {_adaptive_threshold:.1f}s，已自动转为异步 (id: {_async_id})，结果将通过 preempt 自动回传"
-                _t_result = None
-                _t_fmt = "text"
-                _t_raw_inline = (
-                    f'⏳ Tool "{_t_name}" exceeded {_adaptive_threshold:.1f}s and was '
-                    f'auto-upgraded to async (id: {_async_id}). Result will be delivered via preempt when ready.'
-                )
-                _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1) if "_tool_t0" in dir() else None
-                _tool_entries.append({
-                    "id": _rtc.get("id", ""),
-                    "name": _t_name,
-                    "args": _t_args,
-                    "format": _t_fmt,
-                    "raw_inline": _t_raw_inline,
-                    "truncated": False,
-                    "ref": "",
-                    "summary": _async_summary,
-                    "elapsed_ms": _t_elapsed_ms,
-                    "attachments": [],
-                })
-                await ls.rctx.emit_event("tool_call_end", {
-                    "node_id": ls.node.id,
-                    "task_id": ls.rctx.task_id,
-                    "tool_call_id": _rtc.get("id", ""),
-                    "tool_name": _t_name,
-                    "status": "async_started",
-                    "summary": _async_summary,
-                    "result": _t_result,
-                    "raw_inline": _t_raw_inline,
-                    "format": _t_fmt,
-                    "elapsed_ms": _t_elapsed_ms,
-                })
-                await ls.rctx.emit_event("handoff_progress", {
-                    "message": f"[{ls.node.id}] {_t_name}: 已自动转为异步执行",
-                    "node_id": ls.node.id,
-                    "task_id": ls.rctx.task_id,
-                })
-                continue
-            _t_result = _exec_task.result()
-        else:
-            _t_result = await _execute_registry_tool_with_span(ls.registry, _t_name, _t_args, _tool_ctx)
         # [硬取消-场景1] 工具返回 cancelled 时，仍将结果存入 _tool_entries 再 break。
         # 确保 assistant 的 tool_use 有对应 tool_result 配对，
         # 模型下次看到的是「我调了工具但被用户取消了」而非 tool_use 悬空无响应。
