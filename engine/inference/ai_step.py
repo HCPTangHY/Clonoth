@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import asyncio
 import logging
 import time
 import uuid
-from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -27,6 +25,17 @@ from .resume_builder import _build_resume_messages
 from .loop_state import _LoopState, _persist_ctx, _short
 from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
 from .pseudo_handlers import _handle_pseudo_tool
+# 异步工具生命周期（启动、跟踪、结果投递）已抽入独立模块。
+# _async_tool_tasks 与本模块共享同一字典引用，原地修改对两侧均可见。
+from .async_tools import (
+    _async_tool_tasks,
+    _cleanup_async_tracker,
+    _snapshot_tool_context,
+    _execute_command_async_upgrade_threshold,
+    _execute_registry_tool_with_span,
+    _deliver_started_async_task,
+    _run_async_tool,
+)
 
 from ..context_store import load_context_snapshot
 from ..attachments import build_multimodal_content
@@ -53,17 +62,11 @@ from ..tool_step import (
     truncate_tool_result,
     write_artifact,
 )
-# [2026-04-24] P1.5 熔断器：新增 record_compact_failure, record_compact_success, is_compact_circuit_open
-# 用于在连续压缩失败时跳过自动压缩，避免浪费 API 调用。
-from ..compact import (
-    _format_messages_for_summary,
-    count_real_task_segments,
-    is_compact_circuit_open,
-    record_compact_failure,
-    record_compact_success,
-    should_compact,
-)
-from clonoth_runtime import get_bool, get_int, get_float, load_runtime_config
+# [2026-04-24] P1.5 熔断器：压缩成功后重置熔断计数。
+# 压缩决策逻辑已整体迁入 engine/builtin/compact.py（CompactChecker 插件），
+# ai_step 仅保留 record_compact_success 用于 compact 恢复路径。
+from ..compact import record_compact_success
+from clonoth_runtime import get_int, get_float, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
 # 此处导入供外部通过 ai_step 模块访问（如测试、调试）。
@@ -89,51 +92,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..context import RunContext
-
-
-# ---------------------------------------------------------------------------
-#  异步工具跟踪表（Async Tool Tracking）
-#  [2026-04-23] 从 commit 7d10197 恢复，在 864a333 大扫除中被误删。
-#  key = async_tool_id (8 位 hex), value = 状态字典
-#  用于关联异步工具的启动占位消息与 preempt 回传结果。
-#  done/failed 条目保留 5 分钟后自动清理，防止无限增长。
-# ---------------------------------------------------------------------------
-_async_tool_tasks: dict[str, dict] = {}
-
-# 清理阈值：done/failed 条目保留秒数
-_ASYNC_TRACK_RETAIN_SEC = 300  # 5 minutes
-
-
-def _cleanup_async_tracker() -> None:
-    """清理已完成超过 _ASYNC_TRACK_RETAIN_SEC 的条目。
-
-    在每次新增 tracking 条目时调用，避免 map 无限增长。
-    只清理 status 为 done 或 failed 且 finished_at 已过期的条目。
-    """
-    now = time.monotonic()
-    expired = [
-        k for k, v in _async_tool_tasks.items()
-        if v.get("status") in ("done", "failed")
-        and now - v.get("finished_at", now) > _ASYNC_TRACK_RETAIN_SEC
-    ]
-    for k in expired:
-        del _async_tool_tasks[k]
-
-
-def get_async_tool_tasks() -> list[dict]:
-    """导出当前所有异步工具跟踪条目，供外部查询。
-
-    返回列表，每项包含 async_id, tool_name, status, elapsed 等字段。
-    """
-    result = []
-    now = time.monotonic()
-    for aid, info in _async_tool_tasks.items():
-        entry = {"async_id": aid, **info}
-        # 对 running 状态补算已经过的时间
-        if info.get("status") == "running" and "started_at" in info:
-            entry["elapsed"] = round(now - info["started_at"], 1)
-        result.append(entry)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -208,160 +166,6 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
 # ---------------------------------------------------------------------------
 #  推理循环子函数
 # ---------------------------------------------------------------------------
-
-def _compact_target_session_id(ls: _LoopState) -> str:
-    """Return the durable session that automatic compact should rewrite."""
-    # [2026-05-27] Why: child sessions (accumulate 模式的子节点) 的历史独立存储在自己的
-    # JSONL 中，压缩应针对 child_session_id 而非父会话。
-    # How: 优先返回 child_session_id；不存在时回退到旧逻辑（parent_session_id or session_id）。
-    # Purpose: 与 engine/builtin/compact.py 保持一致，让子节点 session 接入自动压缩。
-    child_sid = str(getattr(ls.rctx, "child_session_id", "") or "").strip()
-    if child_sid:
-        return child_sid
-    return str(getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id or "").strip()
-
-
-async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
-    """上下文压缩检查。如需压缩则返回 DISPATCH action。"""
-    if ls.compacted or ls.compact_threshold <= 0:
-        return None
-    compact_sid = _compact_target_session_id(ls)
-    # [2026-04-24] P1.5 熔断器：连续压缩失败达到阈值时跳过自动压缩
-    if is_compact_circuit_open(compact_sid):
-        return None
-    if not should_compact(ls.messages, ls.compact_threshold, ls.last_prompt_tokens):
-        return None
-
-    # ---------------------------------------------------------------
-    # Pre-check: count task segments in ConversationStore. If there
-    # are not enough segments to compress (≤ keep_recent), skip the
-    # LLM compactor call entirely to avoid wasting API calls.
-    # ---------------------------------------------------------------
-    try:
-        _conv_store = getattr(ls.rctx, 'conversation_store', None)
-        if _conv_store:
-            _stored_msgs = _conv_store.load(compact_sid)
-            # [2026-05-17] Why: compact_summary is the prior compressed prefix,
-            # not a real task segment. How: use the shared segment counter that
-            # skips compact_summary and counts only consecutive real task ids.
-            # Purpose: this legacy ai_step path stays aligned with builtin
-            # compact and stops dispatching when only keep_recent real tasks remain.
-            _seg_count = count_real_task_segments(_stored_msgs)
-            if _seg_count <= ls.compact_keep_recent:
-                logger.info(
-                    "skip compact: only %d task segments (keep_recent=%d), not enough to compress",
-                    _seg_count, ls.compact_keep_recent,
-                )
-                ls.compacted = True  # prevent retrigger this step
-                return None
-    except Exception as _seg_err:
-        logger.warning("segment pre-check failed, proceeding with compact: %s", _seg_err)
-
-    # ---------------------------------------------------------------
-    # P6 Snip Compact (Level 2): 用已有轮摘要替换旧 task 消息链
-    # 在 dispatch LLM compactor 前先尝试，可能免去 LLM 调用
-    # ---------------------------------------------------------------
-    try:
-        from engine.task_record import (
-            load_task_records,
-            snip_history,
-            snip_store,
-        )
-        # [AutoC 2026-05-13] Why: branch sessions are forked copies, so snipping
-        # them does not reduce the durable parent history. How: use the same
-        # parent-first target as LLM compact. Purpose: L2 and L3 compaction both
-        # persist to the session future branches will fork from.
-        _snip_sid = compact_sid
-        _snip_records = load_task_records(ls.rctx.workspace_root, _snip_sid)
-        if _snip_records:
-            # Incremental: snip a few oldest tasks per trigger
-            _snipped, _snip_count, _snipped_ids = snip_history(
-                ls.messages, _snip_records,
-            )
-            if _snip_count > 0:
-                ls.messages = _snipped
-                # Persist to ConversationStore so next load sees snipped version
-                _store = getattr(ls.rctx, 'conversation_store', None)
-                if _store:
-                    try:
-                        _stored = _store.load(_snip_sid)
-                        _persisted = snip_store(_stored, _snip_records, _snipped_ids)
-                        _store.replace_all(_snip_sid, _persisted)
-                    except Exception as _pe:
-                        logger.warning("failed to persist snipped history: %s", _pe)
-                await ls.rctx.emit_event("snip_compact", {
-                    "node_id": ls.node.id, "step": step,
-                    "snipped_tasks": _snip_count,
-                })
-                # Snipped something → done for this round, continue task
-                logger.info("snip_compact: replaced %d tasks, skipping LLM compact", _snip_count)
-                ls.compacted = True
-                return None
-
-    except Exception as _snip_err:
-        logger.warning("snip compact failed, falling through to LLM compact: %s", _snip_err)
-
-    ls.compacted = True
-    try:
-        await ls.rctx.emit_event("compact_start", {"node_id": ls.node.id, "step": step})
-        conversation_text = _format_messages_for_summary(
-            [m for m in ls.messages if m.get("role") != "system" and not m.get("_dynamic")]
-        )
-        # ---------------------------------------------------------------
-        # P5b PTL Retry: 压缩请求本身过长时截断
-        # compactor 节点也有模型上下文上限，如果待压缩的对话文本超过
-        # 这个上限，压缩请求自身就会 413。这里在发送前做预截断：
-        # 保留尾部（最近的对话），丢弃头部（最旧的部分），并对齐到
-        # 消息分隔符边界，避免截断产生不完整消息。
-        # ~100K tokens ≈ 300K chars（按 3 字符/token 估算）
-        # ---------------------------------------------------------------
-        _ptl_max_chars = 300000
-        if len(conversation_text) > _ptl_max_chars:
-            _ptl_original_len = len(conversation_text)
-            conversation_text = conversation_text[-_ptl_max_chars:]
-            # 找到第一个完整消息边界（--- 分隔符），丢弃截断的不完整消息
-            _first_sep = conversation_text.find("\n\n---\n\n")
-            if _first_sep > 0:
-                conversation_text = conversation_text[_first_sep + len("\n\n---\n\n"):]
-            await ls.rctx.emit_event("ptl_truncated", {
-                "node_id": ls.node.id, "step": step,
-                "original_chars": _ptl_original_len,
-            })
-        if conversation_text.strip():
-            ctx_ref = _persist_ctx(ls, step)
-            return TaskAction(
-                action=ACTION_DISPATCH,
-                node_id=ls.node.id,
-                target_node="system.compactor",
-                context_ref=ctx_ref,
-                dispatch_input={
-                    "instruction": conversation_text,
-                    "_compact_dispatch": True,
-                    "context_mode": "fresh",
-                    "_compact_keep_recent": ls.compact_keep_recent,
-                    "_compact_threshold_tokens": ls.compact_threshold,
-                    # [AutoC 2026-05-13] Why: supervisor applies the compactor
-                    # result after dispatch returns, and branch session ids are
-                    # temporary. How: carry the parent-first target session in the
-                    # dispatch input. Purpose: LLM compact rewrites the durable
-                    # parent ConversationStore.
-                    "target_session_id": compact_sid,
-                    "_system_task": True,
-                    "use_context": False,
-                },
-            )
-    except Exception as compact_err:
-        # [2026-04-24] P1.5 熔断器：记录压缩失败，累计达阈值后自动跳过
-        # [AutoC 2026-05-13] Why: the circuit breaker should follow the session
-        # we tried to compact, not the branch currently executing. How: record the
-        # failure against compact_sid. Purpose: retry suppression matches the
-        # parent ConversationStore target.
-        record_compact_failure(compact_sid)
-        await ls.rctx.emit_event("compact_failed", {
-            "node_id": ls.node.id, "step": step, "error": str(compact_err),
-        })
-    return None
-
 
 # ---------------------------------------------------------------------------
 #  工具调用处理
@@ -699,266 +503,6 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     if pseudo_calls or real_tool_calls:
         ls.use_stream = ls.streaming
     return None
-
-
-# ---------------------------------------------------------------------------
-#  异步工具后台执行器
-#  [2026-04-23] 从 commit 7d10197 恢复，在 864a333 大扫除中被误删。
-#  当工具 spec 标记 async_mode=True 时，工具在后台 asyncio.Task 中执行，
-#  完成后通过 preempt API 将结果注入回当前任务的对话流。
-# ---------------------------------------------------------------------------
-
-def _snapshot_tool_context(tool_ctx: ToolContext) -> ToolContext:
-    """Return an immutable-enough ToolContext snapshot for background tool work."""
-    # [AutoC 2026-06-27] Why: _execute_real_tools reuses one ToolContext and rewrites
-    # tool_call_id for every tool in the batch. How: copy dataclass fields and the
-    # node-specific dynamic attributes before scheduling background work. Purpose:
-    # async execute_command callbacks keep the approval and artifact identity of the
-    # original tool call.
-    snapshot = replace(tool_ctx)
-    for attr in ("_node_id", "_node_extra"):
-        if hasattr(tool_ctx, attr):
-            setattr(snapshot, attr, getattr(tool_ctx, attr))
-    return snapshot
-
-
-def _execute_command_async_upgrade_threshold(
-    tool_name: str,
-    tool_args: dict[str, Any],
-    runtime_cfg: dict[str, Any] | None,
-) -> float | None:
-    """Return the adaptive async threshold for execute_command, or None."""
-    # [AutoC 2026-06-27] Why: execute_command has its own hard timeout that must
-    # remain the absolute kill ceiling, while the engine may stop waiting earlier.
-    # How: enable only for execute_command and compute min(threshold, timeout*0.8),
-    # skipping calls whose timeout is too close to the configured threshold. Purpose:
-    # slow shell commands continue in the background without changing tool syntax.
-    if str(tool_name or "") != "execute_command":
-        return None
-    cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
-    if not get_bool(cfg, "meta.execute_command.async_upgrade.enabled", True):
-        return None
-    threshold_sec = get_float(
-        cfg,
-        "meta.execute_command.async_upgrade.threshold_sec",
-        60.0,
-        min_value=0.01,
-        max_value=3600.0,
-    )
-    default_timeout_sec = get_float(
-        cfg,
-        "meta.execute_command.default_timeout_sec",
-        90.0,
-        min_value=1.0,
-        max_value=3600.0,
-    )
-    timeout_raw = (tool_args or {}).get("timeout_sec")
-    try:
-        timeout_sec = float(timeout_raw) if timeout_raw is not None else float(default_timeout_sec)
-    except Exception:
-        timeout_sec = float(default_timeout_sec)
-    if timeout_sec <= threshold_sec + 1.0:
-        return None
-    effective = min(float(threshold_sec), float(timeout_sec) * 0.8)
-    return effective if effective > 0 else None
-
-
-async def _execute_registry_tool_with_span(
-    registry: ToolRegistry,
-    tool_name: str,
-    tool_args: dict[str, Any],
-    tool_ctx: ToolContext,
-    *,
-    async_call: bool = False,
-) -> Any:
-    """Run one registry tool call inside the existing SignalBus span."""
-    # [AutoC 2026-06-27] Why: synchronous, declared-async, and adaptive-async paths
-    # must keep the same tool.call signal semantics. How: centralize registry.execute
-    # under one span helper. Purpose: refactoring async delivery does not silently
-    # drop signal metadata or duplicate execution logic.
-    _args_summary = _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200)
-    payload: dict[str, Any] = {"tool": tool_name, "args_summary": _args_summary}
-    if async_call:
-        payload["async"] = True
-    with get_bus().span('tool.call', payload=payload):
-        return await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx)
-
-
-async def _deliver_async_result(
-    *,
-    registry: ToolRegistry,
-    http: "httpx.AsyncClient",
-    supervisor_url: str,
-    task_id: str,
-    session_id: str,
-    tool_name: str,
-    tool_args: dict,
-    tool_ctx: ToolContext,
-    async_tool_id: str,
-    started_at: float,
-    runtime_cfg: dict[str, Any] | None = None,
-    step: int = 0,
-    index: int = 0,
-    tool_call_id: str = "",
-    result: Any = None,
-    error: Exception | None = None,
-) -> None:
-    """Format, track, and deliver an async tool result through supervisor."""
-    # [AutoC 2026-06-27] Why: declared async tools and adaptive execute_command share
-    # the same callback protocol. How: move result shaping, truncation, tracker
-    # updates, attachment extraction, and async_tool_result POST into one delivery
-    # function. Purpose: adaptive upgrade can await an already-started process without
-    # copying the existing callback implementation.
-    try:
-        if error is not None:
-            raise error
-        _elapsed = time.monotonic() - started_at
-        _summary = summarize_result(tool_name, result, args=tool_args)
-        _tool_spec = registry.get_spec(tool_name)
-        _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
-        if isinstance(raw, str):
-            _limit = get_tool_inline_limit(tool_name, runtime_cfg)
-            _ref = ""
-            if artifact_enabled(runtime_cfg) and len(raw) > _limit:
-                _ref = write_artifact(tool_ctx.workspace_root, task_id, step, index, tool_name, tool_call_id or async_tool_id, raw)
-            raw, _was_truncated = truncate_tool_result(tool_name, raw, _limit, _ref, config=runtime_cfg)
-
-        _async_tool_tasks[async_tool_id] = {
-            "tool_name": tool_name,
-            "status": "done",
-            "task_id": task_id,
-            "started_at": started_at,
-            "finished_at": time.monotonic(),
-            "elapsed": round(_elapsed, 1),
-        }
-
-        preempt_text = (
-            f'✅ Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
-            f'\nSummary: {_summary}\nResult:\n{raw}'
-        )
-
-        attachments: list[str] = []
-        if isinstance(result, dict):
-            data = result.get("data") if isinstance(result.get("data"), dict) else {}
-            source_attachments = data.get("attachments") if isinstance(data.get("attachments"), list) else result.get("attachments")
-            if isinstance(source_attachments, list):
-                for a in source_attachments:
-                    if isinstance(a, dict) and a.get("path"):
-                        attachments.append(str(a["path"]))
-                    elif isinstance(a, str):
-                        attachments.append(a)
-
-        payload: dict = {"message": preempt_text, "task_id": task_id}
-        if attachments:
-            payload["attachment_paths"] = attachments
-
-        await http.post(
-            f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-            json=payload,
-        )
-    except Exception as e:
-        _async_tool_tasks[async_tool_id] = {
-            "tool_name": tool_name,
-            "status": "failed",
-            "task_id": task_id,
-            "started_at": started_at,
-            "finished_at": time.monotonic(),
-            "elapsed": round(time.monotonic() - started_at, 1),
-            "error": str(e),
-        }
-        try:
-            await http.post(
-                f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-                json={"message": f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}', "task_id": task_id},
-            )
-        except Exception:
-            pass
-
-
-async def _deliver_started_async_task(
-    exec_task: "asyncio.Task[Any]",
-    **delivery_kwargs: Any,
-) -> None:
-    """Await an already-started tool task and deliver its final async result."""
-    # [AutoC 2026-06-27] Why: adaptive execute_command begins as a normal registry
-    # execution before the threshold proves it is slow. How: await that existing task
-    # instead of starting the command again, then delegate to _deliver_async_result.
-    # Purpose: the subprocess remains single-instance and execute_command's internal
-    # timeout still owns the eventual kill behavior.
-    try:
-        result = await exec_task
-    except Exception as e:
-        await _deliver_async_result(error=e, **delivery_kwargs)
-    else:
-        await _deliver_async_result(result=result, **delivery_kwargs)
-
-
-async def _run_async_tool(
-    registry: ToolRegistry,
-    http: "httpx.AsyncClient",
-    supervisor_url: str,
-    task_id: str,
-    session_id: str,
-    tool_name: str,
-    tool_args: dict,
-    tool_ctx: ToolContext,
-    async_tool_id: str,
-    runtime_cfg: dict[str, Any] | None = None,
-    step: int = 0,
-    index: int = 0,
-    tool_call_id: str = "",
-) -> None:
-    """后台执行异步工具，完成后通过路由 session 的 API 注入结果。"""
-    # [Fork/Merge 2026-05-12] session_id here is the event/user-facing route session.
-    # Why: async tool results create a new inbound and must attach to the parent session when
-    # the original task is running on a branch. How: callers pass parent_session_id when present.
-    # Purpose: branch-local ConversationStore writes remain isolated while async callbacks still
-    # reach the SDK conversation_key mapping.
-    _started = time.monotonic()
-    try:
-        result = await _execute_registry_tool_with_span(
-            registry,
-            tool_name,
-            tool_args,
-            tool_ctx,
-            async_call=True,
-        )
-    except Exception as e:
-        await _deliver_async_result(
-            registry=registry,
-            http=http,
-            supervisor_url=supervisor_url,
-            task_id=task_id,
-            session_id=session_id,
-            tool_name=tool_name,
-            tool_args=tool_args,
-            tool_ctx=tool_ctx,
-            async_tool_id=async_tool_id,
-            started_at=_started,
-            runtime_cfg=runtime_cfg,
-            step=step,
-            index=index,
-            tool_call_id=tool_call_id,
-            error=e,
-        )
-    else:
-        await _deliver_async_result(
-            registry=registry,
-            http=http,
-            supervisor_url=supervisor_url,
-            task_id=task_id,
-            session_id=session_id,
-            tool_name=tool_name,
-            tool_args=tool_args,
-            tool_ctx=tool_ctx,
-            async_tool_id=async_tool_id,
-            started_at=_started,
-            runtime_cfg=runtime_cfg,
-            step=step,
-            index=index,
-            tool_call_id=tool_call_id,
-            result=result,
-        )
 
 
 # ---------------------------------------------------------------------------
