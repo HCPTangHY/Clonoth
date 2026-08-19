@@ -172,14 +172,15 @@ class GeminiProvider(BaseProvider):
                 except (json.JSONDecodeError, TypeError):
                     resp_obj = {"result": raw_content}
                 # Gemini requires all function responses for the same turn to be
-                # grouped in a single role="function" entry.  Merge into the
-                # previous entry if it's also a function response.
+                # grouped in a single role="user" entry with functionResponse parts.
+                # (2026-08-19: changed from role="function" to role="user" per current
+                # Gemini API spec; the old "function" role is no longer accepted.)
                 _fr_part = {"functionResponse": {"name": name, "response": resp_obj}}
-                if contents and contents[-1].get("role") == "function":
+                if contents and contents[-1].get("role") == "user" and contents[-1]["parts"] and "functionResponse" in contents[-1]["parts"][-1]:
                     contents[-1]["parts"].append(_fr_part)
                 else:
                     contents.append({
-                        "role": "function",
+                        "role": "user",
                         "parts": [_fr_part],
                     })
                 continue
@@ -323,12 +324,15 @@ class GeminiProvider(BaseProvider):
         tc_counter = 0  # for generating synthetic tool_call ids
         # [2026-05-01] 收集所有原始 parts，Gemini 3 要求整个 response 原样回传
         all_raw_parts: list[dict[str, Any]] = []
+        # [2026-08-18] 保留原始响应文本，用于非 SSE 格式（如 Vertex AI JSON 数组）的回退解析
+        _raw_chunks: list[str] = []
 
         try:
             # Gemini SSE: each line is "data: {json}\n\n"
             buf = ""
             async for raw_chunk in resp.aiter_text():
                 buf += raw_chunk
+                _raw_chunks.append(raw_chunk)
                 # Process complete SSE events in buffer
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
@@ -407,6 +411,56 @@ class GeminiProvider(BaseProvider):
             log.warning("Gemini stream read error: %s", exc)
         finally:
             await resp.aclose()
+
+        # [2026-08-18] Vertex AI / 非 SSE 回退：如果 SSE 解析一无所获，
+        # 尝试将原始响应当作 JSON 数组解析（Vertex streamGenerateContent
+        # 在不带 alt=sse 时返回 JSON 数组而非 SSE 事件流）。
+        if not all_raw_parts and not text_parts and not thinking_parts and not tool_calls and _raw_chunks:
+            _raw_body = "".join(_raw_chunks).strip()
+            if _raw_body:
+                try:
+                    _fb = json.loads(_raw_body)
+                    if isinstance(_fb, dict):
+                        _fb = [_fb]
+                    if isinstance(_fb, list):
+                        log.info("Gemini SSE empty; JSON-array fallback (%d chunks)", len(_fb))
+                        for _fd in _fb:
+                            _cands = _fd.get("candidates") or []
+                            if not _cands:
+                                continue
+                            for _p in (_cands[0].get("content") or {}).get("parts") or []:
+                                all_raw_parts.append(_p)
+                                if _p.get("thought"):
+                                    _t = _p.get("text", "")
+                                    if _t:
+                                        thinking_parts.append(_t)
+                                        if on_thinking:
+                                            await on_thinking(_t)
+                                elif "text" in _p:
+                                    _t = _p["text"]
+                                    text_parts.append(_t)
+                                    if on_text:
+                                        await on_text(_t)
+                                elif "functionCall" in _p:
+                                    _fc = _p["functionCall"]
+                                    tc_counter += 1
+                                    _tc_id = f"call_{tc_counter}"
+                                    _tc_idx = tc_counter - 1
+                                    _tc_name = _fc.get("name", "")
+                                    _tc_args_raw = _fc.get("args") or {}
+                                    _tc_args = _tc_args_raw if isinstance(_tc_args_raw, dict) else {"_raw": _tc_args_raw}
+                                    if on_tool_delta:
+                                        await on_tool_delta({"event": "tool_call_start", "index": _tc_idx, "id": _tc_id, "name": _tc_name})
+                                        await on_tool_delta({"event": "tool_call_args_delta", "index": _tc_idx, "delta": json.dumps(_tc_args, ensure_ascii=False)})
+                                        await on_tool_delta({"event": "tool_call_done", "index": _tc_idx})
+                                    tool_calls.append(ToolCall(id=_tc_id, name=_tc_name, arguments=_tc_args))
+                                elif "inlineData" in _p:
+                                    inline_data_list.append(_p["inlineData"])
+                            _um = _fd.get("usageMetadata")
+                            if _um:
+                                usage = _parse_usage(_um)
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    pass
 
         full_text = "".join(text_parts) or None
         reasoning = "".join(thinking_parts) or None
