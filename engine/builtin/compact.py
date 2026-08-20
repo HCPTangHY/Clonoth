@@ -22,6 +22,45 @@ from engine.protocol import ACTION_DISPATCH, TaskAction
 logger = logging.getLogger(__name__)
 
 
+def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
+    """Harvest the last real prompt_tokens from history when the loop has none.
+
+    Why: a new task starts with last_prompt_tokens=None, so should_compact fell
+    back to the chars//3 estimate, which underestimates CJK-heavy history and
+    misses overshoot until the first provider call fails or returns usage —
+    exactly the "上轮没到上限，这轮一开始就超了" case. How: scan newest-first
+    for the last assistant message carrying _meta.usage.prompt_tokens
+    (written by shadow write on every assistant turn, carried into history by
+    _message_to_history_dict), then add a rough chars//3 estimate for messages
+    appended after it (tool results, finish result, the new user instruction).
+    Purpose: the first before_step check of a task sees real usage and can
+    compact before the first LLM request goes out.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        usage = (msg.get("_meta") or {}).get("usage")
+        if not isinstance(usage, dict):
+            continue
+        pt = usage.get("prompt_tokens")
+        if isinstance(pt, bool) or not isinstance(pt, (int, float)) or pt <= 0:
+            continue
+        tail_chars = 0
+        for tail in messages[i + 1:]:
+            if not isinstance(tail, dict):
+                continue
+            content = tail.get("content", "")
+            if isinstance(content, str):
+                tail_chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        tail_chars += len(part["text"])
+        return int(pt) + tail_chars // 3
+    return None
+
+
 # Why: the built-in loader discovers handlers from per-file metadata.
 # How: declare the handler class, hook methods, and priority in one place.
 # Purpose: remove central hard-coded registration while keeping this handler self-describing.
@@ -162,7 +201,17 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     compact_sid = _compact_target_session_id(ls)
     if is_compact_circuit_open(compact_sid):
         return None
-    if not should_compact(ls.messages, ls.compact_threshold, ls.last_prompt_tokens):
+    if not should_compact(
+        ls.messages, ls.compact_threshold,
+        # [AutoC 2026-08-20] Why: the first check of a new task has no in-task
+        # usage yet, but the previous task's real prompt size is sitting in the
+        # history metadata. How: seed from the last assistant usage instead of
+        # falling straight to the chars//3 estimate. Purpose: catch "last round
+        # under threshold, this round starts over" before the first LLM call.
+        ls.last_prompt_tokens
+        if ls.last_prompt_tokens is not None
+        else _seed_prompt_tokens(ls.messages),
+    ):
         return None
 
     # ---------------------------------------------------------------
@@ -282,39 +331,3 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
             "error": str(compact_error),
         })
     return None
-
-
-def estimate_context_tokens(messages: list[dict[str, Any]], last_usage: dict | None = None) -> int:
-    """Estimate token usage using the same fallback rules as ai_step.py.
-
-    Why: context usage estimation is useful outside ai_step after compaction logic
-    moved into hooks. How: prefer the last provider usage, then fall back to
-    stored assistant completion usage and character counts. Purpose: keep future
-    dynamic-context updates able to reuse the extracted helper.
-    """
-    if last_usage:
-        prompt_tokens = last_usage.get("prompt_tokens", 0) or 0
-        completion_tokens = last_usage.get("completion_tokens", 0) or 0
-        if prompt_tokens > 0:
-            return prompt_tokens + completion_tokens
-
-    total = 0
-    for msg in messages:
-        if msg.get("_dynamic") or msg.get("_ephemeral"):
-            continue
-        meta = msg.get("_meta", {})
-        if isinstance(meta, dict):
-            usage = meta.get("usage", {})
-            if isinstance(usage, dict):
-                completion_tokens = usage.get("completion_tokens", 0)
-                if completion_tokens and isinstance(completion_tokens, int) and completion_tokens > 0:
-                    total += completion_tokens
-                    continue
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total += len(content) // 3
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    total += len(part["text"]) // 3
-    return total
