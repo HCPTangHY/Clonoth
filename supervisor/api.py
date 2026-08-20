@@ -282,6 +282,9 @@ def create_app(
         "/v1/admin/auth/login",
         "/v1/health",
     }
+    # [AutoC 2026-08-20] 插件路由面用 public=True 写入此集合；中间件闭包持有
+    # 同一对象引用，运行期新增的公开路径立即生效，无需重建中间件。
+    app.state.auth_exempt_paths = _AUTH_EXEMPT_PATHS
 
     @app.middleware("http")
     async def _auth_middleware(request: Request, call_next):
@@ -2412,6 +2415,48 @@ def create_app(
         @app.get("/admin/")
         async def _admin_redirect_to_web() -> _RR:
             return _RR("/web/")
+
+    # ── 插件能力清单 + 插件路由挂载 ─────────────────────────────
+    # Why: 插件声明自己有什么（hook、工具、路由、前端 manifest），不指定给谁用；
+    # web 前端和 Discord adapter 从这里发现能力。How: 聚合 hook_registry 元数据
+    # 与 routes face 的声明，PLUGIN_META 的 client 字段原样透传。
+    @app.get("/v1/plugins")
+    async def list_registered_plugins() -> dict[str, Any]:
+        routes_by_owner: dict[str, list[dict[str, Any]]] = {}
+        routes_face = getattr(state, "routes_face", None)
+        if routes_face is not None:
+            for rec in routes_face.list_routes():
+                routes_by_owner.setdefault(rec["owner"], []).append(rec)
+        known: set[str] = set()
+        plugins_out: list[dict[str, Any]] = []
+        for meta in state.hook_registry.list_plugins():
+            name = str(meta.get("name") or "")
+            known.add(name)
+            plugins_out.append({
+                "name": name,
+                "version": str(meta.get("version") or ""),
+                "description": str(meta.get("description") or ""),
+                "author": str(meta.get("author") or ""),
+                "module": str(meta.get("module") or ""),
+                "hooks": list(meta.get("hooks") or []),
+                "tools": list(meta.get("tools") or []),
+                "routes": routes_by_owner.get(name, []),
+                "client": meta.get("client"),
+            })
+        # 有路由声明但没有元数据的 owner（加载中途失败等）也列出，便于排查。
+        for owner, recs in sorted(routes_by_owner.items()):
+            if owner not in known:
+                plugins_out.append({
+                    "name": owner, "version": "", "description": "",
+                    "author": "", "module": "", "hooks": [], "tools": [],
+                    "routes": recs, "client": None,
+                })
+        return {"plugins": plugins_out}
+
+    # 插件路由挂载必须放在 create_app 尾部：核心路由全部先注册，
+    # 路由面的冲突检测才能以完整核心集合为基准，插件无法遮蔽核心端点。
+    if getattr(state, "routes_face", None) is not None:
+        state.routes_face.attach(app, workspace_root=state.workspace_root)
 
     # 启动时打印 token 并写入共享文件供 engine 读取
     token = get_admin_token()

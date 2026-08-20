@@ -108,7 +108,16 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # and hard-coded registration.
         from engine.context import EngineContext
 
+        # Why: plugins declare HTTP routes on a face only the supervisor can
+        # satisfy (the FastAPI app lives in this process); engine-side loads
+        # see contributions.get("routes") -> None and skip. How: mount one
+        # PluginRoutesFace on the supervisor context before the loaders run
+        # and keep it on the state so create_app can attach the app later.
+        from engine.faces.routes import PluginRoutesFace
+
+        self.routes_face = PluginRoutesFace()
         _supervisor_ctx = EngineContext(hooks=self.hook_registry)
+        _supervisor_ctx.contributions.mount("routes", self.routes_face)
         _builtin_handlers = auto_discover_and_register(self.hook_registry, context=_supervisor_ctx)
         # Why: the Clonoth runtime may temporarily run with a reduced built-in
         # handler set while features are being rolled out. How: keep optional

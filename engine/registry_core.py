@@ -56,6 +56,16 @@ class DisposalLedger:
             return
         self._plugin_disposers.setdefault(name, []).append(disposer)
 
+    def current_owner(self) -> str | None:
+        """Return the plugin currently being loaded, if any.
+
+        Why: registration surfaces need to attribute declarations to the plugin
+        being loaded without trusting self-declared metadata. How: expose the
+        collecting stack top. Purpose: the routes face derives its owner and
+        default prefix from this value.
+        """
+        return self._collecting_stack[-1] if self._collecting_stack else None
+
     def owned(self, plugin_name: str) -> int:
         """Return how many disposers are archived for one plugin."""
         return len(self._plugin_disposers.get((plugin_name or "").strip(), []))
