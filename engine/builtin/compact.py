@@ -31,8 +31,17 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
     exactly the "上轮没到上限，这轮一开始就超了" case. How: scan newest-first
     for the last assistant message carrying _meta.usage.prompt_tokens
     (written by shadow write on every assistant turn, carried into history by
-    _message_to_history_dict), then add a rough chars//3 estimate for messages
-    appended after it (tool results, finish result, the new user instruction).
+    _message_to_history_dict). The seed is then
+
+        prompt_tokens          # 历史+上轮内容，含上轮动态（真实）
+        + completion_tokens    # 上轮输出，本轮成为历史（真实）
+        + tail chars//3        # 上轮末尾新增（finish 结果等）与新 user（估算）
+
+    This turn's dynamic injection is deliberately NOT counted: the stale
+    previous-turn dynamic still sits inside the real prompt_tokens, and the
+    two renders are near-identical between turns, so the residual phantom
+    stands in for the new one. Net error is only the turn-to-turn delta of
+    the dynamic content, not its full size.
     Purpose: the first before_step check of a task sees real usage and can
     compact before the first LLM request goes out.
     """
@@ -46,9 +55,15 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
         pt = usage.get("prompt_tokens")
         if isinstance(pt, bool) or not isinstance(pt, (int, float)) or pt <= 0:
             continue
+        ct = usage.get("completion_tokens")
+        if isinstance(ct, bool) or not isinstance(ct, (int, float)) or ct < 0:
+            ct = 0
         tail_chars = 0
         for tail in messages[i + 1:]:
             if not isinstance(tail, dict):
+                continue
+            if tail.get("_dynamic"):
+                # 抵消项：本轮动态不数，由基数里残留的上轮动态顶替。
                 continue
             content = tail.get("content", "")
             if isinstance(content, str):
@@ -57,7 +72,7 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
                 for part in content:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         tail_chars += len(part["text"])
-        return int(pt) + tail_chars // 3
+        return int(pt) + int(ct) + tail_chars // 3
     return None
 
 
