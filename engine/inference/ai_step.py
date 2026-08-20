@@ -838,7 +838,7 @@ async def _execute_real_tools(
         if isinstance(_t_raw_inline, str):
             _step_inline_state["used"] = _step_inline_state.get("used", 0) + len(_t_raw_inline)
 
-        _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1) if "_tool_t0" in dir() else None
+        _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1)
         _tool_entries.append({
             "id": _rtc.get("id", ""),
             "name": _t_name,
@@ -962,87 +962,6 @@ async def _execute_real_tools(
             _shadow_write(ls, _tool_att_msg, message_type="tool_result_attachment")
 
     return None
-
-
-# ---------------------------------------------------------------------------
-#  纯文本响应处理
-# ---------------------------------------------------------------------------
-
-def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | None:
-    """处理纯文本响应（无 tool_calls）。"""
-    text = (resp.text or "").strip()
-    if not text:
-        return None
-
-    if ls.preempt_after_step:
-        ctx_ref = _persist_ctx(ls, step + 1)
-        return TaskAction(
-            action=ACTION_PREEMPTED, node_id=ls.node.id,
-            context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
-        )
-
-    # ---- hybrid 模式：纯文本视为隐式 finish，直接投递给用户 ----
-    # 不 reject、不重试，将裸文本包装为 ACTION_FINISH 返回。
-    # result 中标记 implicit_finish=True，供事件日志/管理界面区分显式与隐式 finish。
-    # 参见 RFC: data/rfc_hybrid_output_mode.md
-    if getattr(ls.node, 'output_mode', 'tool_only') == 'hybrid':
-        # 写入 assistant 消息到对话历史 + ConversationStore，与 _handle_tool_calls 对齐
-        _assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
-        # [refactor 2026-04-18] 与 _handle_tool_calls 对齐：动态 provider 名、metadata/reasoning 新字段
-        _provider_name = getattr(ls.provider, 'name', '') or 'unknown'
-        _implicit_meta = MessageMeta(
-            provider=_provider_name,
-            tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-            message_type="assistant",
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
-            metadata={_provider_name: resp.provider_meta} if getattr(resp, "provider_meta", None) else {},
-            tool_call_ids=[],
-            reasoning=getattr(resp, "reasoning", "") or "",
-            has_reasoning=bool(getattr(resp, "reasoning", "") or ""),
-            inline_data=getattr(resp, "inline_data", None) or [],
-            usage=dict(ls.last_usage) if ls.last_usage else {},
-            reasoning_started_at=getattr(ls, '_reasoning_started_iso', '') or '',
-            reasoning_ended_at=getattr(ls, '_reasoning_ended_iso', '') or '',
-        )
-        set_message_meta(_assistant_msg, _implicit_meta)
-        ls.messages.append(_assistant_msg)
-        _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
-
-        ctx_ref = _persist_ctx(ls, step + 1)
-        return TaskAction(
-            action=ACTION_FINISH, node_id=ls.node.id,
-            result={
-                "text": text,
-                "attachments": [],  # [AutoC 2026-08-06] 隐式 finish 不自动带附件
-                "implicit_finish": True,
-            },
-            context_ref=ctx_ref,
-            summary=_short(text, 240),
-        )
-
-    # ---- tool_only 模式：现有行为，reject 纯文本并重试 ----
-    ls.plaintext_retry_count += 1
-    if ls.plaintext_retry_count <= ls.plaintext_retry_max:
-        _retry_hint = ls.formatter.build_retry_hint()
-        ls.messages.append({
-            "role": "user",
-            "content": _retry_hint,
-            "_retry_hint": True,
-        })
-        ls.use_stream = ls.streaming
-        return None
-
-    # 重试耗尽后：返回 FAIL 而非 FINISH
-    # 引擎内核不认可裸正文作为合法结束，只有 finish 工具才能产生 ACTION_FINISH。
-    # 将原先的 ACTION_FINISH 改为 ACTION_FAIL，error 中附带截断原始文本用于调试。
-    ctx_ref = _persist_ctx(ls, step + 1)
-    return TaskAction(
-        action=ACTION_FAIL, node_id=ls.node.id,
-        error=f"模型未使用 finish 工具，裸文本不被内核认可为合法结束。原始文本: {_short(text, 200)}",
-        context_ref=ctx_ref,
-        summary="plaintext_without_finish",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1491,7 +1410,6 @@ async def run_ai_node(
         if _usage_ctx.response is not resp:
             resp = _usage_ctx.response
 
-        import sys as _ds2; _ds2.stderr.write(f"[DIAG-AISTEP] post-hook: ok={resp.ok} err={repr((resp.error or '')[:150])} text={repr((resp.text or '')[:80])} st={resp.status_code}\n"); _ds2.stderr.flush()
         if not resp.ok:
             return _build_failure_action(ls, resp, step)
 
@@ -1551,11 +1469,6 @@ async def run_ai_node(
             return await _fire_task_end_hook_if_finish(ls, _plaintext_result.action, step + 1)
         if _plaintext_result.modified:
             continue  # hook injected retry hint, loop back to LLM
-
-        # LEGACY: replaced by hook PlaintextRetryHandler.
-        # action = _handle_plaintext_response(ls, resp, step)
-        # if action is not None:
-        #     return action
 
     # ---- 达到最大步数 ----
     # Phase 3 Hook System：max_steps 是任务错误结束路径，先交给 on_task_error
