@@ -27,6 +27,11 @@ HOOK_POINTS: dict[str, str] = {
     "before_step": "每轮推理开始前触发。extra: step 序号等。返回 action 可终止。",
     "after_llm_call": "LLM 返回后触发。extra: response/usage。可读取用量做统计。",
     "before_tool_call": "工具执行前触发。extra: tool_name/arguments。返回 block 可拒绝执行。",
+    "terminal_tool": (
+        "终止型伪工具（finish/ask）实际执行前触发。extra: loop_state/terminal_call。"
+        "handler 返回 intercepted=True 表示已写入拦截 tool_result，循环跳过本次执行"
+        "但任务继续；返回 action 则直接终止任务（如 PREEMPTED）；返回 None 放行执行。"
+    ),
     "execute_tool": (
         "真实工具执行策略点：结构化 start 事件发出后、实际执行前触发。"
         "extra: loop_state/tool_name/tool_args/tool_ctx/spec/call_index/t0。"
@@ -210,20 +215,21 @@ class HookRegistry:
         modified = False
         merged_override: dict | None = None
         adopted_execution: Any = None
+        intercepted = False
         for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
             try:
                 result = entry.callback(ctx)
                 if inspect.isawaitable(result):
                     _close_awaitable(result)
                     raise RuntimeError("async hook handler registered on sync fire(); use afire()")
-                stop_result, modified, merged_override, adopted_execution = _process_hook_result(
-                    result, modified, merged_override, adopted_execution,
+                stop_result, modified, merged_override, adopted_execution, intercepted = _process_hook_result(
+                    result, modified, merged_override, adopted_execution, intercepted,
                 )
                 if stop_result is not None:
                     return stop_result
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
-        return HookResult(modified=modified, result_override=merged_override, execution=adopted_execution)
+        return HookResult(modified=modified, result_override=merged_override, execution=adopted_execution, intercepted=intercepted)
 
     async def afire(self, hook_point: str, ctx: Any) -> HookResult:
         """Asynchronously run handlers for one hook point."""
@@ -233,19 +239,20 @@ class HookRegistry:
         modified = False
         merged_override: dict | None = None
         adopted_execution: Any = None
+        intercepted = False
         for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
             try:
                 result = entry.callback(ctx)
                 if inspect.isawaitable(result):
                     result = await result
-                stop_result, modified, merged_override, adopted_execution = _process_hook_result(
-                    result, modified, merged_override, adopted_execution,
+                stop_result, modified, merged_override, adopted_execution, intercepted = _process_hook_result(
+                    result, modified, merged_override, adopted_execution, intercepted,
                 )
                 if stop_result is not None:
                     return stop_result
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
-        return HookResult(modified=modified, result_override=merged_override, execution=adopted_execution)
+        return HookResult(modified=modified, result_override=merged_override, execution=adopted_execution, intercepted=intercepted)
 
     def list_hooks(self) -> dict[str, list[str]]:
         """Return registered hook points and handler names."""
@@ -318,13 +325,14 @@ def _handler_priority(handler: Any, priority: int | None) -> int:
 
 def _process_hook_result(
     result: Any, modified: bool, merged_override: dict | None, adopted_execution: Any,
-) -> tuple[Any | None, bool, dict | None, Any]:
+    intercepted: bool,
+) -> tuple[Any | None, bool, dict | None, Any, bool]:
     """Apply shared hook-result chain rules."""
     # Why: sync and async fire must stop on the same result shapes. How: use duck
     # typing for HookResult-compatible objects and aggregate non-terminal mutation.
     # Purpose: support engine.builtin.result.HookResultLike without importing it here.
     if result is None:
-        return None, modified, merged_override, adopted_execution
+        return None, modified, merged_override, adopted_execution, intercepted
     result_modified = bool(getattr(result, "modified", False))
     modified = modified or result_modified
     # [AutoC 2026-08-19] Why: result overrides from several non-terminal handlers
@@ -344,6 +352,11 @@ def _process_hook_result(
     execution = getattr(result, "execution", None)
     if execution is not None and adopted_execution is None:
         adopted_execution = execution
+    # [AutoC 2026-08-20] Why: interception is an OR-aggregated boolean, unlike
+    # the single-owner execution channel. How: once any handler intercepts, the
+    # chain result stays intercepted. Purpose: multiple guards can agree that a
+    # terminal call must not run.
+    intercepted = intercepted or bool(getattr(result, "intercepted", False))
     should_stop = bool(getattr(result, "block", False) or getattr(result, "skip_step", False) or getattr(result, "action", None) is not None)
     if should_stop:
         if modified and not result_modified and hasattr(result, "modified"):
@@ -352,8 +365,10 @@ def _process_hook_result(
             result.result_override = merged_override
         if adopted_execution is not None and hasattr(result, "execution"):
             result.execution = adopted_execution
-        return result, modified, merged_override, adopted_execution
-    return None, modified, merged_override, adopted_execution
+        if intercepted and hasattr(result, "intercepted"):
+            result.intercepted = intercepted
+        return result, modified, merged_override, adopted_execution, intercepted
+    return None, modified, merged_override, adopted_execution, intercepted
 
 
 def _close_awaitable(value: Any) -> None:

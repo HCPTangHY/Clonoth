@@ -61,6 +61,12 @@ class HookResult:
     # Purpose: execution strategies (async dispatch, adaptive upgrade, timeouts)
     # are plugins, not loop code.
     execution: Any = None
+    # [AutoC 2026-08-20] Why: terminal_tool handlers need a dedicated "handled,
+    # skip execution" signal distinct from content mutation (modified) and
+    # chain termination (action). How: set intercepted=True after writing the
+    # interception tool_result. Purpose: the loop can distinguish "blocked
+    # from delivering but keep running" from every other result shape.
+    intercepted: bool = False
 
 
 class Handler(ABC):

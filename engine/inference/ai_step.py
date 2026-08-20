@@ -384,106 +384,27 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
 
     # finish/ask 最后执行（同轮真实工具已完成）
     if _terminal_call:
-        # ---------------------------------------------------------------
-        # Preempt V3 需求2: finish/ask 拦截
-        # 在执行 finish/ask 之前再次检查 preempt 状态。如果有待注入的 preempt
-        # 消息（用户在 LLM 推理/工具执行期间发了新消息），拦截 finish/ask：
-        # 不产生 TaskAction(FINISH/ASK)，改为塞一个假 tool_result 维持 native
-        # 模式下 tool_use/tool_result 的配对完整性（Claude API 强校验），
-        # 然后让主循环继续，下一轮由 PreemptChecker 注入新用户消息。
-        #
-        # 同时补全 V2 遗漏：preempt_after_step（无消息 preempt）在只有 finish/ask
-        # 没有真工具的场景下也需要被检查，此前会跳过导致终止工具照常执行。
-        # ---------------------------------------------------------------
-        if ls.preempt_inject_info is None and not ls.preempt_after_step:
-            _pi_finish = await ls.rctx.check_preempted()
-            if _pi_finish.get("preempted"):
-                if _pi_finish.get("message"):
-                    ls.preempt_inject_info = _pi_finish
-                else:
-                    ls.preempt_after_step = True
-
-        if ls.preempt_inject_info is not None:
-            # 有消息的 preempt：拦截 finish/ask，塞假 tool_result，任务继续
-            from .tool_format import ParsedToolCall as _FinishPTC
-            _terminal_name = str(getattr(_terminal_call, "name", "") or "finish").strip() or "finish"
-            _finish_parsed = _FinishPTC(
-                id=getattr(_terminal_call, "id", "") or "",
-                name=_terminal_name,
-                arguments=dict(_terminal_call.arguments or {}),
-            )
-            _intercept_msg = ls.formatter.format_tool_result(
-                _finish_parsed,
-                "\u26a0\ufe0f Preempted: new user input received. Task continues.",
-            )
-            # [2026-05-01] 写入当前 tool_mode，避免真 native 的拦截结果被当作旧 fake-native。
-            # [2026-05-07] preempt 拦截 ACK 只服务当前运行期配对。
-            # 原因：该终止工具未交付，不能让 fake-native/json 的文本结果在恢复后压制未来正常 finish/ask。
-            # 做法：补齐 ephemeral、tool_call_id 和 name，让清洗函数按调用 ID 精确移除。
-            # 目的：任务继续时不会向下一轮 provider 回放被拦截的终止工具。
-            _intercept_msg["_ephemeral"] = True
-            if _finish_parsed.id:
-                _intercept_msg.setdefault("tool_call_id", _finish_parsed.id)
-            _intercept_msg.setdefault("name", _terminal_name)
-            set_message_meta(_intercept_msg, MessageMeta(
-                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-                message_type="tool_result",
-                control_tool_name=_terminal_name,
-                control_tool_status="preempt_intercepted",
-            ))
-            ls.messages.append(_intercept_msg)
-            # [2026-05-07] 被新用户输入拦截的 finish 未交付，不能写入长期历史。
-            # [AutoC 2026-05-31] Why: ask has the same terminal semantics, so an
-            # intercepted ask is also not a delivered clarification request. How:
-            # keep the result only in runtime memory and do not call _shadow_write.
-            # Purpose: next prompt is driven by real user input, not by replaying an
-            # intercepted terminal tool.
-            await ls.rctx.emit_event("preempt_finish_intercepted", {
-                "node_id": ls.node.id,
-                "task_id": ls.rctx.task_id,
-                "step": step,
-            })
-            # 不 return TaskAction — 函数返回 None，主循环 continue 到下一轮
-        elif ls.preempt_after_step:
-            # 无消息的 preempt：与真工具后的 preempt_after_step 路径对齐，
-            # 保存上下文后退出任务
-            # [2026-05-01] 补写 finish/ask 的 tool_result，确保 native 模式下
-            # functionCall/functionResponse 严格 1:1 配对（Gemini 强校验）
-            from .tool_format import ParsedToolCall as _FinishPTC2
-            _terminal_name2 = str(getattr(_terminal_call, "name", "") or "finish").strip() or "finish"
-            _finish_parsed2 = _FinishPTC2(
-                id=getattr(_terminal_call, "id", "") or "",
-                name=_terminal_name2,
-                arguments=dict(_terminal_call.arguments or {}),
-            )
-            _preempt_result = ls.formatter.format_tool_result(
-                _finish_parsed2, "preempted",
-            )
-            # [2026-05-07] 无消息 preempt 的 finish ACK 同样只保留在运行期。
-            # 原因：保存上下文后恢复时不应看到 finish tool_call/tool_result；但本轮内存仍需满足 provider 配对。
-            # 做法：设置 ephemeral，并补齐 tool_call_id/name 供 snapshot 清洗精确匹配。
-            # 目的：preempt 快照只恢复真实对话，不恢复控制流占位结果。
-            _preempt_result["_ephemeral"] = True
-            if _finish_parsed2.id:
-                _preempt_result.setdefault("tool_call_id", _finish_parsed2.id)
-            _preempt_result.setdefault("name", _terminal_name2)
-            set_message_meta(_preempt_result, MessageMeta(
-                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-                message_type="tool_result",
-                control_tool_name=_terminal_name2,
-                control_tool_status="preempted",
-            ))
-            ls.messages.append(_preempt_result)
-            # [2026-05-07] 无消息 preempt 也不能持久化未交付的 finish/ask 结果。
-            # 原因：任务会带上下文退出，恢复后不应看到已经终止的工具轮。
-            # 做法：只把结果留在运行期消息中，并依赖 ephemeral 过滤快照。
-            # 目的：恢复后的历史保持待继续执行的状态。
-            ctx_ref = _persist_ctx(ls, step + 1)
-            return TaskAction(
-                action=ACTION_PREEMPTED, node_id=ls.node.id,
-                context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
-            )
-        else:
+        # [AutoC 2026-08-20] Why: whether a terminal tool may actually run is a
+        # policy decision (preempt interception), not loop mechanics. How: fire
+        # terminal_tool before executing finish/ask; handlers may intercept
+        # (write an ephemeral paired tool_result and keep the task running) or
+        # return a terminal action (PREEMPTED). Purpose: the loop no longer
+        # knows about preempt scheduling around terminal tools.
+        _terminal_ctx = HookContext(
+            messages=ls.messages,
+            tools=ls.openai_tools,
+            node=ls.node,
+            provider=ls.provider,
+            rctx=ls.rctx,
+            step=step,
+            tool_call=_terminal_call,
+            tool_calls=list(resp.tool_calls or []),
+            extra={"loop_state": ls, "terminal_call": _terminal_call},
+        )
+        _terminal_result = await hook_registry.afire("terminal_tool", _terminal_ctx)
+        if _terminal_result.action is not None:
+            return _terminal_result.action
+        if not _terminal_result.intercepted:
             action = await _handle_pseudo_tool(ls, _terminal_call, step)
             if action is not None:
                 return action

@@ -23,6 +23,7 @@ class HookResultLike:
     modified: bool = False
     result_override: Any = None
     execution: Any = None
+    intercepted: bool = False
 
 
 def hook_result(
@@ -35,6 +36,7 @@ def hook_result(
     modified: bool = False,
     result_override: Any = None,
     execution: Any = None,
+    intercepted: bool = False,
 ) -> HookResultLike:
     """Build a HookResult-compatible object without hook-package imports.
 
@@ -52,4 +54,5 @@ def hook_result(
         modified=modified,
         result_override=result_override,
         execution=execution,
+        intercepted=intercepted,
     )
