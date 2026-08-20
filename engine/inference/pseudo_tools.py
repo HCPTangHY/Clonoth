@@ -483,3 +483,52 @@ def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[di
         allowed = set(node.tool_access.allow)
         return [s for s in all_specs if s.get("name") in allowed]
     return []
+
+
+def build_node_tool_specs(
+    *,
+    registry: Any,
+    node: "Node",
+    downstream_info: list[dict[str, str]] | None = None,
+    switch_info: list[dict[str, str]] | None = None,
+    task_context: dict[str, Any] | None = None,
+) -> tuple[set[str], list[dict]]:
+    """Build the model-visible tool list and the allowed real-tool name set.
+
+    Why: tool-list composition (node filtering, dynamic dispatch expansion,
+    switch_node gating, control-tool injection) is presentation policy, not
+    loop mechanics. How: run the same filtering and spec-expansion chain that
+    was inlined in run_ai_node and return both the authorization set and the
+    OpenAI tool list. Purpose: the entry function composes instead of building.
+    """
+    tool_specs = _filter_tool_specs(node, registry.list_specs())
+    allowed = {s.get("name") for s in tool_specs if s.get("name")}
+    openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
+
+    delegate_targets = list(node.delegate_targets)
+    if delegate_targets:
+        # [2026-05-04] Register one dynamic dispatch tool per delegate target.
+        # Why: target selection should happen through tool choice, not through an
+        # aggregate dispatch schema. Purpose: keep dynamic dispatch intact.
+        openai_tools.extend(_dispatch_delegate_specs(delegate_targets, downstream_info))
+
+    # switch_node 仅对非系统节点注入（系统节点如 memory_extractor 不应切换入口）
+    _is_system_task = bool((task_context or {}).get("is_system_task"))
+    if not _is_system_task:
+        _sw_targets = [info["id"] for info in (switch_info or [])]
+        openai_tools.append(_switch_node_spec(
+            _sw_targets, switch_info,
+            current_node_id=node.id, current_node_name=node.name,
+        ))
+
+    # [AutoC 2026-08-06] hybrid 模式下不注入 finish 工具：free prose 即隐式 finish。
+    # tool_only 模式下保留原行为。
+    _output_mode = getattr(node, 'output_mode', 'hybrid')
+    if _output_mode == 'tool_only':
+        openai_tools.append(_finish_spec())
+    # [AutoC 2026-05-31] ask 在所有模式下都可用：节点需要向上游请求信息时使用。
+    openai_tools.append(_ask_spec())
+    openai_tools.append(_reply_spec())
+    openai_tools.append(_compact_context_spec())
+    openai_tools.append(_preempt_task_spec())
+    return allowed, openai_tools

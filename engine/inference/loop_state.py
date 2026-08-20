@@ -170,3 +170,68 @@ def _persist_ctx(ls: _LoopState, step_count: int) -> str:
         step_count=step_count, context_ref=ls.context_ref,
         last_message_id=ls.last_shadow_message_id,
     )
+
+
+def _build_loop_state(
+    *,
+    rctx: "RunContext",
+    node: Any,
+    provider: Any,
+    registry: Any,
+    run_id: str,
+    context_ref: str,
+    runtime_cfg: dict[str, Any],
+    streaming: bool,
+    messages: list[dict[str, Any]],
+    system_prompt: list[dict[str, Any]],
+    is_block_mode: bool,
+    openai_tools: list[dict[str, Any]],
+    history: list[dict[str, Any]],
+    collected_attachments: list[dict[str, Any]],
+    tool_produced_attachments: list[dict[str, Any]],
+    formatter: Any,
+    allowed_real_tools: set,
+) -> _LoopState:
+    """Construct the loop state, resolving retry/compact parameters from config.
+
+    Why: the parameter-resolution block (get_int/get_float defaults for compact
+    thresholds, retry backoff, plaintext retry) was inlined in run_ai_node.
+    How: keep the exact same defaults here and return the state object.
+    Purpose: the entry function states its inputs, not its config plumbing.
+    """
+    from clonoth_runtime import get_int, get_float
+
+    return _LoopState(
+        rctx=rctx,
+        node=node,
+        provider=provider,
+        registry=registry,
+        run_id=run_id,
+        context_ref=context_ref,
+        runtime_cfg=runtime_cfg,
+        streaming=streaming,
+        messages=messages,
+        system_prompt=system_prompt,
+        is_block_mode=is_block_mode,
+        openai_tools=openai_tools,
+        history=history,
+        collected_attachments=collected_attachments,
+        tool_produced_attachments=tool_produced_attachments,
+        formatter=formatter,
+        allowed_real_tools=allowed_real_tools,
+        compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
+        compact_keep_recent=get_int(runtime_cfg, "engine.compact.keep_recent", 6, min_value=2, max_value=50),
+        compacted=False,
+        last_prompt_tokens=None,
+        retry_max=get_int(runtime_cfg, "engine.retry.max_retries", 3, min_value=0, max_value=10),
+        retry_initial_delay=get_float(runtime_cfg, "engine.retry.initial_delay_sec", 1.0, min_value=0.1, max_value=60.0),
+        retry_max_delay=get_float(runtime_cfg, "engine.retry.max_delay_sec", 30.0, min_value=1.0, max_value=300.0),
+        retry_backoff=get_float(runtime_cfg, "engine.retry.backoff_multiplier", 2.0, min_value=1.0, max_value=10.0),
+        plaintext_retry_count=0,
+        # 改动：plaintext retry 默认值从 2 → 3，与 retry_max（LLM 报错重试）对齐，
+        # 给模型更多机会自行修正未调 finish 的问题。
+        plaintext_retry_max=get_int(runtime_cfg, "engine.plaintext_retry_max", 3, min_value=0, max_value=10),
+        preempt_after_step=False,
+        preempt_inject_info=None,
+        use_stream=streaming,
+    )

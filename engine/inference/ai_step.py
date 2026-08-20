@@ -8,20 +8,9 @@ from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
 
-from .pseudo_tools import (
-    _dispatch_delegate_specs,
-    _is_pseudo_tool_name,
-    _finish_spec,
-    _ask_spec,
-    _reply_spec,
-    _compact_context_spec,
-    _preempt_task_spec,
-    _switch_node_spec,
-    _to_openai_tools,
-    _filter_tool_specs,
-)
-from .resume_builder import _build_resume_messages
-from .loop_state import _LoopState, _persist_ctx, _short
+from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs
+from .resume_builder import apply_resume_messages, collect_resume_attachments
+from .loop_state import _LoopState, _build_loop_state, _persist_ctx, _short
 from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
 from .pseudo_handlers import _handle_pseudo_tool
 # [AutoC 2026-08-19] 执行策略（async_mode 分流、execute_command 自适应升级）已迁入
@@ -32,7 +21,7 @@ from ..context_store import load_context_snapshot
 from ..attachments import build_multimodal_content
 # Phase 1 (Session Conversation Store): 导入 Message 模型用于影子写入。
 # ai_step 在每次 append assistant/tool_result 消息后，best-effort 写入 ConversationStore。
-from ..conversation_store import ConversationStore, Message, MessageType
+from ..conversation_store import Message, MessageType
 from ..node import Node
 from .message_assembly import assemble_initial_messages
 from ..protocol import (
@@ -53,11 +42,7 @@ from ..tool_step import (
     summarize_result,
     truncate_tool_result,
 )
-# [2026-04-24] P1.5 熔断器：压缩成功后重置熔断计数。
-# 压缩决策逻辑已整体迁入 engine/builtin/compact.py（CompactChecker 插件），
-# ai_step 仅保留 record_compact_success 用于 compact 恢复路径。
-from ..compact import record_compact_success
-from clonoth_runtime import get_int, get_float, load_runtime_config
+from clonoth_runtime import get_int, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
 # 此处导入供外部通过 ai_step 模块访问（如测试、调试）。
@@ -68,9 +53,6 @@ from .tool_format import (
 )
 from .message_model import MessageMeta, set_message_meta
 from providers.base import BaseProvider, ToolCall, ProviderResponse
-# Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
-# get_bus() 返回全局单例 SignalBus，Signal 是不可变事件数据类。
-from ..signals import Signal, get_bus
 # Phase 3 Hook System：引入 hook registry 与上下文对象。
 # 原因：before_tool_call 的业务检查要从 ai_step.py 的硬编码分支迁出。
 # 做法：ai_step 只负责构造 HookContext 并触发 registry；具体规则由 handler 实现。
@@ -1056,33 +1038,11 @@ async def run_ai_node(
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
 
     # ---- 收集附件 ----
-    collected_attachments: list[dict[str, Any]] = []
+    # [AutoC 2026-08-20] Why: resume attachment merging is a nested-fallback
+    # chain over resume payloads, not loop logic. How: delegate to the resume
+    # module collector. Purpose: keep the entry function declarative.
+    collected_attachments = collect_resume_attachments(attachments, resume_data)
     _tool_produced_attachments: list[dict[str, Any]] = []
-    if attachments:
-        collected_attachments.extend(attachments)
-    if resume_data and isinstance(resume_data, dict):
-        for e in (resume_data.get("tool_results") or resume_data.get("entries") or []):
-            if isinstance(e, dict):
-                # [AutoC 2026-05-31] Why: resumed tool entries may carry either the
-                # old top-level attachments list or the new data.attachments list.
-                # How: inspect the nested data dict before the legacy field.
-                # Purpose: avoid dropping generated files when resuming sessions.
-                e_data = e.get("data") if isinstance(e.get("data"), dict) else {}
-                e_atts = e_data.get("attachments") if isinstance(e_data.get("attachments"), list) else e.get("attachments")
-                if isinstance(e_atts, list):
-                    collected_attachments.extend(e_atts)
-        if isinstance(resume_data.get("attachments"), list):
-            collected_attachments.extend(resume_data["attachments"])
-        rd = resume_data.get("result")
-        if isinstance(rd, dict):
-            # [AutoC 2026-05-31] Why: final result payloads can also be migrated to
-            # data.attachments. How: prefer nested attachments and fall back to the
-            # old result.attachments list. Purpose: keep finish-time attachments
-            # selectable after a resume.
-            rd_data = rd.get("data") if isinstance(rd.get("data"), dict) else {}
-            rd_atts = rd_data.get("attachments") if isinstance(rd_data.get("attachments"), list) else rd.get("attachments")
-            if isinstance(rd_atts, list):
-                collected_attachments.extend(rd_atts)
 
     # ---- 恢复或新建消息历史 ----
     step_count = 0
@@ -1144,162 +1104,25 @@ async def run_ai_node(
     # ---- 追加恢复消息 ----
     formatter = create_tool_formatter(node.tool_mode)
     if resume_data:
-        messages.extend(_build_resume_messages(resume_data))
-        # [AutoC 2026-06-10] output_rejected: inject reject as a properly formatted
-        # finish tool result through the node's formatter pipeline.
-        if str(resume_data.get("type") or "") == "output_rejected":
-            _rej_result = resume_data.get("result") if isinstance(resume_data.get("result"), dict) else {}
-            _rej_from = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
-            _rej_reason = str(resume_data.get("reject_reason") or _rej_result.get("text") or "").strip()
-            _rej_line = f"reject by {_rej_from}: {_rej_reason}" if _rej_from else f"reject: {_rej_reason}"
-            _finish_call_id = str(resume_data.get("_finish_tool_call_id") or "").strip()
-            _finish_result_idx = -1
-
-            # [AutoC 2026-08-06] 判断是否为隐式 finish（hybrid free prose）。
-            # hybrid 模式下 tool_call_log 可能残留被 guard reject 的 finish 调用 id，
-            # 但实际 JSONL/messages 里没有 finish tool_call，不能走显式分支。
-            # 检测方式：在 messages 里找不到对应的 finish assistant tool_call。
-            _is_implicit_finish = True
-            if _finish_call_id:
-                for _m in reversed(messages):
-                    if _m.get("role") != "assistant":
-                        continue
-                    for _tc in (_m.get("tool_calls") or []):
-                        if not isinstance(_tc, dict):
-                            continue
-                        _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
-                        _tc_id = str(_tc.get("id") or "").strip()
-                        _tc_name = str(_tc.get("name") or _fn.get("name") or "")
-                        if _tc_name == "finish" and _tc_id == _finish_call_id:
-                            _is_implicit_finish = False
-                            break
-                    if not _is_implicit_finish:
-                        break
-
-            logger.info("output_rejected: from=%s reason=%s fcid=%r implicit=%s msg_count=%d",
-                     _rej_from, _rej_reason[:80], _finish_call_id, _is_implicit_finish, len(messages))
-
-            if _is_implicit_finish:
-                # Hybrid 模式隐式 finish 或无 finish call_id：
-                # 以 user 角色注入 reject，追加到 messages 末尾。
-                # reject 作为当前指令应该在动态上下文（背景信息）之后。
-                _rej_user_msg = {"role": "user", "content": _rej_line}
-                set_message_meta(_rej_user_msg, MessageMeta(
-                    message_type="output_rejected",
-                ))
-                messages.append(_rej_user_msg)
-                logger.info("output_rejected(implicit): appended user reject msg at idx=%d",
-                            len(messages) - 1)
-                _store = getattr(rctx, 'conversation_store', None)
-                _target_sid = getattr(rctx, 'child_session_id', '') or rctx.session_id
-                if _store:
-                    try:
-                        from engine.conversation_store import Message as _StoreMsg
-                        from datetime import datetime, timezone
-                        from uuid import uuid4
-                        _store.append(_target_sid, _StoreMsg(
-                            id=str(uuid4()),
-                            role="user",
-                            content=_rej_line,
-                            message_type="output_rejected",
-                            created_at=datetime.now(timezone.utc).isoformat(),
-                        ))
-                    except Exception as _wr_exc:
-                        logger.warning("output_rejected(implicit): append failed sid=%s: %s",
-                                    _target_sid, _wr_exc)
-            else:
-                # 显式 finish：找到对应的 tool_result 并替换内容。
-                if _finish_call_id:
-                    for _idx in range(len(messages) - 1, -1, -1):
-                        _m = messages[_idx]
-                        if _m.get("role") != "tool":
-                            continue
-                        if str(_m.get("tool_call_id") or "").strip() != _finish_call_id:
-                            continue
-                        if str(_m.get("name") or "").strip() != "finish":
-                            continue
-                        _finish_result_idx = _idx
-                        break
-                _rej_parsed = ParsedToolCall(
-                    id=_finish_call_id,
-                    name="finish",
-                    arguments={},
-                )
-                _rej_msg = formatter.format_tool_result(_rej_parsed, _rej_line)
-                set_message_meta(_rej_msg, MessageMeta(
-                    tool_mode=getattr(node, 'tool_mode', 'fake-native'),
-                    message_type="tool_result",
-                ))
-                if _finish_result_idx >= 0:
-                    _old_msg_id = str(messages[_finish_result_idx].get("id") or "").strip()
-                    messages[_finish_result_idx] = _rej_msg
-                    logger.info("output_rejected(explicit): replaced tool_result at idx=%d fcid=%s",
-                             _finish_result_idx, _finish_call_id)
-                    _store = getattr(rctx, 'conversation_store', None)
-                    _target_sid = getattr(rctx, 'child_session_id', '') or rctx.session_id
-                    if _old_msg_id and _store:
-                        try:
-                            _store.update_message(_target_sid, _old_msg_id, _rej_msg)
-                        except Exception as _upd_exc:
-                            logger.warning("output_rejected: update_message failed sid=%s msg=%s: %s",
-                                        _target_sid, _old_msg_id, _upd_exc)
-                    elif not _old_msg_id:
-                        logger.warning("output_rejected: msg id missing, cannot persist reject to JSONL")
-                else:
-                    messages.append(_rej_msg)
-                    logger.info("output_rejected(explicit): appended orphan tool_result fcid=%s",
-                             _finish_call_id)
-        if str(resume_data.get("type") or "") == "compact_done":
-            # [2026-04-24] P1.5 熔断器：压缩成功时重置失败计数
-            # [AutoC 2026-05-13] Why: compaction may have targeted the parent
-            # session while the task resumed on a branch. How: reset the breaker
-            # on parent_session_id when present. Purpose: success accounting stays
-            # consistent with parent-first compact targeting.
-            record_compact_success(rctx.parent_session_id or rctx.session_id)
-            # Phase 2 Signal: compact.done 信号，通过 SignalBus 发射供监控使用
-            _cd_payload = {
-                "node_id": node.id,
-                "success": resume_data.get("success", True),
-                "before": resume_data.get("before", 0),
-                "after": resume_data.get("after", 0),
-            }
-            # task 粒度信息（ConvStore 路径产生）
-            for _k in ("total_segments", "kept_segments", "compressed_segments"):
-                if _k in resume_data:
-                    _cd_payload[_k] = resume_data[_k]
-            get_bus().emit(Signal(name="compact.done", payload=_cd_payload))
-            await rctx.emit_event("compact_done", _cd_payload)
+        # [AutoC 2026-08-20] Why: output_rejected / compact_done resume handling
+        # is message-repair logic, not loop mechanics. How: delegate to the
+        # resume module, which appends rebuilt messages and runs the special
+        # resume types. Purpose: the entry function keeps the resume decision.
+        await apply_resume_messages(
+            messages=messages, resume_data=resume_data,
+            formatter=formatter, node=node, rctx=rctx,
+        )
 
     # ---- 构建工具列表 ----
-    tool_specs = _filter_tool_specs(node, registry.list_specs())
-    _allowed_real_tools = {s.get("name") for s in tool_specs if s.get("name")}
-    openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
-
-    delegate_targets = list(node.delegate_targets)
-    if delegate_targets:
-        # [2026-05-04] Register one dynamic dispatch tool per delegate target.
-        # Why: target selection should happen through tool choice, not through an
-        # aggregate dispatch schema. How: expand node.delegate_targets into only
-        # dispatch:{target_id} specs. Purpose: keep dynamic dispatch intact while
-        # removing the old aggregate dispatch tools from the model-visible list.
-        openai_tools.extend(_dispatch_delegate_specs(delegate_targets, downstream_info))
-
-    # switch_node 仅对非系统节点注入（系统节点如 memory_extractor 不应切换入口）
-    _is_system_task = bool((rctx.task_context or {}).get("is_system_task"))
-    if not _is_system_task:
-        _sw_targets = [info["id"] for info in (switch_info or [])]
-        openai_tools.append(_switch_node_spec(_sw_targets, switch_info, current_node_id=node.id, current_node_name=node.name))
-
-    # [AutoC 2026-08-06] hybrid 模式下不注入 finish 工具：free prose 即隐式 finish，
-    # 模型不需要也不应该看到 finish 工具。tool_only 模式下保留原行为。
-    _output_mode = getattr(node, 'output_mode', 'hybrid')
-    if _output_mode == 'tool_only':
-        openai_tools.append(_finish_spec())
-    # [AutoC 2026-05-31] ask 在所有模式下都可用：节点需要向上游请求信息时使用。
-    openai_tools.append(_ask_spec())
-    openai_tools.append(_reply_spec())
-    openai_tools.append(_compact_context_spec())
-    openai_tools.append(_preempt_task_spec())
+    # [AutoC 2026-08-20] Why: tool-list composition (node filtering, dispatch
+    # expansion, switch gating, control-tool injection) is presentation policy.
+    # How: delegate to the pseudo-tools builder and receive the authorization
+    # set plus the model-visible list. Purpose: compose, not build.
+    _allowed_real_tools, openai_tools = build_node_tool_specs(
+        registry=registry, node=node,
+        downstream_info=downstream_info, switch_info=switch_info,
+        task_context=rctx.task_context,
+    )
 
     # ---- 工具定义注入（formatter 统一处理 native/json 差异）----
     if openai_tools:
@@ -1312,39 +1135,18 @@ async def run_ai_node(
                 break
 
     # ---- 构造循环状态 ----
-    ls = _LoopState(
-        rctx=rctx,
-        node=node,
-        provider=provider,
-        registry=registry,
-        run_id=run_id,
-        context_ref=context_ref,
-        runtime_cfg=runtime_cfg,
-        streaming=streaming,
-        messages=messages,
-        system_prompt=system_prompt,
-        is_block_mode=_is_block_mode,
-        openai_tools=openai_tools,
-        history=history,
+    # [AutoC 2026-08-20] Why: config-plumbing defaults (compact thresholds,
+    # retry backoff, plaintext retry) are not entry-function concerns. How:
+    # delegate to the loop-state factory with the resolved inputs.
+    # Purpose: run_ai_node states its inputs, not its config defaults.
+    ls = _build_loop_state(
+        rctx=rctx, node=node, provider=provider, registry=registry,
+        run_id=run_id, context_ref=context_ref, runtime_cfg=runtime_cfg,
+        streaming=streaming, messages=messages, system_prompt=system_prompt,
+        is_block_mode=_is_block_mode, openai_tools=openai_tools, history=history,
         collected_attachments=collected_attachments,
         tool_produced_attachments=_tool_produced_attachments,
-        formatter=formatter,
-        allowed_real_tools=_allowed_real_tools,
-        compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
-        compact_keep_recent=get_int(runtime_cfg, "engine.compact.keep_recent", 6, min_value=2, max_value=50),
-        compacted=False,
-        last_prompt_tokens=None,
-        retry_max=get_int(runtime_cfg, "engine.retry.max_retries", 3, min_value=0, max_value=10),
-        retry_initial_delay=get_float(runtime_cfg, "engine.retry.initial_delay_sec", 1.0, min_value=0.1, max_value=60.0),
-        retry_max_delay=get_float(runtime_cfg, "engine.retry.max_delay_sec", 30.0, min_value=1.0, max_value=300.0),
-        retry_backoff=get_float(runtime_cfg, "engine.retry.backoff_multiplier", 2.0, min_value=1.0, max_value=10.0),
-        plaintext_retry_count=0,
-        # 改动：plaintext retry 默认值从 2 → 3，与 retry_max（LLM 报错重试）对齐，
-        # 给模型更多机会自行修正未调 finish 的问题。
-        plaintext_retry_max=get_int(runtime_cfg, "engine.plaintext_retry_max", 3, min_value=0, max_value=10),
-        preempt_after_step=False,
-        preempt_inject_info=None,
-        use_stream=streaming,
+        formatter=formatter, allowed_real_tools=_allowed_real_tools,
     )
 
     # ---- 推理循环 ----
