@@ -1074,6 +1074,12 @@ class SessionMixin:
                 # task metadata after refresh.
                 "source_task_id": msg.source_task_id,
             }
+            # [2026-08-19] source_inbound_seq: expose for retry button in web frontend.
+            if isinstance(msg.meta, dict) and msg.meta.get("source_inbound_seq") is not None:
+                try:
+                    entry["source_inbound_seq"] = int(msg.meta["source_inbound_seq"])
+                except (ValueError, TypeError):
+                    pass
             # Extract thinking/reasoning from meta
             if isinstance(msg.meta, dict):
                 reasoning = str(

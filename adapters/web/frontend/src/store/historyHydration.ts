@@ -794,6 +794,8 @@ export function hydrateStructuredHistory(
           provider: message.provider || undefined,
           providerMetadata: message.provider_metadata,
           usage: message.usage,
+          // [2026-08-19] Persist source_inbound_seq so retry button works after refresh.
+          inboundSeq: message.source_inbound_seq ?? undefined,
         },
         blocks: userBlocks,
         attachments,

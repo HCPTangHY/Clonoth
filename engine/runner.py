@@ -1138,6 +1138,8 @@ async def _run_node_task(
         # child result. Purpose: refreshed history can render callbacks without storing
         # the LLM-only English prefix or any backend-localized prose.
         _inbound_meta: dict[str, Any] = {}
+        if source_inbound_seq is not None:
+            _inbound_meta["source_inbound_seq"] = int(source_inbound_seq)
         if _inbound_summary:
             _inbound_meta["summary"] = _inbound_summary
         if _inbound_child_session_id:

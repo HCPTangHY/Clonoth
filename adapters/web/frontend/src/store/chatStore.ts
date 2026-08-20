@@ -620,14 +620,19 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     const message = state.messagesById[messageId];
     if (!message || message.role !== 'user') return;
     const inboundSeq = message.source.inboundSeq;
-    if (!inboundSeq) return;
+    // [2026-08-20] history 消息 id 是 message:{cid}:history:{后端UUID}，拆出原始 id 作凭证；
+    // 实时消息 id 是前端生成的，此时靠 inboundSeq。
+    const rawMessageId = message.id.includes(':history:')
+      ? (message.id.split(':history:').pop() || message.id)
+      : message.id;
+    if (!inboundSeq && !rawMessageId) return;
 
     const activeConversation = getActiveConversation(state);
     const sessionId = activeConversation?.sessionId || '';
     if (!sessionId) return;
 
     try {
-      const result = await retryInbound(sessionId, inboundSeq, newText);
+      const result = await retryInbound(sessionId, { inboundSeq, messageId: rawMessageId }, newText);
       if (!result.ok) return;
 
       // Remove all messages from the retried message onward in the UI

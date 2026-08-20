@@ -165,7 +165,8 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
     ? (continuesIntoNext ? 'px-3 pt-0 pb-2 sm:px-4' : 'px-3 pt-0 pb-3 sm:px-4')
     : (continuesIntoNext ? 'px-3 pt-3 pb-2 sm:px-4' : 'px-3 py-3 sm:px-4');
 
-  const showRetry = message.role === 'user' && message.status === 'completed' && !!message.source.inboundSeq;
+  // [2026-08-20] retry 凭证改为 message id（后端 JSONL 通用），不再要求 inboundSeq。
+  const showRetry = message.role === 'user' && message.status === 'completed';
   const retryEdit = useUserRetryEdit(message);
 
   return (
@@ -185,7 +186,7 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
             )}
             {active && <span aria-label="消息正在活动" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />}
             {showRetry && !retryEdit.editing && (
-              <span className="ml-auto flex gap-1.5 opacity-0 transition-opacity group-hover/card:opacity-100">
+              <span className="ml-auto flex gap-1.5 opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover/card:opacity-100">
                 <button
                   className="font-mono text-[0.55rem] text-[var(--duties-tertiary)] hover:text-blue-600 transition-colors"
                   title="原样重试"

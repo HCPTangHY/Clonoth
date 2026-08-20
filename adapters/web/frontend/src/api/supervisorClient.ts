@@ -823,14 +823,21 @@ export async function cancelActiveTasks(sessionId: string): Promise<any> {
 
 // ── Retry ──
 
-export async function retryInbound(sessionId: string, sourceInboundSeq: number, newText?: string): Promise<{
+export async function retryInbound(
+  sessionId: string,
+  credential: { inboundSeq?: number; messageId?: string },
+  newText?: string,
+): Promise<{
   ok: boolean;
   new_inbound_seq?: number;
   source_inbound_seq?: number;
   truncated_messages?: number;
   error?: string;
 }> {
-  const payload: Record<string, unknown> = { source_inbound_seq: sourceInboundSeq };
+  // [2026-08-20] message_id 是通用凭证（JSONL 每条消息都有）；inboundSeq 用于实时消息。
+  const payload: Record<string, unknown> = {};
+  if (credential.inboundSeq) payload.source_inbound_seq = credential.inboundSeq;
+  if (credential.messageId) payload.message_id = credential.messageId;
   if (newText !== undefined) payload.new_text = newText;
   const resp = await apiFetch(`/sessions/${sessionId}/retry`, {
     method: 'POST',
@@ -1114,6 +1121,8 @@ export interface StructuredMessage {
   reasoning_ended_at?: string;
   // [2026-06-06] Preempt message flag from meta.preempt.
   is_preempt?: boolean;
+  // [2026-08-19] source_inbound_seq for retry button after history hydration.
+  source_inbound_seq?: number;
 }
 
 export interface ChildSessionInfo {
