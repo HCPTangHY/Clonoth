@@ -12,6 +12,7 @@ import {
   type KeyboardEvent,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
@@ -124,6 +125,35 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
   });
   const conversationKey = useChatStore((state) =>
     state.activeConversationId ? `web:${state.activeConversationId}` : '',
+  );
+
+  // [AutoC 2026-08-22] Plugin input slots need the reroll target and generating
+  // state as data. Why: a quick-reroll contribution cannot read the store by
+  // itself; the host resolves the last user message id here. How: reverse-scan
+  // the active conversation's order array; empty when a child session is being
+  // viewed (target conversation ambiguous) or nothing to rewind. Purpose: slot
+  // scripts get a declarative enable/disable signal instead of store access.
+  const activeConversationId = useChatStore((state) => state.activeConversationId);
+  const rerollTargetId = useChatStore((state) => {
+    if (state.viewingChildSessionId) return '';
+    const cid = state.activeConversationId;
+    if (!cid) return '';
+    const order = state.messageOrderByConversation[cid] || [];
+    for (let i = order.length - 1; i >= 0; i--) {
+      const message = state.messagesById[order[i]];
+      if (message?.role === 'user') return order[i];
+    }
+    return '';
+  });
+  const inputSlotData = useMemo(
+    () => ({
+      conversationId: activeConversationId || '',
+      sessionId: contextSessionId,
+      isGenerating,
+      composerDisabled,
+      rerollTargetId,
+    }),
+    [activeConversationId, contextSessionId, isGenerating, composerDisabled, rerollTargetId],
   );
 
   const hasDraft = draft.trim().length > 0 || attachments.length > 0;
@@ -258,7 +288,19 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
   };
 
   return (
-    <div className="mx-auto max-w-3xl px-2 py-2 sm:px-3 sm:py-3">
+    <div className="relative mx-auto max-w-3xl px-2 py-2 sm:px-3 sm:py-3">
+      {/* [AutoC 2026-08-22] Floating slot above the input bar. Why: quick-action
+          chips need to hover over the message area without consuming layout
+          height. How: absolutely positioned layer pinned to this container's top
+          edge, right-aligned flex wrap; PluginSlotHost renders nothing when the
+          slot has no contribution. */}
+      <div className="pointer-events-none absolute inset-x-2 bottom-full z-10 sm:inset-x-3">
+        <PluginSlotHost
+          className="pointer-events-auto mb-1 flex flex-wrap items-center justify-end gap-1"
+          data={inputSlotData}
+          slot="input_above"
+        />
+      </div>
       {/* [2026-06-05] Why: previews should not consume the bordered composer body.
           How: keep the existing preview list above the form container. Purpose:
           attachments remain visible while the textarea and toolbar share one border. */}
@@ -324,8 +366,21 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
               <Icon name={approvalDisplay.icon} size={16} />
               <span>{approvalDisplay.label}</span>
             </button>
+            {/* Reserved slot: plugins may append toolbar controls on the left. */}
+            <PluginSlotHost
+              className="flex min-w-0 items-center gap-1.5"
+              data={inputSlotData}
+              slot="input_toolbar_left"
+            />
           </div>
           <div className="flex items-center gap-2">
+            {/* Reserved slot: plugins may append toolbar controls on the right
+                (quick actions like reroll, before the context indicator). */}
+            <PluginSlotHost
+              className="flex items-center gap-2"
+              data={inputSlotData}
+              slot="input_toolbar_right"
+            />
             {contextUsage && (
               <div
                 className="relative"

@@ -10,10 +10,11 @@
 import { useEffect, useRef } from 'react';
 
 import { usePluginsStore, type SlotContribution } from '../../store/pluginsStore';
+import { getPluginSlotApi, type PluginSlotApi } from '../../store/slotApi';
 
 interface SlotModule {
-  mount?: (ctx: { el: HTMLElement; data?: Record<string, unknown> }) => void;
-  update?: (ctx: { el: HTMLElement; data?: Record<string, unknown> }) => void;
+  mount?: (ctx: { el: HTMLElement; data?: Record<string, unknown>; api?: PluginSlotApi }) => void;
+  update?: (ctx: { el: HTMLElement; data?: Record<string, unknown>; api?: PluginSlotApi }) => void;
   destroy?: () => void;
 }
 
@@ -30,13 +31,18 @@ interface PluginSlotHostProps {
   className?: string;
 }
 
+// [AutoC 2026-08-22] Why: `contributions || []` mints a new array identity every
+// render when the slot is empty, firing the effect below needlessly. How: one
+// module-level empty constant for both empty cases.
+const EMPTY: SlotContribution[] = [];
+
 export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) => {
   const contributions = usePluginsStore((s) => s.slotsBySlot[slot]);
   const clientScriptsEnabled = usePluginsStore((s) => s.clientScriptsEnabled);
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const instancesRef = useRef<Map<string, SlotInstance>>(new Map());
 
-  const list: SlotContribution[] = clientScriptsEnabled ? contributions || [] : [];
+  const list: SlotContribution[] = clientScriptsEnabled ? contributions ?? EMPTY : EMPTY;
 
   useEffect(() => {
     const instances = instancesRef.current;
@@ -81,7 +87,7 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
               return;
             }
             try {
-              fresh.mod.mount?.({ el, data });
+              fresh.mod.mount?.({ el, data, api: getPluginSlotApi() });
             } catch (err) {
               console.error(`[plugin-slot:${contribution.slotId}] mount failed`, err);
             }
@@ -94,7 +100,7 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
       }
       if (inst.mod && !inst.failed) {
         try {
-          inst.mod.update?.({ el, data });
+          inst.mod.update?.({ el, data, api: getPluginSlotApi() });
         } catch {
           /* plugin errors stay isolated */
         }
