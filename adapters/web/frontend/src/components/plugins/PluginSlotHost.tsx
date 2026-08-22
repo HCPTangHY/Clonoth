@@ -6,15 +6,37 @@
 // mount/update/destroy), and keep React away from the children — React renders
 // only the container div and never reconciles plugin-written nodes. Errors in
 // one contribution are isolated and never break the surrounding page.
+// [AutoC 2026-08-22] Context v2: mount/update receive { el, data, api, state,
+// events }. `state` is plugin-private and survives remounts (wiped only when the
+// contribution disappears); `events` is a scoped subscriber whose subscriptions
+// are auto-revoked on destroy. A contribution may declare mode 'replace' to take
+// over the whole slot region — the highest-priority replace wins and all other
+// contributions in that slot are not mounted.
 // Purpose: small widgets (badges, counters) extend the chat UI without iframes.
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 
 import { usePluginsStore, type SlotContribution } from '../../store/pluginsStore';
 import { getPluginSlotApi, type PluginSlotApi } from '../../store/slotApi';
+import {
+  getPluginState,
+  subscribePluginEvent,
+  wipePluginState,
+  type PluginEventEmitter,
+} from '../../store/pluginRuntime';
+
+interface SlotContextShape {
+  el: HTMLElement;
+  data?: Record<string, unknown>;
+  api?: PluginSlotApi;
+  /** Plugin-private state; survives host remounts, wiped on contribution removal. */
+  state: Record<string, unknown>;
+  /** Scoped event subscriber; subscriptions auto-revoked when this instance dies. */
+  events: PluginEventEmitter;
+}
 
 interface SlotModule {
-  mount?: (ctx: { el: HTMLElement; data?: Record<string, unknown>; api?: PluginSlotApi }) => void;
-  update?: (ctx: { el: HTMLElement; data?: Record<string, unknown>; api?: PluginSlotApi }) => void;
+  mount?: (ctx: SlotContextShape) => void;
+  update?: (ctx: SlotContextShape) => void;
   destroy?: () => void;
 }
 
@@ -23,6 +45,7 @@ interface SlotInstance {
   mod: SlotModule | null;
   blobUrl: string;
   failed: boolean;
+  eventDisposers: Set<() => void>;
 }
 
 interface PluginSlotHostProps {
@@ -42,7 +65,22 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const instancesRef = useRef<Map<string, SlotInstance>>(new Map());
 
-  const list: SlotContribution[] = clientScriptsEnabled ? contributions ?? EMPTY : EMPTY;
+  const all: SlotContribution[] = clientScriptsEnabled ? contributions ?? EMPTY : EMPTY;
+
+  // replace 模式：声明 replace 的贡献接管整个槽位区域，取优先级最高者。
+  const list = useMemo(() => {
+    const idx = all.findIndex((c) => c.mode === 'replace');
+    return idx >= 0 ? [all[idx]] : all;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [all]);
+
+  const scopedEvents = (inst: SlotInstance): PluginEventEmitter => ({
+    on: (type, handler) => {
+      const dispose = subscribePluginEvent(type, handler);
+      inst.eventDisposers.add(dispose);
+      return dispose;
+    },
+  });
 
   useEffect(() => {
     const instances = instancesRef.current;
@@ -58,8 +96,11 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
         /* plugin errors stay isolated */
       }
       URL.revokeObjectURL(inst.blobUrl);
+      for (const dispose of inst.eventDisposers) dispose();
       instances.delete(slotId);
       containers.delete(slotId);
+      // contribution gone for good — its private state dies with it
+      wipePluginState(slotId);
     }
 
     for (const contribution of list) {
@@ -70,7 +111,13 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
         const blobUrl = URL.createObjectURL(
           new Blob([contribution.script], { type: 'text/javascript' }),
         );
-        const fresh: SlotInstance = { contribution, mod: null, blobUrl, failed: false };
+        const fresh: SlotInstance = {
+          contribution,
+          mod: null,
+          blobUrl,
+          failed: false,
+          eventDisposers: new Set(),
+        };
         inst = fresh;
         instances.set(contribution.slotId, fresh);
         import(/* @vite-ignore */ blobUrl)
@@ -87,7 +134,13 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
               return;
             }
             try {
-              fresh.mod.mount?.({ el, data, api: getPluginSlotApi() });
+              fresh.mod.mount?.({
+                el,
+                data,
+                api: getPluginSlotApi(),
+                state: getPluginState(contribution.slotId),
+                events: scopedEvents(fresh),
+              });
             } catch (err) {
               console.error(`[plugin-slot:${contribution.slotId}] mount failed`, err);
             }
@@ -100,7 +153,13 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
       }
       if (inst.mod && !inst.failed) {
         try {
-          inst.mod.update?.({ el, data, api: getPluginSlotApi() });
+          inst.mod.update?.({
+            el,
+            data,
+            api: getPluginSlotApi(),
+            state: getPluginState(contribution.slotId),
+            events: scopedEvents(inst),
+          });
         } catch {
           /* plugin errors stay isolated */
         }
@@ -109,7 +168,8 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [list, data]);
 
-  // final teardown when the host unmounts
+  // final teardown when the host unmounts (state and events revocation only —
+  // private state intentionally survives remounts)
   useEffect(
     () => () => {
       for (const inst of instancesRef.current.values()) {
@@ -119,6 +179,7 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
           /* plugin errors stay isolated */
         }
         URL.revokeObjectURL(inst.blobUrl);
+        for (const dispose of inst.eventDisposers) dispose();
       }
       instancesRef.current.clear();
     },

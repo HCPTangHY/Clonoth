@@ -9,6 +9,7 @@
 import { connectGlobalWS, disconnectGlobalWS } from '../api';
 import { maybeAutoApproveApprovalRequest, resetApprovalState } from './approvalManager';
 export { autoApprovedApprovalIds } from './approvalManager';
+import { dispatchPluginEvent } from './pluginRuntime';
 import { reduceChatEvent } from './eventReducer';
 import {
   appendAgentRouteEventLog,
@@ -84,6 +85,12 @@ export function startEventPump(set: StoreSetter, get: StoreGetter): void {
   connectGlobalWS(
     0,
     (event) => {
+      // [AutoC 2026-08-22] Plugin event tap: every incoming event reaches plugin
+      // subscribers before the store reducer runs, regardless of whether the
+      // reducer routes it to a conversation. Slot plugins get reactivity without
+      // the host re-rendering for them.
+      dispatchPluginEvent(event.type, event.payload);
+
       let shouldReconcileTerminalTask = false;
       let shouldRefreshContextUsage = false;
 

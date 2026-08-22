@@ -27,6 +27,12 @@ export interface SlotContribution {
   slot: string;
   script: string;
   priority: number;
+  /**
+   * 'replace' takes over the whole slot region: the highest-priority replace
+   * contribution renders alone and every other contribution is not mounted.
+   * Default 'append' keeps the old behavior of rendering alongside others.
+   */
+  mode: 'append' | 'replace';
 }
 
 interface PluginsState {
@@ -96,6 +102,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
             slot: slot.slot,
             script: slot.script,
             priority: Number.isFinite(slot.priority) ? Number(slot.priority) : 50,
+            mode: slot.mode === 'replace' ? 'replace' : 'append',
           };
           (slotsBySlot[entry.slot] ||= []).push(entry);
         }

@@ -50,6 +50,24 @@ export function getStoredAdminToken(): string {
   }
 }
 
+/**
+ * [AutoC 2026-08-22] Authenticated passthrough for plugin slot scripts.
+ * Why: the slot api whitelist cannot anticipate every backend capability a
+ * plugin needs; each addition previously required host code and a rebuild.
+ * How: expose one request function that injects auth and the /v1 prefix,
+ * throwing on non-ok like apiFetch, and return parsed JSON (null when the
+ * response has no body). Purpose: plugins reach any endpoint the web UI can
+ * reach without host changes.
+ */
+export async function pluginApiRequest(path: string, init?: RequestInit): Promise<unknown> {
+  const resp = await apiFetch(path, init);
+  try {
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
 // ── Attachment upload ──
 
 export interface UploadedAttachment {
