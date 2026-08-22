@@ -249,6 +249,32 @@ async def _send_ws_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
     await websocket.send_text(text)
 
 
+def _path_matches_template(path: str, template: str) -> bool:
+    """Segment-wise match of a concrete path against a route template.
+
+    Why: public plugin routes may be templates carrying ``{name}`` or
+    ``{name:path}`` segments (e.g. static file routers); the auth middleware's
+    literal set-membership check never matches those against real request
+    paths. How: split both sides on "/"; a ``{name}`` segment matches exactly
+    one path segment, a ``{name:path}`` segment (must be last) matches the
+    remaining one-or-more segments. Purpose: ``public=True`` declarations
+    stay exempt regardless of route shape.
+    """
+    ps = path.split("/")
+    ts = template.split("/")
+    i = 0
+    for j, seg in enumerate(ts):
+        if seg.startswith("{") and seg.endswith(":path}"):
+            return j == len(ts) - 1 and i < len(ps)
+        if i >= len(ps):
+            return False
+        if seg.startswith("{") or seg == ps[i]:
+            i += 1
+        else:
+            return False
+    return i == len(ps)
+
+
 def create_app(
     *,
     state: SupervisorState,
@@ -288,7 +314,17 @@ def create_app(
 
     @app.middleware("http")
     async def _auth_middleware(request: Request, call_next):
-        if request.url.path.startswith("/v1/") and request.url.path not in _AUTH_EXEMPT_PATHS:
+        path = request.url.path
+        # [AutoC 2026-08-22] Why: public plugin routes can be templates with
+        # {param}/{param:path} segments (static panel routers); literal set
+        # membership never matches real request paths against them. How: fall
+        # back to segment-wise template matching for entries containing '{'.
+        # Purpose: public=True declarations stay exempt regardless of route shape.
+        is_exempt = path in _AUTH_EXEMPT_PATHS or any(
+            "{" in pattern and _path_matches_template(path, pattern)
+            for pattern in _AUTH_EXEMPT_PATHS
+        )
+        if path.startswith("/v1/") and not is_exempt:
             try:
                 verify_admin_token(request)
             except HTTPException:

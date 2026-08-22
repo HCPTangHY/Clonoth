@@ -16,6 +16,7 @@ import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { WorkspaceFileTree } from '../components/workspace/WorkspaceFileTree';
 import type { ConversationMeta } from '../store/chatStore';
+import { usePluginsStore } from '../store/pluginsStore';
 import { useViewStore, type ViewMode, type PanelOverlayState } from '../store/viewStore';
 import type { Attachment } from '../types';
 import type { ToolExecution, WsMessage } from '../types/message';
@@ -51,9 +52,28 @@ export interface AppViewDefinition {
 
 const safeSessionId = (sessionId: string) => sessionId || 'no-session';
 
+// [AutoC 2026-08-22] Plugin panels resolve through the runtime manifest instead of
+// a compiled switch arm. Why: panels come from backend PLUGIN_META at runtime and
+// must not require a frontend rebuild. How: the plugin:{owner}:{id} namespace reads
+// the resolved panel from pluginsStore. Purpose: plugin UI mounts through the same
+// overlay channel as built-in overlays, with identical close semantics.
+import { PluginPanel } from '../components/plugins/PluginPanel';
+
 /** Resolve a panel overlay id to a React element. Add new overlays here. */
 function resolveOverlay(id: string, ctx: AppViewContext): ReactNode {
   const close = () => useViewStore.getState().clearPanelOverlays();
+  if (id.startsWith('plugin:')) {
+    const panel = usePluginsStore.getState().panelByKey(id);
+    if (!panel) return null;
+    return (
+      <PluginPanel
+        entry={panel.entry}
+        sessionId={safeSessionId(ctx.sessionId)}
+        title={panel.title}
+        onClose={close}
+      />
+    );
+  }
   switch (id) {
     case 'files':
       return <WorkspaceFileTree sessionId={safeSessionId(ctx.sessionId)} onClose={close} />;

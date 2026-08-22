@@ -6,9 +6,11 @@
 import { useEffect, useState } from 'react';
 
 import { getActiveNode, getAppConfig, getNodes, getSessionWorkspace } from '../../api/supervisorClient';
+import { usePluginsStore } from '../../store/pluginsStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { Button, Icon } from '../common';
+import { PluginSlotHost } from '../plugins/PluginSlotHost';
 import { SessionConfigModal } from '../settings/SessionConfigModal';
 
 interface HeaderProps {
@@ -30,6 +32,8 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
   const [configModalFocus, setConfigModalFocus] = useState<'node' | 'model' | 'workspace' | 'title' | null>(null);
   const [draftTitle, setDraftTitle] = useState(title);
   const [workspaceName, setWorkspaceName] = useState('');
+  // [AutoC 2026-08-22] Plugin panel entries come from the runtime manifest.
+  const pluginPanels = usePluginsStore((s) => s.panels);
 
   // Sync draft when title prop changes from outside
   useEffect(() => { setDraftTitle(title); }, [title]);
@@ -171,6 +175,32 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
             </Button>
           )}
 
+          {/* [AutoC 2026-08-22] Plugin panel entries — one button per declared panel,
+              toggling the same overlay channel the workspace file tree uses. */}
+          {pluginPanels.map((panel) => (
+            <button
+              key={panel.key}
+              className="inline-flex h-7 shrink-0 items-center gap-1 px-2 font-mono text-[0.6rem] text-[var(--duties-secondary)] transition-colors hover:text-[var(--duties-text)]"
+              onClick={() => {
+                const { panelOverlay, setPanelOverlay } = useViewStore.getState();
+                const { setRightPanelOpen } = useSettingsStore.getState();
+                if (panelOverlay.right === panel.key) {
+                  setPanelOverlay('right', null);
+                } else {
+                  setPanelOverlay('right', panel.key);
+                  setRightPanelOpen(true);
+                }
+              }}
+              title={`打开插件面板：${panel.title}`}
+              type="button"
+            >
+              <Icon name="extension" size={13} />
+              <span className="hidden sm:inline">{panel.title}</span>
+            </button>
+          ))}
+
+          {/* Reserved slot: plugins may append small header widgets. */}
+          <PluginSlotHost slot="header_actions" />
         </div>
       </div>
     </header>

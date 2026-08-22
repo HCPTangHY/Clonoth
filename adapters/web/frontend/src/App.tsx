@@ -13,9 +13,11 @@ import { useEffect } from 'react';
 import { checkHealth, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
 import { AppLayout } from './components/layout';
+import { PluginStyles } from './components/plugins/PluginStyles';
 import { SetupWizard } from './components/setup/SetupWizard';
 import { useChat } from './hooks/useChat';
 import { useChatStore } from './store/chatStore';
+import { usePluginsStore } from './store/pluginsStore';
 import { useSettingsStore } from './store/settingsStore';
 import { useViewStore } from './store/viewStore';
 import type { Attachment } from './types';
@@ -52,6 +54,14 @@ const MainApp = () => {
   // legacy startup loader and its old message accumulator.
   useEffect(() => {
     useChatStore.getState().loadStartup();
+  }, []);
+
+  // [AutoC 2026-08-22] Plugin manifest: panels/slots/styles all come from the
+  // backend plugin list. Why: the web adapter is one consumer of what plugins
+  // declare; it holds no plugin state of its own. How: one startup fetch after
+  // the chat store begins loading. Purpose: plugin UI appears without any build step.
+  useEffect(() => {
+    void usePluginsStore.getState().refresh();
   }, []);
 
   // [2026-06-01] Health check runs at App level so every registered view can show
@@ -112,16 +122,21 @@ const MainApp = () => {
   };
 
   return (
-    <AppLayout
-      composer={view.composer?.(viewContext)}
-      header={view.header(viewContext)}
-      logPanel={view.rightBottom?.(viewContext)}
-      rightOverlay={view.rightOverlay?.(viewContext)}
-      rightPanel={view.rightTop?.(viewContext)}
-      sidebar={view.sidebar(viewContext)}
-    >
-      {view.main(viewContext)}
-    </AppLayout>
+    <>
+      {/* [AutoC 2026-08-22] Style-tier plugin contributions render as synced
+          <style> tags; null component keeps it out of layout flow. */}
+      <PluginStyles />
+      <AppLayout
+        composer={view.composer?.(viewContext)}
+        header={view.header(viewContext)}
+        logPanel={view.rightBottom?.(viewContext)}
+        rightOverlay={view.rightOverlay?.(viewContext)}
+        rightPanel={view.rightTop?.(viewContext)}
+        sidebar={view.sidebar(viewContext)}
+      >
+        {view.main(viewContext)}
+      </AppLayout>
+    </>
   );
 };
 

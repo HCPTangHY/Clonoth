@@ -21,6 +21,7 @@ import type { Attachment } from '../../types';
 import { Icon } from '../common';
 import { AttachmentList } from './AttachmentList';
 import { ContextPopover } from './ContextPopover';
+import { PluginSlotHost } from '../plugins/PluginSlotHost';
 
 const APPROVAL_LEVEL_ORDER: ApprovalLevel[] = ['manual', 'smart', 'yolo'];
 
@@ -420,6 +421,8 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
           type="file"
         />
       </form>
+      {/* Reserved slot: plugins may append widgets under the composer. */}
+      <PluginSlotHost slot="input_suffix" className="mt-1.5" />
     </div>
   );
 };

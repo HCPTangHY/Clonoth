@@ -42,7 +42,7 @@ function authHeaders(token: string): Record<string, string> {
  * unavailable. Purpose: authenticated browser sessions keep working without changing
  * every existing call site.
  */
-function getStoredAdminToken(): string {
+export function getStoredAdminToken(): string {
   try {
     return localStorage.getItem('clonoth_admin_token') || '';
   } catch {
@@ -1244,4 +1244,65 @@ export async function getWorkspaceTree(
   if (opts.depth) params.set('depth', String(opts.depth));
   const resp = await apiFetch(`/workspace/tree?${params}`, { headers: authHeaders(token) });
   return resp.json();
+}
+
+// ── Plugin capability listing ──
+
+// [AutoC 2026-08-22] Plugin manifest types for the three-tier client contribution
+// model (panels / slots / styles) declared in backend PLUGIN_META and served by
+// GET /v1/plugins. Why: adapters discover what plugins offer at runtime instead
+// of compiling against them. How: transparent pass-through types; the store
+// normalizes them into lookup structures.
+export interface PluginPanelDecl {
+  id: string;
+  slot?: string;
+  title?: string;
+  entry: string;
+}
+
+export interface PluginSlotDecl {
+  slot_id: string;
+  slot: string;
+  script: string;
+  priority?: number;
+  mode?: string;
+}
+
+export interface PluginClientManifest {
+  panels?: PluginPanelDecl[];
+  slots?: PluginSlotDecl[];
+  styles?: string;
+}
+
+export interface PluginRouteEntry {
+  method: string;
+  path: string;
+  summary?: string;
+}
+
+export interface PluginRouteRecord {
+  owner: string;
+  prefix: string;
+  public?: boolean;
+  description?: string;
+  mounted?: boolean;
+  routes?: PluginRouteEntry[];
+}
+
+export interface PluginListItem {
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  module: string;
+  hooks: string[];
+  tools: string[];
+  routes: PluginRouteRecord[];
+  client: PluginClientManifest | null;
+}
+
+export async function listPlugins(): Promise<PluginListItem[]> {
+  const resp = await apiFetch('/plugins');
+  const data = await resp.json();
+  return Array.isArray(data?.plugins) ? data.plugins : [];
 }

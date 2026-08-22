@@ -9,6 +9,7 @@ import { useChatStore } from '../../store/chatStore';
 import { AttachmentList } from './AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
 import { BLOCK_STACK_CLASS, type MessageRenderContext } from './renderingConstants';
+import { PluginSlotHost } from '../plugins/PluginSlotHost';
 
 interface MessageCardProps {
   message: WsMessage;
@@ -247,6 +248,12 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
         )}
 
         <AttachmentList attachments={attachments} sessionId={message.sessionId} />
+
+        {/* Reserved slot: plugins may append per-message widgets (votes, badges). */}
+        <PluginSlotHost
+          data={{ messageId: message.id, role: message.role, sessionId: message.sessionId }}
+          slot="message_footer"
+        />
 
         {showRetry && retryEdit.editing && (
           <div className="mt-1.5 flex flex-col gap-1.5">

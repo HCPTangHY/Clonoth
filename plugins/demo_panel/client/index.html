@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>演示面板</title>
+<style>
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 16px; background: #0f1115; color: #d6d9e0; }
+  h3 { margin: 0 0 10px; font-size: 14px; }
+  p, li { font-size: 12px; line-height: 1.7; }
+  .ok { color: #4ade80; }
+  .err { color: #f87171; }
+  ul { margin: 8px 0 0; padding-left: 18px; }
+</style>
+</head>
+<body>
+  <h3>demo_panel 演示面板</h3>
+  <p id="boot">读取 boot 对象…</p>
+  <p id="plugins">查询插件清单…</p>
+  <ul id="list"></ul>
+  <script>
+    (function () {
+      var boot = (window.parent && window.parent.__CLONOTH_BOOT__) || null;
+      var bootEl = document.getElementById('boot');
+      if (!boot || !boot.token) {
+        bootEl.className = 'err';
+        bootEl.textContent = '未取得 boot 对象（token/sessionId）';
+        return;
+      }
+      bootEl.className = 'ok';
+      bootEl.textContent = 'boot ok · 会话 ' + String(boot.sessionId || '').slice(0, 8);
+
+      fetch('/v1/plugins', { headers: { Authorization: 'Bearer ' + boot.token } })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function (j) {
+          var names = (j.plugins || []).map(function (p) { return p.name; });
+          var el = document.getElementById('plugins');
+          el.className = 'ok';
+          el.textContent = '已加载插件 ' + names.length + ' 个';
+          var list = document.getElementById('list');
+          names.forEach(function (n) {
+            var li = document.createElement('li');
+            li.textContent = n;
+            list.appendChild(li);
+          });
+        })
+        .catch(function (e) {
+          var el = document.getElementById('plugins');
+          el.className = 'err';
+          el.textContent = '查询失败：' + e.message;
+        });
+    })();
+  </script>
+</body>
+</html>

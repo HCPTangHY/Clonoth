@@ -9,6 +9,7 @@ import { useChatStore, type ChildNodeState, type ConversationMeta } from '../../
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { Button, getChildNodeStatusLabel, Icon, StatusDot } from '../common';
+import { PluginSlotHost } from '../plugins/PluginSlotHost';
 
 interface SidebarProps {
   conversations: ConversationMeta[];
@@ -107,6 +108,12 @@ export const Sidebar = ({
                   {formatTime(conv.updatedAt)}
                 </span>
               </button>
+              {/* Reserved slot: plugins may append badges under each conversation row. */}
+              <PluginSlotHost
+                className="px-3 pb-1"
+                data={{ conversationId: conv.id, sessionId: conv.sessionId, title: conv.title }}
+                slot="session_item_suffix"
+              />
               {/* Delete button — visible on hover (desktop) or always visible (mobile).
                   [2026-06-01] Why: remove the literal close glyph used for deletion.
                   How: render the Material Symbols delete icon through Icon. Purpose:

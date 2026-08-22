@@ -258,3 +258,41 @@ class PluginRoutesFace:
                 "routes": routes,
             })
         return records
+
+
+def static_router(directory: "str | PathLike[str]") -> Any:
+    """Build an APIRouter serving static files from one directory.
+
+    Why: plugin panels are plain HTML/JS pages the plugin itself ships; there
+    is no build toolchain and no bundler. How: one wildcard GET route resolves
+    the requested relative path inside ``directory`` with a resolve()
+    containment check (path traversal refused), maps directory requests to
+    index.html, and returns a FileResponse (Starlette guesses the media type);
+    no directory listing. Declare with ``public=True`` on the routes face so
+    iframes can load the entry without an Authorization header. Purpose:
+    plugins get a web UI surface with zero frontend involvement.
+    """
+    from pathlib import Path
+
+    from fastapi import APIRouter, HTTPException
+    from fastapi.responses import FileResponse
+
+    root = Path(directory).resolve()
+    if not root.is_dir():
+        raise ValueError(f"static_router: directory does not exist: {root}")
+
+    router = APIRouter()
+
+    @router.get("/{file_path:path}", include_in_schema=False)
+    async def _serve_static(file_path: str) -> FileResponse:
+        cleaned = (file_path or "").strip("/")
+        if not cleaned:
+            cleaned = "index.html"
+        target = (root / cleaned).resolve()
+        if target != root and root not in target.parents:
+            raise HTTPException(status_code=404, detail="Not Found")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="Not Found")
+        return FileResponse(target)
+
+    return router
