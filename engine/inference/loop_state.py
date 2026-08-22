@@ -135,6 +135,11 @@ class _LoopState:
     # 为后续 snapshot 瘦身（不再存完整 messages 数组）做准备。
     last_shadow_message_id: str = ""
 
+    # [AutoC 2026-08-22] 插件私有状态空间。按插件名隔离，随 LoopState 生命周期
+    # 自动创建和销毁。插件通过 ls.plugin_data.setdefault("my_plugin", {})
+    # 读写，无需向 _LoopState dataclass 添加字段。
+    plugin_data: dict[str, dict[str, Any]] = field(default_factory=dict)
+
 
 def _persist_ctx(ls: _LoopState, step_count: int) -> str:
     """便捷函数：持久化当前节点上下文快照。

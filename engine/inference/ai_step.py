@@ -805,66 +805,62 @@ async def _execute_real_tools(
         })
 
     if _tool_entries:
-        for _entry in _tool_entries:
-            _result_body = _entry["raw_inline"]
-            # [AutoC 2026-06-08] Why: truncation now happens immediately after
-            # result_to_raw so both WebSocket metadata and ConversationStore receive
-            # the same bounded content. How: this formatter stage only forwards the
-            # prepared body. Purpose: remove the old hard-coded 32k loss point.
-            # [2026-05-01] 真实工具结果统一走 formatter.format_tool_result。
-            # 原因：真 native 需要 role=tool + tool_call_id，而旧代码在这里手写 user 文本，
-            # 会绕过新 NativeToolFormatter。fake-native/json 仍由各自 formatter 生成旧文本。
-            _tool_msg = ls.formatter.format_tool_result(
-                ParsedToolCall(
-                    id=str(_entry.get("id") or ""),
-                    name=str(_entry["name"]),
-                    arguments=dict(_entry.get("args") or {}),
-                ),
-                _result_body,
-            )
-            set_message_meta(_tool_msg, MessageMeta(
-                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-                message_type="tool_result",
-            ))
-            # [AutoC 2026-06-15] Why: ConversationStore only persists content as
-            # text (raw_inline), but the frontend result suffix logic (getDataField)
-            # needs the original structured dict with fields like appliedCount,
-            # returncode, totalFiles, etc. How: store the original tool result in
-            # _meta so session_history_structured can expose it. Purpose: refreshed
-            # pages render the same "→ 3/3 通过 +10 -1" suffixes as live events.
-            _tool_meta = _tool_msg.setdefault("_meta", {})
-            _structured = _entry.get("result")
-            if isinstance(_structured, dict):
-                _tool_meta["tool_result_structured"] = _structured
-            _tool_meta["tool_result_raw_inline"] = str(_entry.get("raw_inline") or "")
-            _tool_meta["tool_result_format"] = str(_entry.get("format") or "")
-            _tool_meta["tool_result_summary"] = str(_entry.get("summary") or "")
-            if _entry.get("elapsed_ms") is not None:
-                _tool_meta["tool_result_elapsed_ms"] = _entry.get("elapsed_ms")
-            _entry_attachments = _entry.get("attachments")
-            if isinstance(_entry_attachments, list):
-                _tool_meta["attachments"] = list(_entry_attachments)
-                _tool_meta["tool_result_attachments"] = list(_entry_attachments)
-            ls.messages.append(_tool_msg)
-            # Phase 1: 影子写入 tool_result 消息到 ConversationStore
-            _shadow_write(ls, _tool_msg, MessageType.TOOL_RESULT)
-        if _tool_atts:
-            # [AutoC 2026-06-01] Why: tool-generated image attachments were only
-            # appended to runtime memory, so a later task could not reload them
-            # from ConversationStore. How: keep the exact multimodal message in
-            # a variable, append it, then shadow-write it. Purpose: persist tool
-            # image results across task boundaries without changing prompt text.
-            _tool_att_msg = {
-                "role": "user",
-                "content": build_multimodal_content(
-                    "以上工具执行产生了以下图片结果：", _tool_atts, workspace_root=ls.rctx.workspace_root,
-                ),
-                "_meta": {"attachments": list(_tool_atts)},
-            }
-            ls.messages.append(_tool_att_msg)
-            _shadow_write(ls, _tool_att_msg, message_type="tool_result_attachment")
+        _persist_tool_results(ls, _tool_entries, _tool_atts)
 
     return None
+
+
+def _persist_tool_results(
+    ls: _LoopState,
+    entries: list[dict[str, Any]],
+    tool_atts: list[dict[str, Any]],
+) -> None:
+    """Format, persist, and append tool result messages to the loop state.
+
+    [AutoC 2026-08-22] Extracted from _execute_real_tools so that an
+    after_tool_call handler can replace or extend the write-back logic
+    by calling ctx.stop_chain() and performing its own persistence.
+    Without interception this function produces the same output as before.
+    """
+    for _entry in entries:
+        _result_body = _entry["raw_inline"]
+        _tool_msg = ls.formatter.format_tool_result(
+            ParsedToolCall(
+                id=str(_entry.get("id") or ""),
+                name=str(_entry["name"]),
+                arguments=dict(_entry.get("args") or {}),
+            ),
+            _result_body,
+        )
+        set_message_meta(_tool_msg, MessageMeta(
+            tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+            message_type="tool_result",
+        ))
+        _tool_meta = _tool_msg.setdefault("_meta", {})
+        _structured = _entry.get("result")
+        if isinstance(_structured, dict):
+            _tool_meta["tool_result_structured"] = _structured
+        _tool_meta["tool_result_raw_inline"] = str(_entry.get("raw_inline") or "")
+        _tool_meta["tool_result_format"] = str(_entry.get("format") or "")
+        _tool_meta["tool_result_summary"] = str(_entry.get("summary") or "")
+        if _entry.get("elapsed_ms") is not None:
+            _tool_meta["tool_result_elapsed_ms"] = _entry.get("elapsed_ms")
+        _entry_attachments = _entry.get("attachments")
+        if isinstance(_entry_attachments, list):
+            _tool_meta["attachments"] = list(_entry_attachments)
+            _tool_meta["tool_result_attachments"] = list(_entry_attachments)
+        ls.messages.append(_tool_msg)
+        _shadow_write(ls, _tool_msg, MessageType.TOOL_RESULT)
+    if tool_atts:
+        _tool_att_msg = {
+            "role": "user",
+            "content": build_multimodal_content(
+                "以上工具执行产生了以下图片结果：", tool_atts, workspace_root=ls.rctx.workspace_root,
+            ),
+            "_meta": {"attachments": list(tool_atts)},
+        }
+        ls.messages.append(_tool_att_msg)
+        _shadow_write(ls, _tool_att_msg, message_type="tool_result_attachment")
 
 
 # ---------------------------------------------------------------------------

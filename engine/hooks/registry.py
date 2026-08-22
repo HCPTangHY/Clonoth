@@ -216,7 +216,11 @@ class HookRegistry:
         merged_override: dict | None = None
         adopted_execution: Any = None
         intercepted = False
+        _next_called = True  # 默认放行，兼容旧 handler
         for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
+            if not _next_called:
+                break
+            _next_called = True  # 每次重置；只有 handler 显式设 ctx._next_skipped 才停
             try:
                 result = entry.callback(ctx)
                 if inspect.isawaitable(result):
@@ -227,6 +231,9 @@ class HookRegistry:
                 )
                 if stop_result is not None:
                     return stop_result
+                # 瀑布语义：handler 可以通过 ctx.stop_chain() 终止后续 handler 执行
+                if getattr(ctx, '_chain_stopped', False):
+                    break
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
         return HookResult(modified=modified, result_override=merged_override, execution=adopted_execution, intercepted=intercepted)
@@ -250,6 +257,8 @@ class HookRegistry:
                 )
                 if stop_result is not None:
                     return stop_result
+                if getattr(ctx, '_chain_stopped', False):
+                    break
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
         return HookResult(modified=modified, result_override=merged_override, execution=adopted_execution, intercepted=intercepted)

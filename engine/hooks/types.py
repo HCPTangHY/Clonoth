@@ -30,6 +30,21 @@ class HookContext:
     tool_calls: list = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
 
+    # [AutoC 2026-08-22] 瀑布链控制。handler 调用 ctx.stop_chain() 后，
+    # 后续优先级更低的 handler 不再执行，但当前 handler 的 HookResult
+    # 仍正常处理。与 action 终止的区别：stop_chain 不产生 TaskAction，
+    # 流程继续执行，只是后续 handler 被跳过。
+    _chain_stopped: bool = field(default=False, repr=False)
+
+    def stop_chain(self) -> None:
+        """Stop the hook chain after the current handler returns.
+
+        Subsequent lower-priority handlers will not execute. The current
+        handler's HookResult is still processed normally. This does NOT
+        produce a TaskAction — the inference loop continues its flow.
+        """
+        self._chain_stopped = True
+
 
 @dataclass
 class HookResult:
