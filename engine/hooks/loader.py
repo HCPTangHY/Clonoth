@@ -107,6 +107,14 @@ def _load_module_from_path(py_file: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot create import spec for {py_file}")
     module = importlib.util.module_from_spec(spec)
+    # [plugin-admin 2026-08-23] Why: directory plugins register themselves in
+    # sys.modules but file plugins did not, so runtime admin meta lookup and
+    # module-drop-before-reload only worked for packages. How: mirror the
+    # package loader and publish the module under the same stable key. Purpose:
+    # .py-file and directory plugins behave identically after load.
+    import sys
+
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 

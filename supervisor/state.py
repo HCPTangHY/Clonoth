@@ -243,6 +243,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 if not (is_pkg or is_disabled_pkg or _is_enabled_python_plugin(entry) or is_disabled_py):
                     continue
                 stem = entry.name.removesuffix(".disabled")
+                # [plugin-admin 2026-08-23] Why: display and dedup keys must be
+                # suffix-free for both shapes — a .py file previously kept its
+                # extension in the entry name shown by the admin UI. How: strip
+                # .disabled first, then a trailing .py. Purpose: entries read as
+                # stable plugin names regardless of file kind.
+                if stem.endswith(".py"):
+                    stem = stem[:-3]
                 seen_entries.add(stem)
                 meta_name = self._entry_meta_name(entry)
                 meta = loaded.get(meta_name)
