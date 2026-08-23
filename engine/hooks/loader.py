@@ -21,6 +21,51 @@ from ..context import accepts_context
 logger = logging.getLogger(__name__)
 
 
+# [plugin-admin 2026-08-23] Per-entry load error table. Why: plugin load
+# failures used to be visible only in the process log, so the admin UI could
+# only show "not loaded" without the reason. How: scan and single-load record
+# failures here keyed by entry stem; a successful load clears the entry.
+# Purpose: the plugin manager surfaces the actual ImportError/TypeError.
+_LOAD_ERRORS: dict[str, str] = {}
+
+
+def get_load_error(entry_name: str) -> str:
+    """Return the last recorded load error for one entry, or empty string."""
+    return _LOAD_ERRORS.get(Path(entry_name).stem, "")
+
+
+def _resolve_client_assets(plugin_dir: Path, meta: dict) -> None:
+    """Inline {"file": relative_path} references inside PLUGIN_META.client.
+
+    Why: slot scripts and styles were embedded as Python string literals in
+    __init__.py, which loses editor support entirely. How: walk client.slots
+    and client.styles; any value shaped as {"file": "client/x.js"} is read
+    from the plugin directory (containment-checked) and replaced by its text.
+    Purpose: consumers (the web manifest) always receive plain strings.
+    """
+    client = meta.get("client")
+    if not isinstance(client, dict):
+        return
+    base = Path(plugin_dir).resolve()
+
+    def _inline(value: Any) -> Any:
+        if not (isinstance(value, dict) and isinstance(value.get("file"), str)):
+            return value
+        rel = value["file"].strip()
+        target = (base / rel).resolve()
+        if base != target and base not in target.parents:
+            raise ValueError(f"client asset escapes plugin directory: {rel!r}")
+        return target.read_text(encoding="utf-8")
+
+    slots = client.get("slots")
+    if isinstance(slots, list):
+        for slot in slots:
+            if isinstance(slot, dict) and "script" in slot:
+                slot["script"] = _inline(slot["script"])
+    if "styles" in client:
+        client["styles"] = _inline(client["styles"])
+
+
 def _default_plugin_meta(py_file: Path) -> dict:
     """Build default metadata for a plugin file."""
     # Why: existing plugins predate PLUGIN_META and must keep loading unchanged.
@@ -163,7 +208,12 @@ def drop_plugin_module(entry_name: str) -> None:
         sys.modules.pop(key, None)
 
 
-def _load_one_plugin(hook_registry: HookRegistry, entry: Path, context: Any = None) -> dict:
+def _load_one_plugin(
+    hook_registry: HookRegistry,
+    entry: Path,
+    context: Any = None,
+    process: str | None = None,
+) -> dict:
     """Import one plugin entry and register it. Returns its meta dict.
 
     Why: startup directory scan and runtime single-plugin load must share one
@@ -174,6 +224,34 @@ def _load_one_plugin(hook_registry: HookRegistry, entry: Path, context: Any = No
     is_package = _is_plugin_package(entry)
     module = _load_package_from_dir(entry) if is_package else _load_module_from_path(entry)
     meta = _normalize_plugin_meta(entry, getattr(module, "PLUGIN_META", {}))
+
+    # [plugin-admin 2026-08-23] Process targeting: PLUGIN_META may declare
+    # "processes": ["supervisor"] / ["engine"] so a plugin skips the wrong
+    # process explicitly instead of silently no-oping on a missing face.
+    targets = meta.get("processes")
+    if process and isinstance(targets, list) and targets and process not in targets:
+        raise PluginProcessSkip(
+            f"plugin {meta['name']} targets processes {targets}, not {process}"
+        )
+
+    # [plugin-admin 2026-08-23] Name coherence: the meta name, the entry name,
+    # and the sys.modules key are three independent sources. Mismatches used to
+    # cause the admin UI to misreport load state (no_tool_finish_guard).
+    entry_stem = entry.stem if not is_package else entry.name
+    if meta["name"] != entry_stem:
+        logger.warning(
+            "Plugin name mismatch: PLUGIN_META name %r differs from entry name %r; "
+            "admin tooling keys on the meta name",
+            meta["name"], entry_stem,
+        )
+
+    # [plugin-admin 2026-08-23] Client asset resolution: slots/styles may
+    # reference files ({"file": "client/slot.js"}) instead of inlining source
+    # in the Python manifest. How: read the file from the plugin directory and
+    # substitute the content before meta registration, so consumers always see
+    # plain strings. Purpose: plugin JS/CSS live in real files with editor
+    # support instead of triple-quoted Python strings.
+    _resolve_client_assets(entry if is_package else entry.parent, meta)
 
     # Mode 1: PLUGIN_META with handler_class + hook_points
     raw_meta = getattr(module, "PLUGIN_META", None)
@@ -204,20 +282,36 @@ def _load_one_plugin(hook_registry: HookRegistry, entry: Path, context: Any = No
         )
         return meta
 
-    # Mode 2: Legacy register() function
+    # Mode 2: register() function. The argument is always the EngineContext
+    # (falling back to the bare registry only when no context exists at all).
     register = getattr(module, "register", None)
     if not callable(register):
         raise ValueError(
             f"Plugin {meta['name']} {meta['version']} ({entry.name}) has no PLUGIN_META handler or register()"
         )
     with hook_registry.collecting(meta["name"]):
-        register(_legacy_register_argument(register, hook_registry, context))
+        try:
+            register(context if context is not None else hook_registry)
+        except AttributeError as exc:
+            # [plugin-admin 2026-08-23] Legacy plugins wrote
+            # register(hook_registry) and call hook_registry.register(...).
+            # That call now fails against EngineContext; translate the
+            # attribute error into an actionable migration message.
+            raise TypeError(
+                f"Plugin {meta['name']} uses the legacy register(hook_registry) "
+                f"signature. Migrate to register(ctx) and use ctx.hooks.register(...). "
+                f"Original error: {exc}"
+            ) from exc
     hook_registry.register_plugin_meta(meta)
     logger.info(
-        "Loaded external plugin (legacy): %s %s (%s)",
+        "Loaded external plugin (register): %s %s (%s)",
         meta["name"], meta["version"], entry.name,
     )
     return meta
+
+
+class PluginProcessSkip(Exception):
+    """Raised when a plugin declares processes that exclude the current one."""
 
 
 def load_single_plugin(
@@ -226,6 +320,7 @@ def load_single_plugin(
     entry_name: str,
     context: Any = None,
     event_sink: Any = None,
+    process: str | None = None,
 ) -> dict:
     """Load one plugin entry at runtime. Returns its meta dict; raises on failure.
 
@@ -249,7 +344,15 @@ def load_single_plugin(
         raise ValueError(f"no enabled plugin entry named {clean!r} under {plugins_dir}")
 
     drop_plugin_module(clean)
-    meta = _load_one_plugin(hook_registry, entry, context)
+    try:
+        meta = _load_one_plugin(hook_registry, entry, context, process=process)
+    except PluginProcessSkip:
+        raise
+    except Exception as exc:
+        # [plugin-admin 2026-08-23] record the failure so the admin UI can show it
+        _LOAD_ERRORS[Path(clean).stem] = f"{type(exc).__name__}: {exc}"
+        raise
+    _LOAD_ERRORS.pop(Path(clean).stem, None)
     if callable(event_sink):
         try:
             event_sink("plugin_loaded", {"plugin": meta.get("name", clean), "entry": clean})
@@ -258,20 +361,25 @@ def load_single_plugin(
     return meta
 
 
-def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path, context: Any = None) -> int:
+def load_external_plugins(
+    hook_registry: HookRegistry,
+    plugins_dir: Path,
+    context: Any = None,
+    process: str | None = None,
+) -> int:
     """Load enabled external hook plugins from plugins_dir.
 
     Supports two registration modes (checked in order):
     1. PLUGIN_META auto-discovery — same mechanism as engine/builtin.
-    2. Legacy register() function — backward compatible with older plugins.
+    2. register(ctx) function — receives the EngineContext.
 
     Each entry may be a single .py file or a directory with __init__.py
     (one plugin, one entry; internal splitting stays private to the plugin).
 
-    When ``context`` (an EngineContext) is provided, handler classes whose
-    __init__ takes an argument receive it, and legacy register() functions
-    whose first parameter is named ctx/context/engine_ctx receive it instead
-    of the bare hook registry.
+    ``process`` identifies the loading process ("engine" or "supervisor");
+    plugins declaring PLUGIN_META["processes"] skip mismatched processes.
+    Load failures are recorded in the module-level error table (visible via
+    get_load_error) and logged, without aborting the remaining scan.
 
     Returns:
         Number of plugin entries loaded successfully.
@@ -286,30 +394,12 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path, contex
         if not is_package and not _is_enabled_python_plugin(entry):
             continue
         try:
-            _load_one_plugin(hook_registry, entry, context)
+            _load_one_plugin(hook_registry, entry, context, process=process)
+            _LOAD_ERRORS.pop(entry.stem, None)
             count += 1
+        except PluginProcessSkip as exc:
+            logger.info("Skipped plugin %s: %s", entry.name, exc)
         except Exception as exc:
+            _LOAD_ERRORS[entry.stem] = f"{type(exc).__name__}: {exc}"
             logger.error("Failed to load plugin %s: %s", entry.name, exc, exc_info=True)
     return count
-
-
-def _legacy_register_argument(register: Any, hook_registry: HookRegistry, context: Any) -> Any:
-    """Choose what a legacy register() function receives.
-
-    Why: old plugins declare register(hook_registry); new ones may declare
-    register(ctx) to reach every registration surface. How: when a context is
-    available and the first parameter is named ctx/context/engine_ctx, pass the
-    EngineContext; otherwise pass the hook registry as before. Purpose: adopt
-    the new entry point without touching existing plugin files.
-    """
-    if context is None:
-        return hook_registry
-    import inspect
-
-    try:
-        params = list(inspect.signature(register).parameters.values())
-    except (TypeError, ValueError):
-        return hook_registry
-    if params and params[0].name in {"ctx", "context", "engine_ctx"}:
-        return context
-    return hook_registry

@@ -130,7 +130,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # External plugins: same mechanism as engine, scan plugins/ directory
         from engine.hooks.loader import load_external_plugins
         _plugins_dir = workspace_root / "plugins"
-        _ext_count = load_external_plugins(self.hook_registry, _plugins_dir, context=_supervisor_ctx)
+        _ext_count = load_external_plugins(
+            self.hook_registry, _plugins_dir, context=_supervisor_ctx, process="supervisor"
+        )
         if _ext_count:
             logger.info("Loaded %d external plugin(s) for supervisor hooks", _ext_count)
         # [plugin-admin 2026-08-23] Runtime plugin management state. Why: the
@@ -230,7 +232,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
     def plugin_admin_list(self) -> list[dict[str, Any]]:
         """Merge filesystem entries with loaded registry state for the admin UI."""
-        from engine.hooks.loader import _is_enabled_python_plugin, _is_plugin_package
+        from engine.hooks.loader import _is_enabled_python_plugin, _is_plugin_package, get_load_error
 
         loaded = {str(m.get("name") or ""): m for m in self.hook_registry.list_plugins()}
         entries: list[dict[str, Any]] = []
@@ -265,6 +267,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     "hooks": list(meta.get("hooks") or []) if meta else [],
                     "builtin": False,
                     "external": True,
+                    # [plugin-admin 2026-08-23] surface the last load failure so
+                    # "未加载" stops being a dead end for the operator
+                    "error": "" if meta else get_load_error(stem),
                 })
         # builtin (engine-side) plugins: display-only, engine process owns them
         for name, meta in sorted(loaded.items()):

@@ -355,3 +355,41 @@ def register(hook_registry: HookRegistry) -> None:
     # 原因：真实工具执行前是阻止危险工具的合适位置。
     hook_registry.register("before_tool_call", RequireSafeToolName())
 ```
+
+## EngineContext 注册面（2026-08 统一入口）
+
+插件加载时收到的 `ctx` 是 `EngineContext`，三类注册面各一个字段：
+
+- `ctx.hooks`（拦截型）：HookRegistry，13 个 hook 点，支持 execution（单主）、result_override（按键合并）、intercepted（或聚合）三种通道与 stop_chain 断链。
+- `ctx.providers`（渠道型）：ProviderRegistry，模型后端注册。
+- `ctx.contributions`（声明型容器）：按名挂载 face，用 `get(name)` 取用。当前已挂载：`prompt_sections`（engine）、`routes`（supervisor）。新增 face 不需要改框架，调用 `Contributions.mount(name, face)`。
+
+### routes face（supervisor 进程）
+
+```python
+routes = ctx.contributions.get("routes")
+if routes is not None:
+    routes.register(router, mount="sessions", public=False, description="...")
+```
+
+- 默认挂在 `/v1/plugins/{owner}` 下；`mount="sessions"` 挂到 `/v1/sessions`。
+- `public=True` 豁免全局鉴权（用于静态资源）；其余路由走 `/v1/` 统一鉴权中间件。
+- 与 core 端点路径冲突时拒绝挂载（core 优先）。
+- 卸载插件时挂载自动摘除（DisposalLedger 归档）。
+- 静态界面资源用 `routes.register(static_router(dir), public=True)`。
+
+### 前端贡献（PLUGIN_META.client）
+
+插件可声明前端贡献，web 前端启动时从 `/v1/plugins` 读取 manifest 消费：
+
+- `panels`：iframe 面板，`slot: "right"`（聊天右栏）或 `"settings"`（设置区独立 tab）。面板内用 `window.parent.__CLONOTH_BOOT__` 取 token/sessionId；宿主自动注入主题变量与滚动条规则。
+- `slots`：槽位脚本，`script` 为 ES module 源码（或 `{"file": "client/x.js"}` 引用文件）。上下文 `{ el, data, api, state, events }`；`mode: "replace"` 可接管整个槽位。
+- `styles`：全局 CSS（或 `{"file": ...}` 引用）。
+
+槽位脚本宿主服务：`api.call(name, ...)` 调宿主动作注册表（hostActions.ts，core 登记动作一次、插件按名调用），`api.request(path)` 直连后端，`state` 按 slotId 隔离且跨重挂载存活，`events.on(type, fn)` 订阅 supervisor 事件流。
+
+### 进程声明与加载诊断
+
+- PLUGIN_META 可声明 `"processes": ["engine"]` / `["supervisor"]`，不匹配的进程跳过（info 日志，不算失败）。
+- PLUGIN_META 的 `name` 建议与条目名一致；不一致时 loader 打警告（管理界面按 meta 名归因）。
+- 加载失败记录在 loader 的错误表，插件管理界面展示具体异常。

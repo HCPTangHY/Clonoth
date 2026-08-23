@@ -1,45 +1,83 @@
-# 外部 Hook 插件目录
+# 外部插件目录
 
-`plugins/` 用于放置本地外部 hook 插件。AI 节点启动时会扫描这个目录，并加载启用的 Python 文件。
+`plugins/` 放置本地外部插件。engine 与 supervisor 两个进程启动时各自扫描这个目录并加载启用的条目；插件管理器（设置区「插件」页）支持运行时装卸与启停。
 
-## 启用规则
+## 条目形态与启用规则
 
-会被加载的文件必须同时满足以下条件：
+一个条目可以是：
 
-1. 是普通文件。
-2. 文件名以 `.py` 结尾。
-3. 文件名不以 `_` 开头。
-4. 文件名不以 `.disabled` 结尾。
+- **单文件**：`my_plugin.py`
+- **目录包**：`my_plugin/`（含 `__init__.py`，内部可拆分模块）
 
-`example_hook.py.disabled` 是模板文件。复制它或去掉 `.disabled` 后缀即可启用示例。
+被加载的条目必须：不以 `_` 开头、不以 `.disabled` 结尾。停用 = 重命名为 `xxx.disabled`；启用 = 去掉后缀。
 
 ## 插件协议
 
-插件必须提供：
+模块必须提供 `PLUGIN_META`（推荐，自动发现模式）或 `register(ctx)` 函数。
 
-```python
-from engine.hooks import HookRegistry
-
-
-def register(hook_registry: HookRegistry) -> None:
-    # 目的：把外部 handler 接入指定 hook point。
-    # 做法：调用 hook_registry.register。
-    # 原因：外部插件和内置 handler 使用同一套注册协议。
-    ...
-```
-
-插件可以提供可选的 `PLUGIN_META`：
+### 方式一：PLUGIN_META（推荐）
 
 ```python
 PLUGIN_META = {
-    "name": "example-hook",
+    "name": "my-plugin",          # 建议与条目名一致（不一致会打警告）
     "version": "1.0.0",
-    "description": "Example external hook plugin template.",
-    "author": "Clonoth",
-    "hooks": ["before_step"],
+    "description": "做什么的一句话",
+    "author": "you",
+    "handler_class": "MyHandler",      # 可选：hook handler 类
+    "hook_points": [("before_step", "handle")],  # handler 方法挂到哪个 hook 点
+    "priority": 100,                    # 可选，hook 优先级
+    "tools": [...],                     # 可选：工具声明
+    "client": {...},                    # 可选：前端贡献（见下）
+    "processes": ["supervisor"],        # 可选：只在指定进程加载
+}
+
+
+class MyHandler:
+    name = "my-plugin"
+
+    def __init__(self, ctx):   # 可选：声明参数即收到 EngineContext
+        self.ctx = ctx
+
+    async def handle(self, hook_ctx): ...
+```
+
+### 方式二：register(ctx)
+
+```python
+def register(ctx) -> None:
+    ctx.hooks.register("before_step", my_handler)   # 拦截型
+    # ctx.contributions.get("routes") / ("prompt_sections")   # 声明型
+```
+
+`ctx` 是 `EngineContext`，统一入口：`ctx.hooks`（拦截型注册表）、`ctx.providers`（渠道型）、`ctx.contributions`（声明型容器）。注意：旧式 `register(hook_registry)` 签名已废弃，加载会失败并给出迁移提示。
+
+## 注册面速查
+
+| 你要做什么 | 入口 | 进程 |
+|---|---|---|
+| 拦截/修改流程 | `ctx.hooks.register(hook点, handler)` | 两者 |
+| 注册工具 | PLUGIN_META `tools` | engine |
+| 注入 prompt 内容 | `ctx.contributions.get("prompt_sections").register_section(...)` | engine |
+| 注册 HTTP 路由 | `ctx.contributions.get("routes").register(router, ...)` | supervisor |
+| 前端面板/槽位/样式 | PLUGIN_META `client` | 任意（前端读 manifest） |
+
+## 前端贡献（client）
+
+```python
+PLUGIN_META["client"] = {
+    "panels": [{"id": "x", "slot": "settings", "title": "标题",
+                "entry": "/v1/plugins/my-plugin/client/"}],
+    "slots": [{"slot_id": "my.x", "slot": "input_toolbar_right",
+               "priority": 50, "script": {"file": "client/slot.js"}}],
+    "styles": {"file": "client/styles.css"},   # 或内联字符串
 }
 ```
 
-加载器会补齐缺失的元数据字段。没有 `register()` 的文件会被跳过；加载失败只会记录日志，不会阻止引擎启动。重复扫描时，handler 按名称替换，因此注册应使用稳定的 `handler.name`。
+`script`/`styles` 支持内联字符串或 `{"file": 相对路径}` 文件引用（加载时内联，推荐文件方式——有编辑器支持）。槽位脚本上下文 `ctx = { el, data, api, state, events }`：`api.call(name, ...)` 调宿主动作（如 `retryMessage`），`api.request(path)` 直连后端 API，`state` 跨重挂载存活，`events.on(type, fn)` 订阅事件流。
 
-完整开发说明见 `docs/plugin-system.md`。
+## 其他
+
+- `example_hook.py.disabled` 是模板：去掉 `.disabled` 后缀即可启用。
+- 卸载是彻底的：注册返回的 disposer 按插件归档，卸载时逆序回放。
+- 加载失败不阻断其他插件，原因在插件管理界面可见。
+- 完整文档见 `docs/plugin-system.md`。

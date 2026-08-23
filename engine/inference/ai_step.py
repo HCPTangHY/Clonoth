@@ -949,7 +949,7 @@ async def run_ai_node(
     # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。
     # 做法：调用幂等的外部插件加载器；HookRegistry 会按 handler.name 替换旧实例。
     # 目的：启动时自动发现插件，同时避免重复注册和单个插件失败影响引擎启动。
-    load_external_plugins(hook_registry, rctx.workspace_root / "plugins", context=_engine_ctx)
+    load_external_plugins(hook_registry, rctx.workspace_root / "plugins", context=_engine_ctx, process="engine")
 
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)

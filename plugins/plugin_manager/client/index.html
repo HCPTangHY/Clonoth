@@ -153,10 +153,12 @@ function row(p, meta) {
   const title = p.name || p.entry;
   const ver = meta && meta.version ? ' ' + meta.version : (p.version ? ' ' + p.version : '');
   const entryFile = p.builtin ? '' : '<div class="entryfile">' + esc(p.file_name) + '</div>';
+  const errLine = (!p.builtin && !p.loaded && p.error)
+    ? '<div style="color:var(--danger);font-size:10px;font-family:var(--mono);margin-top:3px">加载失败：' + esc(p.error) + '</div>' : '';
   const isOpen = expanded.has(p.builtin ? 'b:' + p.name : p.entry);
   let main = '<tr class="mainrow' + (isOpen ? ' open' : '') + '" data-expand="' + esc(p.builtin ? 'b:' + p.name : p.entry) + '">'
     + '<td class="name"><span class="caret">' + (p.builtin ? '' : '▶') + '</span>' + esc(title) + esc(ver)
-    + '<div style="margin-top:3px">' + tags.join('') + '</div>' + entryFile + '</td>'
+    + '<div style="margin-top:3px">' + tags.join('') + '</div>' + entryFile + errLine + '</td>'
     + '<td class="desc" title="' + esc(p.description || (meta && meta.description) || '') + '">'
     + esc(p.description || (meta && meta.description) || '') + '</td>'
     + '<td style="white-space:nowrap">' + buttons(p) + '</td></tr>';

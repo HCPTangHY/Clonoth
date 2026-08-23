@@ -1,0 +1,35 @@
+"""示例插件：演示 PLUGIN_META + register(ctx) 协议与三类注册面。
+
+去掉文件名的 .disabled 后缀即可启用。本示例只在加载时打印一行日志，
+不注册任何 hook（避免影响推理流程）；取消注释可试挂 hook。
+"""
+
+PLUGIN_META = {
+    "name": "example-hook",
+    "version": "1.0.0",
+    "description": "示例插件：演示新协议（EngineContext 统一入口）",
+    "author": "Clonoth",
+    # "processes": ["engine", "supervisor"],  # 可选：限定加载进程
+    # "hooks": ["before_step"],               # 展示用：声明挂了哪些 hook 点
+}
+
+
+def register(ctx) -> None:
+    """加载入口。ctx 是 EngineContext：ctx.hooks / ctx.providers / ctx.contributions。
+
+    拦截型示例（取消注释）：
+        async def my_handler(hook_ctx): ...
+        ctx.hooks.register("before_step", my_handler, priority=100)
+
+    声明型示例（supervisor 进程注册 HTTP 路由）：
+        routes = ctx.contributions.get("routes")
+        if routes is not None:
+            from fastapi import APIRouter
+            router = APIRouter()
+            @router.get("/ping")
+            async def _ping(): return {"ok": True}
+            routes.register(router)   # 落在 /v1/plugins/example-hook/ping
+    """
+    import logging
+
+    logging.getLogger(__name__).info("example-hook loaded")
