@@ -151,7 +151,7 @@ Create `config/nodes/<name>.yaml` with required fields: `id`, `name`, `descripti
 
 ### New Hook Plugin
 
-Create `plugins/<name>.py`, expose `register(hook_registry)` function and optional `PLUGIN_META`.
+Create `plugins/<name>.py`, expose `PLUGIN_META` (auto-discovery) or a `register(ctx)` function receiving the EngineContext. See docs/plugin-system.md.
 
 ### New Skill
 

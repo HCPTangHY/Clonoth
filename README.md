@@ -35,7 +35,7 @@ Hook 系统将运行时策略从主推理流程中拆出，便于测试和维护
 
 ### 外部插件
 
-`plugins` 目录支持外部 Hook 插件。插件文件通过暴露 `register(hook_registry)` 函数注册处理器，也可以提供可选的 `PLUGIN_META` 元数据。示例文件 `plugins/example_hook.py.disabled` 展示了基本协议，去掉 `.disabled` 后缀即可作为插件模板启用。
+`plugins` 目录支持外部插件。插件通过 `PLUGIN_META`（自动发现）或 `register(ctx)` 函数（收到 EngineContext 统一注册面入口）注册 hook handler、工具、HTTP 路由和前端贡献（面板/槽位/样式）。示例文件 `plugins/example_hook.py.disabled` 展示了基本协议，去掉 `.disabled` 后缀即可作为插件模板启用；运行时装卸见设置区「插件」管理页。
 
 ### 多平台接入
 
@@ -199,7 +199,7 @@ pytest
 
 - 新增模型后端：在 `providers/` 中新增 Provider 实现，并接入 `ProviderRegistry` 约定。
 - 新增 Hook：实现 `Handler`，通过 Hook 注册表注册到对应 Hook 点。
-- 新增外部插件：在 `plugins/` 中创建插件文件，暴露 `register(hook_registry)` 函数。
+- 新增外部插件：在 `plugins/` 中创建插件文件，声明 `PLUGIN_META` 或提供 `register(ctx)` 函数。
 - 新增工具：在 `tools/` 或 `toolbox/` 的约定位置实现工具，并完成注册。
 - 新增技能：在 `skills/` 中添加技能说明文件，并配置触发策略。
 

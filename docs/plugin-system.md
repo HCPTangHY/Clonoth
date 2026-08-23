@@ -124,27 +124,34 @@ Hook 的目标是把推理循环中的横切逻辑移出 `engine/inference/ai_st
 | `reason` | 面向内部或模型的简短原因。 |
 | `error_message` | 更明确的错误文本。 |
 | `modified` | 表示 handler 修改了上下文或运行状态。 |
+| `channels` | 点特设的通道值。fire 点从 `result.channels.get(name)` 读取。 |
 
 通道（channels）：点特设的返回值放在 `channels` dict 里，不再占用 HookResult 的公共字段。
 handler 返回 `hook_result(channels={"execution": ...})`；registry 按 CHANNEL_SEMANTICS 聚合
-（execution 单主 first、result_override 按键 merge、intercepted 或聚合），fire 点从
-`result.channels.get(name)` 读取。新增通道只需在 registry 的 CHANNEL_SEMANTICS 表加一行
-（默认 first 语义），不改 HookResult 类型。
+（execution 单主 first、result_override 按键 merge、intercepted 或聚合，未知键默认 first），
+fire 点从 `result.channels.get(name)` 读取。新增通道只需在 registry 的 CHANNEL_SEMANTICS
+表加一行，不改 HookResult 类型。断链时聚合值写入终止结果的 channels。
 
 ### 钩子点列表
 
-当前支持以下 hook point：
+契约表以 `engine/hooks/registry.py` 的 `HOOK_POINTS` 为准（含 extra 字段与通道语义）；注册未声明的点会打警告。当前 13 个 hook point：
+
+engine 推理进程（async afire）：
 
 | hook point | 触发时机 | 典型用途 |
 | --- | --- | --- |
-| `before_prompt_build` | 初始 messages 组装完成后，工具定义注入前。 | 过程性拦截或重建 messages；向 prompt 贡献内容应优先使用 prompt sections。 |
-| `before_step` | 每次推理循环顶部，调用 LLM 之前。 | 检查取消、处理 preempt、执行上下文压缩。 |
-| `before_tool_call` | 工具调用处理前。当前既有整轮工具调用检查，也有单个真实工具执行前检查。 | finish 并列调用保护、审批、工具策略检查。 |
-| `after_tool_call` | 真实工具返回后，工具结果写回模型前。 | 收集附件、记录工具副作用。 |
-| `before_response` | 模型没有产生工具调用，准备处理纯文本响应前。 | 混合输出隐式 finish、tool-only 模式重试或失败。 |
-| `after_llm_call` | provider 返回 `ProviderResponse` 后。 | 统计 token 用量、记录模型响应信息。 |
-| `on_task_end` | 正常 finish 返回前。 | 保存上下文快照、补充完成元数据。 |
-| `on_task_error` | 错误结束路径。当前已覆盖达到最大步数等路径。 | 保存错误现场、补充失败元数据。 |
+| `before_prompt_build` | 初始 messages 组装完成后、发送 LLM 前。 | 过程性拦截；向 prompt 贡献内容应优先用 prompt sections。 |
+| `before_step` | 每轮推理开始前。 | 取消检查、preempt 注入、上下文压缩。 |
+| `after_llm_call` | provider 返回 `ProviderResponse` 后。 | 统计 token 用量。 |
+| `before_tool_call` | 工具执行前。 | finish 并列保护、审批、工具策略。 |
+| `terminal_tool` | 终止型伪工具（finish/ask）实际执行前。 | preempt 拦截：channels 的 `intercepted` 表示已写拦截结果、跳过执行但任务继续。 |
+| `execute_tool` | 真实工具执行策略点（start 事件后、执行前）。 | 执行策略接管：channels 的 `execution`（awaitable 或 async_started 标记），单主。授权仍归 before_tool_call。 |
+| `after_tool_call` | 同步真实工具执行后、事件与 entry 写回前。 | 收集附件；channels 的 `result_override`（raw_inline/truncated/ref）改写结果呈现，按键合并。 |
+| `before_response` | 纯文本回复发出前。 | hybrid 隐式 finish、tool-only 重试。 |
+| `on_task_end` | 任务正常结束时。 | 保存上下文快照、收尾统计。 |
+| `on_task_error` | 任务异常时。 | 保存错误现场。 |
+
+supervisor 进程（sync fire）：`on_inbound_message`、`on_schedule_tick`、`on_entry_task_complete`。
 
 ## 内置 handler
 
@@ -152,7 +159,7 @@ handler 返回 `hook_result(channels={"execution": ...})`；registry 按 CHANNEL
 
 | handler 类 | name | hook point | priority | 说明 |
 | --- | --- | --- | ---: | --- |
-| `PreemptChecker` | `preempt_checker` | `before_step` | 100 | 检查取消请求和软打断状态。需要注入新用户消息时，调用 `rebuild_dynamic_context` 重建动态上下文（经 prompt sections）并追加新消息。 |
+| `PreemptChecker` | `preempt_checker` | `before_step`、`terminal_tool` | 100 | 检查取消请求和软打断状态。需要注入新用户消息时，调用 `rebuild_dynamic_context` 重建动态上下文（经 prompt sections）并追加新消息。 |
 | `CompactChecker` | `compact_checker` | `before_step` | 50 | 在循环顶部执行 microcompact、闲置后的 proactive snip，并在上下文超过阈值时触发系统压缩节点。 |
 | `KnowledgeInjector` | `knowledge_inject` | 无（声明型） | 50 | 在 `__init__` 中通过 `ctx.contributions.prompt_sections` 注册 `knowledge_static` / `knowledge_dynamic` 两个 section，统一构建 skill、memory 的静态与动态注入内容；同时提供六个 skill/memory CRUD 工具。 |
 | `FinishGuardHandler` | `finish_guard` | `before_tool_call` | 100 | 拒绝 `finish()` 与其他非 `intermediate_reply()` 工具在同一轮同时调用，避免任务终止后遗漏其他工具结果。 |
@@ -161,68 +168,86 @@ handler 返回 `hook_result(channels={"execution": ...})`；registry 按 CHANNEL
 | `UsageTracker` | `usage_tracker` | `after_llm_call` | 0 | 读取 `ProviderResponse.usage`，累加到 `RunContext.total_usage`。 |
 | `PlaintextRetryHandler` | `plaintext_retry` | `before_response` | 0 | 处理没有工具调用的纯文本响应。hybrid 模式下生成隐式 finish；tool-only 模式下追加重试提示，超过次数后失败。 |
 | `ContextSnapshotSaver` | `context_snapshot_saver` | `on_task_end`、`on_task_error` | 0 | 保存循环上下文快照，并把 `context_ref` 和 `snapshot_saved` 写入 `ctx.extra`。 |
+| `SpillPolicy` | `spill_policy` | `after_tool_call` | 0 | 工具结果截断与 artifact 溢出策略，经 `result_override` 通道改写结果呈现。 |
+| `AsyncScheduler` | `async_scheduler` | `execute_tool` | 100 | 异步工具分派与 execute_command 自适应升级，经 `execution` 通道接管执行。 |
+| `RetryApiPlugin` | `retry_api` | 无（路由） | 100 | `POST /v1/sessions/{id}/retry` 端点（supervisor 进程，routes face，`wants_context`）。 |
+| `AgentManage` | `agent_manage` | 无 | 100 | 提供 create_agent 工具。 |
+
+无 hook 点的插件（knowledge_inject、retry_api、agent_manage）通过 `wants_context: true` 声明接收 EngineContext，在构造时注册 face 内容。
 
 ## 外部插件协议
 
-外部 hook 插件放在工作区的 `plugins/` 目录。AI 节点启动时会扫描该目录，并加载启用的 Python 文件。
+外部插件放在工作区的 `plugins/` 目录。engine 与 supervisor 两个进程启动时各自扫描并加载启用的条目；插件管理器（设置区「插件」页）支持运行时装卸与启停。
 
-启用条件如下：
+条目形态与启用规则：
 
-1. 必须是普通文件。
-2. 文件名必须以 `.py` 结尾。
-3. 文件名不能以 `_` 开头。
-4. 文件名不能以 `.disabled` 结尾。
+- 单文件 `my_plugin.py`，或目录包 `my_plugin/`（含 `__init__.py`）。
+- 不以 `_` 开头、不以 `.disabled` 结尾（停用 = 重命名加后缀，启用 = 去掉后缀）。
 
-插件模块必须暴露一个可调用的 `register(hook_registry)` 函数。插件可以选择暴露 `PLUGIN_META` 字典，用于展示插件元数据。
+插件模块必须提供 `PLUGIN_META`（推荐，自动发现模式）或 `register(ctx)` 函数。
 
-`PLUGIN_META` 的文档字段如下：
+`PLUGIN_META` 的字段如下：
 
 | 字段 | 说明 |
 | --- | --- |
-| `name` | 插件名称。为空时使用文件名。 |
-| `version` | 插件版本。为空时使用 `unknown`。 |
+| `name` | 插件名称。建议与条目名一致；不一致时 loader 打警告。 |
+| `version` | 插件版本。 |
 | `description` | 插件说明。 |
 | `author` | 作者。 |
-| `hooks` | 插件注册的 hook point 列表。 |
+| `handler_class` | 可选。hook handler 类名；配合 `hook_points` 构成自动发现模式。 |
+| `hook_points` | 可选。`[(hook点, 方法名)]` 列表，loader 自动注册。 |
+| `priority` | 可选。hook 执行优先级，缺省读实例的 `priority` 属性。 |
+| `wants_context` | 可选。为 true 时 handler 类构造收到 EngineContext；不声明则零参构造。 |
+| `tools` | 可选。工具声明列表，注册进 ToolRegistry。 |
+| `client` | 可选。前端贡献（panels/slots/styles），见后文。 |
+| `requires` | 可选。依赖的插件名列表，按依赖序加载，缺失则跳过并记录。 |
+| `processes` | 可选。`["engine"]` / `["supervisor"]`，限定加载进程；不匹配的进程跳过（不算失败）。 |
+| `hooks` | 展示用。插件注册的 hook point 列表（供管理界面展示）。 |
 
-插件加载失败只会记录日志，不会阻止引擎启动。没有 `register()` 函数的插件会被跳过。重复加载时，handler 按名称替换，插件元数据也按插件名称替换。
-
-最小插件示例：
+register 形态（无 handler 类时）：
 
 ```python
-from engine.hooks import Handler, HookContext, HookRegistry, HookResult
+def register(ctx) -> None:
+    ctx.hooks.register("before_step", my_handler)   # 拦截型
+```
 
-# 目的：让插件列表能展示人类可读信息。
-# 做法：在模块级声明 PLUGIN_META，加载器会读取并补齐缺省字段。
-# 原因：register() 只负责注册逻辑，不适合承载展示元数据。
+`ctx` 始终是 `EngineContext`（见后文「EngineContext 注册面」）。旧式 `register(hook_registry)` 签名已废弃，加载会失败并给出迁移指引。
+
+加载语义：
+
+- 加载失败不阻断其他插件；失败原因记录在 loader 错误表，插件管理界面红字展示。
+- 重复加载时 handler 按名称替换；卸载是彻底的——注册返回的 disposer 按插件归档，卸载时逆序回放。
+- `client.slots[].script` 与 `client.styles` 支持内联字符串或 `{"file": "client/x.js"}` 文件引用（加载时内联，含目录穿越校验）。
+
+最小插件示例（PLUGIN_META 模式）：
+
+```python
 PLUGIN_META = {
     "name": "my-hook",
     "version": "1.0.0",
-    "description": "示例外部 hook 插件。",
+    "description": "示例外部插件。",
     "author": "local",
-    "hooks": ["before_step"],
+    "handler_class": "MyHandler",
+    "hook_points": [("before_step", "handle")],
 }
 
 
-class MyHandler(Handler):
-    # 目的：让 HookRegistry 能按名称去重。
-    # 做法：使用稳定、唯一的 handler name。
-    # 原因：AI 节点会重复扫描 plugins/，同名替换能保持加载幂等。
-    name = "my_handler"
+class MyHandler:
+    name = "my-hook"
     priority = 10
 
-    async def handle(self, ctx: HookContext) -> HookResult | None:
-        # 目的：示例插件不改变运行时行为。
-        # 做法：返回 None，表示不介入当前 hook 链。
-        # 原因：开发者可以在这里读取或修改 ctx.messages、ctx.extra 等字段。
+    async def handle(self, ctx):
         return None
+```
+
+register 模式示例：
+
+```python
+PLUGIN_META = {"name": "my-hook", "version": "1.0.0"}
 
 
-def register(hook_registry: HookRegistry) -> None:
-    # 目的：把 handler 安装到指定 hook point。
-    # 做法：调用 HookRegistry.register。
-    # 原因：外部插件和内置 handler 使用同一个注册协议。
-    hook_registry.register("before_step", MyHandler())
+def register(ctx) -> None:
+    ctx.hooks.register("before_step", MyHandler(), priority=10)
 ```
 
 ## 开发指南：新增 Provider
@@ -352,21 +377,20 @@ class RequireSafeToolName(Handler):
 注册到外部插件时，在 `plugins/my_policy.py` 中提供 `register()`：
 
 ```python
-from engine.hooks import HookRegistry
-
-
-def register(hook_registry: HookRegistry) -> None:
+def register(ctx) -> None:
     # 目的：把本地策略接入工具调用前检查。
-    # 做法：注册到 before_tool_call。
+    # 做法：注册到 before_tool_call（经 EngineContext 的 hooks 注册面）。
     # 原因：真实工具执行前是阻止危险工具的合适位置。
-    hook_registry.register("before_tool_call", RequireSafeToolName())
+    ctx.hooks.register("before_tool_call", RequireSafeToolName())
 ```
+
+或直接使用 PLUGIN_META 自动发现（`handler_class` + `hook_points`），无需 `register()` 函数。
 
 ## EngineContext 注册面（2026-08 统一入口）
 
 插件加载时收到的 `ctx` 是 `EngineContext`，三类注册面各一个字段：
 
-- `ctx.hooks`（拦截型）：HookRegistry，13 个 hook 点，支持 execution（单主）、result_override（按键合并）、intercepted（或聚合）三种通道与 stop_chain 断链。
+- `ctx.hooks`（拦截型）：HookRegistry，13 个 hook 点。通道语义集中在 `channels` dict（CHANNEL_SEMANTICS 表：execution 单主、result_override 按键合并、intercepted 或聚合、未知键默认 first），支持 stop_chain 断链。
 - `ctx.providers`（渠道型）：ProviderRegistry，模型后端注册。
 - `ctx.contributions`（声明型容器）：按名挂载 face，用 `get(name)` 取用。当前已挂载：`prompt_sections`（engine）、`routes`（supervisor）。新增 face 不需要改框架，调用 `Contributions.mount(name, face)`。
 
@@ -383,6 +407,7 @@ if routes is not None:
 - 与 core 端点路径冲突时拒绝挂载（core 优先）。
 - 卸载插件时挂载自动摘除（DisposalLedger 归档）。
 - 静态界面资源用 `routes.register(static_router(dir), public=True)`。
+- 路由插件（如 retry_api、plugin_manager）在 PLUGIN_META 声明 `"wants_context": true`，构造时注册路由；engine 进程无 routes face，构造器取不到即跳过。
 
 ### 前端贡献（PLUGIN_META.client）
 
