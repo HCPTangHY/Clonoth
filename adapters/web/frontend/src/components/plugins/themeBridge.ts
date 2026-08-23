@@ -38,6 +38,36 @@ export function collectHostCssVariables(): Record<string, string> {
   return vars;
 }
 
+// [AutoC 2026-08-23] Rule-level sync. Why: injecting variable values alone
+// left rule structure (scrollbar width, radius, border size) hardcoded in
+// panel HTML — any host change to those values would silently desync again.
+// How: serialize the host's own :root/html rules (variable declarations,
+// including var()-to-var aliases) plus global chrome rules (`*` scrollbar
+// styles and ::selection) verbatim as cssText. Purpose: panel chrome is the
+// host's rule text, not a hand-copied approximation of it.
+export function collectHostThemeCss(): string {
+  const chunks: string[] = [];
+  for (const sheet of Array.from(document.styleSheets)) {
+    let rules: CSSRuleList;
+    try {
+      rules = sheet.cssRules;
+    } catch {
+      continue;
+    }
+    for (const rule of Array.from(rules)) {
+      if (!(rule instanceof CSSStyleRule)) continue;
+      const selector = rule.selectorText || '';
+      const isRoot = /(^|,)\s*(:root|html)\b/.test(selector);
+      const isGlobalChrome =
+        selector === '*' ||
+        selector.startsWith('*::-webkit-scrollbar') ||
+        selector === '::selection';
+      if (isRoot || isGlobalChrome) chunks.push(rule.cssText);
+    }
+  }
+  return chunks.join('\n');
+}
+
 /** Copy the live host theme onto another same-origin document's root element. */
 export function applyHostTheme(target: Document | null | undefined): void {
   if (!target) return;
@@ -46,4 +76,13 @@ export function applyHostTheme(target: Document | null | undefined): void {
   for (const [name, value] of Object.entries(vars)) {
     rootStyle.setProperty(name, value);
   }
+  // host rule text rides in one owned <style> element; appended last so host
+  // rules win over any pre-injection fallback styles in the panel page
+  let styleEl = target.querySelector('style[data-clonoth-host-theme]');
+  if (!styleEl) {
+    styleEl = target.createElement('style');
+    styleEl.setAttribute('data-clonoth-host-theme', '');
+    target.head.appendChild(styleEl);
+  }
+  styleEl.textContent = collectHostThemeCss();
 }
