@@ -16,7 +16,12 @@
     --ok: #2e7d32; --danger: #a33c3c;
     --mono: 'Geist Mono', ui-monospace, Menlo, Consolas, monospace;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; scrollbar-color: var(--duties-scrollbar-thumb, #ccc) var(--duties-scrollbar-track, transparent); scrollbar-width: thin; }
+  *::-webkit-scrollbar { width: 0.45rem; height: 0.45rem; }
+  *::-webkit-scrollbar-track { background: var(--duties-scrollbar-track, transparent); }
+  *::-webkit-scrollbar-thumb { background: var(--duties-scrollbar-thumb, #ccc); border: 0.125rem solid transparent; border-radius: 999px; background-clip: content-box; }
+  *::-webkit-scrollbar-thumb:hover { background: var(--duties-scrollbar-thumb-hover, #4a4a4a); background-clip: content-box; }
+  *::-webkit-scrollbar-corner { background: transparent; }
   body {
     font: 12px/1.6 'Inter', ui-sans-serif, system-ui, sans-serif;
     background: var(--bg); color: var(--text); padding: 20px 24px;
