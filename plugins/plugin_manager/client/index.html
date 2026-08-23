@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>插件管理</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --secondary: #8b949e; --accent: #58a6ff;
+    --danger: #f85149; --ok: #3fb950;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--bg); color: var(--text); padding: 20px;
+  }
+  header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 14px; }
+  h1 { font-size: 15px; font-weight: 600; }
+  .hint { color: var(--secondary); font-size: 11px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--secondary); font-weight: 500; font-size: 11px; }
+  td.name { font-weight: 600; white-space: nowrap; }
+  td.desc { color: var(--secondary); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 10px; border: 1px solid var(--border); margin-right: 4px; color: var(--secondary); }
+  .tag.on { color: var(--ok); border-color: var(--ok); }
+  .tag.off { color: var(--danger); border-color: var(--danger); }
+  .tag.builtin { color: var(--accent); border-color: var(--accent); }
+  button {
+    font: inherit; font-size: 11px; cursor: pointer; padding: 3px 9px;
+    background: transparent; color: var(--secondary);
+    border: 1px solid var(--border); border-radius: 4px; margin-right: 4px;
+  }
+  button:hover:not(:disabled) { color: var(--text); border-color: var(--text); }
+  button:disabled { opacity: 0.3; cursor: not-allowed; }
+  button.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
+  #msg { margin-top: 12px; font-size: 11px; color: var(--secondary); min-height: 16px; }
+  #msg.err { color: var(--danger); }
+  .empty { color: var(--secondary); padding: 24px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>插件管理</h1>
+  <span class="hint">外部插件支持运行时装卸与启停；builtin 为 engine 进程内置，仅展示。<button id="refresh" style="margin-left:10px">刷新</button></span>
+</header>
+<div id="table"></div>
+<div id="msg"></div>
+<script>
+'use strict';
+
+// boot 对象由宿主 PluginPanel 在 iframe 挂载前写入 window（同源）。
+function boot() {
+  try {
+    const b = window.parent.__CLONOTH_BOOT__;
+    if (b && b.token) return b;
+  } catch (e) { /* cross-origin fallback below */ }
+  return { token: '' };
+}
+
+async function api(path, init) {
+  const b = boot();
+  const resp = await fetch('/v1/plugins/plugin_manager' + path, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(b.token ? { Authorization: 'Bearer ' + b.token } : {}),
+      ...(init && init.headers) || {},
+    },
+  });
+  if (!resp.ok) {
+    let detail = '';
+    try { detail = (await resp.json()).detail || ''; } catch (e) {}
+    throw new Error(resp.status + (detail ? ' ' + detail : ''));
+  }
+  return resp.json();
+}
+
+function say(text, isErr) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = isErr ? 'err' : '';
+}
+
+function buttons(p) {
+  if (p.builtin) return '';
+  const parts = [];
+  if (p.loaded) {
+    parts.push('<button data-op="unload" data-entry="' + p.entry + '">卸载</button>');
+    parts.push('<button data-op="load" data-entry="' + p.entry + '">重载</button>');
+  } else if (p.enabled) {
+    parts.push('<button data-op="load" data-entry="' + p.entry + '">加载</button>');
+  } else {
+    parts.push('<button data-op="enable" data-entry="' + p.entry + '">启用</button>');
+  }
+  if (p.enabled && p.entry !== 'plugin_manager') {
+    parts.push('<button class="danger" data-op="disable" data-entry="' + p.entry + '">停用</button>');
+  }
+  return parts.join('');
+}
+
+function row(p) {
+  const tags = [];
+  if (p.builtin) tags.push('<span class="tag builtin">builtin</span>');
+  else {
+    tags.push(p.loaded ? '<span class="tag on">已加载</span>' : '<span class="tag">未加载</span>');
+    tags.push(p.enabled ? '<span class="tag on">已启用</span>' : '<span class="tag off">已停用</span>');
+    tags.push('<span class="tag">' + p.kind + '</span>');
+  }
+  const hooks = (p.hooks || []).length;
+  const meta = p.version ? (p.name + ' ' + p.version + (hooks ? ' · ' + hooks + ' hooks' : '')) : p.name;
+  return '<tr><td class="name">' + meta + '<div style="margin-top:3px">' + tags.join('') + '</div></td>'
+    + '<td class="desc" title="' + String(p.description || '').replace(/"/g, '&quot;') + '">' + (p.description || '') + '</td>'
+    + '<td style="white-space:nowrap">' + buttons(p) + '</td></tr>';
+}
+
+async function refresh() {
+  try {
+    const data = await api('/list');
+    const rows = (data.plugins || []).map(row).join('');
+    document.getElementById('table').innerHTML = rows
+      ? '<table><tr><th style="width:34%">插件</th><th>描述</th><th style="width:170px">操作</th></tr>' + rows + '</table>'
+      : '<div class="empty">plugins/ 目录为空，尚无外部插件</div>';
+    say('共 ' + (data.plugins || []).length + ' 项 · ' + new Date().toLocaleTimeString());
+  } catch (err) {
+    document.getElementById('table').innerHTML = '<div class="empty">加载失败：' + err.message + '</div>';
+    say('列表获取失败：' + err.message, true);
+  }
+}
+
+document.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-op]');
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    await api('/' + btn.dataset.entry + '/' + btn.dataset.op, { method: 'POST' });
+    say(btn.dataset.entry + ' ' + btn.dataset.op + ' 完成');
+    await refresh();
+  } catch (err) {
+    say(err.message, true);
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('refresh').addEventListener('click', refresh);
+refresh();
+setInterval(refresh, 8000);
+</script>
+</body>
+</html>

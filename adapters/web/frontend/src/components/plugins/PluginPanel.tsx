@@ -15,9 +15,13 @@ interface PluginPanelProps {
   title: string;
   sessionId: string;
   onClose: () => void;
+  /** [plugin-admin 2026-08-23] When false, render the bare iframe without the
+   * title bar and close button — the settings-view variant where the sidebar
+   * already names the tab and closing is navigation, not an overlay. */
+  chrome?: boolean;
 }
 
-export const PluginPanel = ({ entry, title, sessionId, onClose }: PluginPanelProps) => {
+export const PluginPanel = ({ entry, title, sessionId, onClose, chrome = true }: PluginPanelProps) => {
   // remount the frame whenever entry or session changes; the effect below
   // re-publishes the boot object before the new page's scripts run.
   const frameKey = useMemo(() => `${entry}::${sessionId}`, [entry, sessionId]);
@@ -35,20 +39,22 @@ export const PluginPanel = ({ entry, title, sessionId, onClose }: PluginPanelPro
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center justify-between border-b border-[var(--duties-border)] px-3 py-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <Icon name="extension" size={14} />
-          <span className="truncate font-mono text-xs font-semibold">{title}</span>
+      {chrome && (
+        <div className="flex items-center justify-between border-b border-[var(--duties-border)] px-3 py-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <Icon name="extension" size={14} />
+            <span className="truncate font-mono text-xs font-semibold">{title}</span>
+          </div>
+          <button
+            className="text-[var(--duties-tertiary)] transition-colors hover:text-[var(--duties-text)]"
+            onClick={onClose}
+            title="关闭面板"
+            type="button"
+          >
+            <Icon name="close" size={16} />
+          </button>
         </div>
-        <button
-          className="text-[var(--duties-tertiary)] transition-colors hover:text-[var(--duties-text)]"
-          onClick={onClose}
-          title="关闭面板"
-          type="button"
-        >
-          <Icon name="close" size={16} />
-        </button>
-      </div>
+      )}
       <iframe
         key={frameKey}
         src={entry}

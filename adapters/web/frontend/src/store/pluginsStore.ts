@@ -11,6 +11,7 @@ import {
   listPlugins,
   type PluginListItem,
 } from '../api/supervisorClient';
+import { subscribePluginEvent } from './pluginRuntime';
 
 export interface ResolvedPanel {
   /** namespaced overlay id: plugin:{owner}:{panel-id} */
@@ -38,7 +39,10 @@ export interface SlotContribution {
 interface PluginsState {
   loaded: boolean;
   plugins: PluginListItem[];
+  /** right-overlay panels (chat view) */
   panels: ResolvedPanel[];
+  /** settings-view panels: full-page iframe tabs in the settings sidebar */
+  settingsPanels: ResolvedPanel[];
   slotsBySlot: Record<string, SlotContribution[]>;
   stylesByOwner: Record<string, string>;
   clientScriptsEnabled: boolean;
@@ -61,6 +65,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
   loaded: false,
   plugins: [],
   panels: [],
+  settingsPanels: [],
   slotsBySlot: {},
   stylesByOwner: {},
   clientScriptsEnabled: readClientScriptsPref(),
@@ -75,6 +80,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     }
     const scriptsOn = get().clientScriptsEnabled;
     const panels: ResolvedPanel[] = [];
+    const settingsPanels: ResolvedPanel[] = [];
     const slotsBySlot: Record<string, SlotContribution[]> = {};
     const stylesByOwner: Record<string, string> = {};
     for (const plugin of plugins) {
@@ -83,15 +89,18 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       const owner = plugin.name;
       for (const panel of client.panels || []) {
         if (!panel?.id || !panel.entry) continue;
-        // v1 supports the right overlay slot only
-        if (panel.slot && panel.slot !== 'right') continue;
-        panels.push({
+        const resolved: ResolvedPanel = {
           key: `plugin:${owner}:${panel.id}`,
           owner,
           panelId: panel.id,
           title: panel.title || panel.id,
           entry: panel.entry,
-        });
+        };
+        // [plugin-admin 2026-08-23] Two panel destinations: the chat right
+        // overlay ('right', the original slot) and the settings view — a
+        // settings panel becomes one full-page tab in the settings sidebar.
+        if (panel.slot === 'settings') settingsPanels.push(resolved);
+        else if (!panel.slot || panel.slot === 'right') panels.push(resolved);
       }
       if (scriptsOn) {
         for (const slot of client.slots || []) {
@@ -114,7 +123,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     for (const list of Object.values(slotsBySlot)) {
       list.sort((a, b) => b.priority - a.priority);
     }
-    set({ loaded: true, plugins, panels, slotsBySlot, stylesByOwner });
+    set({ loaded: true, plugins, panels, settingsPanels, slotsBySlot, stylesByOwner });
   },
 
   panelByKey: (key) => get().panels.find((p) => p.key === key) || null,
@@ -129,3 +138,11 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     void get().refresh();
   },
 }));
+
+// [plugin-admin 2026-08-23] Live manifest updates. Why: the backend now emits
+// plugin_loaded / plugin_unloaded events (SupervisorState._emit_plugin_event);
+// the store should follow without polling. How: subscribe once on the module
+// level — pluginRuntime imports nothing from stores, so there is no cycle — and
+// re-pull the manifest whenever a plugin lifecycle event arrives.
+subscribePluginEvent('plugin_loaded', () => void usePluginsStore.getState().refresh());
+subscribePluginEvent('plugin_unloaded', () => void usePluginsStore.getState().refresh());

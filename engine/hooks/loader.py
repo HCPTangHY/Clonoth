@@ -86,6 +86,13 @@ def _is_plugin_package(path: Path) -> bool:
         return False
     if path.name.startswith(("_", ".")):
         return False
+    # [plugin-admin 2026-08-23] Directory plugins honour the same .disabled
+    # suffix as .py files. Why: enable/disable renames the entry; without this
+    # check a disabled package would keep loading at startup. How: reject names
+    # ending in .disabled exactly like _is_enabled_python_plugin does. Purpose:
+    # one uniform disable convention for both plugin shapes.
+    if path.name.endswith(".disabled"):
+        return False
     return (path / "__init__.py").is_file()
 
 
@@ -126,6 +133,123 @@ def _load_package_from_dir(plugin_dir: Path) -> ModuleType:
     return module
 
 
+def plugin_module_key(entry_name: str) -> str:
+    """Stable sys.modules key for one plugin entry."""
+    return f"clonoth_external_plugin_{Path(entry_name).stem}"
+
+
+def drop_plugin_module(entry_name: str) -> None:
+    """Remove one plugin entry's module (and submodules) from sys.modules.
+
+    Why: the loaders register packages under a fixed module name, so an
+    unloaded plugin's module object would otherwise survive in sys.modules and
+    a later reload would re-exec nothing, silently returning the stale object.
+    How: pop the package key and every key namespaced under it, then clear the
+    parent spec cache entries importlib keeps for file locations. Purpose:
+    reload is a genuine re-execution of current on-disk source.
+    """
+    import sys
+
+    base = plugin_module_key(entry_name)
+    for key in [k for k in list(sys.modules) if k == base or k.startswith(base + ".")]:
+        sys.modules.pop(key, None)
+
+
+def _load_one_plugin(hook_registry: HookRegistry, entry: Path, context: Any = None) -> dict:
+    """Import one plugin entry and register it. Returns its meta dict.
+
+    Why: startup directory scan and runtime single-plugin load must share one
+    code path. How: this is the former loop body of load_external_plugins,
+    unchanged; it raises on failure instead of swallowing. Purpose: callers
+    decide between best-effort (scan) and strict (admin operation) handling.
+    """
+    is_package = _is_plugin_package(entry)
+    module = _load_package_from_dir(entry) if is_package else _load_module_from_path(entry)
+    meta = _normalize_plugin_meta(entry, getattr(module, "PLUGIN_META", {}))
+
+    # Mode 1: PLUGIN_META with handler_class + hook_points
+    raw_meta = getattr(module, "PLUGIN_META", None)
+    if isinstance(raw_meta, dict) and raw_meta.get("handler_class") and isinstance(raw_meta.get("hook_points"), list):
+        class_name = str(raw_meta["handler_class"]).strip()
+        cls = getattr(module, class_name)
+        # Why: registrations made during load must be reversible,
+        # including registrations done in __init__ (e.g. prompt
+        # sections). How: instantiate and register inside
+        # collecting(name) so the ledger archives each disposer under
+        # this plugin; teardown() joins the same ledger. Purpose:
+        # unload_plugin(name) undoes the whole load.
+        with hook_registry.collecting(meta["name"]):
+            instance = cls(context) if context is not None and accepts_context(cls) else cls()
+            priority = raw_meta.get("priority", getattr(instance, "priority", None))
+            for item in raw_meta["hook_points"]:
+                if isinstance(item, (tuple, list)) and len(item) == 2:
+                    hook_point, method_name = str(item[0]).strip(), str(item[1]).strip()
+                    method = getattr(instance, method_name)
+                    hook_registry.register(hook_point, method, priority=priority)
+            teardown = getattr(instance, "teardown", None)
+            if callable(teardown):
+                hook_registry.add_plugin_disposer(meta["name"], teardown)
+        hook_registry.register_plugin_meta(meta)
+        logger.info(
+            "Loaded external plugin (PLUGIN_META): %s %s (%s)",
+            meta["name"], meta["version"], entry.name,
+        )
+        return meta
+
+    # Mode 2: Legacy register() function
+    register = getattr(module, "register", None)
+    if not callable(register):
+        raise ValueError(
+            f"Plugin {meta['name']} {meta['version']} ({entry.name}) has no PLUGIN_META handler or register()"
+        )
+    with hook_registry.collecting(meta["name"]):
+        register(_legacy_register_argument(register, hook_registry, context))
+    hook_registry.register_plugin_meta(meta)
+    logger.info(
+        "Loaded external plugin (legacy): %s %s (%s)",
+        meta["name"], meta["version"], entry.name,
+    )
+    return meta
+
+
+def load_single_plugin(
+    hook_registry: HookRegistry,
+    plugins_dir: Path,
+    entry_name: str,
+    context: Any = None,
+    event_sink: Any = None,
+) -> dict:
+    """Load one plugin entry at runtime. Returns its meta dict; raises on failure.
+
+    Why: plugin administration (unload/reload/enable/disable) needs a strict
+    single-entry load that the startup scan cannot provide. How: resolve the
+    entry name inside plugins_dir with a containment check (no separators, no
+    ..), drop any stale sys.modules copy so reload re-executes on-disk source,
+    then register through the shared _load_one_plugin path. event_sink, when
+    given, is called as event_sink(event_type, payload) after success — the
+    loader itself stays process-neutral about where events go. Purpose:
+    runtime plugin management without a process restart.
+    """
+    clean = str(entry_name or "").strip()
+    if not clean or "/" in clean or "\\" in clean or clean in {".", ".."} or ".." in Path(clean).parts:
+        raise ValueError(f"invalid plugin entry name: {entry_name!r}")
+    plugins_dir = Path(plugins_dir).resolve()
+    entry = (plugins_dir / clean).resolve()
+    if plugins_dir != entry and plugins_dir not in entry.parents:
+        raise ValueError(f"plugin entry escapes plugins directory: {entry_name!r}")
+    if not _is_plugin_package(entry) and not _is_enabled_python_plugin(entry):
+        raise ValueError(f"no enabled plugin entry named {clean!r} under {plugins_dir}")
+
+    drop_plugin_module(clean)
+    meta = _load_one_plugin(hook_registry, entry, context)
+    if callable(event_sink):
+        try:
+            event_sink("plugin_loaded", {"plugin": meta.get("name", clean), "entry": clean})
+        except Exception as exc:  # event emission must never fail the load
+            logger.warning("plugin_loaded event sink failed: %s", exc)
+    return meta
+
+
 def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path, context: Any = None) -> int:
     """Load enabled external hook plugins from plugins_dir.
 
@@ -154,55 +278,8 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path, contex
         if not is_package and not _is_enabled_python_plugin(entry):
             continue
         try:
-            module = _load_package_from_dir(entry) if is_package else _load_module_from_path(entry)
-            meta = _normalize_plugin_meta(entry, getattr(module, "PLUGIN_META", {}))
-
-            # Mode 1: PLUGIN_META with handler_class + hook_points
-            raw_meta = getattr(module, "PLUGIN_META", None)
-            if isinstance(raw_meta, dict) and raw_meta.get("handler_class") and isinstance(raw_meta.get("hook_points"), list):
-                class_name = str(raw_meta["handler_class"]).strip()
-                cls = getattr(module, class_name)
-                # Why: registrations made during load must be reversible,
-                # including registrations done in __init__ (e.g. prompt
-                # sections). How: instantiate and register inside
-                # collecting(name) so the ledger archives each disposer under
-                # this plugin; teardown() joins the same ledger. Purpose:
-                # unload_plugin(name) undoes the whole load.
-                with hook_registry.collecting(meta["name"]):
-                    instance = cls(context) if context is not None and accepts_context(cls) else cls()
-                    priority = raw_meta.get("priority", getattr(instance, "priority", None))
-                    for item in raw_meta["hook_points"]:
-                        if isinstance(item, (tuple, list)) and len(item) == 2:
-                            hook_point, method_name = str(item[0]).strip(), str(item[1]).strip()
-                            method = getattr(instance, method_name)
-                            hook_registry.register(hook_point, method, priority=priority)
-                    teardown = getattr(instance, "teardown", None)
-                    if callable(teardown):
-                        hook_registry.add_plugin_disposer(meta["name"], teardown)
-                hook_registry.register_plugin_meta(meta)
-                count += 1
-                logger.info(
-                    "Loaded external plugin (PLUGIN_META): %s %s (%s)",
-                    meta["name"], meta["version"], entry.name,
-                )
-                continue
-
-            # Mode 2: Legacy register() function
-            register = getattr(module, "register", None)
-            if not callable(register):
-                logger.warning(
-                    "Plugin %s %s (%s) has no PLUGIN_META or register(), skipped",
-                    meta["name"], meta["version"], entry.name,
-                )
-                continue
-            with hook_registry.collecting(meta["name"]):
-                register(_legacy_register_argument(register, hook_registry, context))
-            hook_registry.register_plugin_meta(meta)
+            _load_one_plugin(hook_registry, entry, context)
             count += 1
-            logger.info(
-                "Loaded external plugin (legacy): %s %s (%s)",
-                meta["name"], meta["version"], entry.name,
-            )
         except Exception as exc:
             logger.error("Failed to load plugin %s: %s", entry.name, exc, exc_info=True)
     return count

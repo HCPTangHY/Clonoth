@@ -4,11 +4,11 @@
 // Purpose: settings pages can be added, removed, or reordered without changing the
 // root application component.
 import { useViewStore } from '../../store/viewStore';
-import { getSettingsTab } from './settingsTabs';
+import { useSettingsTab } from './settingsTabs';
 
 export const SettingsPageHost = () => {
   const activeSettingsTab = useViewStore(state => state.activeSettingsTab);
-  const tab = getSettingsTab(activeSettingsTab);
+  const tab = useSettingsTab(activeSettingsTab);
   const Page = tab.Page;
 
   return <Page />;

@@ -3,7 +3,7 @@
 // conditional. How: each tab provides a label, order, main Page, and optional right
 // panel component. Purpose: the settings sidebar, host, and right panel all resolve
 // pages from the same data source.
-import { createElement, type ComponentType } from 'react';
+import { createElement, useMemo, type ComponentType } from 'react';
 
 import { ClientSettingsPage } from './pages/ClientSettingsPage';
 import { GeneralSettingsPage } from './pages/GeneralSettingsPage';
@@ -77,4 +77,42 @@ export function getSettingsTab(tabId: string): SettingsTabDefinition {
   // resolve through the registry and return settingsTabs[0] as a safe default.
   // Purpose: the host and right panel share identical fallback behavior.
   return settingsTabs.find(tab => tab.id === tabId) || settingsTabs[0];
+}
+
+// [plugin-admin 2026-08-23] Plugin-declared settings pages.
+// Why: plugins can declare panel slot 'settings' in PLUGIN_META; the manager
+// plugin uses it to own one full settings tab without a frontend build. How:
+// merge the static registry with the runtime manifest — each plugin panel
+// becomes a tab whose Page renders a chrome-less PluginPanel iframe (no title
+// bar; the settings sidebar already names the tab). Purpose: settings
+// navigation stays data-driven for plugins exactly as for built-ins.
+import { usePluginsStore } from '../../store/pluginsStore';
+import { PluginPanel } from '../plugins/PluginPanel';
+
+function pluginSettingsTabs(): SettingsTabDefinition[] {
+  const panels = usePluginsStore.getState().settingsPanels;
+  return panels.map((panel) => ({
+    id: panel.key,
+    label: panel.title,
+    icon: 'extension',
+    order: 100,
+    Page: () =>
+      createElement(PluginPanel, {
+        chrome: false,
+        entry: panel.entry,
+        sessionId: '',
+        title: panel.title,
+        onClose: () => undefined,
+      }),
+  }));
+}
+
+export function useSettingsTabs(): SettingsTabDefinition[] {
+  const settingsPanels = usePluginsStore((s) => s.settingsPanels);
+  return useMemo(() => [...settingsTabs, ...pluginSettingsTabs()], [settingsPanels]);
+}
+
+export function useSettingsTab(tabId: string): SettingsTabDefinition {
+  const tabs = useSettingsTabs();
+  return tabs.find((tab) => tab.id === tabId) || tabs[0];
 }

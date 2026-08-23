@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 import threading
 import uuid
 from dataclasses import dataclass
@@ -132,6 +133,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         _ext_count = load_external_plugins(self.hook_registry, _plugins_dir, context=_supervisor_ctx)
         if _ext_count:
             logger.info("Loaded %d external plugin(s) for supervisor hooks", _ext_count)
+        # [plugin-admin 2026-08-23] Runtime plugin management state. Why: the
+        # admin plugin's routes reach SupervisorState through app.state and need
+        # the same loader inputs the startup scan used. How: keep the resolved
+        # plugins dir and the supervisor context for later single-entry loads.
+        # Purpose: load/unload/enable/disable without a process restart.
+        self.plugins_dir = _plugins_dir
+        self._supervisor_ctx = _supervisor_ctx
 
         # ---- Child Session 隔离（Phase A）：映射表 ----
         # (parent_session_id, node_id, context_key) → child_session_id
@@ -171,6 +179,178 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     self.parent_entry_branches.setdefault(psid, set()).add(child_sid)
 
         self._reconcile_after_restart()
+
+    # ── [plugin-admin 2026-08-23] Runtime external-plugin management ───────
+
+    # The manager plugin itself is exempt from unload/disable: removing it
+    # would take the routes serving the management UI offline mid-operation.
+    _PROTECTED_PLUGIN_ENTRIES = {"plugin_manager"}
+
+    def _emit_plugin_event(self, type_: str, payload: dict[str, Any]) -> None:
+        """Append one plugin lifecycle event to the global event stream."""
+        # Why: the web pluginsStore must learn about load/unload without polling.
+        # How: EventLog global subscribers (/v1/ws) receive every row regardless
+        # of session_id; use SYSTEM_SESSION_ID and component "supervisor". All
+        # management paths (API, future RPC, CLI) emit from here so event shape
+        # stays uniform. Purpose: one source of plugin lifecycle notifications.
+        try:
+            self.eventlog.append(
+                session_id=SYSTEM_SESSION_ID,
+                component="supervisor",
+                type_=type_,
+                payload={**payload, "component": "supervisor"},
+            )
+        except Exception as exc:
+            logger.warning("plugin event %s failed: %s", type_, exc)
+
+    def _plugin_entry_path(self, entry_name: str, *, allow_disabled: bool = True) -> Path:
+        """Resolve one plugin entry inside plugins_dir; raises ValueError on escape."""
+        clean = str(entry_name or "").strip()
+        if not clean or "/" in clean or "\\" in clean or ".." in Path(clean).parts:
+            raise ValueError(f"invalid plugin entry name: {entry_name!r}")
+        base = self.plugins_dir.resolve()
+        cand = (base / clean).resolve()
+        if base not in cand.parents:
+            raise ValueError(f"plugin entry escapes plugins directory: {entry_name!r}")
+        if not cand.exists() and allow_disabled:
+            disabled = base / (clean + ".disabled")
+            if disabled.exists():
+                return disabled
+        return cand
+
+    def _entry_meta_name(self, entry: Path) -> str:
+        """Best-effort meta name for one entry without registering anything."""
+        from engine.hooks.loader import plugin_module_key
+
+        module = sys.modules.get(plugin_module_key(entry.name))
+        raw = getattr(module, "PLUGIN_META", None)
+        if isinstance(raw, dict) and raw.get("name"):
+            return str(raw["name"])
+        return entry.stem
+
+    def plugin_admin_list(self) -> list[dict[str, Any]]:
+        """Merge filesystem entries with loaded registry state for the admin UI."""
+        from engine.hooks.loader import _is_enabled_python_plugin, _is_plugin_package
+
+        loaded = {str(m.get("name") or ""): m for m in self.hook_registry.list_plugins()}
+        entries: list[dict[str, Any]] = []
+        seen_entries: set[str] = set()
+        if self.plugins_dir.is_dir():
+            for entry in sorted(self.plugins_dir.iterdir()):
+                is_pkg = _is_plugin_package(entry)
+                is_disabled_pkg = entry.is_dir() and entry.name.endswith(".disabled") and (entry / "__init__.py").is_file()
+                is_disabled_py = entry.is_file() and entry.name.endswith(".py.disabled")
+                if not (is_pkg or is_disabled_pkg or _is_enabled_python_plugin(entry) or is_disabled_py):
+                    continue
+                stem = entry.name.removesuffix(".disabled")
+                seen_entries.add(stem)
+                meta_name = self._entry_meta_name(entry)
+                meta = loaded.get(meta_name)
+                entries.append({
+                    "entry": stem,
+                    "file_name": entry.name,
+                    "kind": "package" if (is_pkg or is_disabled_pkg) else "file",
+                    "enabled": not entry.name.endswith(".disabled"),
+                    "loaded": meta is not None,
+                    "name": meta_name,
+                    "version": str(meta.get("version") or "") if meta else "",
+                    "description": str(meta.get("description") or "") if meta else "",
+                    "hooks": list(meta.get("hooks") or []) if meta else [],
+                    "builtin": False,
+                    "external": True,
+                })
+        # builtin (engine-side) plugins: display-only, engine process owns them
+        for name, meta in sorted(loaded.items()):
+            if meta.get("version") == "builtin" and name not in seen_entries:
+                entries.append({
+                    "entry": "",
+                    "file_name": "",
+                    "kind": "builtin",
+                    "enabled": True,
+                    "loaded": True,
+                    "name": name,
+                    "version": "builtin",
+                    "description": str(meta.get("description") or ""),
+                    "hooks": list(meta.get("hooks") or []),
+                    "builtin": True,
+                    "external": False,
+                })
+        return entries
+
+    def _plugin_event_sink(self, entry: str):
+        def _sink(event_type: str, payload: dict[str, Any]) -> None:
+            self._emit_plugin_event(event_type, payload)
+
+        return _sink
+
+    def plugin_admin_load(self, entry_name: str) -> dict[str, Any]:
+        """Load (or reload) one external plugin entry at runtime."""
+        from engine.hooks.loader import drop_plugin_module, load_single_plugin
+
+        entry = self._plugin_entry_path(entry_name)
+        if entry.name.endswith(".disabled"):
+            raise ValueError(f"plugin {entry_name!r} is disabled; enable it first")
+        meta_name = self._entry_meta_name(entry)
+        if meta_name in {str(m.get("name") or "") for m in self.hook_registry.list_plugins()}:
+            # already loaded — treat as reload: undo old registrations first
+            self.hook_registry.unload_plugin(meta_name)
+            drop_plugin_module(entry.stem)
+        meta = load_single_plugin(
+            self.hook_registry,
+            self.plugins_dir,
+            entry.stem if entry.is_dir() else entry.name,
+            context=self._supervisor_ctx,
+            event_sink=self._plugin_event_sink(entry.stem),
+        )
+        return {"ok": True, "plugin": meta.get("name"), "entry": entry_name}
+
+    def plugin_admin_unload(self, entry_name: str) -> dict[str, Any]:
+        """Unload one external plugin entry; registrations are replayed in reverse."""
+        from engine.hooks.loader import drop_plugin_module
+
+        if entry_name in self._PROTECTED_PLUGIN_ENTRIES:
+            raise ValueError("the plugin manager cannot unload itself")
+        entry = self._plugin_entry_path(entry_name)
+        meta_name = self._entry_meta_name(entry)
+        known = {str(m.get("name") or ""): m for m in self.hook_registry.list_plugins()}
+        if meta_name not in known:
+            raise ValueError(f"plugin {entry_name!r} is not loaded")
+        result = self.hook_registry.unload_plugin(meta_name)
+        drop_plugin_module(entry.name.removesuffix(".disabled"))
+        self._emit_plugin_event("plugin_unloaded", {"plugin": meta_name, "entry": entry_name})
+        return {"ok": True, **result}
+
+    def plugin_admin_enable(self, entry_name: str) -> dict[str, Any]:
+        """Remove the .disabled suffix and load the entry."""
+        entry = self._plugin_entry_path(entry_name, allow_disabled=False)
+        disabled = entry.with_name(entry.name + ".disabled")
+        target = disabled if disabled.exists() else entry
+        if not target.exists():
+            raise ValueError(f"no plugin entry named {entry_name!r}")
+        if target.name.endswith(".disabled"):
+            restored = target.with_name(target.name.removesuffix(".disabled"))
+            target.rename(restored)
+        return self.plugin_admin_load(entry_name)
+
+    def plugin_admin_disable(self, entry_name: str) -> dict[str, Any]:
+        """Unload if loaded, then rename the entry with a .disabled suffix."""
+        if entry_name in self._PROTECTED_PLUGIN_ENTRIES:
+            raise ValueError("the plugin manager cannot disable itself")
+        entry = self._plugin_entry_path(entry_name, allow_disabled=False)
+        if not entry.exists():
+            raise ValueError(f"no plugin entry named {entry_name!r}")
+        if entry.name.endswith(".disabled"):
+            return {"ok": True, "already": True}
+        meta_name = self._entry_meta_name(entry)
+        known = {str(m.get("name") or ""): m for m in self.hook_registry.list_plugins()}
+        if meta_name in known:
+            self.hook_registry.unload_plugin(meta_name)
+            self._emit_plugin_event("plugin_unloaded", {"plugin": meta_name, "entry": entry_name})
+        from engine.hooks.loader import drop_plugin_module
+
+        drop_plugin_module(entry.name)
+        entry.rename(entry.with_name(entry.name + ".disabled"))
+        return {"ok": True}
 
     def _build_supervisor_hook_ctx(self, **extra: Any) -> dict[str, Any]:
         """Build the callback-only context passed to built-in supervisor hooks."""

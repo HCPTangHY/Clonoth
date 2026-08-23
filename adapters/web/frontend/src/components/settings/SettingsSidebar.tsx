@@ -6,11 +6,13 @@
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
-import { settingsTabs } from './settingsTabs';
+import { settingsTabs, useSettingsTabs } from './settingsTabs';
 
 export const SettingsSidebar = () => {
   const { isConnected } = useSettingsStore();
   const { activeSettingsTab, closeSettings, setSettingsTab } = useViewStore();
+  // [plugin-admin 2026-08-23] Plugin settings panels join the same navigation.
+  const tabs = useSettingsTabs();
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -36,7 +38,7 @@ export const SettingsSidebar = () => {
       </div>
 
       <nav aria-label="设置分区" className="min-h-0 flex-1 overflow-y-auto p-2">
-        {settingsTabs.map((tab) => {
+        {tabs.map((tab) => {
           const isActive = tab.id === activeSettingsTab;
           return (
             <button
