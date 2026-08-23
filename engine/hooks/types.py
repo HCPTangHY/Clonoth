@@ -62,26 +62,14 @@ class HookResult:
     reason: str = ""
     error_message: str = ""
     modified: bool = False
-    # [AutoC 2026-08-19] Why: content-contributing hooks (after_tool_call) need to
-    # replace derived presentation fields of a tool result without stopping the
-    # chain. How: handlers return a partial dict here; the registry merges overrides
-    # across handlers key by key and the fire site applies the merged value.
-    # Purpose: policy handlers can rewrite what the model sees while remaining
-    # non-terminal and composable with other handlers on the same point.
-    result_override: Any = None
-    # [AutoC 2026-08-19] Why: scheduling hooks (execute_tool) need to replace how
-    # a tool is executed, not just its derived text. How: handlers supply an
-    # awaitable (or ready value) that resolves the tool result or an
-    # async_started marker; the registry adopts the first non-None execution.
-    # Purpose: execution strategies (async dispatch, adaptive upgrade, timeouts)
-    # are plugins, not loop code.
-    execution: Any = None
-    # [AutoC 2026-08-20] Why: terminal_tool handlers need a dedicated "handled,
-    # skip execution" signal distinct from content mutation (modified) and
-    # chain termination (action). How: set intercepted=True after writing the
-    # interception tool_result. Purpose: the loop can distinguish "blocked
-    # from delivering but keep running" from every other result shape.
-    intercepted: bool = False
+    # [AutoC 2026-08-23] Point-specific channels live in one dict instead of
+    # dedicated fields. Why: each new hook point used to add a public field to
+    # this shared return type (result_override, execution, intercepted), growing
+    # the common contract for point-local semantics. How: handlers return
+    # channels={"execution": ...}; the registry aggregates per CHANNEL_SEMANTICS
+    # and fire sites read result.channels.get(name). Purpose: adding a channel
+    # is a data entry, not a schema change.
+    channels: dict[str, Any] = field(default_factory=dict)
 
 
 class Handler(ABC):

@@ -122,7 +122,7 @@ class AsyncScheduler:
             )
             return hook_result(
                 modified=True,
-                execution=_async_marker(async_id, summary, raw_inline, "异步执行已启动"),
+                channels={"execution": _async_marker(async_id, summary, raw_inline, "异步执行已启动")},
             )
 
         # [AutoC 2026-06-27] Why: execute_command may run longer than the model
@@ -180,4 +180,4 @@ class AsyncScheduler:
             )
             return _async_marker(async_id, summary, raw_inline, "已自动转为异步执行")
 
-        return hook_result(modified=True, execution=_adaptive())
+        return hook_result(modified=True, channels={"execution": _adaptive()})

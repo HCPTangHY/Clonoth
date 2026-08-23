@@ -94,9 +94,9 @@ class SpillPolicy:
 
         return hook_result(
             modified=truncated or bool(ref),
-            result_override={
+            channels={"result_override": {
                 "raw_inline": raw_inline,
                 "truncated": truncated,
                 "ref": ref,
-            },
+            }},
         )

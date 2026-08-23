@@ -22,6 +22,7 @@ PLUGIN_META = {
     "handler_class": "RetryApiPlugin",
     "hook_points": [],
     "priority": 100,
+    "wants_context": True,
     "description": "消息重试 API：取消活跃任务、截断对话到目标消息、重新提交",
     "author": "core",
 }

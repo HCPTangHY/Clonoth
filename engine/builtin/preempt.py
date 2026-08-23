@@ -144,7 +144,7 @@ class PreemptChecker:
                 "task_id": ls.rctx.task_id,
                 "step": ctx.step,
             })
-            return hook_result(intercepted=True)
+            return hook_result(channels={"intercepted": True})
 
         if ls.preempt_after_step:
             # 无消息的 preempt：补配对结果后保存上下文退出。

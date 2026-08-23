@@ -16,9 +16,95 @@ from types import ModuleType
 from typing import Any
 
 from .registry import HookRegistry
-from ..context import accepts_context
 
 logger = logging.getLogger(__name__)
+
+
+def iter_hook_points(meta: dict[str, Any]) -> list[tuple[str, str]]:
+    """Validate and return hook point declarations from PLUGIN_META."""
+    # Why: malformed metadata should fail one module clearly instead of registering
+    # a partial handler. How: require a list of two-item declarations. Purpose:
+    # keep auto-discovery predictable and easy to diagnose. Shared by the built-in
+    # and external loaders.
+    raw_points = meta.get("hook_points")
+    if not isinstance(raw_points, list):
+        raise ValueError("PLUGIN_META.hook_points must be a list")
+    points: list[tuple[str, str]] = []
+    for item in raw_points:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError(f"invalid hook point declaration: {item!r}")
+        hook_point, method_name = str(item[0]).strip(), str(item[1]).strip()
+        if not hook_point or not method_name:
+            raise ValueError(f"empty hook point declaration: {item!r}")
+        points.append((hook_point, method_name))
+    return points
+
+
+def register_declared_tools(module_name: str, meta: dict[str, Any], tool_registry: Any) -> list[Any]:
+    """Register PLUGIN_META.tools declarations into the provided ToolRegistry."""
+    # Why: plugins own their tool implementations and schemas. How: when a
+    # ToolRegistry is provided, validate each declaration and pass it through
+    # register_builtin_tool(). Purpose: loader failures stay localized; returns
+    # disposers so callers can archive them in the plugin ledger.
+    raw_tools = meta.get("tools")
+    if raw_tools is None or tool_registry is None:
+        return []
+    if not isinstance(raw_tools, list):
+        raise ValueError(f"{module_name} PLUGIN_META.tools must be a list")
+    register_builtin_tool = getattr(tool_registry, "register_builtin_tool", None)
+    if not callable(register_builtin_tool):
+        raise TypeError("tool_registry must provide register_builtin_tool")
+    disposers: list[Any] = []
+    for tool in raw_tools:
+        if not isinstance(tool, dict):
+            raise ValueError(f"{module_name} has invalid tool declaration: {tool!r}")
+        name = str(tool.get("name") or "").strip()
+        description = str(tool.get("description") or "")
+        input_schema = tool.get("input_schema")
+        func = tool.get("func")
+        if not name:
+            raise ValueError(f"{module_name} tool declaration missing name")
+        if not isinstance(input_schema, dict):
+            raise ValueError(f"{module_name}.{name} input_schema must be a dict")
+        if not callable(func):
+            raise ValueError(f"{module_name}.{name} func must be callable")
+        dispose = register_builtin_tool(name, description, input_schema, func)
+        if callable(dispose):
+            disposers.append(dispose)
+    return disposers
+
+
+def register_meta_handler(
+    hook_registry: HookRegistry,
+    module: ModuleType,
+    meta: dict,
+    *,
+    ledger_name: str,
+    context: Any = None,
+    tool_registry: Any = None,
+) -> Any:
+    """Instantiate PLUGIN_META's handler class and register all declarations.
+
+    [plugin-admin 2026-08-23] Shared by the built-in and external loaders so
+    both honor one contract: explicit "wants_context": true instantiation (no
+    signature sniffing), collecting() attribution, hook-point registration,
+    teardown archival, and tool declarations. Returns the handler instance.
+    """
+    class_name = str(meta.get("handler_class") or "").strip()
+    if not class_name:
+        raise ValueError("PLUGIN_META.handler_class is required")
+    cls = getattr(module, class_name)
+    with hook_registry.collecting(ledger_name):
+        instance = cls(context) if context is not None and meta.get("wants_context") else cls()
+        priority = meta.get("priority", getattr(instance, "priority", None))
+        for hook_point, method_name in iter_hook_points(meta):
+            method = getattr(instance, method_name)
+            hook_registry.register(str(hook_point), method, priority=priority)
+        teardown = getattr(instance, "teardown", None)
+        if callable(teardown):
+            hook_registry.add_plugin_disposer(ledger_name, teardown)
+        register_declared_tools(module.__name__, meta, tool_registry)
+    return instance
 
 
 # [plugin-admin 2026-08-23] Per-entry load error table. Why: plugin load
@@ -256,25 +342,9 @@ def _load_one_plugin(
     # Mode 1: PLUGIN_META with handler_class + hook_points
     raw_meta = getattr(module, "PLUGIN_META", None)
     if isinstance(raw_meta, dict) and raw_meta.get("handler_class") and isinstance(raw_meta.get("hook_points"), list):
-        class_name = str(raw_meta["handler_class"]).strip()
-        cls = getattr(module, class_name)
-        # Why: registrations made during load must be reversible,
-        # including registrations done in __init__ (e.g. prompt
-        # sections). How: instantiate and register inside
-        # collecting(name) so the ledger archives each disposer under
-        # this plugin; teardown() joins the same ledger. Purpose:
-        # unload_plugin(name) undoes the whole load.
-        with hook_registry.collecting(meta["name"]):
-            instance = cls(context) if context is not None and accepts_context(cls) else cls()
-            priority = raw_meta.get("priority", getattr(instance, "priority", None))
-            for item in raw_meta["hook_points"]:
-                if isinstance(item, (tuple, list)) and len(item) == 2:
-                    hook_point, method_name = str(item[0]).strip(), str(item[1]).strip()
-                    method = getattr(instance, method_name)
-                    hook_registry.register(hook_point, method, priority=priority)
-            teardown = getattr(instance, "teardown", None)
-            if callable(teardown):
-                hook_registry.add_plugin_disposer(meta["name"], teardown)
+        register_meta_handler(
+            hook_registry, module, meta, ledger_name=meta["name"], context=context,
+        )
         hook_registry.register_plugin_meta(meta)
         logger.info(
             "Loaded external plugin (PLUGIN_META): %s %s (%s)",

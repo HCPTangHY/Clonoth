@@ -228,28 +228,3 @@ class EngineContext:
         if ledger is None:
             ledger = DisposalLedger()
         self.contributions.set_ledger(ledger)
-
-
-def accepts_context(cls: Any) -> bool:
-    """Return whether a handler class constructor takes an explicit argument.
-
-    Why: existing handler classes use zero-argument constructors; new ones may
-    declare ``__init__(self, ctx)``. How: inspect the signature, ignoring
-    *args/**kwargs catch-alls. Purpose: let both loaders inject EngineContext
-    without breaking legacy handler classes.
-    """
-    import inspect
-
-    try:
-        init = cls.__init__
-        if init is object.__init__:
-            return False
-        params = [
-            p
-            for p in inspect.signature(init).parameters.values()
-            if p.name != "self"
-            and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-        ]
-        return bool(params)
-    except (TypeError, ValueError):
-        return False

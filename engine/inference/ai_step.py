@@ -404,7 +404,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         _terminal_result = await hook_registry.afire("terminal_tool", _terminal_ctx)
         if _terminal_result.action is not None:
             return _terminal_result.action
-        if not _terminal_result.intercepted:
+        if not _terminal_result.channels.get("intercepted"):
             action = await _handle_pseudo_tool(ls, _terminal_call, step)
             if action is not None:
                 return action
@@ -586,7 +586,7 @@ async def _execute_real_tools(
         )
         _exec_result = await hook_registry.afire("execute_tool", _exec_ctx)
         if _exec_result.action is not None:
-            _close_execution(getattr(_exec_result, "execution", None))
+            _close_execution(_exec_result.channels.get("execution"))
             return _exec_result.action
         if _exec_result.block or _exec_result.skip_step:
             # 此点不承担授权（是否执行由 before_tool_call 决定），但保留
@@ -623,7 +623,7 @@ async def _execute_real_tools(
                 "elapsed_ms": _t_elapsed_ms,
             })
             continue
-        _execution = getattr(_exec_result, "execution", None)
+        _execution = _exec_result.channels.get("execution")
         if _execution is None:
             _t_result = await _execute_registry_tool_with_span(ls.registry, _t_name, _t_args, _tool_ctx)
         elif inspect.isawaitable(_execution):
@@ -725,8 +725,8 @@ async def _execute_real_tools(
         _after_result = await hook_registry.afire("after_tool_call", _after_ctx)
         if _after_result.action is not None:
             return _after_result.action
-        if isinstance(_after_result.result_override, dict):
-            _ov = _after_result.result_override
+        _ov = _after_result.channels.get("result_override")
+        if isinstance(_ov, dict):
             if "raw_inline" in _ov:
                 _t_raw_inline = _ov["raw_inline"]
             _t_truncated = bool(_ov.get("truncated", _t_truncated))

@@ -43,8 +43,8 @@ HOOK_POINTS: dict[str, str] = {
     "after_tool_call": (
         "每个同步真实工具执行后、结构化格式化之后、事件与 entry 写回之前触发。"
         "extra: loop_state/tool_name/tool_args/tool_result/raw_inline/step_inline_state/"
-        "call_index/tool_attachments。handler 可通过 result_override={raw_inline,"
-        "truncated,ref} 改写模型可见的 inline 文本与截断元数据（spill 策略），"
+        "call_index/tool_attachments。handler 可通过 channels 的 result_override 键"
+        "（raw_inline/truncated/ref）改写模型可见的 inline 文本与截断元数据（spill 策略），"
         "或收集附件；返回 action 终止任务。"
     ),
     "before_response": "纯文本回复发出前触发。extra: text。可修改或拦截。",
@@ -213,9 +213,7 @@ class HookRegistry:
         supervisor code async.
         """
         modified = False
-        merged_override: dict | None = None
-        adopted_execution: Any = None
-        intercepted = False
+        channels: dict[str, Any] = {}
         _next_called = True  # 默认放行，兼容旧 handler
         for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
             if not _next_called:
@@ -226,9 +224,7 @@ class HookRegistry:
                 if inspect.isawaitable(result):
                     _close_awaitable(result)
                     raise RuntimeError("async hook handler registered on sync fire(); use afire()")
-                stop_result, modified, merged_override, adopted_execution, intercepted = _process_hook_result(
-                    result, modified, merged_override, adopted_execution, intercepted,
-                )
+                stop_result, modified = _process_hook_result(result, modified, channels)
                 if stop_result is not None:
                     return stop_result
                 # 瀑布语义：handler 可以通过 ctx.stop_chain() 终止后续 handler 执行
@@ -236,7 +232,7 @@ class HookRegistry:
                     break
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
-        return HookResult(modified=modified, result_override=merged_override, execution=adopted_execution, intercepted=intercepted)
+        return HookResult(modified=modified, channels=channels)
 
     async def afire(self, hook_point: str, ctx: Any) -> HookResult:
         """Asynchronously run handlers for one hook point."""
@@ -244,24 +240,20 @@ class HookRegistry:
         # How: call each normalized callback and await awaitable results. Purpose:
         # keep engine control-flow semantics while sharing registration with sync hooks.
         modified = False
-        merged_override: dict | None = None
-        adopted_execution: Any = None
-        intercepted = False
+        channels: dict[str, Any] = {}
         for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
             try:
                 result = entry.callback(ctx)
                 if inspect.isawaitable(result):
                     result = await result
-                stop_result, modified, merged_override, adopted_execution, intercepted = _process_hook_result(
-                    result, modified, merged_override, adopted_execution, intercepted,
-                )
+                stop_result, modified = _process_hook_result(result, modified, channels)
                 if stop_result is not None:
                     return stop_result
                 if getattr(ctx, '_chain_stopped', False):
                     break
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
-        return HookResult(modified=modified, result_override=merged_override, execution=adopted_execution, intercepted=intercepted)
+        return HookResult(modified=modified, channels=channels)
 
     def list_hooks(self) -> dict[str, list[str]]:
         """Return registered hook points and handler names."""
@@ -332,52 +324,53 @@ def _handler_priority(handler: Any, priority: int | None) -> int:
     return 100
 
 
+# [AutoC 2026-08-23] Channel merge semantics by name. Why: hook points compose
+# channel values differently — execution is single-owner, result_override merges
+# per key, intercepted ORs. How: one table consulted at aggregation time;
+# unknown channels default to "first" so a new channel needs no framework change
+# unless it composes. Purpose: adding a channel is a data entry, not a schema
+# change on HookResult.
+CHANNEL_SEMANTICS: dict[str, str] = {
+    "execution": "first",
+    "result_override": "merge_dict",
+    "intercepted": "or",
+}
+
+
 def _process_hook_result(
-    result: Any, modified: bool, merged_override: dict | None, adopted_execution: Any,
-    intercepted: bool,
-) -> tuple[Any | None, bool, dict | None, Any, bool]:
+    result: Any, modified: bool, channels: dict[str, Any],
+) -> tuple[Any | None, bool]:
     """Apply shared hook-result chain rules."""
     # Why: sync and async fire must stop on the same result shapes. How: use duck
     # typing for HookResult-compatible objects and aggregate non-terminal mutation.
     # Purpose: support engine.builtin.result.HookResultLike without importing it here.
     if result is None:
-        return None, modified, merged_override, adopted_execution, intercepted
+        return None, modified
     result_modified = bool(getattr(result, "modified", False))
     modified = modified or result_modified
-    # [AutoC 2026-08-19] Why: result overrides from several non-terminal handlers
-    # must all survive the chain. How: merge dict-shaped overrides key by key
-    # (later handlers win per key) and never stop the chain on an override alone.
-    # Purpose: spill policy and future result-processing handlers stay composable.
-    override = getattr(result, "result_override", None)
-    if isinstance(override, dict) and override:
-        if merged_override is None:
-            merged_override = dict(override)
-        else:
-            merged_override.update(override)
-    # [AutoC 2026-08-19] Why: an execution replacement is a single-owner decision,
-    # unlike per-key override merging. How: the first non-None execution wins and
-    # later handlers cannot override it. Purpose: scheduling strategies stay
-    # unambiguous when several handlers answer execute_tool.
-    execution = getattr(result, "execution", None)
-    if execution is not None and adopted_execution is None:
-        adopted_execution = execution
-    # [AutoC 2026-08-20] Why: interception is an OR-aggregated boolean, unlike
-    # the single-owner execution channel. How: once any handler intercepts, the
-    # chain result stays intercepted. Purpose: multiple guards can agree that a
-    # terminal call must not run.
-    intercepted = intercepted or bool(getattr(result, "intercepted", False))
+    for key, value in (getattr(result, "channels", None) or {}).items():
+        semantic = CHANNEL_SEMANTICS.get(key, "first")
+        if semantic == "merge_dict":
+            if isinstance(value, dict) and value:
+                existing = channels.get(key)
+                merged = dict(existing) if isinstance(existing, dict) else {}
+                merged.update(value)
+                channels[key] = merged
+        elif semantic == "or":
+            channels[key] = bool(channels.get(key)) or bool(value)
+        else:  # "first": single-owner, first non-None wins
+            if value is not None and channels.get(key) is None:
+                channels[key] = value
     should_stop = bool(getattr(result, "block", False) or getattr(result, "skip_step", False) or getattr(result, "action", None) is not None)
     if should_stop:
         if modified and not result_modified and hasattr(result, "modified"):
             result.modified = True
-        if merged_override is not None and hasattr(result, "result_override"):
-            result.result_override = merged_override
-        if adopted_execution is not None and hasattr(result, "execution"):
-            result.execution = adopted_execution
-        if intercepted and hasattr(result, "intercepted"):
-            result.intercepted = intercepted
-        return result, modified, merged_override, adopted_execution, intercepted
-    return None, modified, merged_override, adopted_execution, intercepted
+        # terminated chains still carry the merged channels so the fire site
+        # sees the same aggregate shape as a completed chain
+        if hasattr(result, "channels"):
+            result.channels = dict(channels)
+        return result, modified
+    return None, modified
 
 
 def _close_awaitable(value: Any) -> None:

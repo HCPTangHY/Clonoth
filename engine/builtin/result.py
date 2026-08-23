@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -21,9 +21,7 @@ class HookResultLike:
     reason: str = ""
     error_message: str = ""
     modified: bool = False
-    result_override: Any = None
-    execution: Any = None
-    intercepted: bool = False
+    channels: dict[str, Any] = field(default_factory=dict)
 
 
 def hook_result(
@@ -34,9 +32,7 @@ def hook_result(
     reason: str = "",
     error_message: str = "",
     modified: bool = False,
-    result_override: Any = None,
-    execution: Any = None,
-    intercepted: bool = False,
+    channels: dict[str, Any] | None = None,
 ) -> HookResultLike:
     """Build a HookResult-compatible object without hook-package imports.
 
@@ -52,7 +48,5 @@ def hook_result(
         reason=reason,
         error_message=error_message,
         modified=modified,
-        result_override=result_override,
-        execution=execution,
-        intercepted=intercepted,
+        channels=dict(channels or {}),
     )

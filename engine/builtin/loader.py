@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..context import accepts_context
+from ..hooks.loader import iter_hook_points, register_meta_handler
 
 if TYPE_CHECKING:
     from toolbox.registry import ToolRegistry
@@ -89,36 +89,19 @@ def auto_discover_and_register(
                 continue
         try:
             # Why: every registration a plugin makes must be reversible, including
-            # registrations done in __init__ (e.g. prompt sections). How: run
-            # instantiation, hook registration, and tool registration inside
-            # collecting(handler_name) so the shared disposal ledger archives
-            # each returned disposer under this plugin. Purpose:
-            # unload_plugin(handler_name) undoes the whole load across every
-            # registration surface.
-            collecting = getattr(registry, "collecting", None)
-            if callable(collecting):
-                with collecting(handler_name):
-                    instance = _instantiate_handler(module, meta, context)
-                    priority = meta.get("priority", getattr(instance, "priority", None))
-                    for hook_point, method_name in _iter_hook_points(meta):
-                        method = getattr(instance, method_name)
-                        registry.register(str(hook_point), method, priority=priority)
-                    _register_declared_tools(module_name, meta, tool_registry)
-            else:
-                instance = _instantiate_handler(module, meta, context)
-                priority = meta.get("priority", getattr(instance, "priority", None))
-                for hook_point, method_name in _iter_hook_points(meta):
-                    method = getattr(instance, method_name)
-                    registry.register(str(hook_point), method, priority=priority)
-                _register_declared_tools(module_name, meta, tool_registry)
+            # registrations done in __init__ (e.g. prompt sections). How: the
+            # shared register_meta_handler runs instantiation, hook registration,
+            # teardown archival, and tool registration inside collecting(name) so
+            # the shared disposal ledger archives each disposer under this plugin.
+            # Purpose: unload_plugin(handler_name) undoes the whole load across
+            # every registration surface.
+            instance = register_meta_handler(
+                registry, module, meta, ledger_name=handler_name,
+                context=context, tool_registry=tool_registry,
+            )
             handler_name = str(getattr(instance, "name", "") or py_file.stem)
             handlers[handler_name] = instance
             loaded.add(handler_name)
-            teardown = getattr(instance, "teardown", None)
-            if callable(teardown):
-                add_disposer = getattr(registry, "add_plugin_disposer", None)
-                if callable(add_disposer):
-                    add_disposer(handler_name, teardown)
             _register_meta(registry, py_file, meta, handler_name)
         except Exception as exc:
             logger.error("Failed to load built-in hook %s: %s", module_name, exc, exc_info=True)
@@ -165,84 +148,6 @@ def _should_skip(py_file: Path) -> bool:
     if py_file.stem in _SKIP_MODULES:
         return True
     return py_file.name.startswith("_")
-
-
-def _instantiate_handler(module: Any, meta: dict[str, Any], context: Any = None) -> Any:
-    """Instantiate the handler class named by PLUGIN_META.
-
-    Why: plugins need one stable object to reach every registration surface.
-    How: when the handler __init__ declares parameters beyond self and a context
-    is provided, pass the EngineContext; parameterless handlers keep the old
-    zero-argument construction. Purpose: introduce ctx injection without
-    breaking any existing handler class.
-    """
-    class_name = str(meta.get("handler_class") or "").strip()
-    if not class_name:
-        raise ValueError("PLUGIN_META.handler_class is required")
-    cls = getattr(module, class_name)
-    if context is not None and accepts_context(cls):
-        return cls(context)
-    return cls()
-
-
-def _register_declared_tools(module_name: str, meta: dict[str, Any], tool_registry: "ToolRegistry | None") -> list[Any]:
-    """Register PLUGIN_META.tools declarations into the provided ToolRegistry."""
-    # Why: built-in plugins can now own their tool implementations and schemas.
-    # How: when a ToolRegistry is provided, validate each metadata declaration and
-    # pass it through register_builtin_tool(). Purpose: remove hard-coded knowledge
-    # tools from toolbox.registry.py while keeping loader failures localized.
-    # Returns the disposers produced by registration so the caller can archive
-    # them in the plugin ledger.
-    raw_tools = meta.get("tools")
-    if raw_tools is None:
-        return []
-    if tool_registry is None:
-        return []
-    if not isinstance(raw_tools, list):
-        raise ValueError(f"{module_name} PLUGIN_META.tools must be a list")
-
-    register_builtin_tool = getattr(tool_registry, "register_builtin_tool", None)
-    if not callable(register_builtin_tool):
-        raise TypeError("tool_registry must provide register_builtin_tool")
-
-    disposers: list[Any] = []
-    for tool in raw_tools:
-        if not isinstance(tool, dict):
-            raise ValueError(f"{module_name} has invalid tool declaration: {tool!r}")
-        name = str(tool.get("name") or "").strip()
-        description = str(tool.get("description") or "")
-        input_schema = tool.get("input_schema")
-        func = tool.get("func")
-        if not name:
-            raise ValueError(f"{module_name} tool declaration missing name")
-        if not isinstance(input_schema, dict):
-            raise ValueError(f"{module_name}.{name} input_schema must be a dict")
-        if not callable(func):
-            raise ValueError(f"{module_name}.{name} func must be callable")
-        dispose = register_builtin_tool(name, description, input_schema, func)
-        if callable(dispose):
-            disposers.append(dispose)
-    return disposers
-
-
-def _iter_hook_points(meta: dict[str, Any]) -> list[tuple[str, str]]:
-    """Validate and return hook point declarations from PLUGIN_META."""
-    # Why: malformed metadata should fail one module clearly instead of registering
-    # a partial handler. How: require a list of two-item declarations. Purpose:
-    # keep auto-discovery predictable and easy to diagnose.
-    raw_points = meta.get("hook_points")
-    if not isinstance(raw_points, list):
-        raise ValueError("PLUGIN_META.hook_points must be a list")
-    points: list[tuple[str, str]] = []
-    for item in raw_points:
-        if not isinstance(item, (tuple, list)) or len(item) != 2:
-            raise ValueError(f"invalid hook point declaration: {item!r}")
-        hook_point = str(item[0]).strip()
-        method_name = str(item[1]).strip()
-        if not hook_point or not method_name:
-            raise ValueError(f"invalid hook point declaration: {item!r}")
-        points.append((hook_point, method_name))
-    return points
 
 
 def _register_meta(registry: Any, py_file: Path, meta: dict[str, Any], handler_name: str) -> None:

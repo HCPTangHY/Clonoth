@@ -28,6 +28,7 @@ PLUGIN_META = {
     "handler_class": "KnowledgeInjector",
     "hook_points": [],
     "priority": 50,
+    "wants_context": True,
     # Why: the six skill and memory CRUD tools now belong to the knowledge
     # plugin rather than toolbox.registry.py. How: the concrete declarations are
     # attached after their functions are defined below. Purpose: keep one source

@@ -125,6 +125,12 @@ Hook 的目标是把推理循环中的横切逻辑移出 `engine/inference/ai_st
 | `error_message` | 更明确的错误文本。 |
 | `modified` | 表示 handler 修改了上下文或运行状态。 |
 
+通道（channels）：点特设的返回值放在 `channels` dict 里，不再占用 HookResult 的公共字段。
+handler 返回 `hook_result(channels={"execution": ...})`；registry 按 CHANNEL_SEMANTICS 聚合
+（execution 单主 first、result_override 按键 merge、intercepted 或聚合），fire 点从
+`result.channels.get(name)` 读取。新增通道只需在 registry 的 CHANNEL_SEMANTICS 表加一行
+（默认 first 语义），不改 HookResult 类型。
+
 ### 钩子点列表
 
 当前支持以下 hook point：
