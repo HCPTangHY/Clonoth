@@ -18,6 +18,15 @@ export interface PluginSlotApi {
   /** Send a text message to the active conversation. */
   send: (text: string) => Promise<void>;
   /**
+   * [AutoC 2026-08-23] Retry one specific user message (optionally edited).
+   * Why: retry depends on chatStore internals — history message ids need the
+   * ':history:' credential split and the UI truncation after a successful
+   * retry deletes the truncated message range from the store. How: expose the
+   * store action directly. Purpose: the message_retry plugin reaches retry
+   * through the same code path the old inline MessageCard buttons used.
+   */
+  retryMessage: (messageId: string, newText?: string) => Promise<void>;
+  /**
    * Authenticated request to any supervisor /v1 endpoint.
    * Example: api.request('/sessions'). Non-ok responses reject.
    */
@@ -48,6 +57,10 @@ export function getPluginSlotApi(): PluginSlotApi {
       const trimmed = text.trim();
       if (!trimmed) return;
       await useChatStore.getState().sendMessage(trimmed);
+    },
+    retryMessage: async (messageId, newText) => {
+      if (!messageId) return;
+      await useChatStore.getState().retryMessage(messageId, newText);
     },
     request: async (path, init) => pluginApiRequest(path, init),
   };
