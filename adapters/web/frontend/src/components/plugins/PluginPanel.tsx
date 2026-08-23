@@ -4,11 +4,17 @@
 // How: set window.__CLONOTH_BOOT__ (token + sessionId) before mount so the panel
 // page reads it via window.parent — the token never appears in a URL; remount
 // the iframe per session so stale boot data cannot leak across sessions.
-// Purpose: plugins get a full UI surface with zero frontend build involvement.
-import { useEffect, useMemo } from 'react';
+// [plugin-admin 2026-08-23] Theme injection: after each frame load, copy the
+// host's live CSS variables onto the panel document (themeBridge). Panels
+// reference var(--duties-*) by name and hold no theme values themselves, so
+// host theme changes and plugin styles overrides propagate automatically.
+// Purpose: plugins get a full UI surface with zero frontend build involvement,
+// visually indistinguishable from host chrome.
+import { useEffect, useMemo, useRef } from 'react';
 
 import { getStoredAdminToken } from '../../api/supervisorClient';
 import { Icon } from '../common';
+import { applyHostTheme } from './themeBridge';
 
 interface PluginPanelProps {
   entry: string;
@@ -25,6 +31,7 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, chrome = true }:
   // remount the frame whenever entry or session changes; the effect below
   // re-publishes the boot object before the new page's scripts run.
   const frameKey = useMemo(() => `${entry}::${sessionId}`, [entry, sessionId]);
+  const frameRef = useRef<HTMLIFrameElement>(null);
 
   useEffect(() => {
     const w = window as unknown as { __CLONOTH_BOOT__?: unknown };
@@ -36,6 +43,17 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, chrome = true }:
       delete w.__CLONOTH_BOOT__;
     };
   }, [sessionId]);
+
+  // inject the host theme after every (re)load of the panel document
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const inject = () => applyHostTheme(frame.contentDocument);
+    frame.addEventListener('load', inject);
+    // a remounted frame may already be complete before the listener attaches
+    if (frame.contentDocument?.readyState === 'complete') inject();
+    return () => frame.removeEventListener('load', inject);
+  }, [frameKey]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -57,6 +75,7 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, chrome = true }:
       )}
       <iframe
         key={frameKey}
+        ref={frameRef}
         src={entry}
         title={title}
         className="min-h-0 w-full flex-1 border-0 bg-white"

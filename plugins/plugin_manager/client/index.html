@@ -6,12 +6,13 @@
 <title>插件管理</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-  /* 与宿主 web 主题对齐（adapters/web/frontend/src/styles/index.css 的 --duties-* 值）。
-     iframe 是独立文档，无法继承宿主 CSS 变量，这里按值抄入。 */
+  /* 主题变量引用宿主注入的计算值（themeBridge.ts 在 iframe load 后写入 --duties-*）。
+     回退值仅保证注入前可读；任何宿主主题变更或插件 styles 覆写都会随注入自动跟随。
+     --ok/--danger 是页面局部语义色，不属于宿主主题，保持本地定义。 */
   :root {
-    --bg: #f1f0ee; --panel: #e8e7e5; --muted: #dddcda;
-    --text: #252525; --secondary: #4a4a4a; --tertiary: #6e6e73;
-    --border: #ccc; --accent: #feaf2c;
+    --bg: var(--duties-bg, #f1f0ee); --panel: var(--duties-panel, #e8e7e5); --muted: var(--duties-muted, #dddcda);
+    --text: var(--duties-text, #252525); --secondary: var(--duties-secondary, #4a4a4a); --tertiary: var(--duties-tertiary, #6e6e73);
+    --border: var(--duties-border, #ccc); --accent: var(--duties-accent, #feaf2c);
     --ok: #2e7d32; --danger: #a33c3c;
     --mono: 'Geist Mono', ui-monospace, Menlo, Consolas, monospace;
   }
