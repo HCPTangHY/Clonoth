@@ -2,30 +2,21 @@
 // Why: slot contributions need to trigger host behaviors that only the web app
 // can perform — retry depends on the message-id credential and JSONL fallback
 // logic living in chatStore, and blob-imported plugin modules cannot reach
-// bundled stores. How: a stable singleton resolving actions from
-// useChatStore.getState() at call time, passed to every slot module as ctx.api.
-// Purpose: plugins act on the host through an explicit surface instead of
-// reaching into internals.
-// [AutoC 2026-08-22] The whitelist problem: every new capability used to require
-// host code and a rebuild. `request` opens the full supervisor API (same
-// authentication as the web UI), so curated actions below stay small.
-import { useChatStore } from './chatStore';
+// bundled stores. How: a stable singleton exposing two channels — api.call
+// dispatches to the host action registry (hostActions.ts, actions registered
+// once by name), api.request reaches any supervisor endpoint with auth.
+// Purpose: plugins act on the host through one generic surface; adding a core
+// capability registers an action once, no per-plugin whitelist edits.
 import { pluginApiRequest } from '../api/supervisorClient';
+import { callHostAction } from './hostActions';
 
 export interface PluginSlotApi {
-  /** Retry from the last user message of the active conversation (quick reroll). */
-  reroll: () => Promise<void>;
-  /** Send a text message to the active conversation. */
-  send: (text: string) => Promise<void>;
   /**
-   * [AutoC 2026-08-23] Retry one specific user message (optionally edited).
-   * Why: retry depends on chatStore internals — history message ids need the
-   * ':history:' credential split and the UI truncation after a successful
-   * retry deletes the truncated message range from the store. How: expose the
-   * store action directly. Purpose: the message_retry plugin reaches retry
-   * through the same code path the old inline MessageCard buttons used.
+   * Invoke a registered host action by name, e.g. api.call('retryMessage', id).
+   * Unknown names log a warning and resolve null, so optional chaining across
+   * host versions stays safe.
    */
-  retryMessage: (messageId: string, newText?: string) => Promise<void>;
+  call: (name: string, ...args: unknown[]) => Promise<unknown>;
   /**
    * Authenticated request to any supervisor /v1 endpoint.
    * Example: api.request('/sessions'). Non-ok responses reject.
@@ -38,31 +29,8 @@ let cached: PluginSlotApi | null = null;
 export function getPluginSlotApi(): PluginSlotApi {
   if (cached) return cached;
   cached = {
-    reroll: async () => {
-      const state = useChatStore.getState();
-      // child-session view: which conversation to rewind is ambiguous — refuse.
-      if (state.viewingChildSessionId) return;
-      const cid = state.activeConversationId;
-      if (!cid) return;
-      const order = state.messageOrderByConversation[cid] || [];
-      for (let i = order.length - 1; i >= 0; i--) {
-        const message = state.messagesById[order[i]];
-        if (message?.role === 'user') {
-          await state.retryMessage(order[i]);
-          return;
-        }
-      }
-    },
-    send: async (text) => {
-      const trimmed = text.trim();
-      if (!trimmed) return;
-      await useChatStore.getState().sendMessage(trimmed);
-    },
-    retryMessage: async (messageId, newText) => {
-      if (!messageId) return;
-      await useChatStore.getState().retryMessage(messageId, newText);
-    },
-    request: async (path, init) => pluginApiRequest(path, init),
+    call: (name, ...args) => callHostAction(name, ...args),
+    request: (path, init) => pluginApiRequest(path, init),
   };
   return cached;
 }

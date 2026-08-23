@@ -7,7 +7,7 @@
 宿主侧依赖：
 - MessageCard 的 message_footer 槽位 data：messageId/role/sessionId/
   retryable/text/isLastUserMessage
-- ctx.api.retryMessage(messageId, newText?)（slotApi.ts 白名单方法，
+- ctx.api.call('retryMessage', messageId, newText?)（hostActions.ts 注册表，
   内部走 chatStore.retryMessage：凭证解析 + 后端重试 + UI 截断）
 - article 的 group/card 类名（悬停显示样式挂在这个宿主类上）
 
@@ -88,7 +88,7 @@ export default {
     const ms = this._msgState();
     ms.editing = false;
     ms.draft = null;
-    void ctx.api?.retryMessage?.(ctx.data?.messageId, newText);
+    void ctx.api?.call?.('retryMessage', ctx.data?.messageId, newText);
   },
   _startEdit() {
     const ctx = this._ctx;

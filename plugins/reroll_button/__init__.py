@@ -2,7 +2,7 @@
 
 点击后撤回活动会话最后一条用户消息并重新提交（retry 语义）。
 无后端动作：不注册 hook、不注册路由，纯前端贡献。
-宿主侧依赖：input_toolbar_right 槽位 + ctx.api.reroll（见 slotApi.ts）。
+宿主侧依赖：input_toolbar_right 槽位 + ctx.api.call('reroll')（hostActions.ts 注册表）。
 
 [AutoC 2026-08-22] 槽位上下文 v2 演示：
 - ctx.state：本页重 roll 计数。宿主视图切换导致组件重挂载时计数不丢，
@@ -35,7 +35,7 @@ export default {
       if (btn.disabled) return;
       state.count = (state.count || 0) + 1;
       this._applyTitle();
-      void ctx.api?.reroll?.();
+      void ctx.api?.call?.('reroll');
     });
     this._btn = btn;
     this._ctx = ctx;
