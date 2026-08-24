@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IDE</title>
 <script src="vendor/codemirror.js"></script>
+<script src="vendor/marked.js"></script>
 <style>
 /* [AutoC 2026-08-24] IDE 面板页：单一主页 + 顶部标签栏 + 文本编辑。
    只写结构与变量名映射，不抄宿主值；主题变量与滚动条规则由宿主
@@ -296,23 +297,88 @@ body {
 .tabbar .save-btn {
   display: none;
   align-items: center;
+  gap: 4px;
   height: 100%;
   padding: 0 10px;
   border: 0;
   border-left: 1px solid var(--border);
   background: transparent;
   color: var(--secondary);
-  font-family: var(--mono);
-  font-size: 10px;
   cursor: pointer;
 }
 .tabbar .save-btn.show { display: flex; }
 .tabbar .save-btn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
 .tabbar .save-btn:disabled { opacity: 0.35; cursor: default; }
+.tabbar .save-btn svg { width: 14px; height: 14px; display: block; }
+.tabbar .save-btn .dirty-dot { color: var(--accent); font-size: 9px; line-height: 1; }
+
+/* ── Markdown 渲染视图 ── */
+.md-body {
+  padding: 12px 18px 24px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text);
+  overflow-wrap: break-word;
+}
+.md-body h1, .md-body h2, .md-body h3, .md-body h4, .md-body h5, .md-body h6 {
+  margin: 1em 0 0.5em;
+  line-height: 1.3;
+  color: var(--text);
+}
+.md-body h1 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
+.md-body h2 { font-size: 1.3em; border-bottom: 1px solid var(--border); padding-bottom: 0.2em; }
+.md-body h3 { font-size: 1.15em; }
+.md-body p { margin: 0.5em 0; }
+.md-body a { color: var(--accent); text-decoration: none; }
+.md-body a:hover { text-decoration: underline; }
+.md-body code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+}
+.md-body pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  margin: 0.6em 0;
+}
+.md-body pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.md-body blockquote {
+  margin: 0.6em 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--border);
+  color: var(--secondary);
+}
+.md-body ul, .md-body ol { margin: 0.5em 0; padding-left: 1.6em; }
+.md-body li { margin: 0.15em 0; }
+.md-body table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 11px;
+}
+.md-body th, .md-body td {
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  text-align: left;
+}
+.md-body th { background: var(--bg); }
+.md-body hr { border: 0; border-top: 1px solid var(--border); margin: 1em 0; }
+.md-body img { max-width: 100%; }
 </style>
 </head>
 <body>
-<div class="tabbar" id="tabbar"><div class="bar-end"><button id="bar-save" class="save-btn" title="保存 (Ctrl+S)">保存</button></div></div>
+<div class="tabbar" id="tabbar"><div class="bar-end"><button id="bar-save" class="save-btn" title="保存 (Ctrl+S)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg><span class="dirty-dot" style="display:none">●</span></button></div></div>
 <div class="view" id="view"></div>
 <div class="statusbar" id="statusbar"></div>
 <script>
@@ -394,8 +460,13 @@ let viewPath = null;      // 当前视图为哪个标签渲染，用于切换前
 let saveHint = '';        // 状态栏一次性提示（保存成功/失败）
 
 function newFileTab(path, pinned) {
+  // mode: MD 文件专属，'render'（默认渲染）或 'edit'（编辑器）
   return { path, pinned, loaded: false, kind: '', text: '', savedText: '',
-           dirty: false, scroll: 0, blobUrl: null, note: '' };
+           dirty: false, scroll: 0, blobUrl: null, note: '', mode: 'render' };
+}
+
+function isMarkdown(path) {
+  return /\.(md|markdown)$/i.test(String(path));
 }
 
 function findTab(path) {
@@ -456,7 +527,9 @@ function closeTab(path) {
 }
 
 function renderTabs() {
-  tabbarEl.innerHTML = '';
+  // [AutoC 2026-08-24] 不能 innerHTML 清空整个 tabbar：右端的 bar-end
+  // 保存按钮容器会被销毁，导致按钮永久消失。只移除标签元素，bar-end 保留。
+  tabbarEl.querySelectorAll('.tab').forEach((el) => el.remove());
   for (const tab of tabs) {
     const isTree = tab.path === TREE_TAB;
     const el = document.createElement('div');
@@ -492,7 +565,7 @@ function renderTabs() {
       });
     }
     el.addEventListener('click', () => activate(tab.path));
-    tabbarEl.appendChild(el);
+    tabbarEl.insertBefore(el, tabbarEl.querySelector('.bar-end'));
   }
 }
 
@@ -508,8 +581,9 @@ function showStatus(text) {
 
 function stashScroll() {
   const tab = viewPath && viewPath !== TREE_TAB ? findTab(viewPath) : null;
-  if (!tab || tab.kind !== 'text' || !tab._view) return;
-  tab.scroll = tab._view.scrollDOM.scrollTop;
+  if (!tab || tab.kind !== 'text') return;
+  if (tab._view) tab.scroll = tab._view.scrollDOM.scrollTop;
+  else if (isMarkdown(tab.path) && tab.mode === 'render') tab.scroll = viewEl.scrollTop;
 }
 
 function renderView() {
@@ -533,7 +607,10 @@ function renderView() {
 }
 
 function renderFileTab(tab) {
-  if (tab.kind === 'text') renderEditor(tab);
+  if (tab.kind === 'text') {
+    if (isMarkdown(tab.path) && tab.mode === 'render') renderMarkdown(tab);
+    else renderEditor(tab);
+  }
   else if (tab.kind === 'image') renderImage(tab);
   else showStatus(tab.note || '不支持预览');
 }
@@ -555,6 +632,7 @@ function markEdited(tab, text) {
 
 function renderEditor(tab) {
   viewEl.innerHTML = '';
+  if (tab._view) { tab._view.destroy(); tab._view = null; }
   const host = document.createElement('div');
   host.className = 'cm-host';
   viewEl.appendChild(host);
@@ -589,6 +667,10 @@ function renderEditor(tab) {
         EditorView.updateListener.of((u) => {
           if (u.docChanged) markEdited(tab, u.state.doc.toString());
         }),
+        // MD 文件编辑时启用 Markdown 语法高亮；其他语言走兜底样式。
+        ...(isMarkdown(tab.path)
+          ? [CM.markdown({ base: CM.markdownLanguage })]
+          : []),
         // tabSize 决定 Tab 字符显示宽度，indentUnit 决定 Tab 命令插入的空白，
         // 两者都跟随状态栏的缩进偏好。
         EditorState.tabSize.of(indentWidth),
@@ -603,6 +685,45 @@ function renderEditor(tab) {
   tab._view = view;
   view.scrollDOM.scrollTop = tab.scroll || 0;
   view.requestMeasure();
+}
+
+// [AutoC 2026-08-24] Markdown 渲染：marked 解析 + 本地 sanitize。
+// 文件可能由 AI 写入，渲染前剥离 script/iframe 等元素、on* 事件属性与
+// javascript: 链接，防止面板页内脚本执行（面板可访问 boot token）。
+function sanitizeDom(root) {
+  root.querySelectorAll('script,iframe,object,embed,form,link,meta,style').forEach((el) => el.remove());
+  root.querySelectorAll('*').forEach((el) => {
+    for (const attr of Array.from(el.attributes)) {
+      const name = attr.name.toLowerCase();
+      if (name.startsWith('on')) el.removeAttribute(attr.name);
+      else if ((name === 'href' || name === 'src' || name === 'xlink:href')
+               && /^\s*javascript:/i.test(attr.value)) el.removeAttribute(attr.name);
+    }
+  });
+}
+
+function renderMarkdown(tab) {
+  viewEl.innerHTML = '';
+  if (tab._view) { tab._view.destroy(); tab._view = null; }
+  const body = document.createElement('div');
+  body.className = 'md-body';
+  try {
+    body.innerHTML = MarkedLib.marked.parse(tab.text || '');
+  } catch (err) {
+    body.textContent = tab.text || '';
+  }
+  sanitizeDom(body);
+  viewEl.appendChild(body);
+  viewEl.scrollTop = tab.scroll || 0;
+}
+
+function setTabMode(tab, mode) {
+  if (tab.mode === mode) return;
+  // 编辑 → 渲染：文本已由 docChanged 同步到 tab.text，无需额外保存。
+  tab.mode = mode;
+  stashScroll();
+  renderFileTab(tab);
+  renderStatusbar();
 }
 
 async function saveTab(tab) {
@@ -638,7 +759,8 @@ document.addEventListener('keydown', (e) => {
 function renderStatusbar() {
   const tab = findTab(activePath);
   if (!tab || tab.path === TREE_TAB) {
-    statusbarEl.innerHTML = '<span class="sp">工作区文件</span>';
+    statusbarEl.innerHTML = '<div class="seg grow">工作区文件</div>';
+    barSaveBtn.classList.remove('show');
     return;
   }
   let hint = '';
@@ -651,14 +773,23 @@ function renderStatusbar() {
     hint = tab.dirty ? '未保存 · Ctrl+S' : '已保存';
     hintClass = tab.dirty ? 'hint-dirty' : '';
   }
-  const indentSeg = tab.kind === 'text'
+  const isMd = tab.kind === 'text' && isMarkdown(tab.path);
+  const modeSeg = isMd
+    ? '<div class="seg clickable" id="sb-mode" title="切换渲染/编辑">'
+      + (tab.mode === 'render' ? '编辑' : '渲染') + '</div>'
+    : '';
+  const indentSeg = (tab.kind === 'text' && (!isMd || tab.mode === 'edit'))
     ? '<div class="seg clickable" id="sb-indent" title="Tab 缩进宽度，点击在 2/4/8 间切换">缩进: ' + indentWidth + '</div>'
     : '';
   statusbarEl.innerHTML = '<div class="seg grow">' + esc(tab.path) + '</div>'
     + (hint ? '<div class="seg ' + hintClass + '">' + esc(hint) + '</div>' : '')
-    + indentSeg;
+    + modeSeg + indentSeg;
   const ibtn = document.getElementById('sb-indent');
   if (ibtn) ibtn.addEventListener('click', cycleIndent);
+  const mbtn = document.getElementById('sb-mode');
+  if (mbtn) mbtn.addEventListener('click', () => {
+    setTabMode(tab, tab.mode === 'render' ? 'edit' : 'render');
+  });
   updateSaveButton(tab);
 }
 
@@ -669,14 +800,17 @@ barSaveBtn.addEventListener('click', () => {
   if (tab && tab.kind === 'text') saveTab(tab);
 });
 
+const barSaveDot = barSaveBtn.querySelector('.dirty-dot');
+
 function updateSaveButton(tab) {
-  if (!tab || tab.kind !== 'text') {
+  // 渲染模式的 MD 标签页不可编辑，无保存需求，隐藏按钮。
+  if (!tab || tab.kind !== 'text' || (isMarkdown(tab.path) && tab.mode === 'render')) {
     barSaveBtn.classList.remove('show');
     return;
   }
   barSaveBtn.classList.add('show');
   barSaveBtn.disabled = !tab.dirty;
-  barSaveBtn.textContent = tab.dirty ? '保存 ●' : '保存';
+  barSaveDot.style.display = tab.dirty ? '' : 'none';
 }
 
 function cycleIndent() {
@@ -686,7 +820,7 @@ function cycleIndent() {
   // 重建当前激活的文本编辑器（保留文档内容与滚动位置）；其他标签页在
   // 下次激活时经 renderEditor 读取新偏好。
   const tab = findTab(activePath);
-  if (tab && tab.kind === 'text') {
+  if (tab && tab.kind === 'text' && !(isMarkdown(tab.path) && tab.mode === 'render')) {
     tab.text = tab._view ? tab._view.state.doc.toString() : tab.text;
     if (tab._view) tab.scroll = tab._view.scrollDOM.scrollTop;
     tab._view = null;
