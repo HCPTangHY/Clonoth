@@ -416,7 +416,9 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
                     const toRad = (deg: number) => (deg * Math.PI) / 180;
                     const sx = cx + r * Math.cos(toRad(startAngle));
                     const sy = cy + r * Math.sin(toRad(startAngle));
+                    const cacheRate = contextUsage.cacheHitRate;
                     return (
+                      <span className="relative inline-flex flex-shrink-0" style={{ width: size, height: size }}>
                       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="flex-shrink-0">
                         <circle
                           cx={cx} cy={cy} r={r}
@@ -442,19 +444,20 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
                           />
                         )}
                       </svg>
+                      {/* [AutoC 2026-08-24] 缓存命中率显示在环中心：百分比量纲
+                          与环的进度语义一致，比放在环右侧更紧凑。 */}
+                      {cacheRate !== null && cacheRate !== undefined && (
+                        <span
+                          className="pointer-events-none absolute inset-0 flex items-center justify-center font-mono text-[0.45rem] leading-none text-[var(--duties-tertiary)]"
+                          title={`缓存命中率（指数移动平均）：${(cacheRate * 100).toFixed(1)}%`}
+                        >
+                          {(cacheRate * 100).toFixed(0)}%
+                        </span>
+                      )}
+                      </span>
                     );
                   })()}
                   <span className={contextUsageColorClass(contextUsage.utilization)}>{formatTokenCount(contextUsage.effectiveTokens)}</span>
-                  {/* [AutoC 2026-08-24] 缓存命中率：随 context_usage 事件的
-                      EMA 更新，无缓存数据时不显示。 */}
-                  {contextUsage.cacheHitRate !== null && contextUsage.cacheHitRate !== undefined && (
-                    <span
-                      className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]"
-                      title={`缓存命中率（指数移动平均）：${(contextUsage.cacheHitRate * 100).toFixed(1)}%`}
-                    >
-                      · {(contextUsage.cacheHitRate * 100).toFixed(0)}%
-                    </span>
-                  )}
                 </button>
                 {isContextPopoverOpen && (
                   <ContextPopover

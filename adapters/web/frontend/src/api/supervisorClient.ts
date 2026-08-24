@@ -1011,6 +1011,10 @@ export interface ContextWindowResponse {
   utilization: number;
   source: string;
   message_count: number;
+  // [AutoC 2026-08-24] 缓存字段：后端快照响应已携带 usage 子字典，
+  // 前端类型此前缺失导致 JSON 解析后字段被丢弃，首次进入会话时
+  // 缓存率无法播种。
+  usage?: Record<string, unknown> | null;
 }
 
 export async function getContextWindow(sessionId: string): Promise<ContextWindowResponse> {
