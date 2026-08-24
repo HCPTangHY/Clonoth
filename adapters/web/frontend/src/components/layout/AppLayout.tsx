@@ -153,7 +153,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
       {/* left drag handle (desktop only) */}
       <div
         aria-hidden="true"
-        className="hidden w-1.5 flex-shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--duties-accent)] md:block"
+        className="hidden w-1.5 flex-shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--duties-border)] md:block"
         onPointerDown={startDrag('left')}
       />
 
@@ -196,7 +196,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
       {hasRightPanel && rightPanelOpen && (
         <div
           aria-hidden="true"
-          className="hidden w-1.5 flex-shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--duties-accent)] md:block"
+          className="hidden w-1.5 flex-shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--duties-border)] md:block"
           onPointerDown={startDrag('right')}
         />
       )}
