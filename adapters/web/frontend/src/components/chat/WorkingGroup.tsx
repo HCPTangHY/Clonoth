@@ -10,7 +10,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import type { TextBlock, ToolExecution, WsMessage } from '../../types/message';
 import { Icon } from '../common';
-import { MessageCard } from './MessageCard';
+import { MessageCard, MessageCopyButton } from './MessageCard';
 import { AttachmentList } from './AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
 import { BLOCK_STACK_CLASS } from './renderingConstants';
@@ -202,6 +202,16 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
             </div>
             {lastCard.attachments && lastCard.attachments.length > 0 && (
               <AttachmentList attachments={lastCard.attachments} sessionId={lastCard.sessionId} />
+            )}
+            {/* [AutoC 2026-08-24] 完成态助手消息的文本块由 WorkingGroup 直接
+                渲染、绕过 MessageCard，因此复制按钮需要在这里单独渲染。
+                文本内容从 completionTextBlocks 拼出。 */}
+            {completionTextBlocks.length > 0 && (
+              <div className="msg-footer-row">
+                <MessageCopyButton
+                  text={completionTextBlocks.map((b) => (b as TextBlock).text).join('\n')}
+                />
+              </div>
             )}
           </div>
         </article>

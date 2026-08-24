@@ -235,7 +235,7 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
 // host-level capability every message needs, not a plugin concern. How:
 // clipboard API with textarea fallback, check-mark feedback for 1.5s.
 // Purpose: users copy any message without selecting text manually.
-const MessageCopyButton = ({ text }: { text: string }) => {
+export const MessageCopyButton = ({ text }: { text: string }) => {
   const [copied, setCopied] = useState(false);
   if (!text) return null;
   const doCopy = async () => {
