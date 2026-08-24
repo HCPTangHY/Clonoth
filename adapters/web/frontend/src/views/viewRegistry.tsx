@@ -74,6 +74,20 @@ function resolveOverlay(id: string, ctx: AppViewContext): ReactNode {
       />
     );
   }
+  // [AutoC 2026-08-24] Plugin replacement of built-in overlays: a plugin panel
+  // declaring replaces:'files' takes over the whole overlay. The built-in
+  // implementation below stays as the fallback when no plugin replaces it.
+  const replacement = usePluginsStore.getState().overlayOverrides[id];
+  if (replacement) {
+    return (
+      <PluginPanel
+        entry={replacement.entry}
+        sessionId={safeSessionId(ctx.sessionId)}
+        title={replacement.title}
+        onClose={close}
+      />
+    );
+  }
   switch (id) {
     case 'files':
       return <WorkspaceFileTree sessionId={safeSessionId(ctx.sessionId)} onClose={close} />;

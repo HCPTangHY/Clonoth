@@ -43,6 +43,11 @@ interface PluginsState {
   panels: ResolvedPanel[];
   /** settings-view panels: full-page iframe tabs in the settings sidebar */
   settingsPanels: ResolvedPanel[];
+  /** [AutoC 2026-08-24] Plugin panels replacing a built-in overlay. Key is
+   * the built-in overlay id (e.g. 'files'); the built-in implementation stays
+   * the fallback when no plugin replaces it. Replacement panels activate
+   * through the built-in trigger and are not listed as header entries. */
+  overlayOverrides: Record<string, ResolvedPanel>;
   slotsBySlot: Record<string, SlotContribution[]>;
   stylesByOwner: Record<string, string>;
   clientScriptsEnabled: boolean;
@@ -66,6 +71,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
   plugins: [],
   panels: [],
   settingsPanels: [],
+  overlayOverrides: {},
   slotsBySlot: {},
   stylesByOwner: {},
   clientScriptsEnabled: readClientScriptsPref(),
@@ -81,6 +87,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     const scriptsOn = get().clientScriptsEnabled;
     const panels: ResolvedPanel[] = [];
     const settingsPanels: ResolvedPanel[] = [];
+    const overlayOverrides: Record<string, ResolvedPanel> = {};
     const slotsBySlot: Record<string, SlotContribution[]> = {};
     const stylesByOwner: Record<string, string> = {};
     for (const plugin of plugins) {
@@ -99,7 +106,13 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
         // [plugin-admin 2026-08-23] Two panel destinations: the chat right
         // overlay ('right', the original slot) and the settings view — a
         // settings panel becomes one full-page tab in the settings sidebar.
-        if (panel.slot === 'settings') settingsPanels.push(resolved);
+        // [AutoC 2026-08-24] A panel may declare replaces:'<builtin overlay id>'
+        // to take over that overlay instead of appearing as its own entry;
+        // first declarer wins, the built-in implementation remains the fallback.
+        const replaces = typeof panel.replaces === 'string' ? panel.replaces.trim() : '';
+        if (replaces && (!panel.slot || panel.slot === 'right')) {
+          if (!overlayOverrides[replaces]) overlayOverrides[replaces] = resolved;
+        } else if (panel.slot === 'settings') settingsPanels.push(resolved);
         else if (!panel.slot || panel.slot === 'right') panels.push(resolved);
       }
       if (scriptsOn) {
@@ -123,10 +136,14 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     for (const list of Object.values(slotsBySlot)) {
       list.sort((a, b) => b.priority - a.priority);
     }
-    set({ loaded: true, plugins, panels, settingsPanels, slotsBySlot, stylesByOwner });
+    set({ loaded: true, plugins, panels, settingsPanels, overlayOverrides, slotsBySlot, stylesByOwner });
   },
 
-  panelByKey: (key) => get().panels.find((p) => p.key === key) || null,
+  panelByKey: (key) =>
+    get().panels.find((p) => p.key === key)
+    || get().settingsPanels.find((p) => p.key === key)
+    || Object.values(get().overlayOverrides).find((p) => p.key === key)
+    || null,
 
   setClientScripts: (enabled) => {
     try {

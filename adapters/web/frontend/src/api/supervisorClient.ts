@@ -1288,6 +1288,9 @@ export interface PluginPanelDecl {
   slot?: string;
   title?: string;
   entry: string;
+  /** [AutoC 2026-08-24] Take over a built-in overlay (e.g. 'files') instead of
+   * appearing as a standalone header entry. */
+  replaces?: string;
 }
 
 export interface PluginSlotDecl {
