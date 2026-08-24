@@ -667,6 +667,22 @@ function renderEditor(tab) {
         EditorView.updateListener.of((u) => {
           if (u.docChanged) markEdited(tab, u.state.doc.toString());
         }),
+        // MD 编辑器失焦时切回渲染。relatedTarget 在面板内控件（状态栏
+        // 分栏、保存按钮、标签栏）上时不切，避免点控件时意外切换。
+        ...(isMarkdown(tab.path) ? [EditorView.domEventHandlers({
+          blur: (e) => {
+            const to = e.relatedTarget;
+            if (to && (to.closest('.statusbar') || to.closest('.tabbar'))) return;
+            // 延迟检查：焦点可能还在面板内其他可聚焦元素之间移动
+            setTimeout(() => {
+              const ae = document.activeElement;
+              if (ae && (ae.closest('.cm-editor') || ae.closest('.statusbar') || ae.closest('.tabbar'))) return;
+              if (activePath === tab.path && tab.mode === 'edit') {
+                setTabMode(tab, 'render');
+              }
+            }, 0);
+          },
+        })] : []),
         // MD 文件编辑时启用 Markdown 语法高亮；其他语言走兜底样式。
         ...(isMarkdown(tab.path)
           ? [CM.markdown({ base: CM.markdownLanguage })]
@@ -713,6 +729,16 @@ function renderMarkdown(tab) {
     body.textContent = tab.text || '';
   }
   sanitizeDom(body);
+  // 点击渲染视图任意位置进入编辑模式（Typora 语义）
+  body.addEventListener('click', (e) => {
+    // 链接点击正常跳转，不触发编辑
+    if (e.target.closest('a')) return;
+    setTabMode(tab, 'edit');
+    // 进入编辑后立即获得焦点，让光标落在点击位置附近
+    requestAnimationFrame(() => {
+      if (tab._view) tab._view.focus();
+    });
+  });
   viewEl.appendChild(body);
   viewEl.scrollTop = tab.scroll || 0;
 }
@@ -774,22 +800,19 @@ function renderStatusbar() {
     hintClass = tab.dirty ? 'hint-dirty' : '';
   }
   const isMd = tab.kind === 'text' && isMarkdown(tab.path);
-  const modeSeg = isMd
-    ? '<div class="seg clickable" id="sb-mode" title="切换渲染/编辑">'
-      + (tab.mode === 'render' ? '编辑' : '渲染') + '</div>'
+  // [AutoC 2026-08-24] Typora 式焦点切换：渲染视图点击进入编辑，编辑器
+  // 失焦切回渲染，状态栏不再放切换分栏。渲染态提示放在 hint 之后。
+  const mdHint = (isMd && tab.mode === 'render')
+    ? '<div class="seg">点击进入编辑</div>'
     : '';
   const indentSeg = (tab.kind === 'text' && (!isMd || tab.mode === 'edit'))
     ? '<div class="seg clickable" id="sb-indent" title="Tab 缩进宽度，点击在 2/4/8 间切换">缩进: ' + indentWidth + '</div>'
     : '';
   statusbarEl.innerHTML = '<div class="seg grow">' + esc(tab.path) + '</div>'
     + (hint ? '<div class="seg ' + hintClass + '">' + esc(hint) + '</div>' : '')
-    + modeSeg + indentSeg;
+    + mdHint + indentSeg;
   const ibtn = document.getElementById('sb-indent');
   if (ibtn) ibtn.addEventListener('click', cycleIndent);
-  const mbtn = document.getElementById('sb-mode');
-  if (mbtn) mbtn.addEventListener('click', () => {
-    setTabMode(tab, tab.mode === 'render' ? 'edit' : 'render');
-  });
   updateSaveButton(tab);
 }
 
