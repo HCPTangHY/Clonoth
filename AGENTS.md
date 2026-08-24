@@ -105,15 +105,15 @@ Inbound message → Supervisor creates Task → Engine executes Node → Tool ca
 ## Commit Format
 
 ```
-[AutoC] type(scope): 中文描述
+type(scope): 中文描述
 ```
 
 Types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `chore`.
 Scopes: `engine`, `supervisor`, `sdk`, `provider`, `toolbox`, `config`, `bot`.
 
 Examples:
-- `[AutoC] fix(supervisor): persistent 子节点支持轮摘要和压缩`
-- `[AutoC] feat(engine): 增加 TaskRecord 双写逻辑`
+- `fix(supervisor): persistent 子节点支持轮摘要和压缩`
+- `feat(engine): 增加 TaskRecord 双写逻辑`
 
 ## Code Sync Flow (Production)
 
@@ -121,7 +121,7 @@ All changes MUST be made in the source repo (`clonoth_original/`) first:
 
 1. Edit files in source repo (`clonoth_original/`)
 2. `py_compile` check
-3. `git add -A && git commit -m '[AutoC] ...'`
+3. `git add -A && git commit -m 'type(scope): ...'`
 4. Copy to production instances
 5. Restart affected services
 
