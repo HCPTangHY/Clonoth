@@ -209,12 +209,16 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
 
         <AttachmentList attachments={attachments} sessionId={message.sessionId} />
 
-        {/* [AutoC 2026-08-24] Footer 行：内置复制按钮（用户与助手消息均显示）
-            + message_footer 槽位（插件追加操作，如 message_retry 的重试/编辑）。
-            复制是每条消息都需要的宿主能力，放在槽位旁不走插件协议。 */}
-        {/* [AutoC 2026-08-24] footer 行只在用户消息和助手消息渲染。
-            工具消息没有可复制文本，footer 行空跑且可能遮挡折叠按钮。 */}
-        {(message.role === 'user' || message.role === 'assistant') && (
+        {/* [AutoC 2026-08-24] Footer 行渲染规则：用户消息始终显示（重试/
+            编辑/复制）；助手消息只在完成态卡片（finish/reply/ask）显示——
+            WorkingGroup 折叠区内的工具轮（中间轮次）不显示 footer，完成态
+            卡片的文本块 footer 由 WorkingGroup 在折叠区外单独渲染。 */}
+        {(message.role === 'user' || (
+          message.role === 'assistant'
+          && (message.completionType === 'finish'
+            || message.completionType === 'reply'
+            || message.completionType === 'ask')
+        )) && (
         <div className="msg-footer-row">
           <MessageCopyButton text={plainText} />
           <MessageMetaInfo source={message.source} />
