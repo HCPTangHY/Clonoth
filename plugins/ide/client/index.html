@@ -251,37 +251,68 @@ body {
   background: rgba(254, 175, 44, 0.4);
 }
 
-/* ── status bar ── */
+/* ── status bar：等高同色点击分栏，无独立按钮 ── */
 .statusbar {
   flex-shrink: 0;
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 2px 10px;
+  align-items: stretch;
   border-top: 1px solid var(--border);
   font-family: var(--mono);
   font-size: 10px;
   color: var(--tertiary);
   background: var(--bg);
+  height: 22px;
 }
-.statusbar .sp { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.statusbar .seg {
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+.statusbar .seg.grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.statusbar .seg.clickable {
+  cursor: pointer;
+  color: var(--secondary);
+}
+.statusbar .seg.clickable:hover {
+  background: var(--hover);
+  color: var(--text);
+}
 .statusbar .hint-dirty { color: var(--accent); }
 .statusbar .hint-error { color: #c0392b; }
-.statusbar button {
-  border: 1px solid var(--border);
+
+/* ── tabbar 右端常驻保存 ── */
+.tabbar .bar-end {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.tabbar .save-btn {
+  display: none;
+  align-items: center;
+  height: 100%;
+  padding: 0 10px;
+  border: 0;
+  border-left: 1px solid var(--border);
   background: transparent;
   color: var(--secondary);
   font-family: var(--mono);
   font-size: 10px;
-  padding: 1px 8px;
   cursor: pointer;
 }
-.statusbar button:hover:not(:disabled) { color: var(--text); border-color: var(--text); }
-.statusbar button:disabled { opacity: 0.4; cursor: default; }
+.tabbar .save-btn.show { display: flex; }
+.tabbar .save-btn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.tabbar .save-btn:disabled { opacity: 0.35; cursor: default; }
 </style>
 </head>
 <body>
-<div class="tabbar" id="tabbar"></div>
+<div class="tabbar" id="tabbar"><div class="bar-end"><button id="bar-save" class="save-btn" title="保存 (Ctrl+S)">保存</button></div></div>
 <div class="view" id="view"></div>
 <div class="statusbar" id="statusbar"></div>
 <script>
@@ -519,6 +550,7 @@ function markEdited(tab, text) {
     renderTabs();
     renderStatusbar();
   }
+  if (activePath === tab.path) updateSaveButton(tab);
 }
 
 function renderEditor(tab) {
@@ -590,6 +622,7 @@ async function saveTab(tab) {
   }
   renderTabs();
   renderStatusbar();
+  updateSaveButton(tab);
 }
 
 document.addEventListener('keydown', (e) => {
@@ -618,19 +651,32 @@ function renderStatusbar() {
     hint = tab.dirty ? '未保存 · Ctrl+S' : '已保存';
     hintClass = tab.dirty ? 'hint-dirty' : '';
   }
-  const indentBtn = tab.kind === 'text'
-    ? '<button id="sb-indent" title="Tab 缩进宽度，点击在 2/4/8 间切换">缩进: ' + indentWidth + '</button>'
+  const indentSeg = tab.kind === 'text'
+    ? '<div class="seg clickable" id="sb-indent" title="Tab 缩进宽度，点击在 2/4/8 间切换">缩进: ' + indentWidth + '</div>'
     : '';
-  const saveBtn = tab.kind === 'text'
-    ? '<button id="sb-save"' + (tab.dirty ? '' : ' disabled') + '>保存</button>'
-    : '';
-  statusbarEl.innerHTML = '<span class="sp">' + esc(tab.path) + '</span>'
-    + (hint ? '<span class="' + hintClass + '">' + esc(hint) + '</span>' : '')
-    + indentBtn + saveBtn;
-  const btn = document.getElementById('sb-save');
-  if (btn) btn.addEventListener('click', () => saveTab(tab));
+  statusbarEl.innerHTML = '<div class="seg grow">' + esc(tab.path) + '</div>'
+    + (hint ? '<div class="seg ' + hintClass + '">' + esc(hint) + '</div>' : '')
+    + indentSeg;
   const ibtn = document.getElementById('sb-indent');
   if (ibtn) ibtn.addEventListener('click', cycleIndent);
+  updateSaveButton(tab);
+}
+
+// 标签栏右端常驻保存按钮：仅文本标签页时显示，脏状态点亮
+const barSaveBtn = document.getElementById('bar-save');
+barSaveBtn.addEventListener('click', () => {
+  const tab = findTab(activePath);
+  if (tab && tab.kind === 'text') saveTab(tab);
+});
+
+function updateSaveButton(tab) {
+  if (!tab || tab.kind !== 'text') {
+    barSaveBtn.classList.remove('show');
+    return;
+  }
+  barSaveBtn.classList.add('show');
+  barSaveBtn.disabled = !tab.dirty;
+  barSaveBtn.textContent = tab.dirty ? '保存 ●' : '保存';
 }
 
 function cycleIndent() {
