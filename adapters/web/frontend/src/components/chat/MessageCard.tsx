@@ -149,8 +149,8 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
     .join('\n');
 
   return (
-    <article className={`group/card ${borderClass} ${paddingClass} ${roleStyle.row}`} data-message-id={message.id}>
-      <div className="mx-auto max-w-3xl">
+    <article className={`group/card overflow-hidden ${borderClass} ${paddingClass} ${roleStyle.row}`} data-message-id={message.id}>
+      <div className="mx-auto max-w-3xl min-w-0">
         {!continuedFromPrev && (
           <header className="mb-1.5 flex flex-wrap items-center gap-2">
             <span className={`font-mono text-[0.6rem] font-semibold uppercase tracking-[0.18em] ${roleStyle.label}`}>
@@ -164,6 +164,32 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
               <span className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]">{message.source.nodeName}</span>
             )}
             {active && <span aria-label="消息正在活动" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />}
+            {/* [AutoC 2026-08-24] 操作区移到 header 尾部：header 是注意力起点，
+                长消息滚动时底部按钮不可见；footer 行删除。用户消息始终显示，
+                助手消息只在完成态卡片显示（工具轮由折叠区承载，不放操作）。
+                用户消息的 prevRole 必非 user 连续卡，header 恒存在。 */}
+            {(message.role === 'user' || (
+              message.role === 'assistant'
+              && (message.completionType === 'finish'
+                || message.completionType === 'reply'
+                || message.completionType === 'ask')
+            )) && (
+              <div className="msg-footer-row ml-auto">
+                <MessageCopyButton text={plainText} />
+                <MessageMetaInfo source={message.source} />
+                <PluginSlotHost
+                  data={{
+                    messageId: message.id,
+                    role: message.role,
+                    sessionId: message.sessionId,
+                    retryable,
+                    text: plainText,
+                    isLastUserMessage: !!isLastUserMessage,
+                  }}
+                  slot="message_footer"
+                />
+              </div>
+            )}
           </header>
         )}
 
@@ -209,32 +235,6 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
 
         <AttachmentList attachments={attachments} sessionId={message.sessionId} />
 
-        {/* [AutoC 2026-08-24] Footer 行渲染规则：用户消息始终显示（重试/
-            编辑/复制）；助手消息只在完成态卡片（finish/reply/ask）显示——
-            WorkingGroup 折叠区内的工具轮（中间轮次）不显示 footer，完成态
-            卡片的文本块 footer 由 WorkingGroup 在折叠区外单独渲染。 */}
-        {(message.role === 'user' || (
-          message.role === 'assistant'
-          && (message.completionType === 'finish'
-            || message.completionType === 'reply'
-            || message.completionType === 'ask')
-        )) && (
-        <div className="msg-footer-row">
-          <MessageCopyButton text={plainText} />
-          <MessageMetaInfo source={message.source} />
-          <PluginSlotHost
-            data={{
-              messageId: message.id,
-              role: message.role,
-              sessionId: message.sessionId,
-              retryable,
-              text: plainText,
-              isLastUserMessage: !!isLastUserMessage,
-            }}
-            slot="message_footer"
-          />
-        </div>
-        )}
       </div>
     </article>
   );

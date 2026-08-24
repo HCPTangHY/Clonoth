@@ -66,7 +66,11 @@ export default {
 
     console.debug('[msg_retry] mounted', ctx.slotId, ctx.data?.messageId);
     ctx.el.appendChild(wrap);
-    ctx.el.appendChild(editor);
+    // [AutoC 2026-08-24] 操作区移入 header 后，槽位元素位于 header 行内，
+    // 编辑框若仍挂槽位会挤在行内破坏布局。改挂到消息卡片（article）底部，
+    // 按钮在 header、编辑区在卡片内容下方，符合编辑语义。
+    const hostArticle = ctx.el.closest('article');
+    (hostArticle || ctx.el).appendChild(editor);
 
     // 宿主重挂载（切换会话/视图）后恢复编辑状态与草稿
     const ms = this._msgState();
@@ -195,7 +199,7 @@ _STYLES = r"""
 
 PLUGIN_META = {
     "name": "message_retry",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "description": "消息重试/编辑：用户消息的原样重试与编辑后重试（message_footer 槽位）",
     "author": "clonoth",
     "client": {

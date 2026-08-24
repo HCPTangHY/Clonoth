@@ -126,6 +126,14 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
               {isActive ? '输出中' : '已完成'}
             </span>
             {isActive && <span aria-label="工作进行中" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />}
+            {hasCompletion && lastCard && completionTextBlocks.length > 0 && (
+              <div className="msg-footer-row ml-auto">
+                <MessageCopyButton
+                  text={completionTextBlocks.map((b) => (b as TextBlock).text).join('\n')}
+                />
+                <MessageMetaInfo source={lastCard.source} />
+              </div>
+            )}
           </header>
           <button
             type="button"
@@ -188,8 +196,8 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
 
       {/* Finish text blocks: always visible, no gap with fold above */}
       {hasCompletion && lastCard && (completionTextBlocks.length > 0 || (lastCard.attachments && lastCard.attachments.length > 0)) && completionContext && (
-        <article className="group/card border-b border-[var(--duties-border)] bg-[var(--duties-panel)] px-3 pt-0 pb-3 sm:px-4">
-          <div className="mx-auto max-w-3xl">
+        <article className="group/card overflow-hidden border-b border-[var(--duties-border)] bg-[var(--duties-panel)] px-3 pt-0 pb-3 sm:px-4">
+          <div className="mx-auto max-w-3xl min-w-0">
             <div className={BLOCK_STACK_CLASS}>
               {completionTextBlocks.map((block) => (
                 <RenderBlockView
@@ -202,17 +210,6 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
             </div>
             {lastCard.attachments && lastCard.attachments.length > 0 && (
               <AttachmentList attachments={lastCard.attachments} sessionId={lastCard.sessionId} />
-            )}
-            {/* [AutoC 2026-08-24] 完成态助手消息的文本块由 WorkingGroup 直接
-                渲染、绕过 MessageCard，因此复制按钮需要在这里单独渲染。
-                文本内容从 completionTextBlocks 拼出。 */}
-            {completionTextBlocks.length > 0 && (
-              <div className="msg-footer-row">
-                <MessageCopyButton
-                  text={completionTextBlocks.map((b) => (b as TextBlock).text).join('\n')}
-                />
-                <MessageMetaInfo source={lastCard.source} />
-              </div>
             )}
           </div>
         </article>

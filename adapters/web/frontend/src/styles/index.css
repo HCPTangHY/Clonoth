@@ -88,6 +88,13 @@ textarea {
   color: var(--duties-text);
 }
 
+/* [AutoC 2026-08-24] 消息体防横向溢出：长 URL、长代码行等不得撑宽卡片，
+   pre 已有 overflow-x: auto，其余内容强制断词换行。 */
+.markdown-body {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
 .markdown-body > :first-child {
   margin-top: 0;
 }
@@ -183,7 +190,6 @@ textarea {
   display: flex;
   align-items: center;
   gap: 2px;
-  margin-top: 2px;
   opacity: 0.35;
   transition: opacity 0.15s ease;
 }
@@ -222,11 +228,12 @@ textarea {
 .msg-meta-pop {
   position: absolute;
   bottom: calc(100% + 6px);
-  left: 0;
+  right: 0;
   z-index: 20;
   display: flex;
   flex-direction: column;
   min-width: 132px;
+  max-width: 220px;
   padding: 6px 10px 7px;
   background: var(--duties-card, #ffffff);
   border: 1px solid var(--duties-border);
