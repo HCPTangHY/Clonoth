@@ -57,6 +57,10 @@ export const ContextPopover = ({ sessionId, conversationKey, usage, onClose }: C
 
   const utilizationPercent = Math.min(100, Math.max(0, Math.round(usage.utilization * 100)));
   const usageText = `${formatFullTokens(usage.effectiveTokens)} / ${formatFullTokens(usage.compactThreshold)} tokens (${utilizationPercent}%)`;
+  // [AutoC 2026-08-24] 缓存命中率：有数据时追加在用量文本后
+  const cacheHitRateText = usage.cacheHitRate !== null && usage.cacheHitRate !== undefined
+    ? `缓存率 ${(usage.cacheHitRate * 100).toFixed(1)}%`
+    : null;
 
   useEffect(() => {
     const handleOutsidePress = (event: MouseEvent | TouchEvent) => {
@@ -128,6 +132,9 @@ export const ContextPopover = ({ sessionId, conversationKey, usage, onClose }: C
         role="dialog"
       >
         <p className="font-mono text-xs text-[var(--duties-text)]">{usageText}</p>
+        {cacheHitRateText && (
+          <p className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]">{cacheHitRateText}</p>
+        )}
         <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-[var(--duties-border)]" aria-hidden="true">
           <div
             className={`h-full rounded-full transition-all ${progressColorClass(usage.utilization)}`}
