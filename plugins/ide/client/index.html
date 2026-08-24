@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IDE</title>
+<script src="vendor/codemirror.js"></script>
 <style>
 /* [AutoC 2026-08-24] IDE 面板页：单一主页 + 顶部标签栏 + 文本编辑。
    只写结构与变量名映射，不抄宿主值；主题变量与滚动条规则由宿主
@@ -134,48 +135,50 @@ body {
 
 /* file content */
 .pv-img { display: block; max-width: 100%; margin: 8px auto; }
-.editor-wrap {
+/* CodeMirror 容器撑满视图区 */
+.cm-host {
   flex: 1;
   min-height: 0;
   display: flex;
+  flex-direction: column;
   overflow: hidden;
   background: var(--card);
 }
-/* 行号槽：与 textarea 共用字体/行高/上内边距，自身不滚动，
-   由 textarea 的 scroll 事件镜像 scrollTop。white-space: pre 保证
-   两侧都按物理行布局，长行不换行，行号与内容行一一对应。 */
-.ln-gutter {
-  flex-shrink: 0;
-  overflow: hidden;
-  padding: 8px 0;
-  text-align: right;
-  color: var(--tertiary);
-  background: var(--bg);
-  border-right: 1px solid var(--border);
-  font-family: var(--mono);
-  font-size: 11px;
-  line-height: 1.5;
-  user-select: none;
-}
-.ln-gutter div {
-  padding: 0 8px 0 12px;
-  white-space: pre;
-}
-.editor-textarea {
+.cm-host .cm-editor {
   flex: 1;
-  min-width: 0;
-  border: 0;
-  outline: none;
-  resize: none;
-  padding: 8px 12px;
-  background: var(--card);
-  color: var(--text);
-  font-family: var(--mono);
+  min-height: 0;
   font-size: 11px;
+}
+.cm-host .cm-scroller {
+  font-family: var(--mono);
   line-height: 1.5;
-  white-space: pre;
   overflow: auto;
-  tab-size: 4;
+}
+.cm-host .cm-content {
+  padding: 8px 0;
+  caret-color: var(--text);
+}
+.cm-host .cm-gutters {
+  background: var(--bg);
+  color: var(--tertiary);
+  border-right: 1px solid var(--border);
+  border-left: 0;
+}
+.cm-host .cm-activeLineGutter {
+  background: var(--hover);
+}
+.cm-host .cm-activeLine {
+  background: var(--hover);
+}
+.cm-host .cm-selectionBackground,
+.cm-host.cm-focused .cm-selectionBackground {
+  background: rgba(128, 128, 128, 0.25) !important;
+}
+.cm-host .cm-cursor {
+  border-left-color: var(--text);
+}
+.cm-host .cm-editor.cm-focused {
+  outline: none;
 }
 
 /* ── status bar ── */
@@ -391,9 +394,8 @@ function showStatus(text) {
 
 function stashScroll() {
   const tab = viewPath && viewPath !== TREE_TAB ? findTab(viewPath) : null;
-  if (!tab || tab.kind !== 'text') return;
-  const ta = viewEl.querySelector('textarea');
-  if (ta) tab.scroll = ta.scrollTop;
+  if (!tab || tab.kind !== 'text' || !tab._view) return;
+  tab.scroll = tab._view.scrollDOM.scrollTop;
 }
 
 function renderView() {
@@ -424,8 +426,8 @@ function renderFileTab(tab) {
 
 // ── editor ───────────────────────────────────────────────────────────────
 
-function markEdited(tab, ta) {
-  tab.text = ta.value;
+function markEdited(tab, text) {
+  tab.text = text;
   const wasDirty = tab.dirty;
   const wasPinned = tab.pinned;
   tab.dirty = tab.text !== tab.savedText;
@@ -438,47 +440,50 @@ function markEdited(tab, ta) {
 
 function renderEditor(tab) {
   viewEl.innerHTML = '';
-  const wrap = document.createElement('div');
-  wrap.className = 'editor-wrap';
-  const gutter = document.createElement('div');
-  gutter.className = 'ln-gutter';
-  const ta = document.createElement('textarea');
-  ta.className = 'editor-textarea';
-  ta.value = tab.text;
-  ta.spellcheck = false;
+  const host = document.createElement('div');
+  host.className = 'cm-host';
+  viewEl.appendChild(host);
 
-  // 行号渲染：按物理行数重建（只有行数变化才重建），宽度随行数位数走。
-  let gutterLines = 0;
-  function renderGutter() {
-    const lines = ta.value.split('\n').length;
-    if (lines === gutterLines) return;
-    gutterLines = lines;
-    const width = String(lines).length;
-    gutter.style.width = (width * 0.66 + 1.6) + 'em';
-    let html = '';
-    for (let i = 1; i <= lines; i++) html += '<div>' + i + '</div>';
-    gutter.innerHTML = html;
-    gutter.scrollTop = ta.scrollTop;
-  }
+  const { EditorState, EditorView, keymap, lineNumbers, highlightActiveLine,
+          highlightActiveLineGutter, drawSelection, defaultKeymap, history,
+          historyKeymap, indentWithTab, syntaxHighlighting,
+          defaultHighlightStyle, bracketMatching, foldGutter, searchKeymap,
+          highlightSelectionMatches } = CM;
 
-  ta.addEventListener('input', () => { markEdited(tab, ta); renderGutter(); });
-  ta.addEventListener('scroll', () => { gutter.scrollTop = ta.scrollTop; });
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      ta.setRangeText('\t', ta.selectionStart, ta.selectionEnd, 'end');
-      markEdited(tab, ta);
-      renderGutter();
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-      e.preventDefault();
-      saveTab(tab);
-    }
+  const view = new EditorView({
+    parent: host,
+    state: EditorState.create({
+      doc: tab.text,
+      extensions: [
+        lineNumbers(),
+        highlightActiveLine(),
+        highlightActiveLineGutter(),
+        drawSelection(),
+        history(),
+        bracketMatching(),
+        foldGutter(),
+        syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+        highlightSelectionMatches(),
+        keymap.of([
+          ...defaultKeymap,
+          ...historyKeymap,
+          ...searchKeymap,
+          indentWithTab,
+          { key: 'Mod-s', run: () => { saveTab(tab); return true; } },
+        ]),
+        EditorView.updateListener.of((u) => {
+          if (u.docChanged) markEdited(tab, u.state.doc.toString());
+        }),
+        EditorView.theme({
+          '&': { height: '100%' },
+          '.cm-scroller': { overflow: 'auto' },
+        }),
+      ],
+    }),
   });
-  wrap.appendChild(gutter);
-  wrap.appendChild(ta);
-  viewEl.appendChild(wrap);
-  ta.scrollTop = tab.scroll || 0;
-  renderGutter();
+  tab._view = view;
+  view.scrollDOM.scrollTop = tab.scroll || 0;
+  view.requestMeasure();
 }
 
 async function saveTab(tab) {

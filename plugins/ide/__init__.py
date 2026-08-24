@@ -17,8 +17,8 @@ from pathlib import Path
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.5.0",
-    "description": "Web IDE：接管工作区文件面板（标签栏切换、文本编辑保存）",
+    "version": "0.6.0",
+    "description": "Web IDE：接管工作区文件面板（标签栏切换、CodeMirror 6 编辑器：行号/语法高亮/折叠/搜索）",
     "author": "clonoth",
     "client": {
         "panels": [
