@@ -1275,20 +1275,16 @@ class SessionMixin:
         node_id = str(payload.get("node_id") or "")
         cache_key = (session_id, node_id)
         with self._lock:
-            self._session_context_usage[cache_key] = {
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "total_tokens": usage.get("total_tokens"),
-                # [AutoC 2026-08-24] 缓存字段透传：provider 层已归一化为
-                # cached_prompt_tokens / cache_write_prompt_tokens，此处白名单
-                # 存储此前将其丢弃，导致快照响应的 usage 子字典缺缓存字段，
-                # 前端仪表的会话级缓存率无法从实时事件播种。
-                "cached_prompt_tokens": usage.get("cached_prompt_tokens"),
-                "cache_write_prompt_tokens": usage.get("cache_write_prompt_tokens"),
-                "node_id": node_id,
-                "task_id": str(payload.get("task_id") or ""),
-                "updated_at": _now().isoformat(),
-            }
+            # [AutoC 2026-08-24] usage 全量存储，不再按白名单过滤。
+            # 原因：provider 层已把各渠道字段归一化为 Clonoth 内部格式，
+            # supervisor 只负责搬运；白名单导致每新增一个字段就要改这里，
+            # 缓存字段曾因此被丢弃（快照接口缺缓存数据）。usage 字典
+            # 在归一化后只有数值字段，体量可以忽略。
+            entry = dict(usage)
+            entry["node_id"] = node_id
+            entry["task_id"] = str(payload.get("task_id") or "")
+            entry["updated_at"] = _now().isoformat()
+            self._session_context_usage[cache_key] = entry
 
     def get_session_context_usage(self, session_id: str) -> dict[str, Any]:
         """获取 session 的上下文窗口用量，包含实际值、估算值和利用率。
