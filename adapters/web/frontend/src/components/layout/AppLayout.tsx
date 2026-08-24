@@ -4,10 +4,24 @@
 // without adding App-level conditionals or layout-specific overrides. How: make the
 // composer optional and split the right column into upper and lower slots only.
 // Purpose: AppLayout remains unaware of chat, settings, or any concrete panel type.
+// [AutoC 2026-08-24] Resizable side columns. Why: long session lists and the IDE
+// file panel both outgrow fixed widths, and different workflows want different
+// splits. How: a 6px drag handle on each side boundary (desktop only), pointer
+// events with clamped live width updates, final width persisted via settingsStore.
+// Purpose: column sizing is user-controlled layout state, not a fixed constant.
 import { type PropsWithChildren, type ReactNode, useRef, useState } from 'react';
 
 import { useSettingsStore } from '../../store/settingsStore';
 import { Icon } from '../common';
+
+// [AutoC 2026-08-24] Clamp bounds shared with settingsStore.readStoredWidth —
+// stored values outside the range are discarded there, live drags stop here.
+const LEFT_MIN = 180;
+const LEFT_MAX = 420;
+const RIGHT_MIN = 220;
+const RIGHT_MAX = 640;
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 interface AppLayoutProps extends PropsWithChildren {
   sidebar: ReactNode;
@@ -21,8 +35,44 @@ interface AppLayoutProps extends PropsWithChildren {
 export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rightOverlay, children }: AppLayoutProps) => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { rightPanelOpen, setRightPanelOpen } = useSettingsStore();
+  const sidebarWidth = useSettingsStore((s) => s.sidebarWidth);
+  const rightPanelWidth = useSettingsStore((s) => s.rightPanelWidth);
   const hasRightPanel = Boolean(logPanel || rightPanel);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
+
+  // [AutoC 2026-08-24] Drag-to-resize. Pointer capture keeps tracking outside
+  // the handle; user-select is suppressed for the drag duration so text under
+  // the pointer is not highlighted.
+  const startDrag = (side: 'left' | 'right') => (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const startWidth = side === 'left' ? sidebarWidth : rightPanelWidth;
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+
+    const onMove = (e: PointerEvent) => {
+      const delta = side === 'left' ? e.clientX - startX : startX - e.clientX;
+      const next = clamp(
+        startWidth + delta,
+        side === 'left' ? LEFT_MIN : RIGHT_MIN,
+        side === 'left' ? LEFT_MAX : RIGHT_MAX,
+      );
+      const store = useSettingsStore.getState();
+      if (side === 'left') store.setSidebarWidth(next);
+      else store.setRightPanelWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
 
   const handleTouchStart = (event: React.TouchEvent<HTMLDivElement>) => {
     // [2026-06-02] Store only the first touch point for mobile panel gestures. Why:
@@ -85,12 +135,27 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
       )}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-40 w-[15rem] flex-shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] transition-transform md:relative md:z-auto md:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-40 flex-shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] transition-transform md:relative md:z-auto md:translate-x-0 ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
+        style={{ width: '15rem' }}
+        ref={(el) => {
+          // desktop width follows the draggable value; mobile keeps the fixed
+          // off-canvas width from the class above
+          if (el && window.matchMedia('(min-width: 768px)').matches) {
+            el.style.width = `${sidebarWidth}px`;
+          }
+        }}
       >
         {sidebar}
       </aside>
+
+      {/* left drag handle (desktop only) */}
+      <div
+        aria-hidden="true"
+        className="hidden w-1.5 flex-shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--duties-accent)] md:block"
+        onPointerDown={startDrag('left')}
+      />
 
       <main className="flex min-w-0 flex-1 flex-col">
         <div className="flex-shrink-0 border-b border-[var(--duties-border)] bg-[var(--duties-bg)]">
@@ -127,14 +192,31 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
         )}
       </main>
 
+      {/* right drag handle (desktop only, only when the panel is open) */}
+      {hasRightPanel && rightPanelOpen && (
+        <div
+          aria-hidden="true"
+          className="hidden w-1.5 flex-shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--duties-accent)] md:block"
+          onPointerDown={startDrag('right')}
+        />
+      )}
       {hasRightPanel && (
         <aside
           aria-label="右侧面板"
           className={`flex-shrink-0 flex-col overflow-hidden border-l border-[var(--duties-border)] bg-[var(--duties-panel)] ${
             rightPanelOpen
-              ? 'fixed inset-y-0 right-0 z-40 flex w-[85vw] translate-x-0 transition-transform duration-200 md:relative md:z-auto md:w-72 md:translate-x-0 md:transition-[width]'
+              ? 'fixed inset-y-0 right-0 z-40 flex translate-x-0 transition-transform duration-200 md:relative md:z-auto md:translate-x-0'
               : 'fixed inset-y-0 right-0 z-40 w-[85vw] translate-x-full transition-transform duration-200 md:relative md:z-auto md:w-0 md:translate-x-0 md:transition-[width] md:duration-200'
           }`}
+          style={rightPanelOpen ? { width: `${rightPanelWidth}px` } : undefined}
+          ref={(el) => {
+            if (!el) return;
+            if (window.matchMedia('(min-width: 768px)').matches) {
+              el.style.width = rightPanelOpen ? `${rightPanelWidth}px` : '0px';
+            } else if (rightPanelOpen) {
+              el.style.width = '85vw';
+            }
+          }}
         >
           {rightOverlay && (
             <div className="absolute inset-0 z-10 flex flex-col overflow-hidden bg-[var(--duties-panel)]">

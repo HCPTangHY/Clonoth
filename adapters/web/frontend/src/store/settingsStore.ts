@@ -10,10 +10,23 @@ import type { NodeDef } from '../types';
 
 const LS_KEY_TOKEN = 'clonoth_admin_token';
 const LS_KEY_NODE = 'clonoth_entry_node';
+const LS_KEY_SIDEBAR_WIDTH = 'clonoth_sidebar_width';
+const LS_KEY_RIGHT_WIDTH = 'clonoth_right_width';
 
 type SessionProviderOverride = Record<string, unknown>;
 
 const initialRightPanelOpen = () => window.innerWidth >= 768;
+
+// [AutoC 2026-08-24] Resizable side columns. Widths persist across sessions;
+// out-of-range stored values fall back to defaults. Clamp bounds match the
+// drag handlers in AppLayout (left 180–420, right 220–640).
+function readStoredWidth(key: string, fallback: number, min: number, max: number): number {
+  try {
+    const raw = Number(localStorage.getItem(key));
+    if (Number.isFinite(raw) && raw >= min && raw <= max) return Math.round(raw);
+  } catch { /* storage unavailable */ }
+  return fallback;
+}
 
 interface SettingsState {
   adminToken: string | null;
@@ -48,6 +61,10 @@ interface SettingsState {
   // still needs an independent collapse flag. How: keep one boolean here. Purpose:
   // settings and chat views can both preserve the user's right-panel visibility.
   rightPanelOpen: boolean;
+  // [AutoC 2026-08-24] Side column widths (px). Owned here so AppLayout's drag
+  // handles and any future consumers share one source; persisted on change.
+  sidebarWidth: number;
+  rightPanelWidth: number;
   // [2026-06-12] True when the backend reports no provider has a valid API key.
   needsSetup: boolean;
 
@@ -63,6 +80,8 @@ interface SettingsState {
   setPendingProviderOverride: (override: SessionProviderOverride | null) => void;
   setSessionWorkspaceName: (name: string) => void;
   setRightPanelOpen: (open: boolean) => void;
+  setSidebarWidth: (width: number) => void;
+  setRightPanelWidth: (width: number) => void;
   setNeedsSetup: (v: boolean) => void;
 }
 
@@ -86,6 +105,8 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   pendingProviderOverride: null,
   sessionWorkspaceName: '',
   rightPanelOpen: initialRightPanelOpen(),
+  sidebarWidth: readStoredWidth(LS_KEY_SIDEBAR_WIDTH, 240, 180, 420),
+  rightPanelWidth: readStoredWidth(LS_KEY_RIGHT_WIDTH, 288, 220, 640),
   needsSetup: false,
 
   setAdminToken: (token) => {
@@ -117,6 +138,14 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setPendingProviderOverride: (override) => set({ pendingProviderOverride: override }),
   setSessionWorkspaceName: (name) => set({ sessionWorkspaceName: name }),
   setRightPanelOpen: (open) => set({ rightPanelOpen: open }),
+  setSidebarWidth: (width) => {
+    try { localStorage.setItem(LS_KEY_SIDEBAR_WIDTH, String(Math.round(width))); } catch { /* ignore */ }
+    set({ sidebarWidth: Math.round(width) });
+  },
+  setRightPanelWidth: (width) => {
+    try { localStorage.setItem(LS_KEY_RIGHT_WIDTH, String(Math.round(width))); } catch { /* ignore */ }
+    set({ rightPanelWidth: Math.round(width) });
+  },
   setNeedsSetup: (v) => set({ needsSetup: v }),
 }));
 
