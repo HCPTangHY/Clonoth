@@ -248,6 +248,7 @@ export const MessageCopyButton = ({ text }: { text: string }) => {
   const [copied, setCopied] = useState(false);
   if (!text) return null;
   const doCopy = async () => {
+    console.debug('[copy] clicked, text len', text.length);
     try {
       await navigator.clipboard.writeText(text);
     } catch {
@@ -262,6 +263,7 @@ export const MessageCopyButton = ({ text }: { text: string }) => {
       document.body.removeChild(ta);
     }
     setCopied(true);
+    console.debug('[copy] done');
     setTimeout(() => setCopied(false), 1500);
   };
   return (
@@ -277,10 +279,11 @@ export const MessageCopyButton = ({ text }: { text: string }) => {
 };
 
 // [AutoC 2026-08-24] Upstream metadata display in the footer row. Why: provider
-// and token usage are already on message.source but invisible to users. How:
-// render a tertiary-colour info icon; hover reveals provider name and prompt /
-// completion token counts. Purpose: debugging context and cost awareness without
-// taking layout space.
+// and token usage are already on message.source but invisible to users; a
+// hover-only title tooltip was undiscoverable and click did nothing; an
+// inline text readout pushed sibling buttons down. How: click toggles a
+// floating popover positioned above the footer row, never affecting layout.
+// Purpose: debugging context and cost awareness without layout shift.
 export const MessageMetaInfo = ({ source }: { source?: WsMessage['source'] }) => {
   const provider = typeof source?.provider === 'string' ? source.provider.trim() : '';
   const usage = source?.usage ?? null;
@@ -291,9 +294,19 @@ export const MessageMetaInfo = ({ source }: { source?: WsMessage['source'] }) =>
   if (provider) parts.push(provider);
   if (promptTokens !== null) parts.push(`in ${promptTokens}`);
   if (completionTokens !== null) parts.push(`out ${completionTokens}`);
+  const [open, setOpen] = useState(false);
+  const text = parts.join(' · ');
   return (
-    <span className="msg-meta-info" title={parts.join(' · ')}>
-      <Icon name="info" size={12} />
+    <span className="msg-meta-wrap">
+      <button
+        className="msg-meta-info"
+        onClick={() => setOpen((v) => !v)}
+        title={text}
+        type="button"
+      >
+        <Icon name="info" size={13} />
+      </button>
+      {open && <span className="msg-meta-pop">{text}</span>}
     </span>
   );
 };

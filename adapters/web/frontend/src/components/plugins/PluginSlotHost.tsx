@@ -194,6 +194,9 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
         <div
           key={contribution.slotId}
           data-plugin-slot={contribution.slotId}
+          // [AutoC 2026-08-24] display:contents 让该容器不生成盒子，插件内容
+          // 直接参与父级 flex 布局，与同级宿主元素（复制/信息按钮）基线对齐。
+          style={{ display: 'contents' }}
           ref={(el) => {
             if (el) containersRef.current.set(contribution.slotId, el);
             else containersRef.current.delete(contribution.slotId);

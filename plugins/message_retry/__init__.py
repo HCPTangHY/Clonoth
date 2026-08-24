@@ -26,17 +26,11 @@ export default {
 
     const wrap = document.createElement('div');
     wrap.className = 'msg-retry-acts';
-    // [AutoC 2026-08-24] Unicode 符号字形偏小，与宿主 13px SVG 图标按钮
-    // 视觉不同级。换用 13px SVG 图标，尺寸与复制按钮一致。
+    // [AutoC 2026-08-24] 图标与宿主复制按钮完全同体系：Material Symbols
+    // w400 path、fill=currentColor、13px，视觉尺寸/描边/基线一致。
     wrap.innerHTML =
-      '<button type="button" class="mr-retry" title="原样重试">' +
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
-        'stroke-linecap="round" stroke-linejoin="round" width="13" height="13">' +
-        '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>' +
-      '<button type="button" class="mr-edit" title="编辑后重试">' +
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
-        'stroke-linecap="round" stroke-linejoin="round" width="13" height="13">' +
-        '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>';
+      '<button type="button" class="mr-retry" title="原样重试"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M480-160q-133 0-226.5-93.5T160-480q0-133 93.5-226.5T480-800q85 0 149 34.5T740-671v-99q0-13 8.5-21.5T770-800q13 0 21.5 8.5T800-770v194q0 13-8.5 21.5T770-546H576q-13 0-21.5-8.5T546-576q0-13 8.5-21.5T576-606h138q-38-60-97-97t-137-37q-109 0-184.5 75.5T220-480q0 109 75.5 184.5T480-220q75 0 140-39.5T717-366q5-11 16.5-16.5t22.5-.5q12 5 16 16.5t-1 23.5q-39 84-117.5 133.5T480-160Z"/></svg></button>' +
+      '<button type="button" class="mr-edit" title="编辑后重试"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M180-180h44l472-471-44-44-472 471v44Zm-30 60q-13 0-21.5-8.5T120-150v-73q0-12 5-23.5t13-19.5l557-556q8-8 19-12.5t23-4.5q11 0 22 4.5t20 12.5l44 44q9 9 13 20t4 22q0 11-4.5 22.5T823-694L266-138q-8 8-19.5 13t-23.5 5h-73Zm629-617-41-41 41 41Zm-105 64-22-22 44 44-22-22Z"/></svg></button>';
 
     const editor = document.createElement('div');
     editor.className = 'msg-retry-editor';
@@ -53,8 +47,14 @@ export default {
     this._editor = editor;
     this._ta = editor.querySelector('.mr-textarea');
 
-    wrap.querySelector('.mr-retry').addEventListener('click', () => this._doRetry());
-    wrap.querySelector('.mr-edit').addEventListener('click', () => this._startEdit());
+    wrap.querySelector('.mr-retry').addEventListener('click', () => {
+      console.debug('[msg_retry] retry clicked', ctx.data?.messageId);
+      this._doRetry();
+    });
+    wrap.querySelector('.mr-edit').addEventListener('click', () => {
+      console.debug('[msg_retry] edit clicked', ctx.data?.messageId);
+      this._startEdit();
+    });
     editor.querySelector('.mr-submit').addEventListener('click', () => this._submitEdit());
     editor.querySelector('.mr-cancel').addEventListener('click', () => this._cancelEdit());
     // 用户输入即草稿；宿主 update 永不覆盖正在编辑的内容
@@ -64,6 +64,7 @@ export default {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) this._submitEdit();
     });
 
+    console.debug('[msg_retry] mounted', ctx.slotId, ctx.data?.messageId);
     ctx.el.appendChild(wrap);
     ctx.el.appendChild(editor);
 
@@ -130,17 +131,13 @@ export default {
 """
 
 _STYLES = r"""
+/* [AutoC 2026-08-24] 透明度由父容器 .msg-footer-row 统一控制，本组件不再
+   自行设置（否则与父容器叠加成 0.12，比重制按钮暗得多）。间距与对齐跟
+   随父容器（gap 2px、垂直居中），悬停色跟随宿主正文色。 */
 .msg-retry-acts {
   display: flex;
-  gap: 6px;
-  margin-top: 4px;
-}
-/* [AutoC 2026-08-24] 常显半透明 + 悬停全亮：footer 位置的操作按钮
-   不可见时是一块空白，不如半透明常显提示存在。移动端始终全亮。 */
-.msg-retry-acts { opacity: 0.35; transition: opacity 0.15s ease; }
-.group\/card:hover .msg-retry-acts { opacity: 1; }
-@media (max-width: 639px) {
-  .msg-retry-acts { opacity: 1; }
+  align-items: center;
+  gap: 2px;
 }
 /* [AutoC 2026-08-24] 尺寸对齐宿主复制按钮：SVG 图标 13px、内边距 2px。 */
 .msg-retry-acts button {
@@ -155,7 +152,7 @@ _STYLES = r"""
   justify-content: center;
 }
 .msg-retry-acts button svg { display: block; }
-.msg-retry-acts button:hover { color: #2563eb; }
+.msg-retry-acts button:hover { color: var(--duties-text); }
 .msg-retry-editor {
   margin-top: 6px;
   display: flex;
@@ -198,7 +195,7 @@ _STYLES = r"""
 
 PLUGIN_META = {
     "name": "message_retry",
-    "version": "1.2.0",
+    "version": "1.4.0",
     "description": "消息重试/编辑：用户消息的原样重试与编辑后重试（message_footer 槽位）",
     "author": "clonoth",
     "client": {

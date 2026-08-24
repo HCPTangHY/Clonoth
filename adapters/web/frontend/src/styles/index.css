@@ -192,14 +192,6 @@ textarea {
   .msg-footer-row { opacity: 1; }
 }
 
-/* [AutoC 2026-08-24] 信息图标：悬停时放大提示，不改变布局。 */
-.msg-meta-info {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px;
-  color: var(--duties-tertiary);
-  cursor: default;
-}
 .msg-copy-btn {
   display: inline-flex;
   align-items: center;
@@ -212,12 +204,33 @@ textarea {
   transition: color 0.15s ease;
 }
 .msg-copy-btn:hover { color: var(--duties-text); }
-/* [AutoC 2026-08-24] 元信息图标：与复制按钮同尺寸同级色，悬停显示
-   provider 与 token 用量（title 提示）。 */
+/* [AutoC 2026-08-24] 元信息按钮 + 浮动详情卡。点击在 footer 上方弹出
+   浮层，不占布局、不推挤同级按钮。 */
+.msg-meta-wrap { position: relative; display: inline-flex; }
 .msg-meta-info {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   padding: 2px;
+  border: 0;
+  background: transparent;
   color: var(--duties-tertiary);
-  cursor: default;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+.msg-meta-info:hover { color: var(--duties-text); }
+.msg-meta-pop {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  padding: 3px 8px;
+  background: var(--duties-card, #ffffff);
+  border: 1px solid var(--duties-border);
+  color: var(--duties-secondary);
+  font-family: var(--duties-font-mono, ui-monospace, monospace);
+  font-size: 0.55rem;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  pointer-events: none;
 }
