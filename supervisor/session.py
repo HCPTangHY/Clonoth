@@ -1339,6 +1339,11 @@ class SessionMixin:
                         prompt_tokens = msg_usage["prompt_tokens"]
                         usage["completion_tokens"] = msg_usage.get("completion_tokens")
                         usage["total_tokens"] = msg_usage.get("total_tokens")
+                        # [AutoC 2026-08-24] 缓存字段一并恢复，供快照响应里的
+                        # usage 子字典携带，前端仪表重载后缓存率不丢。
+                        for _ck in ("cached_prompt_tokens", "cache_write_prompt_tokens"):
+                            if msg_usage.get(_ck):
+                                usage[_ck] = msg_usage[_ck]
                         break
 
         msgs = [{"content": m.content, "role": m.role} for m in stored_msgs]
@@ -1371,6 +1376,10 @@ class SessionMixin:
             "utilization": utilization,
             "updated_at": usage.get("updated_at"),
             "message_count": len(msgs),
+            # [AutoC 2026-08-24] 完整 usage 子字典：前端 updateContextUsage 的
+            # 缓存命中率 EMA 读 payload.usage.cached_prompt_tokens；快照路径
+            # 此前不携带 usage，重载后缓存率指标消失。
+            "usage": dict(usage) if usage else None,
         }
 
     @staticmethod

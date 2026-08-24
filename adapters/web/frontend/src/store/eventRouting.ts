@@ -625,6 +625,10 @@ export function maybeUpdateContextUsageFromEvent(event: SupervisorEvent, get: St
     compact_threshold: threshold,
     utilization,
     source: 'llm_usage',
+    // [AutoC 2026-08-24] 原样透传 usage：updateContextUsage 的缓存命中率 EMA
+    // 需要读 payload.usage.cached_prompt_tokens，此前此处构造对象时丢弃了
+    // usage 字段，导致仪表上的缓存率永远不会被实时事件更新。
+    usage,
   });
 }
 
