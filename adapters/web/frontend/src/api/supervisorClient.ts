@@ -61,11 +61,23 @@ export function getStoredAdminToken(): string {
  */
 export async function pluginApiRequest(path: string, init?: RequestInit): Promise<unknown> {
   const resp = await apiFetch(path, init);
-  try {
-    return await resp.json();
-  } catch {
-    return null;
+  // [AutoC 2026-08-24] Parse by content type instead of assuming JSON: the
+  // session file endpoint streams raw file bytes (text, images), and plugins
+  // rendering previews need the body in its natural shape. JSON stays parsed;
+  // text-like bodies come back as strings; everything else is a Blob so the
+  // plugin can decide (object URL for images, blob.text() as a fallback).
+  const ct = resp.headers.get('content-type') || '';
+  if (ct.includes('application/json')) {
+    try {
+      return await resp.json();
+    } catch {
+      return null;
+    }
   }
+  if (ct.startsWith('text/') || ct.includes('javascript') || ct.includes('xml') || ct.includes('json')) {
+    return resp.text();
+  }
+  return resp.blob();
 }
 
 // ── Attachment upload ──
