@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IDE</title>
 <style>
-/* [AutoC 2026-08-24] IDE 面板页。只写结构与变量名映射，不抄宿主值；
-   主题变量与滚动条规则由宿主 themeBridge 在 iframe load 后注入。 */
+/* [AutoC 2026-08-24] IDE 面板页 v2：左右分栏 + 顶部多标签。
+   只写结构与变量名映射，不抄宿主值；主题变量与滚动条规则由宿主
+   themeBridge 在 iframe load 后注入。 */
 :root {
   --bg: var(--duties-bg, #f1f0ee);
   --card: var(--duties-card, #ffffff);
@@ -39,10 +40,20 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.tree {
+.main {
   flex: 1;
   min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ── left: file tree ── */
+.tree-pane {
+  flex-shrink: 0;
+  width: 220px;
+  min-width: 140px;
   overflow: auto;
+  border-right: 1px solid var(--border);
   padding: 4px 0;
 }
 .node {
@@ -58,62 +69,113 @@ body {
   font-size: 11px;
   text-align: left;
   cursor: pointer;
+  user-select: none;
 }
 .node:hover { background: var(--hover); }
 .node.active { color: var(--text); background: var(--hover); }
 .node .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .node .sz { margin-left: auto; flex-shrink: 0; font-size: 9px; color: var(--tertiary); }
 .node .tw { flex-shrink: 0; width: 12px; text-align: center; color: var(--tertiary); }
-.preview {
-  flex-shrink: 0;
-  height: 45%;
-  display: none;
+
+/* ── right: tab bar + editor ── */
+.editor-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
   flex-direction: column;
-  border-top: 1px solid var(--border);
-  min-height: 0;
+  overflow: hidden;
 }
-.preview.open { display: flex; }
-.preview-head {
+.tabbar {
   flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  scrollbar-width: thin;
+}
+.tab {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 10px;
-  border-bottom: 1px solid var(--border);
+  padding: 0 8px 0 10px;
+  height: 28px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--tertiary);
   font-family: var(--mono);
   font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  user-select: none;
 }
-.preview-head .p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.preview-head button {
-  border: 0; background: transparent; color: var(--tertiary);
-  cursor: pointer; font-size: 12px; padding: 0 2px;
+.tab:hover { background: var(--hover); }
+.tab.active {
+  color: var(--text);
+  background: var(--card);
+  box-shadow: inset 0 2px 0 var(--accent);
 }
-.preview-head button:hover { color: var(--text); }
-.preview-body { flex: 1; min-height: 0; overflow: auto; }
-.status { padding: 10px; font-size: 11px; color: var(--tertiary); }
+.tab.preview-tab .nm { font-style: italic; }
+.tab .close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  opacity: 0;
+}
+.tab:hover .close, .tab.active .close { opacity: 1; }
+.tab .close:hover { background: var(--hover); color: var(--text); }
+.editor-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--card);
+  position: relative;
+}
+.status { padding: 12px; font-size: 11px; color: var(--tertiary); }
 .pv-img { display: block; max-width: 100%; max-height: 100%; margin: 8px auto; }
-.pv-code { margin: 0; padding: 6px 0; font-family: var(--mono); font-size: 11px; line-height: 1.5; }
+.pv-code { margin: 0; padding: 8px 0; font-family: var(--mono); font-size: 11px; line-height: 1.5; }
 .pv-line { display: flex; white-space: pre; }
 .pv-line:hover { background: var(--hover); }
-.pv-ln { flex-shrink: 0; width: 3.2em; padding-right: 1em; text-align: right; color: var(--tertiary); user-select: none; }
+.pv-ln { flex-shrink: 0; width: 3.6em; padding-right: 1em; text-align: right; color: var(--tertiary); user-select: none; }
 .pv-lt { flex: 1; padding-right: 12px; }
-.empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--tertiary); font-size: 11px; }
+.empty-editor { height: 100%; display: flex; align-items: center; justify-content: center; color: var(--tertiary); font-size: 11px; }
+.empty-tree { padding: 12px; font-size: 11px; color: var(--tertiary); }
 </style>
 </head>
 <body>
 <div class="pathbar" id="pathbar"></div>
-<div class="tree" id="tree"></div>
-<div class="preview" id="preview">
-  <div class="preview-head">
-    <span class="p" id="pv-path"></span>
-    <button id="pv-close" title="关闭预览">✕</button>
+<div class="main">
+  <div class="tree-pane" id="tree"></div>
+  <div class="editor-pane">
+    <div class="tabbar" id="tabbar"></div>
+    <div class="editor-body" id="editor">
+      <div class="empty-editor">单击文件预览，双击固定标签</div>
+    </div>
   </div>
-  <div class="preview-body" id="pv-body"></div>
 </div>
 <script>
-/* [AutoC 2026-08-24] IDE 面板：接管宿主的 files overlay（PLUGIN_META 面板
- * 声明 replaces:'files'）。自含文件树 + 预览，数据全部来自 supervisor
- * REST（workspace/tree 与 sessions/{id}/file），鉴权经 boot 对象。 */
+/* [AutoC 2026-08-24] IDE 面板 v2：左右分栏 + 顶部多标签（VSCode 语义）。
+ *
+ * 标签生命周期：
+ * - 单击文件 → 预览标签（斜体，同一时间至多一个；再点别的文件时复用替换）
+ * - 双击文件 → 固定标签（不会被替换）
+ * - 标签关闭按钮 / 鼠标中键 → 关闭
+ * 数据全部来自 supervisor REST（workspace/tree 与 sessions/{id}/file），
+ * 鉴权经宿主 boot 对象注入。 */
+
 const boot = (window.parent && window.parent.__CLONOTH_BOOT__) || {};
 const TOKEN = boot.token || '';
 const SESSION_ID = boot.sessionId || '';
@@ -123,13 +185,8 @@ const MAX_TEXT_BYTES = 512 * 1024;
 
 const treeEl = document.getElementById('tree');
 const pathbarEl = document.getElementById('pathbar');
-const previewEl = document.getElementById('preview');
-const pvPathEl = document.getElementById('pv-path');
-const pvBodyEl = document.getElementById('pv-body');
-document.getElementById('pv-close').addEventListener('click', () => {
-  previewEl.classList.remove('open');
-  releaseBlob();
-});
+const tabbarEl = document.getElementById('tabbar');
+const editorEl = document.getElementById('editor');
 
 async function api(path) {
   const resp = await fetch('/v1' + path, {
@@ -160,7 +217,188 @@ function extOf(path) {
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
 }
 
-// ---- tree ----
+function baseName(path) {
+  return String(path).split('/').pop() || String(path);
+}
+
+// ── tab state ────────────────────────────────────────────────────────────
+// tabs: [{ path, pinned }] — at most one unpinned (preview) tab at a time.
+// activePath: the tab currently shown in the editor body.
+
+let tabs = [];
+let activePath = null;
+
+function findTab(path) {
+  return tabs.find((t) => t.path === path) || null;
+}
+
+function findPreviewTab() {
+  return tabs.find((t) => !t.pinned) || null;
+}
+
+function openTab(path, pinned) {
+  const existing = findTab(path);
+  if (existing) {
+    if (pinned) existing.pinned = true;
+    activePath = path;
+  } else if (pinned) {
+    tabs.push({ path, pinned: true });
+    activePath = path;
+  } else {
+    const preview = findPreviewTab();
+    if (preview) preview.path = path;   // reuse the preview slot
+    else tabs.push({ path, pinned: false });
+    activePath = path;
+  }
+  renderTabs();
+  loadIntoEditor(path);
+}
+
+function closeTab(path) {
+  const idx = tabs.findIndex((t) => t.path === path);
+  if (idx < 0) return;
+  tabs.splice(idx, 1);
+  if (activePath === path) {
+    const next = tabs[Math.min(idx, tabs.length - 1)];
+    activePath = next ? next.path : null;
+    if (next) loadIntoEditor(next.path);
+    else showEmptyEditor();
+  }
+  renderTabs();
+}
+
+function renderTabs() {
+  tabbarEl.innerHTML = '';
+  for (const tab of tabs) {
+    const el = document.createElement('div');
+    el.className = 'tab' + (tab.path === activePath ? ' active' : '') + (tab.pinned ? '' : ' preview-tab');
+    el.title = tab.path;
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = baseName(tab.path);
+    el.appendChild(nm);
+    const close = document.createElement('button');
+    close.className = 'close';
+    close.type = 'button';
+    close.textContent = '✕';
+    close.title = '关闭';
+    close.addEventListener('click', (e) => {
+      e.stopPropagation();
+      closeTab(tab.path);
+    });
+    el.appendChild(close);
+    el.addEventListener('click', () => {
+      if (activePath === tab.path) return;
+      activePath = tab.path;
+      renderTabs();
+      loadIntoEditor(tab.path);
+    });
+    el.addEventListener('auxclick', (e) => {
+      if (e.button === 1) closeTab(tab.path);  // middle click
+    });
+    // double-click on a preview tab pins it
+    el.addEventListener('dblclick', () => {
+      if (!tab.pinned) { tab.pinned = true; renderTabs(); }
+    });
+    tabbarEl.appendChild(el);
+  }
+}
+
+// ── editor body ──────────────────────────────────────────────────────────
+
+let blobUrl = null;
+let loadSeq = 0;
+
+function releaseBlob() {
+  if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+}
+
+function showEmptyEditor() {
+  releaseBlob();
+  editorEl.innerHTML = '<div class="empty-editor">单击文件预览，双击固定标签</div>';
+}
+
+function showStatus(text) {
+  releaseBlob();
+  editorEl.innerHTML = '<div class="status">' + esc(text) + '</div>';
+}
+
+function renderText(text) {
+  releaseBlob();
+  editorEl.innerHTML = '';
+  let truncated = false;
+  if (text.length > MAX_TEXT_BYTES) {
+    text = text.slice(0, MAX_TEXT_BYTES);
+    truncated = true;
+  }
+  const pre = document.createElement('pre');
+  pre.className = 'pv-code';
+  const frag = document.createDocumentFragment();
+  text.split('\n').forEach((line, i) => {
+    const row = document.createElement('div');
+    row.className = 'pv-line';
+    const no = document.createElement('span');
+    no.className = 'pv-ln';
+    no.textContent = String(i + 1);
+    const lt = document.createElement('span');
+    lt.className = 'pv-lt';
+    lt.textContent = line;
+    row.appendChild(no);
+    row.appendChild(lt);
+    frag.appendChild(row);
+  });
+  pre.appendChild(frag);
+  editorEl.appendChild(pre);
+  if (truncated) {
+    const note = document.createElement('div');
+    note.className = 'status';
+    note.textContent = '文件过大，仅显示前 ' + MAX_TEXT_BYTES + ' 字节';
+    editorEl.appendChild(note);
+  }
+}
+
+async function loadIntoEditor(path) {
+  const seq = ++loadSeq;
+  showStatus('加载中…');
+  let resp;
+  try {
+    resp = await api('/sessions/' + encodeURIComponent(SESSION_ID) + '/file?path=' + encodeURIComponent(path));
+  } catch (err) {
+    if (seq !== loadSeq) return;
+    showStatus('加载失败：' + err.message);
+    return;
+  }
+  if (seq !== loadSeq) return;
+  const ct = resp.headers.get('content-type') || '';
+  const ext = extOf(path);
+  if (ct.startsWith('image/') || IMAGE_EXTS.has(ext)) {
+    const blob = await resp.blob();
+    releaseBlob();
+    blobUrl = URL.createObjectURL(blob);
+    editorEl.innerHTML = '';
+    const img = document.createElement('img');
+    img.className = 'pv-img';
+    img.src = blobUrl;
+    img.alt = path;
+    editorEl.appendChild(img);
+    return;
+  }
+  const buf = await resp.arrayBuffer();
+  if (buf.byteLength > MAX_TEXT_BYTES * 4) {
+    showStatus('二进制文件（' + buf.byteLength + ' B），不支持预览');
+    return;
+  }
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < Math.min(bytes.length, 8192); i++) {
+    if (bytes[i] === 0) {
+      showStatus('二进制文件（' + buf.byteLength + ' B），不支持预览');
+      return;
+    }
+  }
+  renderText(new TextDecoder('utf-8').decode(bytes));
+}
+
+// ── file tree ────────────────────────────────────────────────────────────
 
 async function fetchTree(subPath) {
   const params = new URLSearchParams();
@@ -202,7 +440,7 @@ function renderNode(node, depth, container) {
     if (!isDir) {
       document.querySelectorAll('.node.active').forEach((el) => el.classList.remove('active'));
       btn.classList.add('active');
-      openPreview(node.path);
+      openTab(node.path, false);  // single click → preview tab
       return;
     }
     if (expanded) { setExpanded(false); return; }
@@ -225,106 +463,17 @@ function renderNode(node, depth, container) {
     }
     setExpanded(true);
   });
-}
 
-// ---- preview ----
-
-let blobUrl = null;
-let loadSeq = 0;
-
-function releaseBlob() {
-  if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
-}
-
-function pvStatus(text) {
-  releaseBlob();
-  pvBodyEl.innerHTML = '<div class="status">' + esc(text) + '</div>';
-}
-
-function renderText(text) {
-  releaseBlob();
-  pvBodyEl.innerHTML = '';
-  let truncated = false;
-  if (text.length > MAX_TEXT_BYTES) {
-    text = text.slice(0, MAX_TEXT_BYTES);
-    truncated = true;
-  }
-  const pre = document.createElement('pre');
-  pre.className = 'pv-code';
-  const frag = document.createDocumentFragment();
-  text.split('\n').forEach((line, i) => {
-    const row = document.createElement('div');
-    row.className = 'pv-line';
-    const no = document.createElement('span');
-    no.className = 'pv-ln';
-    no.textContent = String(i + 1);
-    const lt = document.createElement('span');
-    lt.className = 'pv-lt';
-    lt.textContent = line;
-    row.appendChild(no);
-    row.appendChild(lt);
-    frag.appendChild(row);
+  btn.addEventListener('dblclick', () => {
+    if (!isDir) openTab(node.path, true);  // double click → pinned tab
   });
-  pre.appendChild(frag);
-  pvBodyEl.appendChild(pre);
-  if (truncated) {
-    const note = document.createElement('div');
-    note.className = 'status';
-    note.textContent = '文件过大，仅显示前 ' + MAX_TEXT_BYTES + ' 字节';
-    pvBodyEl.appendChild(note);
-  }
 }
 
-async function openPreview(path) {
-  previewEl.classList.add('open');
-  pvPathEl.textContent = path;
-  pvPathEl.title = path;
-  const seq = ++loadSeq;
-  pvStatus('加载中…');
-  let resp;
-  try {
-    resp = await api('/sessions/' + encodeURIComponent(SESSION_ID) + '/file?path=' + encodeURIComponent(path));
-  } catch (err) {
-    if (seq !== loadSeq) return;
-    pvStatus('加载失败：' + err.message);
-    return;
-  }
-  if (seq !== loadSeq) return;
-  const ct = resp.headers.get('content-type') || '';
-  const ext = extOf(path);
-  if (ct.startsWith('image/') || IMAGE_EXTS.has(ext)) {
-    const blob = await resp.blob();
-    releaseBlob();
-    blobUrl = URL.createObjectURL(blob);
-    pvBodyEl.innerHTML = '';
-    const img = document.createElement('img');
-    img.className = 'pv-img';
-    img.src = blobUrl;
-    img.alt = path;
-    pvBodyEl.appendChild(img);
-    return;
-  }
-  const buf = await resp.arrayBuffer();
-  if (buf.byteLength > MAX_TEXT_BYTES * 4) {
-    pvStatus('二进制文件（' + buf.byteLength + ' B），不支持预览');
-    return;
-  }
-  const bytes = new Uint8Array(buf);
-  // 含 NUL 字节视为二进制。
-  for (let i = 0; i < Math.min(bytes.length, 8192); i++) {
-    if (bytes[i] === 0) {
-      pvStatus('二进制文件（' + buf.byteLength + ' B），不支持预览');
-      return;
-    }
-  }
-  renderText(new TextDecoder('utf-8').decode(bytes));
-}
-
-// ---- boot ----
+// ── boot ─────────────────────────────────────────────────────────────────
 
 (async () => {
   if (!SESSION_ID) {
-    treeEl.innerHTML = '<div class="empty">缺少会话上下文</div>';
+    treeEl.innerHTML = '<div class="empty-tree">缺少会话上下文</div>';
     return;
   }
   try {
@@ -334,12 +483,12 @@ async function openPreview(path) {
     const children = (data.tree && data.tree.children) || [];
     treeEl.innerHTML = '';
     if (children.length === 0) {
-      treeEl.innerHTML = '<div class="empty">空目录或未设置工作区</div>';
+      treeEl.innerHTML = '<div class="empty-tree">空目录或未设置工作区</div>';
       return;
     }
     children.forEach((c) => renderNode(c, 0, treeEl));
   } catch (err) {
-    treeEl.innerHTML = '<div class="empty">加载失败：' + esc(err.message) + '</div>';
+    treeEl.innerHTML = '<div class="empty-tree">加载失败：' + esc(err.message) + '</div>';
   }
 })();
 </script>
