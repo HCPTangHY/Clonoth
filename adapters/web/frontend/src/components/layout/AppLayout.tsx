@@ -152,7 +152,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
       )}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-40 flex-shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] transition-transform md:relative md:z-auto md:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-40 flex-shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] transition-transform duration-200 md:relative md:z-auto md:translate-x-0 md:transition-[width] ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
         style={{ width: '15rem' }}
@@ -182,7 +182,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
         <div className="flex-shrink-0 border-b border-[var(--duties-border)] bg-[var(--duties-bg)]">
           <div className="flex items-center">
             <button
-              className="flex-shrink-0 px-3 py-3 text-lg text-[var(--duties-secondary)] transition-colors hover:text-[var(--duties-text)]"
+              className="flex-shrink-0 px-3 py-2 font-mono text-[0.6rem] text-[var(--duties-secondary)] transition-colors hover:text-[var(--duties-text)]"
               onClick={() => {
                 // [AutoC 2026-08-24] Desktop toggles the persisted collapsed
                 // state; mobile toggles the off-canvas drawer.
@@ -198,7 +198,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
               {/* [2026-06-01] Why: replace the hamburger Unicode glyph with Material Symbols.
                   How: render the shared Icon with the menu symbol. Purpose: navigation
                   controls use the same icon font as the rest of the frontend. */}
-              <Icon name="menu" size={22} />
+              <Icon name="menu" size={18} />
             </button>
             <div className="min-w-0 flex-1">{header}</div>
             {hasRightPanel && (
