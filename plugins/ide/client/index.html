@@ -298,6 +298,19 @@ const TOKEN = boot.token || '';
 const SESSION_ID = boot.sessionId || '';
 
 const IMAGE_EXTS = new Set(['png','jpg','jpeg','gif','webp','svg','ico','bmp','avif']);
+
+// [AutoC 2026-08-24] Tab 缩进宽度可调：状态栏按钮在 2/4/8 间循环，
+// 偏好持久化到 localStorage，作用于所有文本标签页（重建编辑器生效）。
+const LS_INDENT = 'clonoth_ide_indent';
+const INDENT_STEPS = [2, 4, 8];
+function readIndent() {
+  try {
+    const n = Number(localStorage.getItem(LS_INDENT));
+    if (INDENT_STEPS.includes(n)) return n;
+  } catch (e) {}
+  return 2;
+}
+let indentWidth = readIndent();
 const MAX_TEXT_BYTES = 512 * 1024;
 const TREE_TAB = '::tree';
 
@@ -517,8 +530,8 @@ function renderEditor(tab) {
   const { EditorState, EditorView, keymap, lineNumbers, highlightActiveLine,
           highlightActiveLineGutter, drawSelection, defaultKeymap, history,
           historyKeymap, indentWithTab, syntaxHighlighting,
-          defaultHighlightStyle, bracketMatching, foldGutter, searchKeymap,
-          highlightSelectionMatches } = CM;
+          defaultHighlightStyle, bracketMatching, foldGutter, indentUnit,
+          searchKeymap, highlightSelectionMatches } = CM;
 
   const view = new EditorView({
     parent: host,
@@ -544,7 +557,10 @@ function renderEditor(tab) {
         EditorView.updateListener.of((u) => {
           if (u.docChanged) markEdited(tab, u.state.doc.toString());
         }),
-        EditorState.tabSize.of(4),
+        // tabSize 决定 Tab 字符显示宽度，indentUnit 决定 Tab 命令插入的空白，
+        // 两者都跟随状态栏的缩进偏好。
+        EditorState.tabSize.of(indentWidth),
+        indentUnit.of(' '.repeat(indentWidth)),
         EditorView.theme({
           '&': { height: '100%' },
           '.cm-scroller': { overflow: 'auto' },
@@ -602,14 +618,35 @@ function renderStatusbar() {
     hint = tab.dirty ? '未保存 · Ctrl+S' : '已保存';
     hintClass = tab.dirty ? 'hint-dirty' : '';
   }
+  const indentBtn = tab.kind === 'text'
+    ? '<button id="sb-indent" title="Tab 缩进宽度，点击在 2/4/8 间切换">缩进: ' + indentWidth + '</button>'
+    : '';
   const saveBtn = tab.kind === 'text'
     ? '<button id="sb-save"' + (tab.dirty ? '' : ' disabled') + '>保存</button>'
     : '';
   statusbarEl.innerHTML = '<span class="sp">' + esc(tab.path) + '</span>'
     + (hint ? '<span class="' + hintClass + '">' + esc(hint) + '</span>' : '')
-    + saveBtn;
+    + indentBtn + saveBtn;
   const btn = document.getElementById('sb-save');
   if (btn) btn.addEventListener('click', () => saveTab(tab));
+  const ibtn = document.getElementById('sb-indent');
+  if (ibtn) ibtn.addEventListener('click', cycleIndent);
+}
+
+function cycleIndent() {
+  const idx = INDENT_STEPS.indexOf(indentWidth);
+  indentWidth = INDENT_STEPS[(idx + 1) % INDENT_STEPS.length];
+  try { localStorage.setItem(LS_INDENT, String(indentWidth)); } catch (e) {}
+  // 重建当前激活的文本编辑器（保留文档内容与滚动位置）；其他标签页在
+  // 下次激活时经 renderEditor 读取新偏好。
+  const tab = findTab(activePath);
+  if (tab && tab.kind === 'text') {
+    tab.text = tab._view ? tab._view.state.doc.toString() : tab.text;
+    if (tab._view) tab.scroll = tab._view.scrollDOM.scrollTop;
+    tab._view = null;
+    renderFileTab(tab);
+  }
+  renderStatusbar();
 }
 
 // ── file tree ────────────────────────────────────────────────────────────
