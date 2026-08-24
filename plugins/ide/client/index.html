@@ -135,10 +135,36 @@ body {
 
 /* file content */
 .pv-img { display: block; max-width: 100%; margin: 8px auto; }
-.editor-textarea {
+.editor-wrap {
   flex: 1;
   min-height: 0;
-  width: 100%;
+  display: flex;
+  overflow: hidden;
+  background: var(--card);
+}
+/* 行号槽：与 textarea 共用字体/行高/上内边距，自身不滚动，
+   由 textarea 的 scroll 事件镜像 scrollTop。white-space: pre 保证
+   两侧都按物理行布局，长行不换行，行号与内容行一一对应。 */
+.ln-gutter {
+  flex-shrink: 0;
+  overflow: hidden;
+  padding: 8px 0;
+  text-align: right;
+  color: var(--tertiary);
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  user-select: none;
+}
+.ln-gutter div {
+  padding: 0 8px 0 12px;
+  white-space: pre;
+}
+.editor-textarea {
+  flex: 1;
+  min-width: 0;
   border: 0;
   outline: none;
   resize: none;
@@ -413,23 +439,47 @@ function markEdited(tab, ta) {
 
 function renderEditor(tab) {
   viewEl.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'editor-wrap';
+  const gutter = document.createElement('div');
+  gutter.className = 'ln-gutter';
   const ta = document.createElement('textarea');
   ta.className = 'editor-textarea';
   ta.value = tab.text;
   ta.spellcheck = false;
-  ta.addEventListener('input', () => markEdited(tab, ta));
+
+  // 行号渲染：按物理行数重建（只有行数变化才重建），宽度随行数位数走。
+  let gutterLines = 0;
+  function renderGutter() {
+    const lines = ta.value.split('\n').length;
+    if (lines === gutterLines) return;
+    gutterLines = lines;
+    const width = String(lines).length;
+    gutter.style.width = (width * 0.66 + 1.6) + 'em';
+    let html = '';
+    for (let i = 1; i <= lines; i++) html += '<div>' + i + '</div>';
+    gutter.innerHTML = html;
+    gutter.scrollTop = ta.scrollTop;
+  }
+
+  ta.addEventListener('input', () => { markEdited(tab, ta); renderGutter(); });
+  ta.addEventListener('scroll', () => { gutter.scrollTop = ta.scrollTop; });
   ta.addEventListener('keydown', (e) => {
     if (e.key === 'Tab') {
       e.preventDefault();
       ta.setRangeText('\t', ta.selectionStart, ta.selectionEnd, 'end');
       markEdited(tab, ta);
+      renderGutter();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
       saveTab(tab);
     }
   });
-  viewEl.appendChild(ta);
+  wrap.appendChild(gutter);
+  wrap.appendChild(ta);
+  viewEl.appendChild(wrap);
   ta.scrollTop = tab.scroll || 0;
+  renderGutter();
 }
 
 async function saveTab(tab) {
