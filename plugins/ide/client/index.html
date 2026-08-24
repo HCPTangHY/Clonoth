@@ -460,9 +460,21 @@ let viewPath = null;      // 当前视图为哪个标签渲染，用于切换前
 let saveHint = '';        // 状态栏一次性提示（保存成功/失败）
 
 function newFileTab(path, pinned) {
-  // mode: MD 文件专属，'render'（默认渲染）或 'edit'（编辑器）
+  // mode: MD 文件专属，'render'（默认渲染）或 'edit'（编辑器）。
+  // scroll 存比例（scrollTop / 可滚动高度）而非像素：渲染与编辑两种模式
+  // 的滚动容器与内容高度都不同，像素值无法对应。cursor 存编辑态游标位置。
   return { path, pinned, loaded: false, kind: '', text: '', savedText: '',
-           dirty: false, scroll: 0, blobUrl: null, note: '', mode: 'render' };
+           dirty: false, scroll: 0, cursor: 0, blobUrl: null, note: '', mode: 'render' };
+}
+
+function scrollFraction(el) {
+  const range = el.scrollHeight - el.clientHeight;
+  return range > 0 ? el.scrollTop / range : 0;
+}
+
+function applyScrollFraction(el, frac) {
+  const range = el.scrollHeight - el.clientHeight;
+  el.scrollTop = range > 0 ? frac * range : 0;
 }
 
 function isMarkdown(path) {
@@ -582,8 +594,12 @@ function showStatus(text) {
 function stashScroll() {
   const tab = viewPath && viewPath !== TREE_TAB ? findTab(viewPath) : null;
   if (!tab || tab.kind !== 'text') return;
-  if (tab._view) tab.scroll = tab._view.scrollDOM.scrollTop;
-  else if (isMarkdown(tab.path) && tab.mode === 'render') tab.scroll = viewEl.scrollTop;
+  if (tab._view) {
+    tab.scroll = scrollFraction(tab._view.scrollDOM);
+    tab.cursor = tab._view.state.selection.main.head;
+  } else if (isMarkdown(tab.path) && tab.mode === 'render') {
+    tab.scroll = scrollFraction(viewEl);
+  }
 }
 
 function renderView() {
@@ -699,7 +715,10 @@ function renderEditor(tab) {
     }),
   });
   tab._view = view;
-  view.scrollDOM.scrollTop = tab.scroll || 0;
+  // 游标位置按文档长度钳制（文档可能被外部改短），滚动按比例恢复。
+  const head = Math.min(tab.cursor || 0, view.state.doc.length);
+  view.dispatch({ selection: { anchor: head } });
+  applyScrollFraction(view.scrollDOM, tab.scroll || 0);
   view.requestMeasure();
 }
 
@@ -740,7 +759,7 @@ function renderMarkdown(tab) {
     });
   });
   viewEl.appendChild(body);
-  viewEl.scrollTop = tab.scroll || 0;
+  applyScrollFraction(viewEl, tab.scroll || 0);
 }
 
 function setTabMode(tab, mode) {
@@ -845,7 +864,10 @@ function cycleIndent() {
   const tab = findTab(activePath);
   if (tab && tab.kind === 'text' && !(isMarkdown(tab.path) && tab.mode === 'render')) {
     tab.text = tab._view ? tab._view.state.doc.toString() : tab.text;
-    if (tab._view) tab.scroll = tab._view.scrollDOM.scrollTop;
+    if (tab._view) {
+      tab.scroll = scrollFraction(tab._view.scrollDOM);
+      tab.cursor = tab._view.state.selection.main.head;
+    }
     tab._view = null;
     renderFileTab(tab);
   }
