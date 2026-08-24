@@ -63,7 +63,13 @@ def _extract_openai_error_message(payload: Any) -> str | None:
     return None
 
 def _extract_usage(data: Any) -> dict[str, int] | None:
-    """Extract token usage dict from an OpenAI response/chunk."""
+    """Extract token usage dict from an OpenAI response/chunk.
+
+    [AutoC 2026-08-24] 缓存命中统一为 Clonoth 内部格式 cached_prompt_tokens。
+    OpenAI 的 prompt_tokens_details.cached_tokens 是嵌套字段；DeepSeek 的
+    prompt_cache_hit_tokens 是平铺字段（DeepSeek 复用此函数解析）。两者都
+    归一化为 cached_prompt_tokens，前端不再需要识别渠道差异。
+    """
     if not isinstance(data, dict):
         return None
     usage = data.get("usage")
@@ -74,6 +80,16 @@ def _extract_usage(data: Any) -> dict[str, int] | None:
         val = usage.get(key)
         if isinstance(val, int):
             result[key] = val
+    # OpenAI: prompt_tokens_details.cached_tokens
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cached = details.get("cached_tokens")
+        if isinstance(cached, int) and cached > 0:
+            result["cached_prompt_tokens"] = cached
+    # DeepSeek: prompt_cache_hit_tokens（平铺）
+    cache_hit = usage.get("prompt_cache_hit_tokens")
+    if isinstance(cache_hit, int) and cache_hit > 0:
+        result["cached_prompt_tokens"] = cache_hit
     return result if result else None
 
 

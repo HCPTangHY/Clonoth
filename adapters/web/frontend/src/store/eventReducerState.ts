@@ -185,10 +185,16 @@ export function buildMessageSource(state: ChatState, event: SupervisorEvent): Me
   const nodeInfo = taskId ? state.nodeByTaskId[taskId] : undefined;
   const inboundSeq = getSourceInboundSeq(payload);
   const llmRequestId = getString(payload.llm_request_id);
+  // [AutoC 2026-08-24] 实时事件的 provider/usage：context_usage 事件在 payload
+  // 顶层携带；outbound/stream 类事件通常不带，空值由 mergeSource 跳过。
+  const provider = getString(payload.provider);
+  const usage = getRecord(payload.usage);
 
   return {
     inboundSeq,
     llmRequestId: llmRequestId || undefined,
+    provider: provider || undefined,
+    usage: usage ? { ...usage } : undefined,
     taskId: childTaskId || undefined,
     childTaskId: childTaskId || undefined,
     nodeId: childNodeId || nodeInfo?.nodeId,
@@ -242,6 +248,11 @@ export function mergeSource(current: MessageSource, patch: MessageSource): Messa
     // How: carry forward existing child/caller metadata unless a newer patch supplies
     // it. Purpose: dispatch callback navigation and titles survive later updates.
     childSessionId: patch.childSessionId || current.childSessionId,
+    // [AutoC 2026-08-24] 上游元信息透传：provider/usage/providerMetadata 由
+    // context_usage 事件或 outbound 事件补齐，合并时后到的有效值覆盖。
+    provider: patch.provider || current.provider,
+    providerMetadata: patch.providerMetadata || current.providerMetadata,
+    usage: patch.usage || current.usage,
   };
 }
 

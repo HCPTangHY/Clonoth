@@ -81,6 +81,27 @@ def _is_encrypted_content_error(error_msg: str) -> bool:
     return has_encrypted_marker and has_verification_failure
 
 
+def _normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
+    """Convert Responses API usage to the standard usage dict.
+
+    [AutoC 2026-08-24] 缓存命中统一为 Clonoth 内部字段 cached_prompt_tokens。
+    Responses API 的 input_tokens_details.cached_tokens 归一化到该字段。
+    """
+    inp = usage.get("input_tokens", 0)
+    out = usage.get("output_tokens", 0)
+    result: dict[str, int] = {
+        "prompt_tokens": inp,
+        "completion_tokens": out,
+        "total_tokens": inp + out,
+    }
+    details = usage.get("input_tokens_details")
+    if isinstance(details, dict):
+        cached = details.get("cached_tokens")
+        if isinstance(cached, int) and cached > 0:
+            result["cached_prompt_tokens"] = cached
+    return result
+
+
 def _response_error_message(resp: httpx.Response) -> str:
     """Extract an API error message from an HTTP response."""
     try:
@@ -582,7 +603,7 @@ class OpenAIResponsesProvider(BaseProvider):
                 text="".join(text_parts) or None,
                 tool_calls=tool_calls,
                 reasoning="".join(thinking_parts) or None,
-                usage={"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out},
+                usage=_normalize_usage(usage),
                 provider_meta=provider_meta,
             )
 
@@ -666,14 +687,12 @@ class OpenAIResponsesProvider(BaseProvider):
 
         usage = body.get("usage", {})
 
-        inp = usage.get("input_tokens", 0)
-        out = usage.get("output_tokens", 0)
         return ProviderResponse(
             ok=True,
             text="".join(text_parts) or None,
             tool_calls=tool_calls,
             reasoning="".join(thinking_parts) or None,
-            usage={"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out},
+            usage=_normalize_usage(usage),
         )
 
 

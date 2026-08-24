@@ -713,15 +713,32 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
 
     const payload = isRecord(data) ? data : {};
     const sessionId = getStringValue(payload.session_id) || getStringValue(payload.sessionId);
+
+    // [AutoC 2026-08-24] 会话级缓存命中率 EMA：从 payload.usage 读统一字段
+    // cached_prompt_tokens（provider 层归一化），与 prompt_tokens 计算本轮
+    // 命中率，再与既有值做指数移动平均（alpha=0.3）。上游未上报时保留旧值。
+    const usageRaw = isRecord(payload.usage) ? payload.usage : null;
+    const promptTokens = usageRaw && typeof usageRaw.prompt_tokens === 'number' ? usageRaw.prompt_tokens : 0;
+    const cachedTokens = usageRaw && typeof usageRaw.cached_prompt_tokens === 'number' ? usageRaw.cached_prompt_tokens : 0;
+    const instantRate = promptTokens > 0 && cachedTokens > 0 ? cachedTokens / promptTokens : null;
+
     set((state) => {
       const active = getActiveConversation(state);
+      // EMA 更新：有本轮命中率时与既有值平滑，无则沿用
+      const existing = sessionId ? state.contextUsageBySession[sessionId] : state.contextUsage;
+      const prevRate = existing?.cacheHitRate ?? null;
+      const nextRate = instantRate !== null
+        ? (prevRate !== null ? prevRate * 0.7 + instantRate * 0.3 : instantRate)
+        : prevRate;
+      const merged = { ...contextUsage, cacheHitRate: nextRate };
+
       const nextBySession = sessionId
-        ? { ...state.contextUsageBySession, [sessionId]: contextUsage }
+        ? { ...state.contextUsageBySession, [sessionId]: merged }
         : state.contextUsageBySession;
       const shouldDisplay = !sessionId || active?.sessionId === sessionId;
       return {
         contextUsageBySession: nextBySession,
-        contextUsage: shouldDisplay ? contextUsage : state.contextUsage,
+        contextUsage: shouldDisplay ? merged : state.contextUsage,
       };
     });
   },

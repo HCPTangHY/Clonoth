@@ -445,6 +445,16 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
                     );
                   })()}
                   <span className={contextUsageColorClass(contextUsage.utilization)}>{formatTokenCount(contextUsage.effectiveTokens)}</span>
+                  {/* [AutoC 2026-08-24] 缓存命中率：随 context_usage 事件的
+                      EMA 更新，无缓存数据时不显示。 */}
+                  {contextUsage.cacheHitRate !== null && contextUsage.cacheHitRate !== undefined && (
+                    <span
+                      className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]"
+                      title={`缓存命中率（指数移动平均）：${(contextUsage.cacheHitRate * 100).toFixed(1)}%`}
+                    >
+                      · {(contextUsage.cacheHitRate * 100).toFixed(0)}%
+                    </span>
+                  )}
                 </button>
                 {isContextPopoverOpen && (
                   <ContextPopover

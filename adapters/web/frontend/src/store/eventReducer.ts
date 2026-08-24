@@ -93,6 +93,7 @@ export const CHAT_EVENT_TYPE_VALUES = [
   'node_switch',
   'preempt_injected',
   'system_notice',
+  'context_usage',
 ] as const;
 
 /** All event types handled by the chat reducer. */
@@ -127,6 +128,41 @@ export function createInitialChatState(): ChatState {
     approvalBlockById: {},
     nodeByTaskId: {},
   };
+}
+
+// [AutoC 2026-08-24] context_usage: merge live provider/usage into the active
+// assistant message source. Why: source.provider/usage were only populated by
+// history hydration; live messages showed no info button until reload. How:
+// match the last assistant message by task_id (fallback: last assistant in the
+// conversation) and merge. Purpose: meta button works for in-flight messages.
+function applyContextUsage(state: ChatState, event: SupervisorEvent): ChatState {
+  const payload = getPayload(event);
+  const usage = getRecord(payload.usage);
+  const provider = getString(payload.provider);
+  if (!usage && !provider) return state;
+  const taskId = getString(payload.task_id);
+  const conversationId = getConversationId(state, event);
+  if (!conversationId) return state;
+  const order = state.messageOrderByConversation[conversationId] || [];
+  // 从尾部向前找 assistant 消息，优先匹配 taskId
+  let targetId = '';
+  for (let i = order.length - 1; i >= 0; i--) {
+    const message = state.messagesById[order[i]];
+    if (!message || message.role !== 'assistant') continue;
+    if (taskId && message.source.taskId && message.source.taskId !== taskId) continue;
+    targetId = message.id;
+    break;
+  }
+  if (!targetId) return state;
+  const message = state.messagesById[targetId];
+  const patch: MessageSource = {
+    ...(provider ? { provider } : {}),
+    ...(usage ? { usage: { ...usage } } : {}),
+  };
+  return upsertMessage(state, {
+    ...message,
+    source: mergeSource(message.source, patch),
+  });
 }
 
 export function reduceChatEvent(state: ChatState, event: SupervisorEvent): ChatState {
@@ -212,6 +248,9 @@ export function reduceChatEvent(state: ChatState, event: SupervisorEvent): ChatS
       break;
     case 'system_notice':
       nextState = applySystemNotice(nextState, event);
+      break;
+    case 'context_usage':
+      nextState = applyContextUsage(nextState, event);
       break;
     default: {
       // [AutoC 2026-06-16] Exhaustive check for handled chat event types.

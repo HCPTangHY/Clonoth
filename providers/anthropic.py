@@ -343,15 +343,28 @@ def _parse_response_content(content_blocks: list[dict]) -> tuple[str, str, list[
 
 
 def _parse_usage(data: dict) -> dict:
-    """Convert Anthropic usage to OpenAI-style usage dict."""
+    """Convert Anthropic usage to OpenAI-style usage dict.
+
+    [AutoC 2026-08-24] 缓存字段统一为 Clonoth 内部格式。
+    Anthropic 的 cache_read_input_tokens（缓存命中）和
+    cache_creation_input_tokens（缓存写入）归一化为
+    cached_prompt_tokens 和 cache_write_prompt_tokens。
+    """
     usage = data.get("usage", {})
     inp = usage.get("input_tokens", 0)
     out = usage.get("output_tokens", 0)
-    return {
+    result = {
         "prompt_tokens": inp,
         "completion_tokens": out,
         "total_tokens": inp + out,
     }
+    cache_read = usage.get("cache_read_input_tokens")
+    if isinstance(cache_read, int) and cache_read > 0:
+        result["cached_prompt_tokens"] = cache_read
+    cache_write = usage.get("cache_creation_input_tokens")
+    if isinstance(cache_write, int) and cache_write > 0:
+        result["cache_write_prompt_tokens"] = cache_write
+    return result
 
 
 # ---------------------------------------------------------------------------

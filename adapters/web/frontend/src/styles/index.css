@@ -205,7 +205,7 @@ textarea {
 }
 .msg-copy-btn:hover { color: var(--duties-text); }
 /* [AutoC 2026-08-24] 元信息按钮 + 浮动详情卡。点击在 footer 上方弹出
-   浮层，不占布局、不推挤同级按钮。 */
+   卡片：渠道标题行（橙色圆点）+ 逐项 token 行，不占布局、不推挤同级按钮。 */
 .msg-meta-wrap { position: relative; display: inline-flex; }
 .msg-meta-info {
   display: inline-flex;
@@ -221,16 +221,48 @@ textarea {
 .msg-meta-info:hover { color: var(--duties-text); }
 .msg-meta-pop {
   position: absolute;
-  bottom: calc(100% + 4px);
+  bottom: calc(100% + 6px);
   left: 0;
   z-index: 20;
-  padding: 3px 8px;
+  display: flex;
+  flex-direction: column;
+  min-width: 132px;
+  padding: 6px 10px 7px;
   background: var(--duties-card, #ffffff);
   border: 1px solid var(--duties-border);
   color: var(--duties-secondary);
   font-family: var(--duties-font-mono, ui-monospace, monospace);
-  font-size: 0.55rem;
-  white-space: nowrap;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  font-size: 0.58rem;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.10);
   pointer-events: none;
+}
+.msg-meta-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--duties-border);
+  color: var(--duties-text);
+  font-weight: 600;
+}
+.msg-meta-pop-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--duties-accent, #feaf2c);
+}
+.msg-meta-pop-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  line-height: 1.7;
+}
+.msg-meta-pop-label { color: var(--duties-tertiary); }
+.msg-meta-pop-value { color: var(--duties-text); font-variant-numeric: tabular-nums; }
+/* [AutoC 2026-08-24] 缓存命中率百分比：比数值小半级、用三级色。 */
+.msg-meta-pop-rate {
+  margin-left: 4px;
+  font-size: 0.52rem;
+  color: var(--duties-tertiary);
 }

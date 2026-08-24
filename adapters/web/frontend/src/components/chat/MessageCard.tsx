@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 // [2026-05-31] MessageCard is the unified v2 renderer for normalized chat messages.
 // Why: Step 2B replaces the old MessageBubble plus StreamPreview split with one replayable
 // message surface. How: derive header, role styling, streaming indicator, ordered block
@@ -280,33 +280,100 @@ export const MessageCopyButton = ({ text }: { text: string }) => {
 
 // [AutoC 2026-08-24] Upstream metadata display in the footer row. Why: provider
 // and token usage are already on message.source but invisible to users; a
-// hover-only title tooltip was undiscoverable and click did nothing; an
-// inline text readout pushed sibling buttons down. How: click toggles a
-// floating popover positioned above the footer row, never affecting layout.
+// hover-only title tooltip was undiscoverable and an inline readout shifted the
+// row. How: click toggles a floating card above the footer, showing provider
+// and per-kind token counts including cache hits when the upstream reports them.
 // Purpose: debugging context and cost awareness without layout shift.
+function _num(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+// [AutoC 2026-08-24] provider 层已统一缓存字段为 Clonoth 内部格式：
+// cached_prompt_tokens（命中）与 cache_write_prompt_tokens（写入）。
+// 前端只读统一字段，不再识别各渠道差异。
+function _cachedTokens(usage: Record<string, unknown>): number | null {
+  return _num(usage.cached_prompt_tokens);
+}
+
+function _cacheWriteTokens(usage: Record<string, unknown>): number | null {
+  return _num(usage.cache_write_prompt_tokens);
+}
+
 export const MessageMetaInfo = ({ source }: { source?: WsMessage['source'] }) => {
   const provider = typeof source?.provider === 'string' ? source.provider.trim() : '';
-  const usage = source?.usage ?? null;
-  const promptTokens = typeof usage?.prompt_tokens === 'number' ? usage.prompt_tokens : null;
-  const completionTokens = typeof usage?.completion_tokens === 'number' ? usage.completion_tokens : null;
+  const usage = (source?.usage && typeof source.usage === 'object')
+    ? source.usage as Record<string, unknown>
+    : null;
+  const promptTokens = usage ? _num(usage.prompt_tokens) : null;
+  const completionTokens = usage ? _num(usage.completion_tokens) : null;
+  const totalTokens = usage ? _num(usage.total_tokens) : null;
+  const cachedTokens = usage ? _cachedTokens(usage) : null;
+  const cacheWriteTokens = usage ? _cacheWriteTokens(usage) : null;
   if (!provider && promptTokens === null) return null;
-  const parts: string[] = [];
-  if (provider) parts.push(provider);
-  if (promptTokens !== null) parts.push(`in ${promptTokens}`);
-  if (completionTokens !== null) parts.push(`out ${completionTokens}`);
+
+  const summary = [
+    provider,
+    promptTokens !== null ? `in ${promptTokens}` : '',
+    completionTokens !== null ? `out ${completionTokens}` : '',
+  ].filter(Boolean).join(' · ');
+
   const [open, setOpen] = useState(false);
-  const text = parts.join(' · ');
+  const wrapRef = useRef<HTMLSpanElement>(null);
+
+  // 打开时监听文档点击：点击在浮层与按钮之外即关闭。
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, [open]);
+
+  const rows: Array<[string, number, (number | null)?]> = [];
+  if (promptTokens !== null) rows.push(['输入', promptTokens]);
+  // [AutoC 2026-08-24] 缓存命中率 = 命中 / 输入，追加在缓存命中行的括号内
+  if (cachedTokens !== null && cachedTokens > 0) {
+    const rate = promptTokens && promptTokens > 0 ? cachedTokens / promptTokens : null;
+    rows.push(['缓存命中', cachedTokens, rate]);
+  }
+  if (cacheWriteTokens !== null && cacheWriteTokens > 0) rows.push(['缓存写入', cacheWriteTokens]);
+  if (completionTokens !== null) rows.push(['输出', completionTokens]);
+  if (totalTokens !== null) rows.push(['总计', totalTokens]);
+
   return (
-    <span className="msg-meta-wrap">
+    <span className="msg-meta-wrap" ref={wrapRef}>
       <button
         className="msg-meta-info"
         onClick={() => setOpen((v) => !v)}
-        title={text}
+        title={summary}
         type="button"
       >
         <Icon name="info" size={13} />
       </button>
-      {open && <span className="msg-meta-pop">{text}</span>}
+      {open && (
+        <span className="msg-meta-pop">
+          {provider && (
+            <span className="msg-meta-pop-head">
+              <span className="msg-meta-pop-dot" />
+              {provider}
+            </span>
+          )}
+          {rows.map(([label, value, rate]) => (
+            <span className="msg-meta-pop-row" key={label}>
+              <span className="msg-meta-pop-label">{label}</span>
+              <span className="msg-meta-pop-value">
+                {value.toLocaleString()}
+                {rate !== null && rate !== undefined && (
+                  <span className="msg-meta-pop-rate">{(rate * 100).toFixed(1)}%</span>
+                )}
+              </span>
+            </span>
+          ))}
+        </span>
+      )}
     </span>
   );
 };

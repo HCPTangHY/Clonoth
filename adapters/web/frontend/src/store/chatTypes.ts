@@ -51,6 +51,9 @@ export interface ContextUsageState {
   compactThreshold: number;
   utilization: number;
   source: string;
+  // [AutoC 2026-08-24] 会话级缓存命中率（EMA）：随每轮 context_usage 事件
+  // 更新，null 表示尚无缓存数据（上游未开启缓存或未上报）。
+  cacheHitRate: number | null;
 }
 
 export interface ChatStoreState extends ChatState {
@@ -429,6 +432,7 @@ export function normalizeContextUsage(data: unknown): ContextUsageState | null {
     compactThreshold,
     utilization: clampContextUtilization(effectiveTokens / compactThreshold),
     source: typeof record.source === 'string' ? record.source : 'unknown',
+    cacheHitRate: null,
   };
 }
 

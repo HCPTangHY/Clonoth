@@ -595,12 +595,20 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _parse_usage(um: dict[str, Any]) -> dict[str, int]:
-    """Convert Gemini usageMetadata to the standard usage dict format."""
-    return {
+    """Convert Gemini usageMetadata to the standard usage dict.
+
+    [AutoC 2026-08-24] 缓存命中统一为 Clonoth 内部字段 cached_prompt_tokens。
+    Gemini 的 cachedContentTokenCount 归一化到该字段。
+    """
+    result = {
         "prompt_tokens": um.get("promptTokenCount", 0),
         "completion_tokens": um.get("candidatesTokenCount", 0),
         "total_tokens": um.get("totalTokenCount", 0),
     }
+    cached = um.get("cachedContentTokenCount")
+    if isinstance(cached, int) and cached > 0:
+        result["cached_prompt_tokens"] = cached
+    return result
 
 
 def _parse_response(data: dict[str, Any]) -> ProviderResponse:

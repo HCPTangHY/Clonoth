@@ -358,6 +358,10 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             await ls.rctx.emit_event("context_usage", {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
+                # [AutoC 2026-08-24] 附带 provider 名：前端消息卡片的元信息按钮
+                # 需要实时显示渠道，历史路径有 JSONL 的 provider 字段，实时路径
+                # 此前缺失。
+                "provider": getattr(ls.provider, "name", "") or "",
                 "usage": resp.usage,
             })
 
