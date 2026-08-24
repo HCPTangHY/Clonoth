@@ -13,8 +13,8 @@ from pathlib import Path
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.3.0",
-    "description": "Web IDE：接管工作区文件面板（左右分栏 + 顶部多标签，VSCode 预览/固定语义）",
+    "version": "0.4.0",
+    "description": "Web IDE：接管工作区文件面板（单一主页 + 顶部标签栏切换，文件树为首标签）",
     "author": "clonoth",
     "client": {
         "panels": [
