@@ -37,6 +37,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
   const { rightPanelOpen, setRightPanelOpen } = useSettingsStore();
   const sidebarWidth = useSettingsStore((s) => s.sidebarWidth);
   const rightPanelWidth = useSettingsStore((s) => s.rightPanelWidth);
+  const sidebarCollapsed = useSettingsStore((s) => s.sidebarCollapsed);
   const hasRightPanel = Boolean(logPanel || rightPanel);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
 
@@ -141,28 +142,41 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
         style={{ width: '15rem' }}
         ref={(el) => {
           // desktop width follows the draggable value; mobile keeps the fixed
-          // off-canvas width from the class above
+          // off-canvas width from the class above. Collapsed (desktop) = 0.
           if (el && window.matchMedia('(min-width: 768px)').matches) {
-            el.style.width = `${sidebarWidth}px`;
+            el.style.width = sidebarCollapsed ? '0px' : `${sidebarWidth}px`;
+            el.style.overflow = sidebarCollapsed ? 'hidden' : '';
+            el.style.borderRightWidth = sidebarCollapsed ? '0px' : '';
           }
         }}
       >
         {sidebar}
       </aside>
 
-      {/* left drag handle (desktop only) */}
-      <div
-        aria-hidden="true"
-        className="hidden w-1.5 flex-shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--duties-border)] md:block"
-        onPointerDown={startDrag('left')}
-      />
+      {/* left drag handle (desktop only, hidden while collapsed) */}
+      {!sidebarCollapsed && (
+        <div
+          aria-hidden="true"
+          className="hidden w-1.5 flex-shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--duties-border)] md:block"
+          onPointerDown={startDrag('left')}
+        />
+      )}
 
       <main className="flex min-w-0 flex-1 flex-col">
         <div className="flex-shrink-0 border-b border-[var(--duties-border)] bg-[var(--duties-bg)]">
           <div className="flex items-center">
             <button
-              className="flex-shrink-0 px-3 py-3 text-lg text-[var(--duties-secondary)] md:hidden"
-              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="flex-shrink-0 px-3 py-3 text-lg text-[var(--duties-secondary)] transition-colors hover:text-[var(--duties-text)]"
+              onClick={() => {
+                // [AutoC 2026-08-24] Desktop toggles the persisted collapsed
+                // state; mobile toggles the off-canvas drawer.
+                if (window.matchMedia('(min-width: 768px)').matches) {
+                  useSettingsStore.getState().setSidebarCollapsed(!sidebarCollapsed);
+                } else {
+                  setSidebarOpen(!sidebarOpen);
+                }
+              }}
+              title={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
               type="button"
             >
               {/* [2026-06-01] Why: replace the hamburger Unicode glyph with Material Symbols.

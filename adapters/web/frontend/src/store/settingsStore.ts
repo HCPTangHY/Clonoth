@@ -12,6 +12,7 @@ const LS_KEY_TOKEN = 'clonoth_admin_token';
 const LS_KEY_NODE = 'clonoth_entry_node';
 const LS_KEY_SIDEBAR_WIDTH = 'clonoth_sidebar_width';
 const LS_KEY_RIGHT_WIDTH = 'clonoth_right_width';
+const LS_KEY_SIDEBAR_COLLAPSED = 'clonoth_sidebar_collapsed';
 
 type SessionProviderOverride = Record<string, unknown>;
 
@@ -65,6 +66,9 @@ interface SettingsState {
   // handles and any future consumers share one source; persisted on change.
   sidebarWidth: number;
   rightPanelWidth: number;
+  // [AutoC 2026-08-24] Desktop left-sidebar collapse. Mobile keeps its own
+  // off-canvas sidebarOpen state in AppLayout; this flag is desktop-only.
+  sidebarCollapsed: boolean;
   // [2026-06-12] True when the backend reports no provider has a valid API key.
   needsSetup: boolean;
 
@@ -82,6 +86,7 @@ interface SettingsState {
   setRightPanelOpen: (open: boolean) => void;
   setSidebarWidth: (width: number) => void;
   setRightPanelWidth: (width: number) => void;
+  setSidebarCollapsed: (collapsed: boolean) => void;
   setNeedsSetup: (v: boolean) => void;
 }
 
@@ -107,6 +112,9 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   rightPanelOpen: initialRightPanelOpen(),
   sidebarWidth: readStoredWidth(LS_KEY_SIDEBAR_WIDTH, 240, 180, 420),
   rightPanelWidth: readStoredWidth(LS_KEY_RIGHT_WIDTH, 288, 220, 640),
+  sidebarCollapsed: (() => {
+    try { return localStorage.getItem(LS_KEY_SIDEBAR_COLLAPSED) === '1'; } catch { return false; }
+  })(),
   needsSetup: false,
 
   setAdminToken: (token) => {
@@ -145,6 +153,10 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setRightPanelWidth: (width) => {
     try { localStorage.setItem(LS_KEY_RIGHT_WIDTH, String(Math.round(width))); } catch { /* ignore */ }
     set({ rightPanelWidth: Math.round(width) });
+  },
+  setSidebarCollapsed: (collapsed) => {
+    try { localStorage.setItem(LS_KEY_SIDEBAR_COLLAPSED, collapsed ? '1' : '0'); } catch { /* ignore */ }
+    set({ sidebarCollapsed: collapsed });
   },
   setNeedsSetup: (v) => set({ needsSetup: v }),
 }));
