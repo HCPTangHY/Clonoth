@@ -113,7 +113,7 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
   return (
     <>
       {/* Working header — same structure as MessageCard article */}
-      <article className={`${expanded ? '' : (hasCompletion ? '' : 'border-b border-[var(--duties-border)]')} bg-[var(--duties-panel)] px-3 pt-3 pb-2 sm:px-4`}>
+      <article className={`group/card ${expanded ? '' : (hasCompletion ? '' : 'border-b border-[var(--duties-border)]')} bg-[var(--duties-panel)] px-3 pt-3 pb-2 sm:px-4`}>
         <div className="mx-auto max-w-3xl">
           <header className="mb-1.5 flex flex-wrap items-center gap-2">
             <span className="font-mono text-[0.6rem] font-semibold uppercase tracking-[0.18em] text-blue-600">

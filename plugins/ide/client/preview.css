@@ -52,3 +52,54 @@
   flex: 1;
   padding-right: 12px;
 }
+
+/* ── @ 文件补全下拉（ide.completer，input_above 槽位） ───────────── */
+
+.ide-completer {
+  width: 100%;
+  max-width: 480px;
+  border: 1px solid var(--duties-border);
+  background: var(--duties-bg);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+  max-height: 240px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+}
+
+.ide-completer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 10px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--duties-secondary);
+}
+
+.ide-completer-row.active,
+.ide-completer-row:hover {
+  background: var(--duties-panel);
+  color: var(--duties-text);
+}
+
+.ide-completer-icon {
+  flex-shrink: 0;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.ide-completer-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-completer-empty {
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--duties-tertiary);
+}

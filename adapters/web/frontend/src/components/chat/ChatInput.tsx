@@ -323,6 +323,7 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
             rows=1 up to six lines. Purpose: text entry gets the full available width. */}
         <textarea
           className="block w-full resize-none bg-transparent px-3 py-2.5 font-sans text-sm leading-5 text-[var(--duties-text)] outline-none placeholder:text-[var(--duties-tertiary)] disabled:cursor-not-allowed disabled:opacity-50"
+          data-composer-textarea
           disabled={composerDisabled}
           onChange={handleDraftChange}
           onKeyDown={handleKeyDown}

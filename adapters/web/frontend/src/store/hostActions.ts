@@ -62,6 +62,34 @@ registerHostAction('retryMessage', async (messageId, newText) => {
   await useChatStore.getState().retryMessage(id, newText == null ? undefined : String(newText));
 });
 
+registerHostAction('insertComposerText', async (text) => {
+  // [AutoC 2026-08-24] Insert text at the composer textarea's cursor (replaces the
+  // current selection). Why: plugin scripts cannot cleanly write a React-controlled
+  // textarea — programmatic value assignment needs the prototype-chain setter trick
+  // plus a manual input event, which would be duplicated by every completer plugin.
+  // How: the host owns the composer, so it performs the write once here: locate the
+  // anchored textarea, splice the value across the selection range, and dispatch a
+  // bubbling input event so React's onChange picks it up. Purpose: completion
+  // selection (@file, /command, future triggers) writes back through one host action.
+  const insertText = String(text ?? '');
+  if (!insertText) return;
+  const ta = document.querySelector<HTMLTextAreaElement>('[data-composer-textarea]');
+  if (!ta) return;
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = ta.selectionEnd ?? start;
+  const nextValue = ta.value.slice(0, start) + insertText + ta.value.slice(end);
+  const valueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype, 'value',
+  )?.set;
+  valueSetter?.call(ta, nextValue);
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  const cursor = start + insertText.length;
+  requestAnimationFrame(() => {
+    ta.setSelectionRange(cursor, cursor);
+    ta.focus();
+  });
+});
+
 registerHostAction('reroll', async () => {
   const state = useChatStore.getState();
   // child-session view: which conversation to rewind is ambiguous — refuse.

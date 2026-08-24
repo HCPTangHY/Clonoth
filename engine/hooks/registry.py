@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 # entry here plus one fire/afire call at the trigger site.
 HOOK_POINTS: dict[str, str] = {
     # ---- engine inference (async afire) ----
+    "before_llm_call": (
+        "每次 provider 调用前、L2 格式化与图片解析之后触发。"
+        "extra: workspace_root。ctx.messages 是本次请求的 L2 产物（每次新建），"
+        "handler 可原地改写或替换 ctx.messages，仅影响本次出站请求，"
+        "不影响 ls.messages 与 JSONL 落库。返回 action 终止任务。"
+        "典型用途：@文件引用展开、请求级脱敏。"
+    ),
     "before_prompt_build": (
         "初始 messages 组装完成后、发送 LLM 前触发。"
         "extra: runtime_cfg/instruction_text/history/attachments/system_prompt。"

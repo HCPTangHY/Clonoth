@@ -14,6 +14,7 @@ from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
 from .tool_format import build_llm_messages, sanitize_control_tool_history
+from ..hooks import HookContext, hook_registry
 # Phase 1: Signal System — 引入信号总线，用于 LLM 调用的可观测性
 # 在 while True 循环前发射 llm.call.start，在 return resp 前发射 llm.call.end，
 # 在重试路径发射 llm.retry，在不可重试失败时发射 llm.error。
@@ -170,6 +171,26 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # 注意：不能修改 ls.messages 本身，它是运行时状态。
     _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
+
+    # [AutoC 2026-08-24] before_llm_call：请求级消息变换点。
+    # Why: @文件引用等内容需要“落库保持字面量、出站前展开”的语义，此前没有
+    # 这个时机（before_prompt_build 只在初始组装时触发一次）。How: 在 L2
+    # 格式化与图片解析之后、provider 调用之前触发，ctx.messages 是本次请求
+    # 的产物（每次新建），handler 改写不影响 ls.messages 与 JSONL。Purpose:
+    # 请求级变换（引用展开、脱敏）与持久化解耦。
+    _llm_hook_ctx = HookContext(
+        messages=llm_messages,
+        tools=[],
+        node=ls.node,
+        provider=ls.provider,
+        rctx=ls.rctx,
+        step=step,
+        extra={"workspace_root": ls.rctx.workspace_root},
+    )
+    _llm_hook_result = await hook_registry.afire("before_llm_call", _llm_hook_ctx)
+    if _llm_hook_result.action is not None:
+        return _llm_hook_result.action
+    llm_messages = _llm_hook_ctx.messages
 
     resp = None
     _retry_attempt = 0
