@@ -481,6 +481,43 @@ function isMarkdown(path) {
   return /\.(md|markdown)$/i.test(String(path));
 }
 
+// [AutoC 2026-08-24] 语法高亮语言映射。CodeMirror 语言按独立包分发，
+// 这里只接入常用语言，按扩展名匹配；未命中的文件走无高亮纯文本。
+// legacy-modes 覆盖 shell/toml/dockerfile/lua/ruby。
+let _langDescs = null;
+function languageFor(path) {
+  if (_langDescs === null) {
+    const { LanguageDescription, StreamLanguage,
+            javascript, python, json, html, css, xml, yaml, rust, cpp,
+            java, go, sql, php,
+            shell, toml, dockerFile, lua, ruby } = CM;
+    _langDescs = [
+      LanguageDescription.of({ name: 'javascript', extensions: ['js','mjs','cjs'], support: javascript() }),
+      LanguageDescription.of({ name: 'typescript', extensions: ['ts','mts','cts'], support: javascript({ typescript: true }) }),
+      LanguageDescription.of({ name: 'jsx', extensions: ['jsx'], support: javascript({ jsx: true }) }),
+      LanguageDescription.of({ name: 'tsx', extensions: ['tsx'], support: javascript({ jsx: true, typescript: true }) }),
+      LanguageDescription.of({ name: 'json', extensions: ['json','jsonl','map'], support: json() }),
+      LanguageDescription.of({ name: 'python', extensions: ['py','pyi'], support: python() }),
+      LanguageDescription.of({ name: 'html', extensions: ['html','htm'], support: html() }),
+      LanguageDescription.of({ name: 'css', extensions: ['css'], support: css() }),
+      LanguageDescription.of({ name: 'xml', extensions: ['xml','svg','xsd'], support: xml() }),
+      LanguageDescription.of({ name: 'yaml', extensions: ['yaml','yml'], support: yaml() }),
+      LanguageDescription.of({ name: 'rust', extensions: ['rs'], support: rust() }),
+      LanguageDescription.of({ name: 'cpp', extensions: ['c','h','cpp','hpp','cc','cxx','hh'], support: cpp() }),
+      LanguageDescription.of({ name: 'java', extensions: ['java'], support: java() }),
+      LanguageDescription.of({ name: 'go', extensions: ['go'], support: go() }),
+      LanguageDescription.of({ name: 'sql', extensions: ['sql'], support: sql() }),
+      LanguageDescription.of({ name: 'php', extensions: ['php'], support: php() }),
+      LanguageDescription.of({ name: 'shell', extensions: ['sh','bash','zsh'], support: StreamLanguage.define(shell) }),
+      LanguageDescription.of({ name: 'toml', extensions: ['toml'], support: StreamLanguage.define(toml) }),
+      LanguageDescription.of({ name: 'dockerfile', extensions: ['dockerfile'], support: StreamLanguage.define(dockerFile) }),
+      LanguageDescription.of({ name: 'lua', extensions: ['lua'], support: StreamLanguage.define(lua) }),
+      LanguageDescription.of({ name: 'ruby', extensions: ['rb'], support: StreamLanguage.define(ruby) }),
+    ];
+  }
+  return CM.LanguageDescription.matchFilename(_langDescs, String(path));
+}
+
 function findTab(path) {
   return tabs.find((t) => t.path === path) || null;
 }
@@ -699,10 +736,11 @@ function renderEditor(tab) {
             }, 0);
           },
         })] : []),
-        // MD 文件编辑时启用 Markdown 语法高亮；其他语言走兜底样式。
+        // MD 文件编辑时启用 Markdown 语法高亮；其他文件按扩展名匹配
+        // 语言包，未命中则无高亮。
         ...(isMarkdown(tab.path)
           ? [CM.markdown({ base: CM.markdownLanguage })]
-          : []),
+          : (() => { const d = languageFor(tab.path); return d && d.support ? [d.support] : []; })()),
         // tabSize 决定 Tab 字符显示宽度，indentUnit 决定 Tab 命令插入的空白，
         // 两者都跟随状态栏的缩进偏好。
         EditorState.tabSize.of(indentWidth),
