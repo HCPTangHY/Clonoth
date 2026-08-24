@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IDE</title>
 <style>
-/* [AutoC 2026-08-24] IDE 面板页 v3：单一主页 + 顶部标签栏（VSCode 语义）。
-   文件树是第一个固定标签「文件」，其余标签是打开的文件；视图切换全部
-   经标签栏完成，不存在分栏。只写结构与变量名映射，主题由宿主注入。 */
+/* [AutoC 2026-08-24] IDE 面板页：单一主页 + 顶部标签栏 + 文本编辑。
+   只写结构与变量名映射，不抄宿主值；主题变量与滚动条规则由宿主
+   themeBridge 在 iframe load 后注入。 */
 :root {
   /* 与宿主右栏同底：宿主 aside 用 --duties-panel，没有 --duties-card。
      视图区用更浅的 --duties-bg 区分内容区。 */
@@ -67,6 +67,9 @@ body {
   box-shadow: inset 0 2px 0 var(--accent);
 }
 .tab.preview-tab .nm { font-style: italic; }
+.tab .dot { display: none; color: var(--accent); font-size: 9px; }
+.tab.dirty .dot { display: inline; }
+.tab.dirty:hover .dot { display: none; }
 .tab .close {
   display: inline-flex;
   align-items: center;
@@ -92,6 +95,8 @@ body {
   min-height: 0;
   overflow: auto;
   background: var(--card);
+  display: flex;
+  flex-direction: column;
 }
 .status { padding: 12px; font-size: 11px; color: var(--tertiary); }
 
@@ -130,23 +135,65 @@ body {
 
 /* file content */
 .pv-img { display: block; max-width: 100%; margin: 8px auto; }
-.pv-code { margin: 0; padding: 8px 0; font-family: var(--mono); font-size: 11px; line-height: 1.5; }
-.pv-line { display: flex; white-space: pre; }
-.pv-line:hover { background: var(--hover); }
-.pv-ln { flex-shrink: 0; width: 3.6em; padding-right: 1em; text-align: right; color: var(--tertiary); user-select: none; }
-.pv-lt { flex: 1; padding-right: 12px; }
+.editor-textarea {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  outline: none;
+  resize: none;
+  padding: 8px 12px;
+  background: var(--card);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 4;
+}
+
+/* ── status bar ── */
+.statusbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 10px;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tertiary);
+  background: var(--bg);
+}
+.statusbar .sp { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.statusbar .hint-dirty { color: var(--accent); }
+.statusbar .hint-error { color: #c0392b; }
+.statusbar button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--secondary);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.statusbar button:hover:not(:disabled) { color: var(--text); border-color: var(--text); }
+.statusbar button:disabled { opacity: 0.4; cursor: default; }
 </style>
 </head>
 <body>
 <div class="tabbar" id="tabbar"></div>
 <div class="view" id="view"></div>
+<div class="statusbar" id="statusbar"></div>
 <script>
-/* [AutoC 2026-08-24] IDE 面板 v3：单主页 + 标签栏切换。
+/* [AutoC 2026-08-24] IDE 面板：单主页 + 标签栏切换 + 文本编辑保存。
  *
  * 「文件」标签固定在第一、不可关闭，内容是工作区文件树。单击树中文件
- * 打开预览标签（斜体，至多一个，再单击别的文件时复用替换）；双击固定。
- * 标签可点切换、✕ 或中键关闭。数据全部来自 supervisor REST，鉴权经
- * 宿主 boot 对象注入。 */
+ * 打开预览标签（斜体，至多一个，再单击别的文件时复用替换）；双击固定；
+ * 编辑预览标签内容会自动将其固定（VSCode 语义）。文本文件直接可编辑，
+ * 脏状态在标签上显示圆点，Ctrl+S 或状态栏按钮保存，写回走本插件注册的
+ * PUT /v1/plugins/ide/file。 */
 
 const boot = (window.parent && window.parent.__CLONOTH_BOOT__) || {};
 const TOKEN = boot.token || '';
@@ -158,11 +205,13 @@ const TREE_TAB = '::tree';
 
 const tabbarEl = document.getElementById('tabbar');
 const viewEl = document.getElementById('view');
+const statusbarEl = document.getElementById('statusbar');
 
-async function api(path) {
-  const resp = await fetch('/v1' + path, {
-    headers: TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {},
-  });
+async function api(path, init) {
+  init = init || {};
+  init.headers = Object.assign(
+    {}, TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}, init.headers || {});
+  const resp = await fetch('/v1' + path, init);
   if (!resp.ok) {
     let detail = '';
     try { detail = (await resp.json()).detail || ''; } catch (e) {}
@@ -193,11 +242,19 @@ function baseName(path) {
 }
 
 // ── tab state ────────────────────────────────────────────────────────────
-// tabs: [{ path, pinned }]，path === TREE_TAB 是文件树标签，永远在首位。
-// 文件标签中至多一个未固定（预览标签）。
+// tabs: [{ path, pinned, loaded, kind, text, savedText, dirty, scroll,
+//          blobUrl, note }]。path === TREE_TAB 是文件树标签，永远在首位。
+// 文件标签中至多一个未固定（预览标签）；编辑预览标签会自动将其固定。
 
 let tabs = [{ path: TREE_TAB, pinned: true }];
 let activePath = TREE_TAB;
+let viewPath = null;      // 当前视图为哪个标签渲染，用于切换前保存滚动位置
+let saveHint = '';        // 状态栏一次性提示（保存成功/失败）
+
+function newFileTab(path, pinned) {
+  return { path, pinned, loaded: false, kind: '', text: '', savedText: '',
+           dirty: false, scroll: 0, blobUrl: null, note: '' };
+}
 
 function findTab(path) {
   return tabs.find((t) => t.path === path) || null;
@@ -205,6 +262,10 @@ function findTab(path) {
 
 function findPreviewTab() {
   return tabs.find((t) => t.path !== TREE_TAB && !t.pinned) || null;
+}
+
+function releaseTab(tab) {
+  if (tab && tab.blobUrl) { URL.revokeObjectURL(tab.blobUrl); tab.blobUrl = null; }
 }
 
 function activate(path) {
@@ -215,15 +276,21 @@ function activate(path) {
 }
 
 function openFileTab(path, pinned) {
-  const existing = findTab(path);
-  if (existing) {
-    if (pinned) existing.pinned = true;
+  let tab = findTab(path);
+  if (tab) {
+    if (pinned) tab.pinned = true;
   } else if (pinned) {
-    tabs.push({ path, pinned: true });
+    tab = newFileTab(path, true);
+    tabs.push(tab);
   } else {
+    tab = newFileTab(path, false);
     const preview = findPreviewTab();
-    if (preview) preview.path = path;
-    else tabs.push({ path, pinned: false });
+    if (preview) {
+      releaseTab(preview);
+      tabs[tabs.indexOf(preview)] = tab;
+    } else {
+      tabs.push(tab);
+    }
   }
   activePath = path;
   renderTabs();
@@ -232,8 +299,11 @@ function openFileTab(path, pinned) {
 
 function closeTab(path) {
   if (path === TREE_TAB) return;
-  const idx = tabs.findIndex((t) => t.path === path);
-  if (idx < 0) return;
+  const tab = findTab(path);
+  if (!tab) return;
+  if (tab.dirty && !confirm('未保存的修改将丢失，确定关闭 ' + baseName(path) + '？')) return;
+  const idx = tabs.indexOf(tab);
+  releaseTab(tab);
   tabs.splice(idx, 1);
   if (activePath === path) {
     const next = tabs[Math.min(idx, tabs.length - 1)] || tabs[0];
@@ -250,13 +320,18 @@ function renderTabs() {
     const el = document.createElement('div');
     el.className = 'tab'
       + (tab.path === activePath ? ' active' : '')
-      + (!isTree && !tab.pinned ? ' preview-tab' : '');
+      + (!isTree && !tab.pinned ? ' preview-tab' : '')
+      + (tab.dirty ? ' dirty' : '');
     el.title = isTree ? '工作区文件' : tab.path;
     const nm = document.createElement('span');
     nm.className = 'nm';
     nm.textContent = isTree ? '文件' : baseName(tab.path);
     el.appendChild(nm);
     if (!isTree) {
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.textContent = '●';
+      el.appendChild(dot);
       const close = document.createElement('button');
       close.className = 'close';
       close.type = 'button';
@@ -281,36 +356,138 @@ function renderTabs() {
 
 // ── view rendering ───────────────────────────────────────────────────────
 
-let blobUrl = null;
 let loadSeq = 0;
 let treeBooted = false;   // 文件树只初始化一次，切换标签时保留展开状态
-
-function releaseBlob() {
-  if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
-}
+let treeRootEl = document.createElement('div');
 
 function showStatus(text) {
-  releaseBlob();
   viewEl.innerHTML = '<div class="status">' + esc(text) + '</div>';
 }
 
+function stashScroll() {
+  const tab = viewPath && viewPath !== TREE_TAB ? findTab(viewPath) : null;
+  if (!tab || tab.kind !== 'text') return;
+  const ta = viewEl.querySelector('textarea');
+  if (ta) tab.scroll = ta.scrollTop;
+}
+
 function renderView() {
+  stashScroll();
+  viewPath = activePath;
   if (activePath === TREE_TAB) {
-    releaseBlob();
     if (treeBooted) {
       viewEl.innerHTML = '';
       viewEl.appendChild(treeRootEl);
     } else {
       bootTree();
     }
+    renderStatusbar();
     return;
   }
-  loadFileIntoView(activePath);
+  const tab = findTab(activePath);
+  if (!tab) { renderStatusbar(); return; }
+  if (!tab.loaded) { loadFileTab(tab); return; }
+  renderFileTab(tab);
+  renderStatusbar();
+}
+
+function renderFileTab(tab) {
+  if (tab.kind === 'text') renderEditor(tab);
+  else if (tab.kind === 'image') renderImage(tab);
+  else showStatus(tab.note || '不支持预览');
+}
+
+// ── editor ───────────────────────────────────────────────────────────────
+
+function markEdited(tab, ta) {
+  tab.text = ta.value;
+  const wasDirty = tab.dirty;
+  const wasPinned = tab.pinned;
+  tab.dirty = tab.text !== tab.savedText;
+  if (!tab.pinned) tab.pinned = true;   // 编辑预览标签 → 固定
+  if (tab.dirty !== wasDirty || tab.pinned !== wasPinned) {
+    renderTabs();
+    renderStatusbar();
+  }
+}
+
+function renderEditor(tab) {
+  viewEl.innerHTML = '';
+  const ta = document.createElement('textarea');
+  ta.className = 'editor-textarea';
+  ta.value = tab.text;
+  ta.spellcheck = false;
+  ta.addEventListener('input', () => markEdited(tab, ta));
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      ta.setRangeText('\t', ta.selectionStart, ta.selectionEnd, 'end');
+      markEdited(tab, ta);
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      saveTab(tab);
+    }
+  });
+  viewEl.appendChild(ta);
+  ta.scrollTop = tab.scroll || 0;
+}
+
+async function saveTab(tab) {
+  if (tab.kind !== 'text' || !tab.dirty) return;
+  try {
+    await api('/plugins/ide/file?session_id=' + encodeURIComponent(SESSION_ID)
+      + '&path=' + encodeURIComponent(tab.path), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      body: tab.text,
+    });
+    tab.savedText = tab.text;
+    tab.dirty = false;
+    saveHint = '已保存';
+  } catch (err) {
+    saveHint = '保存失败：' + err.message;
+  }
+  renderTabs();
+  renderStatusbar();
+}
+
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    const tab = findTab(activePath);
+    if (tab && tab.kind === 'text') {
+      e.preventDefault();
+      saveTab(tab);
+    }
+  }
+});
+
+function renderStatusbar() {
+  const tab = findTab(activePath);
+  if (!tab || tab.path === TREE_TAB) {
+    statusbarEl.innerHTML = '<span class="sp">工作区文件</span>';
+    return;
+  }
+  let hint = '';
+  let hintClass = '';
+  if (saveHint) {
+    hint = saveHint;
+    hintClass = saveHint.startsWith('保存失败') ? 'hint-error' : '';
+    saveHint = '';   // 一次性
+  } else if (tab.kind === 'text') {
+    hint = tab.dirty ? '未保存 · Ctrl+S' : '已保存';
+    hintClass = tab.dirty ? 'hint-dirty' : '';
+  }
+  const saveBtn = tab.kind === 'text'
+    ? '<button id="sb-save"' + (tab.dirty ? '' : ' disabled') + '>保存</button>'
+    : '';
+  statusbarEl.innerHTML = '<span class="sp">' + esc(tab.path) + '</span>'
+    + (hint ? '<span class="' + hintClass + '">' + esc(hint) + '</span>' : '')
+    + saveBtn;
+  const btn = document.getElementById('sb-save');
+  if (btn) btn.addEventListener('click', () => saveTab(tab));
 }
 
 // ── file tree ────────────────────────────────────────────────────────────
-
-let treeRootEl = document.createElement('div');
 
 async function fetchTree(subPath) {
   const params = new URLSearchParams();
@@ -415,81 +592,70 @@ async function bootTree() {
   }
 }
 
-// ── file content ─────────────────────────────────────────────────────────
+// ── file loading & classification ────────────────────────────────────────
 
-function renderText(text) {
-  releaseBlob();
-  viewEl.innerHTML = '';
-  let truncated = false;
-  if (text.length > MAX_TEXT_BYTES) {
-    text = text.slice(0, MAX_TEXT_BYTES);
-    truncated = true;
+async function loadFileTab(tab) {
+  const seq = ++loadSeq;
+  showStatus('加载中…');
+  renderStatusbar();
+  let resp;
+  try {
+    resp = await api('/sessions/' + encodeURIComponent(SESSION_ID)
+      + '/file?path=' + encodeURIComponent(tab.path));
+  } catch (err) {
+    if (activePath === tab.path) showStatus('加载失败：' + err.message);
+    return;
   }
-  const pre = document.createElement('pre');
-  pre.className = 'pv-code';
-  const frag = document.createDocumentFragment();
-  text.split('\n').forEach((line, i) => {
-    const row = document.createElement('div');
-    row.className = 'pv-line';
-    const no = document.createElement('span');
-    no.className = 'pv-ln';
-    no.textContent = String(i + 1);
-    const lt = document.createElement('span');
-    lt.className = 'pv-lt';
-    lt.textContent = line;
-    row.appendChild(no);
-    row.appendChild(lt);
-    frag.appendChild(row);
-  });
-  pre.appendChild(frag);
-  viewEl.appendChild(pre);
-  if (truncated) {
-    const note = document.createElement('div');
-    note.className = 'status';
-    note.textContent = '文件过大，仅显示前 ' + MAX_TEXT_BYTES + ' 字节';
-    viewEl.appendChild(note);
+  const ct = resp.headers.get('content-type') || '';
+  const ext = extOf(tab.path);
+  if (ct.startsWith('image/') || IMAGE_EXTS.has(ext)) {
+    const blob = await resp.blob();
+    tab.kind = 'image';
+    tab.blobUrl = URL.createObjectURL(blob);
+  } else {
+    const buf = await resp.arrayBuffer();
+    if (buf.byteLength > MAX_TEXT_BYTES * 4) {
+      tab.kind = 'binary';
+      tab.note = '二进制文件（' + buf.byteLength + ' B），不支持预览';
+    } else {
+      const bytes = new Uint8Array(buf);
+      let isBinary = false;
+      for (let i = 0; i < Math.min(bytes.length, 8192); i++) {
+        if (bytes[i] === 0) { isBinary = true; break; }
+      }
+      if (isBinary) {
+        tab.kind = 'binary';
+        tab.note = '二进制文件（' + buf.byteLength + ' B），不支持预览';
+      } else {
+        let text = new TextDecoder('utf-8').decode(bytes);
+        if (text.length > MAX_TEXT_BYTES) {
+          text = text.slice(0, MAX_TEXT_BYTES);
+          tab.note = '文件过大，仅加载前 ' + MAX_TEXT_BYTES + ' 字节，保存将被拒绝';
+          tab.kind = 'binary';   // 截断内容不可写回，按只读处理
+        } else {
+          tab.kind = 'text';
+          tab.text = text;
+          tab.savedText = text;
+        }
+      }
+    }
+  }
+  tab.loaded = true;
+  // 仅当本次加载仍是最新且该标签仍激活时才渲染；过期的响应直接丢弃，
+  // 内容已缓存进 tab，切回时直接命中。
+  if (activePath === tab.path && seq === loadSeq) {
+    renderFileTab(tab);
+    renderStatusbar();
   }
 }
 
-async function loadFileIntoView(path) {
-  const seq = ++loadSeq;
-  showStatus('加载中…');
-  let resp;
-  try {
-    resp = await api('/sessions/' + encodeURIComponent(SESSION_ID) + '/file?path=' + encodeURIComponent(path));
-  } catch (err) {
-    if (seq !== loadSeq) return;
-    showStatus('加载失败：' + err.message);
-    return;
-  }
-  if (seq !== loadSeq) return;
-  const ct = resp.headers.get('content-type') || '';
-  const ext = extOf(path);
-  if (ct.startsWith('image/') || IMAGE_EXTS.has(ext)) {
-    const blob = await resp.blob();
-    releaseBlob();
-    blobUrl = URL.createObjectURL(blob);
-    viewEl.innerHTML = '';
-    const img = document.createElement('img');
-    img.className = 'pv-img';
-    img.src = blobUrl;
-    img.alt = path;
-    viewEl.appendChild(img);
-    return;
-  }
-  const buf = await resp.arrayBuffer();
-  if (buf.byteLength > MAX_TEXT_BYTES * 4) {
-    showStatus('二进制文件（' + buf.byteLength + ' B），不支持预览');
-    return;
-  }
-  const bytes = new Uint8Array(buf);
-  for (let i = 0; i < Math.min(bytes.length, 8192); i++) {
-    if (bytes[i] === 0) {
-      showStatus('二进制文件（' + buf.byteLength + ' B），不支持预览');
-      return;
-    }
-  }
-  renderText(new TextDecoder('utf-8').decode(bytes));
+function renderImage(tab) {
+  viewEl.innerHTML = '';
+  const img = document.createElement('img');
+  img.className = 'pv-img';
+  img.src = tab.blobUrl;
+  img.alt = tab.path;
+  viewEl.appendChild(img);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────
