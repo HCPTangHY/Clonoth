@@ -186,13 +186,19 @@ textarea {
   margin-top: 2px;
   opacity: 0.35;
   transition: opacity 0.15s ease;
-  /* [AutoC 2026-08-24] 半透明状态下仍占据布局空间，若允许指针事件会
-     遮挡 WorkingGroup 的折叠按钮点击。低透明度时禁用指针，悬停全亮后恢复。 */
-  pointer-events: none;
 }
-.group\/card:hover .msg-footer-row { opacity: 1; pointer-events: auto; }
+.group\/card:hover .msg-footer-row { opacity: 1; }
 @media (max-width: 639px) {
-  .msg-footer-row { opacity: 1; pointer-events: auto; }
+  .msg-footer-row { opacity: 1; }
+}
+
+/* [AutoC 2026-08-24] 信息图标：悬停时放大提示，不改变布局。 */
+.msg-meta-info {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  color: var(--duties-tertiary);
+  cursor: default;
 }
 .msg-copy-btn {
   display: inline-flex;

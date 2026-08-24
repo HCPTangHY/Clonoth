@@ -26,9 +26,17 @@ export default {
 
     const wrap = document.createElement('div');
     wrap.className = 'msg-retry-acts';
+    // [AutoC 2026-08-24] Unicode 符号字形偏小，与宿主 13px SVG 图标按钮
+    // 视觉不同级。换用 13px SVG 图标，尺寸与复制按钮一致。
     wrap.innerHTML =
-      '<button type="button" class="mr-retry" title="原样重试">↻</button>' +
-      '<button type="button" class="mr-edit" title="编辑后重试">✎</button>';
+      '<button type="button" class="mr-retry" title="原样重试">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+        'stroke-linecap="round" stroke-linejoin="round" width="13" height="13">' +
+        '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>' +
+      '<button type="button" class="mr-edit" title="编辑后重试">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+        'stroke-linecap="round" stroke-linejoin="round" width="13" height="13">' +
+        '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>';
 
     const editor = document.createElement('div');
     editor.className = 'msg-retry-editor';
@@ -134,21 +142,19 @@ _STYLES = r"""
 @media (max-width: 639px) {
   .msg-retry-acts { opacity: 1; }
 }
-/* [AutoC 2026-08-24] 尺寸对齐宿主复制按钮：字号 0.6rem、内边距 2px，
-   与 13px 图标按钮视觉同级。 */
+/* [AutoC 2026-08-24] 尺寸对齐宿主复制按钮：SVG 图标 13px、内边距 2px。 */
 .msg-retry-acts button {
-  font-family: var(--duties-mono, 'Geist Mono', ui-monospace, Menlo, monospace);
-  font-size: 0.6rem;
   background: none;
   border: none;
   padding: 2px;
   cursor: pointer;
   color: var(--duties-tertiary);
   transition: color 0.15s ease;
-  line-height: 1;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
 }
+.msg-retry-acts button svg { display: block; }
 .msg-retry-acts button:hover { color: #2563eb; }
 .msg-retry-editor {
   margin-top: 6px;
@@ -192,7 +198,7 @@ _STYLES = r"""
 
 PLUGIN_META = {
     "name": "message_retry",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "消息重试/编辑：用户消息的原样重试与编辑后重试（message_footer 槽位）",
     "author": "clonoth",
     "client": {
