@@ -417,6 +417,15 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
                     const sx = cx + r * Math.cos(toRad(startAngle));
                     const sy = cy + r * Math.sin(toRad(startAngle));
                     const cacheRate = contextUsage.cacheHitRate;
+                    // [AutoC 2026-08-24] 缓存率分档变色：90% 以上绿色（良好），
+                    // 70%–90% 次级正文色（正常），70% 以下三级灰（偏低）。
+                    const cacheRateColor = cacheRate === null || cacheRate === undefined
+                      ? 'text-[var(--duties-tertiary)]'
+                      : cacheRate >= 0.9
+                        ? 'text-green-600'
+                        : cacheRate >= 0.7
+                          ? 'text-[var(--duties-secondary)]'
+                          : 'text-[var(--duties-tertiary)]';
                     return (
                       <span className="relative inline-flex flex-shrink-0" style={{ width: size, height: size }}>
                       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="flex-shrink-0">
@@ -448,7 +457,7 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
                           与环的进度语义一致，比放在环右侧更紧凑。 */}
                       {cacheRate !== null && cacheRate !== undefined && (
                         <span
-                          className="pointer-events-none absolute inset-0 flex items-center justify-center font-mono text-[0.45rem] leading-none text-[var(--duties-tertiary)]"
+                          className={`pointer-events-none absolute inset-0 flex items-center justify-center font-mono text-[0.45rem] leading-none ${cacheRateColor}`}
                           title={`缓存命中率（指数移动平均）：${(cacheRate * 100).toFixed(1)}%`}
                         >
                           {(cacheRate * 100).toFixed(0)}%
