@@ -188,7 +188,7 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
 
       {/* Finish text blocks: always visible, no gap with fold above */}
       {hasCompletion && lastCard && (completionTextBlocks.length > 0 || (lastCard.attachments && lastCard.attachments.length > 0)) && completionContext && (
-        <article className="border-b border-[var(--duties-border)] bg-[var(--duties-panel)] px-3 pt-0 pb-3 sm:px-4">
+        <article className="group/card border-b border-[var(--duties-border)] bg-[var(--duties-panel)] px-3 pt-0 pb-3 sm:px-4">
           <div className="mx-auto max-w-3xl">
             <div className={BLOCK_STACK_CLASS}>
               {completionTextBlocks.map((block) => (
