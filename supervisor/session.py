@@ -1279,6 +1279,12 @@ class SessionMixin:
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),
                 "total_tokens": usage.get("total_tokens"),
+                # [AutoC 2026-08-24] 缓存字段透传：provider 层已归一化为
+                # cached_prompt_tokens / cache_write_prompt_tokens，此处白名单
+                # 存储此前将其丢弃，导致快照响应的 usage 子字典缺缓存字段，
+                # 前端仪表的会话级缓存率无法从实时事件播种。
+                "cached_prompt_tokens": usage.get("cached_prompt_tokens"),
+                "cache_write_prompt_tokens": usage.get("cache_write_prompt_tokens"),
                 "node_id": node_id,
                 "task_id": str(payload.get("task_id") or ""),
                 "updated_at": _now().isoformat(),
