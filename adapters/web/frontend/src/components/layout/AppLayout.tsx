@@ -19,9 +19,19 @@ import { Icon } from '../common';
 const LEFT_MIN = 180;
 const LEFT_MAX = 420;
 const RIGHT_MIN = 220;
-const RIGHT_MAX = 640;
+// [AutoC 2026-08-24] 右侧上限随左侧栏收起动态放宽：收起时允许拖到视口
+// 宽度的 60%（至少 640），展开时保持 640。IDE 面板在左侧收起后需要
+// 更大的编辑区。持久化值的合法性检查仍在 settingsStore 用固定 640，
+// 防止小屏幕读出大屏幕存下的超大值。
+const RIGHT_MAX_EXPANDED = 640;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+function rightMax(sidebarCollapsed: boolean): number {
+  if (!sidebarCollapsed) return RIGHT_MAX_EXPANDED;
+  const viewport = window.innerWidth || document.documentElement.clientWidth;
+  return Math.max(RIGHT_MAX_EXPANDED, Math.round(viewport * 0.6));
+}
 
 interface AppLayoutProps extends PropsWithChildren {
   sidebar: ReactNode;
@@ -38,6 +48,12 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
   const sidebarWidth = useSettingsStore((s) => s.sidebarWidth);
   const rightPanelWidth = useSettingsStore((s) => s.rightPanelWidth);
   const sidebarCollapsed = useSettingsStore((s) => s.sidebarCollapsed);
+
+  // [AutoC 2026-08-24] 左侧展开时上限收窄到 640：当前右侧宽度超出则
+  // 立即回落，避免展开后右侧占据过宽。
+  if (!sidebarCollapsed && rightPanelWidth > RIGHT_MAX_EXPANDED) {
+    useSettingsStore.getState().setRightPanelWidth(RIGHT_MAX_EXPANDED);
+  }
   const hasRightPanel = Boolean(logPanel || rightPanel);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
 
@@ -59,7 +75,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
       const next = clamp(
         startWidth + delta,
         side === 'left' ? LEFT_MIN : RIGHT_MIN,
-        side === 'left' ? LEFT_MAX : RIGHT_MAX,
+        side === 'left' ? LEFT_MAX : rightMax(useSettingsStore.getState().sidebarCollapsed),
       );
       const store = useSettingsStore.getState();
       if (side === 'left') store.setSidebarWidth(next);
