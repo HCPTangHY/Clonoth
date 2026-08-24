@@ -484,6 +484,36 @@ function isMarkdown(path) {
 // [AutoC 2026-08-24] 语法高亮语言映射。CodeMirror 语言按独立包分发，
 // 这里只接入常用语言，按扩展名匹配；未命中的文件走无高亮纯文本。
 // legacy-modes 覆盖 shell/toml/dockerfile/lua/ruby。
+// 浅色高对比语法配色。tags 来自 @lezer/highlight，颜色值为最终 CSS；
+// 注释与正文引用宿主变量，其余用 Atom One Light 的成熟浅色色系。
+let _hlStyle = null;
+function hlStyle() {
+  if (_hlStyle === null) {
+    const t = CM.tags;
+    _hlStyle = CM.HighlightStyle.define([
+      { tag: [t.keyword, t.controlKeyword, t.moduleKeyword], color: '#a626a4' },
+      { tag: [t.string, t.special(t.string), t.regexp], color: '#50a14f' },
+      { tag: t.comment, color: 'var(--duties-tertiary, #9a9a9a)', fontStyle: 'italic' },
+      { tag: [t.number, t.bool, t.null], color: '#b76b01' },
+      { tag: [t.atom, t.labelName], color: '#0184bc' },
+      { tag: [t.function(t.variableName), t.function(t.propertyName)], color: '#4078f2' },
+      { tag: [t.typeName, t.className, t.namespace], color: '#c18401' },
+      { tag: [t.propertyName, t.attributeName], color: '#e45649' },
+      { tag: t.tagName, color: '#e45649' },
+      { tag: t.attributeValue, color: '#50a14f' },
+      { tag: [t.operator, t.punctuation, t.separator], color: '#383a42' },
+      { tag: [t.variableName, t.name], color: 'var(--duties-text, #1a1a1a)' },
+      { tag: [t.heading, t.strong], color: 'var(--duties-text, #1a1a1a)', fontWeight: 'bold' },
+      { tag: t.emphasis, fontStyle: 'italic' },
+      { tag: t.link, color: 'var(--duties-accent, #feaf2c)' },
+      { tag: [t.invalid, t.deleted], color: '#c0392b' },
+      { tag: t.inserted, color: '#50a14f' },
+      { tag: t.changed, color: '#c18401' },
+    ]);
+  }
+  return _hlStyle;
+}
+
 let _langDescs = null;
 function languageFor(path) {
   if (_langDescs === null) {
@@ -695,6 +725,7 @@ function renderEditor(tab) {
           historyKeymap, indentWithTab, syntaxHighlighting,
           defaultHighlightStyle, bracketMatching, foldGutter, indentUnit,
           searchKeymap, highlightSelectionMatches } = CM;
+  void defaultHighlightStyle;
 
   const view = new EditorView({
     parent: host,
@@ -708,7 +739,9 @@ function renderEditor(tab) {
         history(),
         bracketMatching(),
         foldGutter(),
-        syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+        // [AutoC 2026-08-24] 默认高亮配色饱和度低、在纸张底上不明显，
+        // 换用高对比浅色配色（Atom One Light 色系），注释与正文跟随宿主变量。
+        syntaxHighlighting(hlStyle()),
         highlightSelectionMatches(),
         keymap.of([
           ...defaultKeymap,
