@@ -154,7 +154,7 @@ body {
 .cm-host .cm-editor {
   flex: 1;
   min-height: 0;
-  font-size: 11px;
+  font-size: 12px;
 }
 .cm-host .cm-scroller {
   font-family: var(--mono);
@@ -490,16 +490,18 @@ let _hlStyle = null;
 function hlStyle() {
   if (_hlStyle === null) {
     const t = CM.tags;
+    // [AutoC 2026-08-24] 细线字体下区分度不足：关键字/类型/函数加粗
+    // 补偿，字符串保持常规（绿色已足够显眼），数字加粗。
     _hlStyle = CM.HighlightStyle.define([
-      { tag: [t.keyword, t.controlKeyword, t.moduleKeyword], color: '#a626a4' },
+      { tag: [t.keyword, t.controlKeyword, t.moduleKeyword], color: '#a626a4', fontWeight: 'bold' },
       { tag: [t.string, t.special(t.string), t.regexp], color: '#50a14f' },
       { tag: t.comment, color: 'var(--duties-tertiary, #9a9a9a)', fontStyle: 'italic' },
-      { tag: [t.number, t.bool, t.null], color: '#b76b01' },
+      { tag: [t.number, t.bool, t.null], color: '#b76b01', fontWeight: 'bold' },
       { tag: [t.atom, t.labelName], color: '#0184bc' },
-      { tag: [t.function(t.variableName), t.function(t.propertyName)], color: '#4078f2' },
-      { tag: [t.typeName, t.className, t.namespace], color: '#c18401' },
+      { tag: [t.function(t.variableName), t.function(t.propertyName)], color: '#4078f2', fontWeight: 'bold' },
+      { tag: [t.typeName, t.className, t.namespace], color: '#c18401', fontWeight: 'bold' },
       { tag: [t.propertyName, t.attributeName], color: '#e45649' },
-      { tag: t.tagName, color: '#e45649' },
+      { tag: t.tagName, color: '#e45649', fontWeight: 'bold' },
       { tag: t.attributeValue, color: '#50a14f' },
       { tag: [t.operator, t.punctuation, t.separator], color: '#383a42' },
       { tag: [t.variableName, t.name], color: 'var(--duties-text, #1a1a1a)' },
