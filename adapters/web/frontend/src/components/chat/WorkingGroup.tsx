@@ -10,7 +10,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import type { TextBlock, ToolExecution, WsMessage } from '../../types/message';
 import { Icon } from '../common';
-import { MessageCard, MessageCopyButton } from './MessageCard';
+import { MessageCard, MessageCopyButton, MessageMetaInfo } from './MessageCard';
 import { AttachmentList } from './AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
 import { BLOCK_STACK_CLASS } from './renderingConstants';
@@ -211,6 +211,7 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
                 <MessageCopyButton
                   text={completionTextBlocks.map((b) => (b as TextBlock).text).join('\n')}
                 />
+                <MessageMetaInfo source={lastCard.source} />
               </div>
             )}
           </div>

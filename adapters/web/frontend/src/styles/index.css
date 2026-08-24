@@ -203,3 +203,12 @@ textarea {
   transition: color 0.15s ease;
 }
 .msg-copy-btn:hover { color: var(--duties-text); }
+/* [AutoC 2026-08-24] 元信息图标：与复制按钮同尺寸同级色，悬停显示
+   provider 与 token 用量（title 提示）。 */
+.msg-meta-info {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  color: var(--duties-tertiary);
+  cursor: default;
+}

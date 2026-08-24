@@ -134,15 +134,20 @@ _STYLES = r"""
 @media (max-width: 639px) {
   .msg-retry-acts { opacity: 1; }
 }
+/* [AutoC 2026-08-24] 尺寸对齐宿主复制按钮：字号 0.6rem、内边距 2px，
+   与 13px 图标按钮视觉同级。 */
 .msg-retry-acts button {
   font-family: var(--duties-mono, 'Geist Mono', ui-monospace, Menlo, monospace);
-  font-size: 0.55rem;
+  font-size: 0.6rem;
   background: none;
   border: none;
-  padding: 0 2px;
+  padding: 2px;
   cursor: pointer;
   color: var(--duties-tertiary);
   transition: color 0.15s ease;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
 }
 .msg-retry-acts button:hover { color: #2563eb; }
 .msg-retry-editor {

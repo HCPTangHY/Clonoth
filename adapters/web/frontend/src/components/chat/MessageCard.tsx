@@ -214,6 +214,7 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
             复制是每条消息都需要的宿主能力，放在槽位旁不走插件协议。 */}
         <div className="msg-footer-row">
           <MessageCopyButton text={plainText} />
+          <MessageMetaInfo source={message.source} />
           <PluginSlotHost
             data={{
               messageId: message.id,
@@ -264,6 +265,28 @@ export const MessageCopyButton = ({ text }: { text: string }) => {
     >
       <Icon name={copied ? 'check' : 'content_copy'} size={13} />
     </button>
+  );
+};
+
+// [AutoC 2026-08-24] Upstream metadata display in the footer row. Why: provider
+// and token usage are already on message.source but invisible to users. How:
+// render a tertiary-colour info icon; hover reveals provider name and prompt /
+// completion token counts. Purpose: debugging context and cost awareness without
+// taking layout space.
+export const MessageMetaInfo = ({ source }: { source?: WsMessage['source'] }) => {
+  const provider = typeof source?.provider === 'string' ? source.provider.trim() : '';
+  const usage = source?.usage ?? null;
+  const promptTokens = typeof usage?.prompt_tokens === 'number' ? usage.prompt_tokens : null;
+  const completionTokens = typeof usage?.completion_tokens === 'number' ? usage.completion_tokens : null;
+  if (!provider && promptTokens === null) return null;
+  const parts: string[] = [];
+  if (provider) parts.push(provider);
+  if (promptTokens !== null) parts.push(`in ${promptTokens}`);
+  if (completionTokens !== null) parts.push(`out ${completionTokens}`);
+  return (
+    <span className="msg-meta-info" title={parts.join(' · ')}>
+      <Icon name="info" size={12} />
+    </span>
   );
 };
 

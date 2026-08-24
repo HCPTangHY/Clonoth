@@ -12,6 +12,7 @@ import { CableW400 } from '@material-symbols-svg/react/icons/cable';
 import { CancelW400 } from '@material-symbols-svg/react/icons/cancel';
 import { CheckCircleW400 } from '@material-symbols-svg/react/icons/check-circle';
 import { CheckW400 } from '@material-symbols-svg/react/icons/check';
+import { InfoW400 } from '@material-symbols-svg/react/icons/info';
 import { ContentCopyW400 } from '@material-symbols-svg/react/icons/content-copy';
 import { ChevronLeftW400 } from '@material-symbols-svg/react/icons/chevron-left';
 import { ChevronRightW400 } from '@material-symbols-svg/react/icons/chevron-right';
@@ -25,7 +26,6 @@ import { ErrorW400 } from '@material-symbols-svg/react/icons/error';
 import { FolderW400 } from '@material-symbols-svg/react/icons/folder';
 import { HubW400 } from '@material-symbols-svg/react/icons/hub';
 import { InboxW400 } from '@material-symbols-svg/react/icons/inbox';
-import { InfoW400 } from '@material-symbols-svg/react/icons/info';
 import { KeyboardReturnW400 } from '@material-symbols-svg/react/icons/keyboard-return';
 import { MenuW400 } from '@material-symbols-svg/react/icons/menu';
 import { MenuBookW400 } from '@material-symbols-svg/react/icons/menu-book';
@@ -102,6 +102,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   check: CheckW400,
   check_circle: CheckCircleW400,
   content_copy: ContentCopyW400,
+  info: InfoW400,
   chevron_left: ChevronLeftW400,
   chevron_right: ChevronRightW400,
   close: CloseW400,
@@ -114,7 +115,6 @@ const ICON_MAP: Record<string, SvgIcon> = {
   folder: FolderW400,
   hub: HubW400,
   inbox: InboxW400,
-  info: InfoW400,
   keyboard_return: KeyboardReturnW400,
   menu: MenuW400,
   menu_book: MenuBookW400,
