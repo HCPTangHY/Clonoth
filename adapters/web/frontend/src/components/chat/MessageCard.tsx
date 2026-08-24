@@ -212,6 +212,9 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
         {/* [AutoC 2026-08-24] Footer 行：内置复制按钮（用户与助手消息均显示）
             + message_footer 槽位（插件追加操作，如 message_retry 的重试/编辑）。
             复制是每条消息都需要的宿主能力，放在槽位旁不走插件协议。 */}
+        {/* [AutoC 2026-08-24] footer 行只在用户消息和助手消息渲染。
+            工具消息没有可复制文本，footer 行空跑且可能遮挡折叠按钮。 */}
+        {(message.role === 'user' || message.role === 'assistant') && (
         <div className="msg-footer-row">
           <MessageCopyButton text={plainText} />
           <MessageMetaInfo source={message.source} />
@@ -227,6 +230,7 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
             slot="message_footer"
           />
         </div>
+        )}
       </div>
     </article>
   );
