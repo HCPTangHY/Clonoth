@@ -175,3 +175,31 @@ textarea {
   text-decoration-color: var(--duties-accent);
   text-underline-offset: 0.2rem;
 }
+
+/* [AutoC 2026-08-24] 消息 footer 行：内置复制按钮 + 插件槽位（重试/编辑）。
+   半透明常显 + 悬停全亮，与 message_retry 插件的可见性规则一致。
+   用户消息与助手消息均显示。 */
+.msg-footer-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 2px;
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+.group\/card:hover .msg-footer-row { opacity: 1; }
+@media (max-width: 639px) {
+  .msg-footer-row { opacity: 1; }
+}
+.msg-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--duties-tertiary);
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+.msg-copy-btn:hover { color: var(--duties-text); }

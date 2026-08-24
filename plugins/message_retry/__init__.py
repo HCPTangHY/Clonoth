@@ -11,8 +11,9 @@
   内部走 chatStore.retryMessage：凭证解析 + 后端重试 + UI 截断）
 - article 的 group/card 类名（悬停显示样式挂在这个宿主类上）
 
-行为与内联版一致：confirm 确认、Ctrl+Enter 提交、Esc 取消、桌面端
-悬停显示/移动端常显。
+行为与内联版一致：confirm 确认、Ctrl+Enter 提交、Esc 取消。
+[2026-08-24] 可见性改为半透明常显 + 悬停全亮（原先桌面端完全不可见，
+无悬停时是一块空白）。
 """
 
 _RETRY_SCRIPT = r"""
@@ -126,9 +127,12 @@ _STYLES = r"""
   gap: 6px;
   margin-top: 4px;
 }
-@media (min-width: 640px) {
-  .msg-retry-acts { opacity: 0; transition: opacity 0.15s ease; }
-  .group\/card:hover .msg-retry-acts { opacity: 1; }
+/* [AutoC 2026-08-24] 常显半透明 + 悬停全亮：footer 位置的操作按钮
+   不可见时是一块空白，不如半透明常显提示存在。移动端始终全亮。 */
+.msg-retry-acts { opacity: 0.35; transition: opacity 0.15s ease; }
+.group\/card:hover .msg-retry-acts { opacity: 1; }
+@media (max-width: 639px) {
+  .msg-retry-acts { opacity: 1; }
 }
 .msg-retry-acts button {
   font-family: var(--duties-mono, 'Geist Mono', ui-monospace, Menlo, monospace);
@@ -183,7 +187,7 @@ _STYLES = r"""
 
 PLUGIN_META = {
     "name": "message_retry",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "消息重试/编辑：用户消息的原样重试与编辑后重试（message_footer 槽位）",
     "author": "clonoth",
     "client": {

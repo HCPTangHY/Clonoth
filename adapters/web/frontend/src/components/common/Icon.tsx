@@ -11,6 +11,8 @@ import { BuildW400 } from '@material-symbols-svg/react/icons/build';
 import { CableW400 } from '@material-symbols-svg/react/icons/cable';
 import { CancelW400 } from '@material-symbols-svg/react/icons/cancel';
 import { CheckCircleW400 } from '@material-symbols-svg/react/icons/check-circle';
+import { CheckW400 } from '@material-symbols-svg/react/icons/check';
+import { ContentCopyW400 } from '@material-symbols-svg/react/icons/content-copy';
 import { ChevronLeftW400 } from '@material-symbols-svg/react/icons/chevron-left';
 import { ChevronRightW400 } from '@material-symbols-svg/react/icons/chevron-right';
 import { CloseW400 } from '@material-symbols-svg/react/icons/close';
@@ -97,7 +99,9 @@ const ICON_MAP: Record<string, SvgIcon> = {
   build: BuildW400,
   cable: CableW400,
   cancel: CancelW400,
+  check: CheckW400,
   check_circle: CheckCircleW400,
+  content_copy: ContentCopyW400,
   chevron_left: ChevronLeftW400,
   chevron_right: ChevronRightW400,
   close: CloseW400,

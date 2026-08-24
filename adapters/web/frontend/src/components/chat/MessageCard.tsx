@@ -1,3 +1,4 @@
+import { useState } from 'react';
 // [2026-05-31] MessageCard is the unified v2 renderer for normalized chat messages.
 // Why: Step 2B replaces the old MessageBubble plus StreamPreview split with one replayable
 // message surface. How: derive header, role styling, streaming indicator, ordered block
@@ -9,6 +10,7 @@ import { AttachmentList } from './AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
 import { BLOCK_STACK_CLASS, type MessageRenderContext } from './renderingConstants';
 import { PluginSlotHost } from '../plugins/PluginSlotHost';
+import { Icon } from '../common';
 
 interface MessageCardProps {
   message: WsMessage;
@@ -207,21 +209,61 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
 
         <AttachmentList attachments={attachments} sessionId={message.sessionId} />
 
-        {/* Reserved slot: plugins append per-message widgets here. The
-            message_retry plugin renders the retry/edit UI from this payload. */}
-        <PluginSlotHost
-          data={{
-            messageId: message.id,
-            role: message.role,
-            sessionId: message.sessionId,
-            retryable,
-            text: plainText,
-            isLastUserMessage: !!isLastUserMessage,
-          }}
-          slot="message_footer"
-        />
+        {/* [AutoC 2026-08-24] Footer 行：内置复制按钮（用户与助手消息均显示）
+            + message_footer 槽位（插件追加操作，如 message_retry 的重试/编辑）。
+            复制是每条消息都需要的宿主能力，放在槽位旁不走插件协议。 */}
+        <div className="msg-footer-row">
+          <MessageCopyButton text={plainText} />
+          <PluginSlotHost
+            data={{
+              messageId: message.id,
+              role: message.role,
+              sessionId: message.sessionId,
+              retryable,
+              text: plainText,
+              isLastUserMessage: !!isLastUserMessage,
+            }}
+            slot="message_footer"
+          />
+        </div>
       </div>
     </article>
+  );
+};
+
+// [AutoC 2026-08-24] Per-message copy button. Why: copying message text is a
+// host-level capability every message needs, not a plugin concern. How:
+// clipboard API with textarea fallback, check-mark feedback for 1.5s.
+// Purpose: users copy any message without selecting text manually.
+const MessageCopyButton = ({ text }: { text: string }) => {
+  const [copied, setCopied] = useState(false);
+  if (!text) return null;
+  const doCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // clipboard API unavailable (non-secure context); textarea fallback
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+  return (
+    <button
+      className="msg-copy-btn"
+      onClick={doCopy}
+      title={copied ? '已复制' : '复制'}
+      type="button"
+    >
+      <Icon name={copied ? 'check' : 'content_copy'} size={13} />
+    </button>
   );
 };
 
