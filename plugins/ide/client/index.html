@@ -9,8 +9,10 @@
    文件树是第一个固定标签「文件」，其余标签是打开的文件；视图切换全部
    经标签栏完成，不存在分栏。只写结构与变量名映射，主题由宿主注入。 */
 :root {
-  --bg: var(--duties-bg, #f1f0ee);
-  --card: var(--duties-card, #ffffff);
+  /* 与宿主右栏同底：宿主 aside 用 --duties-panel，没有 --duties-card。
+     视图区用更浅的 --duties-bg 区分内容区。 */
+  --bg: var(--duties-panel, #e8e7e5);
+  --card: var(--duties-bg, #f1f0ee);
   --text: var(--duties-text, #1a1a1a);
   --secondary: var(--duties-secondary, #5b5b5b);
   --tertiary: var(--duties-tertiary, #9a9a9a);
