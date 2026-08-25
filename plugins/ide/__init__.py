@@ -18,7 +18,7 @@ from pathlib import Path
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.8.2",
+    "version": "0.8.3",
     "description": "Web IDE：文件面板 + 编辑器 + @文件引用（输入框补全与请求时展开）",
     "author": "clonoth",
     # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
@@ -112,7 +112,12 @@ def _msg_text_and_writer(msg: dict):
 
 def _expand_file_mentions(ctx) -> None:
     """before_llm_call handler：展开 user 消息中的工作区 @path 引用。"""
-    ws_root = ctx.extra.get("workspace_root")
+    # 优先 session 工作区（与前端 session 级文件树同基准），回退 engine 运行根。
+    ws_root = ctx.extra.get("workspace")
+    if not ws_root and ctx.rctx is not None:
+        ws_root = getattr(ctx.rctx, "workspace", None)
+    if not ws_root:
+        ws_root = ctx.extra.get("workspace_root")
     if not ws_root and ctx.rctx is not None:
         ws_root = getattr(ctx.rctx, "workspace_root", None)
     if not ws_root:
@@ -127,7 +132,10 @@ def _expand_file_mentions(ctx) -> None:
             continue
         parts: list[str] = []
         for m in _MENTION_RE.finditer(text):
-            raw = m.group(1).lstrip("./")
+            # 只剥 ./ 前缀对，不逐字符剥点——保住 .env.example 这类点开头文件。
+            raw = m.group(1)
+            while raw.startswith("./"):
+                raw = raw[2:]
             if not raw or ("." not in raw and "/" not in raw):
                 continue
             target = (ws_root / raw).resolve()

@@ -185,7 +185,13 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
         provider=ls.provider,
         rctx=ls.rctx,
         step=step,
-        extra={"workspace_root": ls.rctx.workspace_root},
+        extra={
+            "workspace_root": ls.rctx.workspace_root,
+            # session 级工作区（runner 启动时从 supervisor 拉取，可能为 None）。
+            # 引用展开等语义上属于会话的变换应优先用它，与前端 session 级
+            # 文件树/文件读端点保持同一基准。
+            "workspace": ls.rctx.workspace,
+        },
     )
     _llm_hook_result = await hook_registry.afire("before_llm_call", _llm_hook_ctx)
     if _llm_hook_result.action is not None:
