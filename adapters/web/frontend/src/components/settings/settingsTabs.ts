@@ -86,6 +86,13 @@ export function getSettingsTab(tabId: string): SettingsTabDefinition {
 // becomes a tab whose Page renders a chrome-less PluginPanel iframe (no title
 // bar; the settings sidebar already names the tab). Purpose: settings
 // navigation stays data-driven for plugins exactly as for built-ins.
+// [AutoC 2026-08-25] Constrain the plugin settings page between the two rails.
+// Why: built-in pages follow settingsPagePrimitives (p-4 sm:p-6 + mx-auto
+// max-w-4xl), but the plugin tab rendered the iframe edge-to-edge across the
+// full main column, touching both sidebars. How: wrap PluginPanel in the same
+// padded, centered container convention as built-in pages, with a bordered
+// card so the iframe reads as one settings card. Purpose: plugin settings tabs
+// share the layout rhythm of every other settings page.
 import { usePluginsStore } from '../../store/pluginsStore';
 import { PluginPanel } from '../plugins/PluginPanel';
 
@@ -97,13 +104,24 @@ function pluginSettingsTabs(): SettingsTabDefinition[] {
     icon: 'extension',
     order: 100,
     Page: () =>
-      createElement(PluginPanel, {
-        chrome: false,
-        entry: panel.entry,
-        sessionId: '',
-        title: panel.title,
-        onClose: () => undefined,
-      }),
+      createElement(
+        'section',
+        { className: 'h-full min-h-0 overflow-hidden p-4 sm:p-6' },
+        createElement(
+          'div',
+          {
+            className:
+              'mx-auto flex h-full min-h-0 max-w-4xl flex-col border border-[var(--duties-border)]',
+          },
+          createElement(PluginPanel, {
+            chrome: false,
+            entry: panel.entry,
+            sessionId: '',
+            title: panel.title,
+            onClose: () => undefined,
+          }),
+        ),
+      ),
   }));
 }
 
