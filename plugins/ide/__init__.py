@@ -54,6 +54,15 @@ PLUGIN_META = {
                 "script": {"file": "client/completer.js"},
             },
         ],
+        # 消息注解器：识别助手消息行内代码里的工作区路径，渲染为可点链接，
+        # 点击经 openPanel 打开 files 面板（ide 已接管）并转交 open-file 意图。
+        "annotators": [
+            {
+                "id": "ide.file_link",
+                "priority": 50,
+                "script": {"file": "client/annotator.js"},
+            },
+        ],
         "styles": {"file": "client/preview.css"},
     },
 }
