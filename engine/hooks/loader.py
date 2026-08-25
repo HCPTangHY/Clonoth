@@ -123,9 +123,9 @@ def get_load_error(entry_name: str) -> str:
 def _resolve_client_assets(plugin_dir: Path, meta: dict) -> None:
     """Inline {"file": relative_path} references inside PLUGIN_META.client.
 
-    Why: slot scripts and styles were embedded as Python string literals in
-    __init__.py, which loses editor support entirely. How: walk client.slots
-    and client.styles; any value shaped as {"file": "client/x.js"} is read
+    Why: slot scripts, annotator scripts, and styles were embedded as Python string literals in
+    __init__.py, which loses editor support entirely. How: walk client.slots,
+    client.annotators, and client.styles; any value shaped as {"file": "client/x.js"} is read
     from the plugin directory (containment-checked) and replaced by its text.
     Purpose: consumers (the web manifest) always receive plain strings.
     """
@@ -148,6 +148,11 @@ def _resolve_client_assets(plugin_dir: Path, meta: dict) -> None:
         for slot in slots:
             if isinstance(slot, dict) and "script" in slot:
                 slot["script"] = _inline(slot["script"])
+    annotators = client.get("annotators")
+    if isinstance(annotators, list):
+        for ann in annotators:
+            if isinstance(ann, dict) and "script" in ann:
+                ann["script"] = _inline(ann["script"])
     if "styles" in client:
         client["styles"] = _inline(client["styles"])
 
