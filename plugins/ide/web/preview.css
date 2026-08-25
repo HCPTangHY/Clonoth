@@ -165,3 +165,44 @@
 }
 .ide-tc-del { background: rgba(192, 57, 43, 0.10); color: #a33327; }
 .ide-tc-add { background: rgba(39, 174, 96, 0.10); color: #1e7e4a; }
+
+/* ── execute_command 命令分段可视化 ────────────────────────────────── */
+.ide-tc-cmd {
+  border: 1px solid var(--duties-border);
+  background: var(--duties-bg);
+  margin: 4px 0;
+}
+.ide-tc-cmdhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--duties-border);
+  font-size: 10px;
+  color: var(--duties-tertiary);
+}
+.ide-tc-timeout {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--duties-tertiary);
+}
+.ide-tc-seg {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.ide-tc-seg + .ide-tc-seg { border-top: 1px dashed var(--duties-border); }
+.ide-tc-seg code { white-space: pre-wrap; overflow-wrap: break-word; flex: 1; min-width: 0; }
+.ide-tc-op { color: var(--duties-tertiary); flex-shrink: 0; user-select: none; }
+.ide-tc-redir {
+  flex-shrink: 0;
+  font-size: 9px;
+  padding: 0 4px;
+  border: 1px solid var(--duties-border);
+  color: var(--duties-tertiary);
+  user-select: none;
+}
