@@ -225,3 +225,11 @@
   background: transparent;
   max-height: 200px;
 }
+
+/* ── diff 行级对齐的上下文行 ────────────────────────────────────────── */
+.ide-tc-ctx {
+  padding: 0 8px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  color: var(--duties-tertiary);
+}

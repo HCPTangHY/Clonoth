@@ -1125,7 +1125,9 @@ window.addEventListener('message', (ev) => {
   const data = ev && ev.data;
   if (!data || data.type !== 'clonoth:panel-intent') return;
   const intent = data.intent;
+  console.log('[ide-intent] received', intent);
   if (!intent || intent.kind !== 'open-file' || !intent.path) return;
+  console.log('[ide-intent] opening', intent.path);
   openFileTab(String(intent.path), false);
 });
 

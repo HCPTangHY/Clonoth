@@ -1,7 +1,11 @@
 // apply_diff 工具卡内容渲染器。
-// 槽位：tool_card_content:apply_diff。把 arguments.diffs 数组渲染为红绿
-// 对比块，并提供"在 IDE 打开"按钮跳到变更文件（走 openPanel 通用动作 +
-// ide 私有的 open-file 意图）。
+// 槽位：tool_card_content:apply_diff。
+//
+// diff 渲染：把 arguments.diffs 的 search/replace 做行级对齐——相同前缀与
+// 后缀行渲染为上下文（无底色），中间差异段红绿对比。这让"只改了三行"
+// 和"整个函数重写"在视觉上一眼可辨。
+//
+// "在 IDE 打开"按钮走 openPanel 通用动作 + ide 私有 open-file 意图。
 
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => (
@@ -9,16 +13,28 @@ function esc(s) {
   ));
 }
 
-function renderDiffBlock(diff) {
-  const before = String(diff.search || '').replace(/\n$/, '').split('\n');
-  const after = String(diff.replace || '').replace(/\n$/, '').split('\n');
+// 行级对齐：相同前缀/后缀行作为上下文，中间差异段红绿对比。
+function renderAlignedDiff(search, replace) {
+  const a = String(search || '').replace(/\n$/, '').split('\n');
+  const b = String(replace || '').replace(/\n$/, '').split('\n');
+
+  // 共同前缀
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  // 共同后缀（不与前缀重叠）
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+
+  const ctxBefore = a.slice(0, pre);
+  const delLines = a.slice(pre, a.length - suf);
+  const addLines = b.slice(pre, b.length - suf);
+  const ctxAfter = a.slice(a.length - suf);
+
   let html = '<div class="ide-tc-diff">';
-  for (const line of before) {
-    html += '<div class="ide-tc-del">- ' + esc(line || ' ') + '</div>';
-  }
-  for (const line of after) {
-    html += '<div class="ide-tc-add">+ ' + esc(line || ' ') + '</div>';
-  }
+  for (const line of ctxBefore) html += '<div class="ide-tc-ctx">  ' + esc(line || ' ') + '</div>';
+  for (const line of delLines) html += '<div class="ide-tc-del">- ' + esc(line || ' ') + '</div>';
+  for (const line of addLines) html += '<div class="ide-tc-add">+ ' + esc(line || ' ') + '</div>';
+  for (const line of ctxAfter) html += '<div class="ide-tc-ctx">  ' + esc(line || ' ') + '</div>';
   html += '</div>';
   return html;
 }
@@ -53,7 +69,7 @@ function render(ctx) {
   if (diffs.length) {
     for (const diff of diffs) {
       const wrap = document.createElement('div');
-      wrap.innerHTML = renderDiffBlock(diff);
+      wrap.innerHTML = renderAlignedDiff(diff.search, diff.replace);
       ctx.el.appendChild(wrap.firstChild);
     }
   } else if (d.argumentsText) {
