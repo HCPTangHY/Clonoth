@@ -103,3 +103,65 @@
   font-size: 11px;
   color: var(--duties-tertiary);
 }
+
+/* ── 工具卡内容渲染器（tool_card_content 槽位） ─────────────────────── */
+.ide-tc-block { margin: 4px 0; }
+.ide-tc-label {
+  font-size: 10px;
+  color: var(--duties-tertiary);
+  margin-bottom: 2px;
+}
+.ide-tc-code {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  background: var(--duties-bg);
+  border: 1px solid var(--duties-border);
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 0;
+}
+.ide-tc-err { color: var(--duties-danger, #c0392b); }
+.ide-tc-kv { display: flex; gap: 8px; font-size: 11px; line-height: 1.7; }
+.ide-tc-k { color: var(--duties-tertiary); flex-shrink: 0; }
+.ide-tc-v { color: var(--duties-text); overflow-wrap: anywhere; }
+
+.ide-tc-filehead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-size: 11px;
+}
+.ide-tc-filehead code { color: var(--duties-text); overflow-wrap: anywhere; }
+.ide-tc-openbtn {
+  flex-shrink: 0;
+  font-size: 10px;
+  padding: 2px 8px;
+  border: 1px solid var(--duties-border);
+  background: transparent;
+  color: var(--duties-secondary);
+  cursor: pointer;
+}
+.ide-tc-openbtn:hover { color: var(--duties-text); border-color: var(--duties-text); }
+
+.ide-tc-diff {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  border: 1px solid var(--duties-border);
+  margin: 4px 0;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.ide-tc-del, .ide-tc-add {
+  padding: 0 8px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.ide-tc-del { background: rgba(192, 57, 43, 0.10); color: #a33327; }
+.ide-tc-add { background: rgba(39, 174, 96, 0.10); color: #1e7e4a; }

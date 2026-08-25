@@ -18,7 +18,7 @@ from pathlib import Path
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.9.0",
+    "version": "0.10.0",
     "description": "Web IDE：文件面板 + 编辑器 + @文件引用（输入框补全与请求时展开）",
     "author": "clonoth",
     # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
@@ -52,6 +52,22 @@ PLUGIN_META = {
                 "priority": 40,
                 "mode": "append",
                 "script": {"file": "web/completer.js"},
+            },
+            {
+                # 工具卡内容区接管：execute_command 分块可视化
+                "slot_id": "ide.tool_execute_command",
+                "slot": "tool_card_content:execute_command",
+                "priority": 50,
+                "mode": "replace",
+                "script": {"file": "web/renderers/execute_command.js"},
+            },
+            {
+                # apply_diff 红绿对比 + 在 IDE 打开
+                "slot_id": "ide.tool_apply_diff",
+                "slot": "tool_card_content:apply_diff",
+                "priority": 50,
+                "mode": "replace",
+                "script": {"file": "web/renderers/apply_diff.js"},
             },
         ],
         # 消息注解器：识别助手消息行内代码里的工作区路径，渲染为可点链接，

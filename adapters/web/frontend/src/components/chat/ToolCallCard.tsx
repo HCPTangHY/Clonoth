@@ -9,8 +9,10 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { decideApproval } from '../../api/supervisorClient';
 import { autoApprovedApprovalIds } from '../../store/approvalManager';
 import { useClientPrefsStore } from '../../store/clientPrefsStore';
+import { usePluginsStore } from '../../store/pluginsStore';
 import type { ToolExecution, ToolStatus } from '../../types/message';
 import { Icon } from '../common';
+import { PluginSlotHost } from '../plugins/PluginSlotHost';
 import { INLINE_BLOCK_BODY_TEXT_CLASS, INLINE_BLOCK_HEADER_TEXT_CLASS } from './renderingConstants';
 
 interface ToolCallCardProps {
@@ -1278,6 +1280,29 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
       ? (inlineSummary ? `${inlineSummary} → ${resultSuffix}` : resultSuffix)
       : inlineSummary;
 
+  // [AutoC 2026-08-25] Tool-card content slot: plugins may take over the
+  // expanded content area. Lookup order: tool-specific slot
+  // (tool_card_content:{name}) first, generic tool_card_content second; the
+  // built-in ToolDetailsSection is the fallback when no plugin contributes.
+  // The header (status icon, collapse, approval) stays host-owned — those
+  // semantics are shared by every tool and are not plugin-overridable.
+  const specificSlotContribs = usePluginsStore((s) => s.slotsBySlot[`tool_card_content:${tool.name}`]);
+  const genericSlotContribs = usePluginsStore((s) => s.slotsBySlot['tool_card_content']);
+  const slotContribs = specificSlotContribs?.length ? specificSlotContribs
+    : genericSlotContribs?.length ? genericSlotContribs
+    : null;
+  const slotData = useMemo(() => ({
+    toolName: tool.name,
+    stableId: tool.stableId,
+    status: tool.status,
+    arguments: tool.arguments,
+    argumentsText: tool.argumentsText,
+    result: typeof tool.result === 'string' ? tool.result : undefined,
+    error: tool.error,
+    elapsedMs: tool.elapsedMs,
+    nodeId: tool.nodeId,
+  }), [tool]);
+
   return (
     <div className={`font-mono ${INLINE_BLOCK_BODY_TEXT_CLASS} text-[var(--duties-secondary)]`}>
       <ToolHeaderButton
@@ -1302,14 +1327,22 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
         onApproval={handleApproval}
       />
       <ToolApprovalOutcome tool={tool} />
-      <ToolDetailsSection
-        tool={tool}
-        expanded={expanded}
-        canExpand={canExpand}
-        isFailed={isFailed}
-        argumentDisplay={argumentDisplay}
-        resultDisplay={resultDisplay}
-      />
+      {expanded && canExpand && slotContribs ? (
+        <PluginSlotHost
+          className="mt-1.5"
+          data={slotData}
+          slot={specificSlotContribs?.length ? `tool_card_content:${tool.name}` : 'tool_card_content'}
+        />
+      ) : (
+        <ToolDetailsSection
+          tool={tool}
+          expanded={expanded}
+          canExpand={canExpand}
+          isFailed={isFailed}
+          argumentDisplay={argumentDisplay}
+          resultDisplay={resultDisplay}
+        />
+      )}
     </div>
   );
 };
