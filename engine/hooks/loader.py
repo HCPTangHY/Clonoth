@@ -121,13 +121,16 @@ def get_load_error(entry_name: str) -> str:
 
 
 def _resolve_client_assets(plugin_dir: Path, meta: dict) -> None:
-    """Inline {"file": relative_path} references inside PLUGIN_META.client.
+    """Inline {"file": relative_path} references anywhere inside PLUGIN_META.client.
 
-    Why: slot scripts, annotator scripts, and styles were embedded as Python string literals in
-    __init__.py, which loses editor support entirely. How: walk client.slots,
-    client.annotators, and client.styles; any value shaped as {"file": "client/x.js"} is read
-    from the plugin directory (containment-checked) and replaced by its text.
-    Purpose: consumers (the web manifest) always receive plain strings.
+    Why: slot scripts and styles were embedded as Python string literals in
+    __init__.py, which loses editor support entirely. The contract lives at the
+    value shape, not the key name: any value shaped as {"file": "client/x.js"}
+    is an asset reference. How: recursively walk the whole client dict and
+    inline every such value (containment-checked), so new client contribution
+    types never require loader changes. Purpose: consumers (the web manifest)
+    always receive plain strings, and the backend never enumerates frontend
+    contribution kinds.
     """
     client = meta.get("client")
     if not isinstance(client, dict):
@@ -143,18 +146,17 @@ def _resolve_client_assets(plugin_dir: Path, meta: dict) -> None:
             raise ValueError(f"client asset escapes plugin directory: {rel!r}")
         return target.read_text(encoding="utf-8")
 
-    slots = client.get("slots")
-    if isinstance(slots, list):
-        for slot in slots:
-            if isinstance(slot, dict) and "script" in slot:
-                slot["script"] = _inline(slot["script"])
-    annotators = client.get("annotators")
-    if isinstance(annotators, list):
-        for ann in annotators:
-            if isinstance(ann, dict) and "script" in ann:
-                ann["script"] = _inline(ann["script"])
-    if "styles" in client:
-        client["styles"] = _inline(client["styles"])
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in list(node.items()):
+                node[key] = _inline(value)
+                _walk(node[key])
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                node[index] = _inline(value)
+                _walk(node[index])
+
+    _walk(client)
 
 
 def _default_plugin_meta(py_file: Path) -> dict:
