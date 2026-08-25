@@ -104,7 +104,8 @@ export default {
           else if (c.type === 'directory') walk(c);
         }
       };
-      walk(resp);
+      // 响应结构是 { tree: <node> }，不是裸根节点。error 节点无 children，walk 自行跳过。
+      walk(resp && resp.tree);
       S.files = flat;
       S.treeSession = sid;
     } catch {
