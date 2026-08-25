@@ -11,6 +11,7 @@
 // edits.
 import { useChatStore } from './chatStore';
 import { useViewStore } from './viewStore';
+import { useSettingsStore } from './settingsStore';
 
 export type HostAction = (...args: unknown[]) => unknown;
 
@@ -111,9 +112,12 @@ registerHostAction('reroll', async () => {
 // Why: annotators and slot plugins need to open overlay panels and hand them a
 // payload without the host parsing it. How: set the overlay with an optional
 // intent; PluginPanel forwards the intent to the panel page on load via
-// postMessage. Purpose: the host owns panel routing, plugins own the payload.
+// postMessage. Opening the overlay also forces the right rail open — an intent
+// that navigates inside a hidden panel would be invisible otherwise. Purpose:
+// the host owns panel routing, plugins own the payload.
 registerHostAction('openPanel', (panelId, intent) => {
   const id = String(panelId ?? '');
   if (!id) return;
   useViewStore.getState().setPanelOverlay('right', id, intent);
+  useSettingsStore.getState().setRightPanelOpen(true);
 });
