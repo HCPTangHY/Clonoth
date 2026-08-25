@@ -234,21 +234,14 @@
   color: var(--duties-tertiary);
 }
 
-/* ── diff 标签页 ───────────────────────────────────────────────────────── */
-.ide-diff-view { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
-.ide-diff-head {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 4px 8px; border-bottom: 1px solid var(--duties-border);
-  font-size: 11px; flex-shrink: 0;
-}
-.ide-diff-head code { color: var(--duties-text); }
-.ide-diff-stat { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10px; color: var(--duties-tertiary); }
+/* ── diff 标签页（滚动容器是 viewEl，与 MD 渲染态一致） ────────────── */
 .ide-diff-body {
-  flex: 1; overflow-y: auto;
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-size: 11px; line-height: 1.6;
+  padding: 4px 0;
 }
 .ide-diff-line { padding: 0 8px; white-space: pre-wrap; overflow-wrap: break-word; }
 .ide-diff-ctx { color: var(--duties-tertiary); }
 .ide-diff-del { background: rgba(192, 57, 43, 0.08); color: #a33327; }
 .ide-diff-add { background: rgba(39, 174, 96, 0.08); color: #1e7e4a; }
+.hint-diff { color: var(--duties-tertiary); }

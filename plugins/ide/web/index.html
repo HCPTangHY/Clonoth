@@ -446,7 +446,8 @@ function extOf(path) {
 }
 
 function baseName(path) {
-  return String(path).split('/').pop() || String(path);
+  // diff 标签的 path 带 ' (diff)' 后缀，显示时剥离
+  return String(path).replace(/ \(diff\)$/, '').split('/').pop() || String(path);
 }
 
 // ── tab state ────────────────────────────────────────────────────────────
@@ -732,15 +733,12 @@ function renderFileTab(tab) {
 
 function renderDiff(tab) {
   viewEl.innerHTML = '';
-  const wrap = document.createElement('div');
-  wrap.className = 'ide-diff-view';
   const before = tab.text;
   const after = tab.afterText;
   if (!before && !after) { showStatus('加载中…'); return; }
 
   const aLines = before.split('\n');
   const bLines = after.split('\n');
-  // 行级对齐：共同前缀与后缀为上下文，中间差异红绿对比
   let pre = 0;
   while (pre < aLines.length && pre < bLines.length && aLines[pre] === bLines[pre]) pre++;
   let suf = 0;
@@ -752,28 +750,21 @@ function renderDiff(tab) {
   const addLines = bLines.slice(pre, bLines.length - suf);
   const ctxAfter = aLines.slice(aLines.length - suf);
 
-  const head = document.createElement('div');
-  head.className = 'ide-diff-head';
-  head.innerHTML = '<code>' + esc(tab.path.replace(/ \(diff\)$/, '')) + '</code>'
-    + '<span class="ide-diff-stat">-' + delLines.length + ' +' + addLines.length + '</span>';
-  wrap.appendChild(head);
-
   const body = document.createElement('div');
   body.className = 'ide-diff-body';
-  for (const l of ctxBefore) body.appendChild(diffLine('ctx', l));
-  for (const l of delLines) body.appendChild(diffLine('del', l));
-  for (const l of addLines) body.appendChild(diffLine('add', l));
-  for (const l of ctxAfter) body.appendChild(diffLine('ctx', l));
-  wrap.appendChild(body);
-  viewEl.appendChild(wrap);
+  const addLine = (cls, text) => {
+    const div = document.createElement('div');
+    div.className = 'ide-diff-line ide-diff-' + cls;
+    div.textContent = (cls === 'del' ? '- ' : cls === 'add' ? '+ ' : '  ') + text;
+    body.appendChild(div);
+  };
+  ctxBefore.forEach(l => addLine('ctx', l));
+  delLines.forEach(l => addLine('del', l));
+  addLines.forEach(l => addLine('add', l));
+  ctxAfter.forEach(l => addLine('ctx', l));
+  viewEl.appendChild(body);
+  // 滚动容器是 viewEl，与普通文件标签（MD 渲染态）一致
   applyScrollFraction(viewEl, tab.scroll);
-}
-
-function diffLine(cls, text) {
-  const div = document.createElement('div');
-  div.className = 'ide-diff-line ide-diff-' + cls;
-  div.textContent = (cls === 'del' ? '- ' : cls === 'add' ? '+ ' : '  ') + text;
-  return div;
 }
 
 // ── editor ───────────────────────────────────────────────────────────────
@@ -963,6 +954,9 @@ function renderStatusbar() {
     hint = saveHint;
     hintClass = saveHint.startsWith('保存失败') ? 'hint-error' : '';
     saveHint = '';   // 一次性
+  } else if (tab.kind === 'diff') {
+    hint = tab.note || '修改前后对比（逆推重建，仅供参考）';
+    hintClass = 'hint-diff';
   } else if (tab.kind === 'text') {
     hint = tab.dirty ? '未保存 · Ctrl+S' : '已保存';
     hintClass = tab.dirty ? 'hint-dirty' : '';
@@ -1199,23 +1193,26 @@ async function loadDiffTab(tab) {
     if (activePath === tab.path) showStatus('加载失败：' + err.message);
     return;
   }
-  const text = await resp.text();
-  tab.text = text;
-  // 按顺序应用 diffs，产出 afterText
-  let after = text;
-  let failed = 0;
-  for (const d of (tab.diffs || [])) {
+  const current = await resp.text();
+  // 工具执行完后文件已是 after 态。逆应用 diffs（replace → search，倒序）
+  // 得到 before 态。逆应用失败的条目说明文件状态与 diff 不匹配，此时
+  // before = current（该条 diff 不体现在对比中）。
+  let before = current;
+  let unmatched = 0;
+  const revDiffs = (tab.diffs || []).slice().reverse();
+  for (const d of revDiffs) {
     const search = String(d.search || '');
     const replace = String(d.replace || '');
-    if (search && after.includes(search)) {
-      after = after.replace(search, replace);
-    } else if (search) {
-      failed++;
+    if (replace && before.includes(replace)) {
+      before = before.replace(replace, search);
+    } else if (replace) {
+      unmatched++;
     }
   }
-  tab.afterText = after;
+  tab.text = before;        // 修改前
+  tab.afterText = current;  // 修改后（当前文件）
   tab.loaded = true;
-  if (failed > 0) tab.note = failed + ' 处 diff 未能匹配当前文件内容';
+  if (unmatched > 0) tab.note = unmatched + ' 处 diff 无法逆向匹配';
   if (activePath === tab.path && seq === loadSeq) {
     renderFileTab(tab);
     renderStatusbar();

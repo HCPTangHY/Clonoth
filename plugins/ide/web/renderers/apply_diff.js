@@ -59,11 +59,7 @@ function render(ctx) {
     btn.className = 'ide-tc-openbtn';
     btn.textContent = '在 IDE 打开';
     btn.addEventListener('click', () => {
-      // open-diff intent：面板页打开 diff 标签，读文件后应用 diffs 渲染
-      // 修改前/修改后的行级对比。diffs 数据随 intent 传递（不透明对象）。
-      void ctx.api?.call?.('openPanel', 'files', {
-        kind: 'open-diff', path, diffs: args.diffs || [],
-      });
+      void ctx.api?.call?.('openPanel', 'files', { kind: 'open-file', path });
     });
     head.appendChild(btn);
     ctx.el.appendChild(head);
