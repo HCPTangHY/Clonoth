@@ -5,11 +5,15 @@
 // panel with the ide-private intent {kind:'open-file', path}.
 
 const _cache = new Map(); // sessionId -> { ts, set }
+const _inflight = new Map(); // sessionId -> Promise (dedup concurrent fetches)
 const _TTL = 60_000;
 
 async function _fileSet(sid) {
   const cached = _cache.get(sid);
   if (cached && Date.now() - cached.ts < _TTL) return cached.set;
+  // Dedup: if a fetch for this sid is already in-flight, piggyback on it.
+  const pending = _inflight.get(sid);
+  if (pending) return pending;
   // The annotator module runs in the host page main world; callHostAction is
   // not importable from a blob module. The host passes api through ctx — but
   // annotators receive { role, sessionId } only. File-set loading therefore
@@ -36,7 +40,20 @@ async function _fileSet(sid) {
   };
   walk(data && data.tree);
   _cache.set(sid, { ts: Date.now(), set });
+  _inflight.delete(sid);
   return set;
+}
+
+// Wrapper that deduplicates concurrent _fileSet calls for the same session.
+function _fileSetDedup(sid) {
+  const existing = _inflight.get(sid);
+  if (existing) return existing;
+  const p = _fileSet(sid).catch((err) => {
+    console.warn('[annotator] _fileSet failed', err);
+    return new Set();
+  }).finally(() => _inflight.delete(sid));
+  _inflight.set(sid, p);
+  return p;
 }
 
 // Path candidate: contains a dot or slash, no whitespace, looks file-like.
@@ -57,7 +74,7 @@ export default function match(text, ctx) {
   // warm) picks them up. Trigger the load as a side effect.
   const cached = _cache.get(sid);
   if (!cached || Date.now() - cached.ts >= _TTL) {
-    void _fileSet(sid); // warm for next render
+    void _fileSetDedup(sid); // warm for next render (deduped)
     return out;
   }
   const set = cached.set;
