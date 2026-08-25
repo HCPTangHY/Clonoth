@@ -31,7 +31,7 @@ PLUGIN_META = {
                 "title": "IDE",
                 # 接管宿主内置 files overlay，不作为独立入口出现在 Header。
                 "replaces": "files",
-                "entry": "/v1/plugins/ide/client/index.html",
+                "entry": "/v1/plugins/ide/web/index.html",
             }
         ],
         "slots": [
@@ -41,7 +41,7 @@ PLUGIN_META = {
                 "priority": 50,
                 # 预览区语义上独占：任一时刻只显示一个文件的内容。
                 "mode": "replace",
-                "script": {"file": "client/preview.js"},
+                "script": {"file": "web/preview.js"},
             },
             {
                 # 输入框 @ 补全：渲染在输入框上方浮动区，检测宿主锚定的
@@ -51,7 +51,7 @@ PLUGIN_META = {
                 "slot": "input_above",
                 "priority": 40,
                 "mode": "append",
-                "script": {"file": "client/completer.js"},
+                "script": {"file": "web/completer.js"},
             },
         ],
         # 消息注解器：识别助手消息行内代码里的工作区路径，渲染为可点链接，
@@ -60,10 +60,10 @@ PLUGIN_META = {
             {
                 "id": "ide.file_link",
                 "priority": 50,
-                "script": {"file": "client/annotator.js"},
+                "script": {"file": "web/annotator.js"},
             },
         ],
-        "styles": {"file": "client/preview.css"},
+        "styles": {"file": "web/preview.css"},
     },
 }
 
@@ -228,7 +228,7 @@ def register(ctx) -> None:
     # ── 面板静态资源 ─────────────────────────────────────────────────
     client = APIRouter()
     client.include_router(
-        static_router(Path(__file__).parent / "client"),
-        prefix="/client",
+        static_router(Path(__file__).parent / "web"),
+        prefix="/web",
     )
     routes.register(client, public=True, description="ide 面板静态资源")

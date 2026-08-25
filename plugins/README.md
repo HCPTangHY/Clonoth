@@ -59,17 +59,17 @@ def register(ctx) -> None:
 | 注册工具 | PLUGIN_META `tools` | engine |
 | 注入 prompt 内容 | `ctx.contributions.get("prompt_sections").register_section(...)` | engine |
 | 注册 HTTP 路由 | `ctx.contributions.get("routes").register(router, ...)` | supervisor |
-| 前端面板/槽位/样式 | PLUGIN_META `client` | 任意（前端读 manifest） |
+| 前端面板/槽位/样式 | PLUGIN_META `web` | 任意（前端读 manifest） |
 
-## 前端贡献（client）
+## 前端贡献（web）
 
 ```python
-PLUGIN_META["client"] = {
+PLUGIN_META["web"] = {
     "panels": [{"id": "x", "slot": "settings", "title": "标题",
-                "entry": "/v1/plugins/my-plugin/client/"}],
+                "entry": "/v1/plugins/my-plugin/web/"}],
     "slots": [{"slot_id": "my.x", "slot": "input_toolbar_right",
-               "priority": 50, "script": {"file": "client/slot.js"}}],
-    "styles": {"file": "client/styles.css"},   # 或内联字符串
+               "priority": 50, "script": {"file": "web/slot.js"}}],
+    "styles": {"file": "web/styles.css"},   # 或内联字符串
 }
 ```
 

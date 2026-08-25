@@ -26,7 +26,7 @@ PLUGIN_META = {
                 # settings 槽位：出现在 web 设置侧栏，独占主区视图
                 "slot": "settings",
                 "title": "插件",
-                "entry": "/v1/plugins/plugin_manager/client/",
+                "entry": "/v1/plugins/plugin_manager/web/",
             }
         ],
     },
@@ -90,7 +90,7 @@ def register(ctx) -> None:
 
     client = APIRouter()
     client.include_router(
-        static_router(Path(__file__).parent / "client"),
-        prefix="/client",
+        static_router(Path(__file__).parent / "web"),
+        prefix="/web",
     )
     routes.register(client, public=True, description="plugin_manager 管理界面静态资源")

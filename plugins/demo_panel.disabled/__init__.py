@@ -1,8 +1,8 @@
 """演示插件：验证插件前端贡献三级机制（panel + slot + styles）。
 
-声明一个右侧面板（iframe 加载本目录 client/index.html）、一个会话条目
-徽章槽位贡献、一段纯 CSS。同时用 routes face 把 client/ 目录以静态文件
-形式挂到 /v1/plugins/demo_panel/client/（public，iframe 无 Authorization
+声明一个右侧面板（iframe 加载本目录 web/index.html）、一个会话条目
+徽章槽位贡献、一段纯 CSS。同时用 routes face 把 web/ 目录以静态文件
+形式挂到 /v1/plugins/demo_panel/web/（public，iframe 无 Authorization
 头也能加载）。engine 进程没有 routes face，register() 直接跳过。
 """
 
@@ -19,7 +19,7 @@ PLUGIN_META = {
                 "id": "demo",
                 "slot": "right",
                 "title": "演示面板",
-                "entry": "/v1/plugins/demo_panel/client/",
+                "entry": "/v1/plugins/demo_panel/web/",
             }
         ],
         "slots": [
@@ -65,11 +65,11 @@ def register(ctx) -> None:
     from engine.faces.routes import static_router
 
     # face 把 router 直接挂在 /v1/plugins/{owner} 下；面板资源要出现在
-    # /client/ 子路径，用 include_router 加一层前缀。
+    # /web/ 子路径，用 include_router 加一层前缀。
     router = APIRouter()
     router.include_router(
-        static_router(Path(__file__).parent / "client"),
-        prefix="/client",
+        static_router(Path(__file__).parent / "web"),
+        prefix="/web",
     )
     routes.register(
         router,
