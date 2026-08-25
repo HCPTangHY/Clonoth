@@ -59,22 +59,28 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
     return () => frame.removeEventListener('load', inject);
   }, [frameKey]);
 
-  // [AutoC 2026-08-25] Forward the open intent to the panel page after load.
+  // [AutoC 2026-08-25] Forward the open intent to the panel page.
   // The intent is opaque to the host; the panel page listens for
-  // 'clonoth:panel-intent' and reacts voluntarily. Sending on load avoids the
-  // race where the overlay opens and the frame is not yet listening.
+  // 'clonoth:panel-intent' and reacts voluntarily. Send on load (cold frame)
+  // and on every intent change while the panel is mounted (warm frame) — the
+  // overlay stays open across clicks, so the load-only path misses repeat
+  // intents.
+  const rightIntent = useViewStore((s) => s.panelOverlay.rightIntent);
+  const lastSentIntent = useRef<unknown>(undefined);
   useEffect(() => {
     if (!overlayId) return;
     const frame = frameRef.current;
     if (!frame) return;
     const send = () => {
       const intent = useViewStore.getState().panelOverlay.rightIntent;
+      if (intent === lastSentIntent.current) return;
+      lastSentIntent.current = intent;
       frame.contentWindow?.postMessage({ type: 'clonoth:panel-intent', intent }, window.location.origin);
     };
     frame.addEventListener('load', send);
     if (frame.contentDocument?.readyState === 'complete') send();
     return () => frame.removeEventListener('load', send);
-  }, [frameKey, overlayId]);
+  }, [frameKey, overlayId, rightIntent]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
