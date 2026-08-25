@@ -2,13 +2,8 @@
 // 槽位：tool_card_content:execute_command。data 是宿主给的工具快照
 // { toolName, arguments, result, error, status, elapsedMs, nodeId }。
 //
-// 命令可视化（纯视觉变换，不执行任何逻辑）：
-// - 引号状态机：单双引号与反斜杠转义内的分隔符不切分，heredoc 等内嵌
-//   脚本保持为一段
-// - 按 && || ; | 分段，每段一行，连接符显示在段首
-// - 每段首词按命令类别着色
-// - 重定向尾缀折叠为灰色标签
-// - 块头右侧"分段/原文"切换，状态存 ctx.state 跨更新保留
+// 命令保持单个大代码块，按行对指令首词做类别着色（纯视觉变换，不切分
+// 不重组，引号/heredoc 内容原样保留在原行）。超时以标签显示在块头。
 
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => (
@@ -17,134 +12,45 @@ function esc(s) {
 }
 
 const CMD_CLASSES = [
-  ['nav',     /^(cd|ls|pwd|tree|pushd|popd)\b/,          '#4078f2'],
-  ['read',    /^(cat|head|tail|less|more|grep|rg|find|sed|awk|wc|diff|sort|uniq|which|file|stat|du|df)\b/, '#50a14f'],
-  ['vcs',     /^(git)\b/,                                 '#986801'],
-  ['runtime', /^(python3?|node|npx|npm|pnpm|yarn|bun|deno|ruby|go|cargo|java|bash|sh|zsh|tsc|esbuild)\b/, '#e45649'],
-  ['net',     /^(curl|wget|ping|ssh|scp|rsync|nc)\b/,     '#0184bc'],
-  ['write',   /^(cp|mv|mkdir|touch|rm|rmdir|ln|chmod|chown|tar|zip|unzip|install)\b/, '#c18401'],
-  ['build',   /^(make|cmake|docker|docker-compose|systemctl|service|pm2)\b/, '#a626a4'],
+  /^(cd|ls|pwd|tree|pushd|popd)\b/,                                                        // 导航
+  /^(cat|head|tail|less|more|grep|rg|find|sed|awk|wc|diff|sort|uniq|which|file|stat|du|df)\b/, // 检索
+  /^(git)\b/,                                                                               // VCS
+  /^(python3?|node|npx|npm|pnpm|yarn|bun|deno|ruby|go|cargo|java|bash|sh|zsh|tsc|esbuild)\b/, // 运行时
+  /^(curl|wget|ping|ssh|scp|rsync|nc)\b/,                                                   // 网络
+  /^(cp|mv|mkdir|touch|rm|rmdir|ln|chmod|chown|tar|zip|unzip|install)\b/,                   // 写操作
+  /^(make|cmake|docker|docker-compose|systemctl|service|pm2)\b/,                            // 构建
 ];
+const CMD_COLORS = ['#4078f2', '#50a14f', '#986801', '#e45649', '#0184bc', '#c18401', '#a626a4'];
 
-function cmdColor(seg) {
-  const first = (seg.trim().match(/^[^\s]+/) || [''])[0];
-  for (const [, re, color] of CMD_CLASSES) {
-    if (re.test(first)) return color;
+function lineColor(line) {
+  const first = (line.trim().match(/^[^\s]+/) || [''])[0];
+  for (let i = 0; i < CMD_CLASSES.length; i++) {
+    if (CMD_CLASSES[i].test(first)) return CMD_COLORS[i];
   }
   return null;
 }
 
-// 引号与 heredoc 感知的分段。规则：
-// 1. 单双引号、反斜杠转义内的 &&/||/;/| 不切
-// 2. heredoc（<< 'TAG' 或 << TAG 或 <<- TAG）识别后，从 heredoc 开始到
-//    对应结束标记行的全部内容保持为一段
-// 3. 引号未闭合时剩余内容全部留在当前段
-function splitCommand(cmd) {
-  // 预处理：识别 heredoc 范围，用占位符替换其中的分隔符
-  const heredocRanges = [];
-  const heredocRe = /<<-?\s*['"]?(\w+)['"]?/g;
-  let hm;
-  while ((hm = heredocRe.exec(cmd)) !== null) {
-    const tag = hm[1];
-    // 找结束标记：单独一行的 TAG
-    const endRe = new RegExp('\\n' + tag + '\\b', 'g');
-    endRe.lastIndex = hm.index + hm[0].length;
-    const endMatch = endRe.exec(cmd);
-    if (endMatch) {
-      heredocRanges.push({ start: hm.index, end: endMatch.index + endMatch[0].length });
+// 逐行处理：行首词与行内段首词（&&/||/;/| 之后的第一个 token）命中类别
+// 则用 span 着色，其余原样。不切行、不识别引号与 heredoc——着色是纯视觉
+// 标记，误着色的最坏结果是内嵌脚本的某个词带颜色，不影响结构与内容。
+function renderCommandText(cmd) {
+  return cmd.split('\n').map((line) => {
+    let out = '';
+    let last = 0;
+    // 段首词位置：行首 或 &&/||/;/| 之后
+    const re = /(^|&&|\|\||[;|])(\s*)(\S+)/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      const word = m[3];
+      const color = lineColor(word);
+      if (!color) continue;
+      out += esc(line.slice(last, m.index)) + esc(m[1]) + esc(m[2]) +
+        '<span style="color:' + color + ';font-weight:600">' + esc(word) + '</span>';
+      last = m.index + m[0].length;
     }
-  }
-
-  const inHeredoc = (pos) => heredocRanges.some(r => pos >= r.start && pos < r.end);
-  // heredoc 结束位置之后应有分段边界
-  const heredocEnds = new Set(heredocRanges.map(r => r.end));
-
-  const segs = [];
-  let cur = '';
-  let i = 0;
-  let quote = null; // null | "'" | '"'
-  while (i < cmd.length) {
-    const ch = cmd[i];
-    // heredoc 范围内的所有字符原样保留，不做任何分段判断
-    if (inHeredoc(i)) {
-      cur += ch;
-      i += 1;
-      // heredoc 刚结束，强制断段
-      if (heredocEnds.has(i) && cur.trim()) {
-        segs.push({ op: segs.length ? '·' : '', text: cur.trim() });
-        cur = '';
-      }
-      continue;
-    }
-    if (quote) {
-      cur += ch;
-      if (ch === '\\' && quote === '"' && i + 1 < cmd.length) {
-        cur += cmd[i + 1];
-        i += 2;
-        continue;
-      }
-      if (ch === quote) quote = null;
-      i += 1;
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      cur += ch;
-      i += 1;
-      continue;
-    }
-    if (ch === '\\' && i + 1 < cmd.length) {
-      cur += ch + cmd[i + 1];
-      i += 2;
-      continue;
-    }
-    const two = cmd.slice(i, i + 2);
-    if (two === '&&' || two === '||') {
-      if (cur.trim()) segs.push({ op: segs.length ? '·' : '', text: cur.trim() });
-      cur = '';
-      i += 2;
-      continue;
-    }
-    if (ch === ';' || (ch === '|' && cmd[i + 1] !== '|')) {
-      if (cur.trim()) segs.push({ op: segs.length ? (ch === '|' ? '|' : ';') : '', text: cur.trim() });
-      cur = '';
-      i += 1;
-      continue;
-    }
-    cur += ch;
-    i += 1;
-  }
-  if (cur.trim()) segs.push({ op: segs.length ? '·' : '', text: cur.trim() });
-  return segs;
-}
-
-function foldRedirects(seg) {
-  const tags = [];
-  const text = seg.replace(/\s*(2>>?|>>?|&>)([^\s]+)/g, (_, op, target) => {
-    tags.push(op + (target === '&1' ? '&1' : ' ' + target));
-    return '';
-  }).trim();
-  return { text, tags };
-}
-
-function renderSegs(cmd) {
-  const segs = splitCommand(cmd);
-  let html = '';
-  for (const seg of segs) {
-    const { text, tags } = foldRedirects(seg.text);
-    const color = cmdColor(text);
-    const first = (text.match(/^[^\s]+/) || [''])[0];
-    const rest = text.slice(first.length);
-    html += '<div class="ide-tc-seg">';
-    if (seg.op) html += '<span class="ide-tc-op">' + esc(seg.op) + '</span>';
-    html += '<code>';
-    html += color ? '<span style="color:' + color + ';font-weight:600">' + esc(first) + '</span>' : esc(first);
-    html += esc(rest);
-    html += '</code>';
-    for (const t of tags) html += '<span class="ide-tc-redir">' + esc(t) + '</span>';
-    html += '</div>';
-  }
-  return html;
+    out += esc(line.slice(last));
+    return out;
+  }).join('\n');
 }
 
 function kv(label, value) {
@@ -156,21 +62,15 @@ function kv(label, value) {
 function render(ctx) {
   const d = ctx.data || {};
   const args = d.arguments || {};
-  const state = ctx.state || (ctx.state = {});
   const parts = [];
 
   if (args.command) {
-    const cmd = String(args.command);
-    const raw = !!state.cmdRaw;
-    let block = '<div class="ide-tc-cmd"><div class="ide-tc-cmdhead"><span>命令</span>' +
-      '<span class="ide-tc-cmdhead-right">';
-    if (args.timeout_sec != null) block += '<span class="ide-tc-timeout">' + esc(args.timeout_sec) + 's</span>';
-    block += '<button type="button" class="ide-tc-cmdtoggle">' + (raw ? '分段' : '原文') + '</button>';
-    block += '</span></div>';
-    block += raw
-      ? '<pre class="ide-tc-code ide-tc-cmdraw">' + esc(cmd) + '</pre>'
-      : renderSegs(cmd);
-    block += '</div>';
+    let block = '<div class="ide-tc-cmd"><div class="ide-tc-cmdhead"><span>命令</span>';
+    if (args.timeout_sec != null) {
+      block += '<span class="ide-tc-timeout">' + esc(args.timeout_sec) + 's</span>';
+    }
+    block += '</div><pre class="ide-tc-code ide-tc-cmdraw">' +
+      renderCommandText(String(args.command)) + '</pre></div>';
     parts.push(block);
   }
 
@@ -187,14 +87,6 @@ function render(ctx) {
   }
 
   ctx.el.innerHTML = parts.join('');
-
-  const toggle = ctx.el.querySelector('.ide-tc-cmdtoggle');
-  if (toggle) {
-    toggle.addEventListener('click', () => {
-      state.cmdRaw = !state.cmdRaw;
-      render(ctx);
-    });
-  }
 }
 
 export default {

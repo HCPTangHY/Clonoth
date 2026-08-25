@@ -1297,7 +1297,11 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
     status: tool.status,
     arguments: tool.arguments,
     argumentsText: tool.argumentsText,
-    result: typeof tool.result === 'string' ? tool.result : undefined,
+    // [AutoC 2026-08-25] result 必须序列化后透传：tool.result 是统一响应结构
+    // （{data: {result: ...}} 等），按 string 过滤会把对象丢成 undefined，插件渲
+    // 染器拿不到结果。与默认渲染共用 getResultText，保证插件和默认渲染看到同一
+    // 份文本。
+    result: getResultText(tool) || undefined,
     error: tool.error,
     elapsedMs: tool.elapsedMs,
     nodeId: tool.nodeId,
