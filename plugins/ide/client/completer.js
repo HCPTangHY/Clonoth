@@ -157,9 +157,11 @@ export default {
   async _pick(path) {
     const S = this._ctx.state;
     if (!this._ta) return;
-    // 选中 token 区间，insertComposerText 以选区替换语义写入。
+    // 选中 @ 之后的过滤文本区间（不含 @ 本身），insertComposerText 以
+    // 选区替换语义写入完整路径。@ 必须保留在草稿里：落库与渲染保持
+    // @path 字面量，engine 侧 before_llm_call 才能识别并展开。
     this._ta.focus();
-    this._ta.setSelectionRange(S.tokenStart, S.tokenEnd);
+    this._ta.setSelectionRange(S.tokenStart + 1, S.tokenEnd);
     await this._ctx.api.call('insertComposerText', path + ' ');
     this._close();
   },

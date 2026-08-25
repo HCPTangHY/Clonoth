@@ -18,7 +18,7 @@ from pathlib import Path
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.8.1",
+    "version": "0.8.2",
     "description": "Web IDE：文件面板 + 编辑器 + @文件引用（输入框补全与请求时展开）",
     "author": "clonoth",
     # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
