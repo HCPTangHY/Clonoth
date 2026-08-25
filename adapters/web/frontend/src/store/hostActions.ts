@@ -10,6 +10,7 @@
 // container (mount by name, consume generically), ending per-plugin whitelist
 // edits.
 import { useChatStore } from './chatStore';
+import { useViewStore } from './viewStore';
 
 export type HostAction = (...args: unknown[]) => unknown;
 
@@ -104,4 +105,15 @@ registerHostAction('reroll', async () => {
       return;
     }
   }
+});
+
+// [AutoC 2026-08-25] Generic panel-open action with opaque intent.
+// Why: annotators and slot plugins need to open overlay panels and hand them a
+// payload without the host parsing it. How: set the overlay with an optional
+// intent; PluginPanel forwards the intent to the panel page on load via
+// postMessage. Purpose: the host owns panel routing, plugins own the payload.
+registerHostAction('openPanel', (panelId, intent) => {
+  const id = String(panelId ?? '');
+  if (!id) return;
+  useViewStore.getState().setPanelOverlay('right', id, intent);
 });

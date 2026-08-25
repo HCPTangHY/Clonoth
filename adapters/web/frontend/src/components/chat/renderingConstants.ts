@@ -10,6 +10,9 @@ export interface MessageRenderContext {
   role: WsMessage['role'];
   status: WsMessage['status'];
   completionType?: WsMessage['completionType'];
+  /** [AutoC 2026-08-25] Session id for annotator context (workspace-scoped
+   * resolution inside annotator scripts). Undefined means no session. */
+  sessionId?: string;
 }
 
 export const BLOCK_STACK_CLASS = 'space-y-2';

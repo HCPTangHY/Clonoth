@@ -102,6 +102,7 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
       role: lastCard.role,
       status: lastCard.status,
       completionType: lastCard.completionType,
+      sessionId: lastCard.sessionId || undefined,
     };
   }, [hasCompletion, lastCard]);
 
@@ -184,6 +185,7 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
                           role: lastCard.role,
                           status: lastCard.status,
                           completionType: lastCard.completionType,
+                          sessionId: lastCard.sessionId || undefined,
                         }}
                       />
                     ))}

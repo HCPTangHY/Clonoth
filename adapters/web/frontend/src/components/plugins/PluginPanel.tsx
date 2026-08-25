@@ -13,6 +13,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 
 import { getStoredAdminToken } from '../../api/supervisorClient';
+import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
 import { applyHostTheme } from './themeBridge';
 
@@ -21,13 +22,16 @@ interface PluginPanelProps {
   title: string;
   sessionId: string;
   onClose: () => void;
+  /** [AutoC 2026-08-25] Overlay id (e.g. 'files' or 'plugin:owner:id') used to
+   * look up the open intent in viewStore and forward it to the panel page. */
+  overlayId?: string;
   /** [plugin-admin 2026-08-23] When false, render the bare iframe without the
    * title bar and close button — the settings-view variant where the sidebar
    * already names the tab and closing is navigation, not an overlay. */
   chrome?: boolean;
 }
 
-export const PluginPanel = ({ entry, title, sessionId, onClose, chrome = true }: PluginPanelProps) => {
+export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrome = true }: PluginPanelProps) => {
   // remount the frame whenever entry or session changes; the effect below
   // re-publishes the boot object before the new page's scripts run.
   const frameKey = useMemo(() => `${entry}::${sessionId}`, [entry, sessionId]);
@@ -54,6 +58,23 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, chrome = true }:
     if (frame.contentDocument?.readyState === 'complete') inject();
     return () => frame.removeEventListener('load', inject);
   }, [frameKey]);
+
+  // [AutoC 2026-08-25] Forward the open intent to the panel page after load.
+  // The intent is opaque to the host; the panel page listens for
+  // 'clonoth:panel-intent' and reacts voluntarily. Sending on load avoids the
+  // race where the overlay opens and the frame is not yet listening.
+  useEffect(() => {
+    if (!overlayId) return;
+    const frame = frameRef.current;
+    if (!frame) return;
+    const send = () => {
+      const intent = useViewStore.getState().panelOverlay.rightIntent;
+      frame.contentWindow?.postMessage({ type: 'clonoth:panel-intent', intent }, window.location.origin);
+    };
+    frame.addEventListener('load', send);
+    if (frame.contentDocument?.readyState === 'complete') send();
+    return () => frame.removeEventListener('load', send);
+  }, [frameKey, overlayId]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">

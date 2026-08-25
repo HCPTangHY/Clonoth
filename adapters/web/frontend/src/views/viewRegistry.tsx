@@ -68,6 +68,7 @@ function resolveOverlay(id: string, ctx: AppViewContext): ReactNode {
     return (
       <PluginPanel
         entry={panel.entry}
+        overlayId={id}
         sessionId={safeSessionId(ctx.sessionId)}
         title={panel.title}
         onClose={close}
@@ -82,6 +83,7 @@ function resolveOverlay(id: string, ctx: AppViewContext): ReactNode {
     return (
       <PluginPanel
         entry={replacement.entry}
+        overlayId={id}
         sessionId={safeSessionId(ctx.sessionId)}
         title={replacement.title}
         onClose={close}

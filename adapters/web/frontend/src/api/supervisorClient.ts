@@ -1305,9 +1305,16 @@ export interface PluginSlotDecl {
   mode?: string;
 }
 
+export interface PluginAnnotatorDecl {
+  id: string;
+  script: string;
+  priority?: number;
+}
+
 export interface PluginClientManifest {
   panels?: PluginPanelDecl[];
   slots?: PluginSlotDecl[];
+  annotators?: PluginAnnotatorDecl[];
   styles?: string;
 }
 

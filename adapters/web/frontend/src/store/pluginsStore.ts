@@ -11,6 +11,7 @@ import {
   listPlugins,
   type PluginListItem,
 } from '../api/supervisorClient';
+import { refreshAnnotators } from './annotators';
 import { subscribePluginEvent } from './pluginRuntime';
 
 export interface ResolvedPanel {
@@ -137,6 +138,9 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       list.sort((a, b) => b.priority - a.priority);
     }
     set({ loaded: true, plugins, panels, settingsPanels, overlayOverrides, slotsBySlot, stylesByOwner });
+    // annotators are rebuilt from the same manifest fetch; fire-and-forget so a
+    // slow annotator script never blocks slot/panel rendering.
+    void refreshAnnotators();
   },
 
   panelByKey: (key) =>

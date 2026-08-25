@@ -273,3 +273,18 @@ textarea {
   font-size: 0.52rem;
   color: var(--duties-tertiary);
 }
+
+/* [AutoC 2026-08-25] Annotated message spans (file links etc. from the
+   annotator registry). Inline-code span that is clickable: keep the code
+   face, add a subtle underline so the affordance is visible without
+   overwhelming the surrounding text. */
+button.msg-annotation {
+  all: unset;
+  cursor: pointer;
+  color: var(--duties-accent);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+  font: inherit;
+}
+button.msg-annotation:hover { color: var(--duties-text); }

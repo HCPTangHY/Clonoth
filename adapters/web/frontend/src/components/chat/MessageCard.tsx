@@ -112,6 +112,7 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
     completionType: message.completionType,
     role: message.role,
     status: message.status,
+    sessionId: message.sessionId || undefined,
   };
   // Why: only dispatch callback cards can navigate to child sessions. How: read the
   // backend-provided source.childSessionId and leave normal messages without an

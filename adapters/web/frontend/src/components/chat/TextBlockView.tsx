@@ -3,12 +3,14 @@
 // RenderBlock objects instead of the old split message/preview fields. How: render
 // Markdown through ReactMarkdown and add small visual markers only from the block's
 // delivery metadata. Purpose: keep all text output in the unified MessageCard path.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 import type { TextBlock } from '../../types/message';
 import { INLINE_BLOCK_BODY_TEXT_CLASS, INLINE_BLOCK_INDENT_CLASS, INLINE_TEXT_BORDER_BASE_CLASS, type MessageRenderContext } from './renderingConstants';
+import { annotateText, getAnnotatorVersion, type AnnotatorMatch } from '../../store/annotators';
+import { callHostAction } from '../../store/hostActions';
 
 interface TextBlockViewProps {
   block: TextBlock;
@@ -41,7 +43,7 @@ function isAssistantFreeProse(block: TextBlock, messageContext?: MessageRenderCo
 // consumes them. How: strip complete and trailing marker sections before rendering.
 // Purpose: users see only the assistant text that belongs in the message body.
 const TOOL_CALL_PATTERN = /<<<TOOL_CALL>>>[\s\S]*?<<<END_TOOL_CALL>>>/g;
-const TRAILING_TOOL_CALL_PATTERN = /<<<TOOL_CALL>>>[\s\S]*$/;
+const TRAILING_TOOL_CALL_PATTERN = /<<<(?:TOOL_CALL|END_TOOL_CALL)>>>[\s\S]*$/;
 
 function cleanProtocolMarkers(text: string): string {
   let cleaned = text.replace(TOOL_CALL_PATTERN, '').replace(TRAILING_TOOL_CALL_PATTERN, '');
@@ -60,25 +62,96 @@ function diffLineClassName(line: string): string {
   return 'diff-line diff-line-context';
 }
 
+// Base markdown renderer map. The code arm delegates non-diff inline code to the
+// annotation-aware renderer via a per-render closure (see buildMarkdownComponents).
 const markdownComponents: Components = {
   code({ node: _node, className, children, ...props }) {
-    if (!isDiffFence(className)) {
-      return <code className={className} {...props}>{children}</code>;
-    }
-
-    const text = String(children ?? '').replace(/\n$/, '');
-    const lines = text.split('\n');
-    return (
-      <code className={`${className || ''} diff-code-block`} {...props}>
-        {lines.map((line, index) => (
-          <span className={diffLineClassName(line)} key={`${index}:${line}`}>
-            {line || ' '}
-          </span>
-        ))}
-      </code>
-    );
+    return renderCodeSpan(className, children, props);
   },
 };
+
+/** Shared code renderer: diff fences get per-line classes, others plain. */
+function renderCodeSpan(
+  className: string | undefined,
+  children: unknown,
+  props: Record<string, unknown>,
+) {
+  const text = String(children ?? '');
+  if (!isDiffFence(className)) {
+    return <code className={className} {...props}>{text}</code>;
+  }
+  const normalized = text.replace(/\n$/, '');
+  const lines = normalized.split('\n');
+  return (
+    <code className={`${className || ''} diff-code-block`} {...props}>
+      {lines.map((line, index) => (
+        <span className={diffLineClassName(line)} key={`${index}:${line}`}>
+          {line || ' '}
+        </span>
+      ))}
+    </code>
+  );
+}
+
+/**
+ * [AutoC 2026-08-25] Build a per-render ReactMarkdown components map whose code
+ * renderer queries the annotator registry with the current message context.
+ * Why: plugins contribute message annotations (file links etc.) without touching
+ * host DOM; the host renders matched spans as clickable. How: the shared
+ * module-level components map cannot see messageContext, so TextBlockView calls
+ * this once per render when annotators are loaded; streaming blocks and an empty
+ * annotator set return the shared map unchanged. Matched spans become buttons
+ * that call the generic openPanel host action with the annotator-declared
+ * panel and opaque intent — the host never parses the intent.
+ */
+function buildMarkdownComponents(
+  messageContext: MessageRenderContext | undefined,
+  streaming: boolean,
+): Components {
+  if (streaming || getAnnotatorVersion() === 0) return markdownComponents;
+  const role = messageContext?.role || '';
+  const sessionId = messageContext?.sessionId || '';
+
+  const annotated: Components = { ...markdownComponents };
+  annotated.code = ({ node: _node, className, children, ...props }) => {
+    if (isDiffFence(className)) {
+      return renderCodeSpan(className, children, props);
+    }
+    const text = String(children ?? '');
+    const matches = annotateText(text, { role, sessionId });
+    if (matches.length === 0) {
+      return <code className={className} {...props}>{text}</code>;
+    }
+    const parts: Array<{ t: string; m?: AnnotatorMatch; key: string }> = [];
+    let cursor = 0;
+    matches.forEach((m, i) => {
+      if (m.start > cursor) parts.push({ t: text.slice(cursor, m.start), key: `p${i}` });
+      parts.push({ t: text.slice(m.start, m.end), m, key: `m${i}` });
+      cursor = m.end;
+    });
+    if (cursor < text.length) parts.push({ t: text.slice(cursor), key: 'tail' });
+    return (
+      <code className={className} {...props}>
+        {parts.map((p) =>
+          p.m ? (
+            <button
+              className="msg-annotation"
+              key={p.key}
+              onClick={() => void callHostAction('openPanel', p.m!.open.panel, p.m!.open.intent)}
+              title={p.t}
+              type="button"
+            >
+              {p.t}
+            </button>
+          ) : (
+            <span key={p.key}>{p.t}</span>
+          ),
+        )}
+      </code>
+    );
+  };
+  return annotated;
+}
 
 export const TextBlockView = ({ block, messageContext }: TextBlockViewProps) => {
   // [2026-06-06] Streaming timeout guard: same pattern as ThinkingBlock.
@@ -112,6 +185,14 @@ export const TextBlockView = ({ block, messageContext }: TextBlockViewProps) => 
   const displayText = cleanProtocolMarkers(block.text);
   const isFreeProse = isAssistantFreeProse(block, messageContext);
 
+  // [AutoC 2026-08-25] Per-render components with annotation context. Memoized on
+  // the streaming flag and annotator version so identical re-renders reuse the map.
+  const components = useMemo(
+    () => buildMarkdownComponents(messageContext, !!isActivelyStreaming),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isActivelyStreaming, messageContext?.role, messageContext?.sessionId, getAnnotatorVersion()],
+  );
+
   if (!displayText && !showCursor) return null;
 
   // Free prose: smaller font, dimmed color, indented to align with tool/thinking blocks
@@ -121,7 +202,7 @@ export const TextBlockView = ({ block, messageContext }: TextBlockViewProps) => 
 
   return (
     <div className={containerClass}>
-      {displayText && <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]}>{displayText}</ReactMarkdown>}
+      {displayText && <ReactMarkdown components={components} remarkPlugins={[remarkGfm]}>{displayText}</ReactMarkdown>}
       {showCursor && (
         // [2026-06-01] Why: the streaming cursor used a block Unicode glyph.
         // How: draw the cursor as a small CSS rectangle instead. Purpose: live text

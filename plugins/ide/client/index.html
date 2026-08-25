@@ -1118,6 +1118,17 @@ function renderImage(tab) {
   viewEl.appendChild(img);
 }
 
+// ── panel-intent listener ──────────────────────────────────────────────────
+// The host forwards the opaque open intent after the iframe loads. ide owns
+// the 'open-file' kind; other intents are ignored.
+window.addEventListener('message', (ev) => {
+  const data = ev && ev.data;
+  if (!data || data.type !== 'clonoth:panel-intent') return;
+  const intent = data.intent;
+  if (!intent || intent.kind !== 'open-file' || !intent.path) return;
+  openFileTab(String(intent.path), false);
+});
+
 // ── boot ─────────────────────────────────────────────────────────────────
 
 renderTabs();
