@@ -464,7 +464,14 @@ function newFileTab(path, pinned) {
   // scroll 存比例（scrollTop / 可滚动高度）而非像素：渲染与编辑两种模式
   // 的滚动容器与内容高度都不同，像素值无法对应。cursor 存编辑态游标位置。
   return { path, pinned, loaded: false, kind: '', text: '', savedText: '',
-           dirty: false, scroll: 0, cursor: 0, blobUrl: null, note: '', mode: 'render' };
+           dirty: false, scroll: 0, cursor: 0, blobUrl: null, note: '', mode: 'render',
+           diffs: null, afterText: '' };
+}
+
+function newDiffTab(path, diffs) {
+  return { path, pinned: true, loaded: false, kind: 'diff', text: '', savedText: '',
+           dirty: false, scroll: 0, cursor: 0, blobUrl: null, note: '', mode: 'render',
+           diffs, afterText: '' };
 }
 
 function scrollFraction(el) {
@@ -591,6 +598,22 @@ function openFileTab(path, pinned) {
   renderView();
 }
 
+function openDiffTab(path, diffs) {
+  // diff 标签页 key 带 ' (diff)' 后缀，与同名文件标签区分。
+  const key = path + ' (diff)';
+  let tab = findTab(key);
+  if (tab) {
+    tab.diffs = diffs;
+    tab.loaded = false;
+  } else {
+    tab = newDiffTab(key, diffs);
+    tabs.push(tab);
+  }
+  activePath = key;
+  renderTabs();
+  renderView();
+}
+
 function closeTab(path) {
   if (path === TREE_TAB) return;
   const tab = findTab(path);
@@ -686,18 +709,71 @@ function renderView() {
   }
   const tab = findTab(activePath);
   if (!tab) { renderStatusbar(); return; }
-  if (!tab.loaded) { loadFileTab(tab); return; }
+  if (!tab.loaded) {
+    if (tab.kind === 'diff') { loadDiffTab(tab); return; }
+    loadFileTab(tab);
+    return;
+  }
   renderFileTab(tab);
   renderStatusbar();
 }
 
 function renderFileTab(tab) {
-  if (tab.kind === 'text') {
+  if (tab.kind === 'diff') renderDiff(tab);
+  else if (tab.kind === 'text') {
     if (isMarkdown(tab.path) && tab.mode === 'render') renderMarkdown(tab);
     else renderEditor(tab);
   }
   else if (tab.kind === 'image') renderImage(tab);
   else showStatus(tab.note || '不支持预览');
+}
+
+// ── diff view ─────────────────────────────────────────────────────────────
+
+function renderDiff(tab) {
+  viewEl.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'ide-diff-view';
+  const before = tab.text;
+  const after = tab.afterText;
+  if (!before && !after) { showStatus('加载中…'); return; }
+
+  const aLines = before.split('\n');
+  const bLines = after.split('\n');
+  // 行级对齐：共同前缀与后缀为上下文，中间差异红绿对比
+  let pre = 0;
+  while (pre < aLines.length && pre < bLines.length && aLines[pre] === bLines[pre]) pre++;
+  let suf = 0;
+  while (suf < aLines.length - pre && suf < bLines.length - pre
+         && aLines[aLines.length - 1 - suf] === bLines[bLines.length - 1 - suf]) suf++;
+
+  const ctxBefore = aLines.slice(0, pre);
+  const delLines = aLines.slice(pre, aLines.length - suf);
+  const addLines = bLines.slice(pre, bLines.length - suf);
+  const ctxAfter = aLines.slice(aLines.length - suf);
+
+  const head = document.createElement('div');
+  head.className = 'ide-diff-head';
+  head.innerHTML = '<code>' + esc(tab.path.replace(/ \(diff\)$/, '')) + '</code>'
+    + '<span class="ide-diff-stat">-' + delLines.length + ' +' + addLines.length + '</span>';
+  wrap.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'ide-diff-body';
+  for (const l of ctxBefore) body.appendChild(diffLine('ctx', l));
+  for (const l of delLines) body.appendChild(diffLine('del', l));
+  for (const l of addLines) body.appendChild(diffLine('add', l));
+  for (const l of ctxAfter) body.appendChild(diffLine('ctx', l));
+  wrap.appendChild(body);
+  viewEl.appendChild(wrap);
+  applyScrollFraction(viewEl, tab.scroll);
+}
+
+function diffLine(cls, text) {
+  const div = document.createElement('div');
+  div.className = 'ide-diff-line ide-diff-' + cls;
+  div.textContent = (cls === 'del' ? '- ' : cls === 'add' ? '+ ' : '  ') + text;
+  return div;
 }
 
 // ── editor ───────────────────────────────────────────────────────────────
@@ -1109,6 +1185,43 @@ async function loadFileTab(tab) {
   }
 }
 
+async function loadDiffTab(tab) {
+  const seq = ++loadSeq;
+  showStatus('加载中…');
+  renderStatusbar();
+  // diff 标签的 path 带 ' (diff)' 后缀，取原始路径读文件
+  const filePath = tab.path.replace(/ \(diff\)$/, '');
+  let resp;
+  try {
+    resp = await api('/sessions/' + encodeURIComponent(SESSION_ID)
+      + '/file?path=' + encodeURIComponent(filePath));
+  } catch (err) {
+    if (activePath === tab.path) showStatus('加载失败：' + err.message);
+    return;
+  }
+  const text = await resp.text();
+  tab.text = text;
+  // 按顺序应用 diffs，产出 afterText
+  let after = text;
+  let failed = 0;
+  for (const d of (tab.diffs || [])) {
+    const search = String(d.search || '');
+    const replace = String(d.replace || '');
+    if (search && after.includes(search)) {
+      after = after.replace(search, replace);
+    } else if (search) {
+      failed++;
+    }
+  }
+  tab.afterText = after;
+  tab.loaded = true;
+  if (failed > 0) tab.note = failed + ' 处 diff 未能匹配当前文件内容';
+  if (activePath === tab.path && seq === loadSeq) {
+    renderFileTab(tab);
+    renderStatusbar();
+  }
+}
+
 function renderImage(tab) {
   viewEl.innerHTML = '';
   const img = document.createElement('img');
@@ -1120,16 +1233,20 @@ function renderImage(tab) {
 
 // ── panel-intent listener ──────────────────────────────────────────────────
 // The host forwards the opaque open intent after the iframe loads. ide owns
-// the 'open-file' kind; other intents are ignored.
+// 'open-file' and 'open-diff'; other intents are ignored.
 window.addEventListener('message', (ev) => {
   const data = ev && ev.data;
   if (!data || data.type !== 'clonoth:panel-intent') return;
   const intent = data.intent;
-  console.log('[ide-intent] received', intent);
-  if (!intent || intent.kind !== 'open-file' || !intent.path) return;
-  console.log('[ide-intent] opening', intent.path);
-  openFileTab(String(intent.path), false);
+  if (!intent) return;
+  if (intent.kind === 'open-file' && intent.path) {
+    openFileTab(String(intent.path), false);
+  } else if (intent.kind === 'open-diff' && intent.path && Array.isArray(intent.diffs)) {
+    openDiffTab(String(intent.path), intent.diffs);
+  }
 });
+// 通知宿主：监听器已就绪，可以重发 intent。解决首次点击只初始化不跳转。
+window.parent.postMessage({ type: 'clonoth:panel-ready' }, window.location.origin);
 
 // ── boot ─────────────────────────────────────────────────────────────────
 

@@ -79,7 +79,21 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
     };
     frame.addEventListener('load', send);
     if (frame.contentDocument?.readyState === 'complete') send();
-    return () => frame.removeEventListener('load', send);
+    // [AutoC 2026-08-25] Panel-ready handshake: the panel page posts
+    // 'clonoth:panel-ready' after its message listener is registered, which
+    // may happen after the iframe load event. Resend the intent then so
+    // first-click intents are not swallowed by an unready panel.
+    const onMessage = (ev: MessageEvent) => {
+      if (ev.source !== frame.contentWindow) return;
+      if ((ev.data as { type?: string })?.type !== 'clonoth:panel-ready') return;
+      lastSentIntent.current = undefined;
+      send();
+    };
+    window.addEventListener('message', onMessage);
+    return () => {
+      frame.removeEventListener('load', send);
+      window.removeEventListener('message', onMessage);
+    };
   }, [frameKey, overlayId, rightIntent]);
 
   return (
