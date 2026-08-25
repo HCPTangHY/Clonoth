@@ -92,10 +92,10 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     const slotsBySlot: Record<string, SlotContribution[]> = {};
     const stylesByOwner: Record<string, string> = {};
     for (const plugin of plugins) {
-      const client = plugin.client;
-      if (!client || typeof client !== 'object') continue;
+      const web = plugin.web;
+      if (!web || typeof web !== 'object') continue;
       const owner = plugin.name;
-      for (const panel of client.panels || []) {
+      for (const panel of web.panels || []) {
         if (!panel?.id || !panel.entry) continue;
         const resolved: ResolvedPanel = {
           key: `plugin:${owner}:${panel.id}`,
@@ -117,7 +117,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
         else if (!panel.slot || panel.slot === 'right') panels.push(resolved);
       }
       if (scriptsOn) {
-        for (const slot of client.slots || []) {
+        for (const slot of web.slots || []) {
           if (!slot?.slot_id || !slot.slot || !slot.script) continue;
           const entry: SlotContribution = {
             slotId: slot.slot_id,
@@ -130,8 +130,8 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
           (slotsBySlot[entry.slot] ||= []).push(entry);
         }
       }
-      if (typeof client.styles === 'string' && client.styles.trim()) {
-        stylesByOwner[owner] = client.styles;
+      if (typeof web.styles === 'string' && web.styles.trim()) {
+        stylesByOwner[owner] = web.styles;
       }
     }
     for (const list of Object.values(slotsBySlot)) {

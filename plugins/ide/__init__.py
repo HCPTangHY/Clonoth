@@ -23,7 +23,7 @@ PLUGIN_META = {
     "author": "clonoth",
     # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
     "processes": ["supervisor", "engine"],
-    "client": {
+    "web": {
         "panels": [
             {
                 "id": "workspace",

@@ -1311,7 +1311,7 @@ export interface PluginAnnotatorDecl {
   priority?: number;
 }
 
-export interface PluginClientManifest {
+export interface PluginWebManifest {
   panels?: PluginPanelDecl[];
   slots?: PluginSlotDecl[];
   annotators?: PluginAnnotatorDecl[];
@@ -1342,7 +1342,7 @@ export interface PluginListItem {
   hooks: string[];
   tools: string[];
   routes: PluginRouteRecord[];
-  client: PluginClientManifest | null;
+  web: PluginWebManifest | null;
 }
 
 export async function listPlugins(): Promise<PluginListItem[]> {

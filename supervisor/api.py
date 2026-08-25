@@ -2335,7 +2335,7 @@ def create_app(
                 "hooks": list(meta.get("hooks") or []),
                 "tools": list(meta.get("tools") or []),
                 "routes": routes_by_owner.get(name, []),
-                "client": meta.get("client"),
+                "web": meta.get("web"),
             })
         # 有路由声明但没有元数据的 owner（加载中途失败等）也列出，便于排查。
         for owner, recs in sorted(routes_by_owner.items()):
@@ -2343,7 +2343,7 @@ def create_app(
                 plugins_out.append({
                     "name": owner, "version": "", "description": "",
                     "author": "", "module": "", "hooks": [], "tools": [],
-                    "routes": recs, "client": None,
+                    "routes": recs, "web": None,
                 })
         return {"plugins": plugins_out}
 

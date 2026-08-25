@@ -64,9 +64,9 @@ export function refreshAnnotators(): Promise<void> {
 
     const wanted = new Map<string, { owner: string; priority: number; script: string }>();
     for (const plugin of plugins) {
-      const client = plugin.client;
-      if (!client || typeof client !== 'object') continue;
-      for (const decl of client.annotators || []) {
+      const web = plugin.web;
+      if (!web || typeof web !== 'object') continue;
+      for (const decl of web.annotators || []) {
         if (!decl?.id || !decl.script) continue;
         wanted.set(annotatorKey(plugin.name, decl), {
           owner: plugin.name,

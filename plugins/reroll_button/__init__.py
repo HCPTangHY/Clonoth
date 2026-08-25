@@ -120,7 +120,7 @@ PLUGIN_META = {
     "version": "1.1.0",
     "description": "输入栏快捷重 roll 按钮（撤回上一条用户消息并重发）",
     "author": "clonoth",
-    "client": {
+    "web": {
         "slots": [
             {
                 "slot_id": "reroll_button.toolbar_right",

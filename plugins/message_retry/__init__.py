@@ -202,7 +202,7 @@ PLUGIN_META = {
     "version": "1.5.0",
     "description": "消息重试/编辑：用户消息的原样重试与编辑后重试（message_footer 槽位）",
     "author": "clonoth",
-    "client": {
+    "web": {
         "slots": [
             {
                 "slot_id": "message_retry.footer",

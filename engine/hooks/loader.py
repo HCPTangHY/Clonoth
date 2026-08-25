@@ -121,19 +121,19 @@ def get_load_error(entry_name: str) -> str:
 
 
 def _resolve_client_assets(plugin_dir: Path, meta: dict) -> None:
-    """Inline {"file": relative_path} references anywhere inside PLUGIN_META.client.
+    """Inline {"file": relative_path} references anywhere inside PLUGIN_META.web.
 
     Why: slot scripts and styles were embedded as Python string literals in
     __init__.py, which loses editor support entirely. The contract lives at the
     value shape, not the key name: any value shaped as {"file": "client/x.js"}
-    is an asset reference. How: recursively walk the whole client dict and
-    inline every such value (containment-checked), so new client contribution
+    is an asset reference. How: recursively walk the whole web contribution dict
+    and inline every such value (containment-checked), so new contribution
     types never require loader changes. Purpose: consumers (the web manifest)
     always receive plain strings, and the backend never enumerates frontend
     contribution kinds.
     """
-    client = meta.get("client")
-    if not isinstance(client, dict):
+    web = meta.get("web")
+    if not isinstance(web, dict):
         return
     base = Path(plugin_dir).resolve()
 
@@ -156,7 +156,7 @@ def _resolve_client_assets(plugin_dir: Path, meta: dict) -> None:
                 node[index] = _inline(value)
                 _walk(node[index])
 
-    _walk(client)
+    _walk(web)
 
 
 def _default_plugin_meta(py_file: Path) -> dict:
@@ -194,6 +194,15 @@ def _normalize_plugin_meta(py_file: Path, raw_meta: object) -> dict:
         meta["author"] = ""
     if meta.get("hooks") is None:
         meta["hooks"] = []
+    # [AutoC 2026-08-25] Adapter-scoped contribution key: the canonical name is
+    # "web" (the web adapter is the consumer). "client" is accepted for one
+    # deprecation window and renamed with a warning.
+    if "web" not in meta and "client" in meta:
+        logger.warning(
+            "Plugin %s uses deprecated PLUGIN_META key 'client'; rename it to 'web'",
+            meta.get("name") or py_file.stem,
+        )
+        meta["web"] = meta.pop("client")
     return meta
 
 

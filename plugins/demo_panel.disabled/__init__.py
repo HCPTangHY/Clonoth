@@ -13,7 +13,7 @@ PLUGIN_META = {
     "version": "1.0.0",
     "description": "演示插件：panel + slot + styles 三级前端贡献",
     "author": "clonoth",
-    "client": {
+    "web": {
         "panels": [
             {
                 "id": "demo",

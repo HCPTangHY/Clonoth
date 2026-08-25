@@ -19,7 +19,7 @@ PLUGIN_META = {
     "version": "1.0.0",
     "description": "插件管理器：外部插件运行时装卸/启停 + 设置区管理界面",
     "author": "clonoth",
-    "client": {
+    "web": {
         "panels": [
             {
                 "id": "manager",

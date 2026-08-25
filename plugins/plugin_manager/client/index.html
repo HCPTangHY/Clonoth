@@ -164,11 +164,12 @@ function row(p, meta) {
     + esc(p.description || (meta && meta.description) || '') + '</td>'
     + '<td class="ops">' + buttons(p) + '</td></tr>';
   if (isOpen) {
-    const client = meta && meta.client;
+    const web = meta && meta.web;
     const clientBits = [];
-    if (client && Array.isArray(client.panels)) clientBits.push('panels×' + client.panels.length);
-    if (client && Array.isArray(client.slots)) clientBits.push('slots×' + client.slots.length);
-    if (client && client.styles) clientBits.push('styles');
+    if (web && Array.isArray(web.panels)) clientBits.push('panels×' + web.panels.length);
+    if (web && Array.isArray(web.slots)) clientBits.push('slots×' + web.slots.length);
+    if (web && Array.isArray(web.annotators)) clientBits.push('annotators×' + web.annotators.length);
+    if (web && web.styles) clientBits.push('styles');
     main += '<tr class="detail open"><td colspan="3"><dl class="meta-grid">'
       + '<dt>名称</dt><dd>' + esc(title) + (ver ? esc(ver) : '') + '</dd>'
       + (meta && meta.author ? '<dt>作者</dt><dd>' + esc(meta.author) + '</dd>' : '')
