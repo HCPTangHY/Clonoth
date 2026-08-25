@@ -18,7 +18,7 @@ from pathlib import Path
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.10.0",
+    "version": "0.11.0",
     "description": "Web IDE：文件面板 + 编辑器 + @文件引用（输入框补全与请求时展开）",
     "author": "clonoth",
     # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
@@ -68,6 +68,38 @@ PLUGIN_META = {
                 "priority": 50,
                 "mode": "replace",
                 "script": {"file": "web/renderers/apply_diff.js"},
+            },
+            {
+                # read_file 文件 chip 列表 + 分节内容块
+                "slot_id": "ide.tool_read_file",
+                "slot": "tool_card_content:read_file",
+                "priority": 50,
+                "mode": "replace",
+                "script": {"file": "web/renderers/read_file.js"},
+            },
+            {
+                # write_file 路径 chip + 内容预览折叠
+                "slot_id": "ide.tool_write_file",
+                "slot": "tool_card_content:write_file",
+                "priority": 50,
+                "mode": "replace",
+                "script": {"file": "web/renderers/write_file.js"},
+            },
+            {
+                # list_dir 目录树文本块
+                "slot_id": "ide.tool_list_dir",
+                "slot": "tool_card_content:list_dir",
+                "priority": 50,
+                "mode": "replace",
+                "script": {"file": "web/renderers/list_dir.js"},
+            },
+            {
+                # grep/search_in_files 匹配按文件分组列表
+                "slot_id": "ide.tool_grep",
+                "slot": "tool_card_content:grep",
+                "priority": 50,
+                "mode": "replace",
+                "script": {"file": "web/renderers/grep.js"},
             },
         ],
         # 消息注解器：识别助手消息行内代码里的工作区路径，渲染为可点链接，

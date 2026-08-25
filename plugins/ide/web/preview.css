@@ -245,3 +245,56 @@
 .ide-diff-del { background: rgba(192, 57, 43, 0.08); color: #a33327; }
 .ide-diff-add { background: rgba(39, 174, 96, 0.08); color: #1e7e4a; }
 .hint-diff { color: var(--duties-tertiary); }
+
+/* ── 工具卡渲染器补充：文件 chip / grep 分组 / 折叠 ─────────────────── */
+.ide-tc-files { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; }
+.ide-tc-filechip {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 10px;
+  padding: 2px 6px;
+  border: 1px solid var(--duties-border);
+  background: var(--duties-bg);
+  color: var(--duties-text);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.ide-tc-filechip:hover { border-color: var(--duties-text); }
+.ide-tc-dirchip { cursor: default; color: var(--duties-secondary); }
+.ide-tc-dirchip:hover { border-color: var(--duties-border); }
+.ide-tc-clamp { max-height: 240px; }
+.ide-tc-more { display: block; margin: 2px 0 4px; }
+.ide-tc-tree { max-height: 320px; }
+.ide-tc-pattern { margin-bottom: 4px; }
+.ide-tc-pattern code {
+  font-size: 11px;
+  color: #986801;
+  font-weight: 600;
+  background: var(--duties-bg);
+  border: 1px solid var(--duties-border);
+  padding: 1px 5px;
+}
+.ide-tc-grep-group { margin: 4px 0; border: 1px solid var(--duties-border); }
+.ide-tc-grep-file {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 10px;
+  padding: 3px 8px;
+  border: 0;
+  border-bottom: 1px solid var(--duties-border);
+  background: var(--duties-bg);
+  color: var(--duties-text);
+  cursor: pointer;
+}
+.ide-tc-grep-file:hover { color: #4078f2; }
+.ide-tc-grep-row {
+  display: flex;
+  gap: 8px;
+  padding: 1px 8px;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.ide-tc-grep-line { color: var(--duties-tertiary); flex-shrink: 0; min-width: 2em; text-align: right; }
+.ide-tc-grep-match { white-space: pre-wrap; overflow-wrap: break-word; flex: 1; min-width: 0; }
