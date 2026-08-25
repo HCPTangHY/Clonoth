@@ -206,3 +206,22 @@
   color: var(--duties-tertiary);
   user-select: none;
 }
+
+/* ── 命令块切换与原文模式 ────────────────────────────────────────────── */
+.ide-tc-cmdhead-right { display: flex; align-items: center; gap: 8px; }
+.ide-tc-cmdtoggle {
+  font-size: 9px;
+  padding: 1px 6px;
+  border: 1px solid var(--duties-border);
+  background: transparent;
+  color: var(--duties-tertiary);
+  cursor: pointer;
+  font-family: inherit;
+}
+.ide-tc-cmdtoggle:hover { color: var(--duties-text); border-color: var(--duties-text); }
+.ide-tc-cmdraw {
+  border: 0;
+  margin: 0;
+  background: transparent;
+  max-height: 200px;
+}
