@@ -33,9 +33,10 @@
   th { color: var(--tertiary); font-weight: 500; font-size: 10.5px; font-family: var(--mono); }
   tr.mainrow { cursor: pointer; }
   tr.mainrow:hover { background: var(--panel); }
-  td.name { font-family: var(--mono); font-weight: 600; font-size: 11.5px; }
+  td.name { font-family: var(--mono); font-weight: 600; font-size: 11.5px; overflow-wrap: anywhere; }
   .entryfile { color: var(--tertiary); font-weight: 400; font-size: 10px; }
   td.desc { color: var(--secondary); font-size: 11.5px; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.ops button { margin-bottom: 2px; }
   .tag {
     display: inline-block; padding: 0 5px; border: 1px solid var(--border); border-radius: 3px;
     font-size: 9.5px; font-family: var(--mono); margin-right: 4px; color: var(--tertiary);
@@ -161,7 +162,7 @@ function row(p, meta) {
     + '<div style="margin-top:3px">' + tags.join('') + '</div>' + entryFile + errLine + '</td>'
     + '<td class="desc" title="' + esc(p.description || (meta && meta.description) || '') + '">'
     + esc(p.description || (meta && meta.description) || '') + '</td>'
-    + '<td style="white-space:nowrap">' + buttons(p) + '</td></tr>';
+    + '<td class="ops">' + buttons(p) + '</td></tr>';
   if (isOpen) {
     const client = meta && meta.client;
     const clientBits = [];

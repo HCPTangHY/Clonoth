@@ -78,7 +78,7 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, chrome = true }:
         ref={frameRef}
         src={entry}
         title={title}
-        className="min-h-0 w-full flex-1 border-0 bg-white"
+        className="min-h-0 w-full flex-1 border-0 bg-[var(--duties-bg)]"
       />
     </div>
   );

@@ -86,13 +86,14 @@ export function getSettingsTab(tabId: string): SettingsTabDefinition {
 // becomes a tab whose Page renders a chrome-less PluginPanel iframe (no title
 // bar; the settings sidebar already names the tab). Purpose: settings
 // navigation stays data-driven for plugins exactly as for built-ins.
-// [AutoC 2026-08-25] Constrain the plugin settings page between the two rails.
-// Why: built-in pages follow settingsPagePrimitives (p-4 sm:p-6 + mx-auto
-// max-w-4xl), but the plugin tab rendered the iframe edge-to-edge across the
-// full main column, touching both sidebars. How: wrap PluginPanel in the same
-// padded, centered container convention as built-in pages, with a bordered
-// card so the iframe reads as one settings card. Purpose: plugin settings tabs
-// share the layout rhythm of every other settings page.
+// [AutoC 2026-08-25] Settings panels fill the area between the two rails.
+// Why: the previous wrapper (padding + max-w-4xl card) followed the built-in
+// page convention but narrowed the iframe and added unwanted margins — plugin
+// pages carry their own internal padding. Horizontal overflow is the panel
+// page's own compression problem, not the container's. How: render the
+// chrome-less PluginPanel directly so the iframe fills the main column, which
+// by layout sits between the two sidebars. Purpose: no host-side chrome; the
+// constraint is the layout itself.
 import { usePluginsStore } from '../../store/pluginsStore';
 import { PluginPanel } from '../plugins/PluginPanel';
 
@@ -104,24 +105,13 @@ function pluginSettingsTabs(): SettingsTabDefinition[] {
     icon: 'extension',
     order: 100,
     Page: () =>
-      createElement(
-        'section',
-        { className: 'h-full min-h-0 overflow-hidden p-4 sm:p-6' },
-        createElement(
-          'div',
-          {
-            className:
-              'mx-auto flex h-full min-h-0 max-w-4xl flex-col border border-[var(--duties-border)]',
-          },
-          createElement(PluginPanel, {
-            chrome: false,
-            entry: panel.entry,
-            sessionId: '',
-            title: panel.title,
-            onClose: () => undefined,
-          }),
-        ),
-      ),
+      createElement(PluginPanel, {
+        chrome: false,
+        entry: panel.entry,
+        sessionId: '',
+        title: panel.title,
+        onClose: () => undefined,
+      }),
   }));
 }
 
