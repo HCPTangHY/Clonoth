@@ -4,31 +4,45 @@
 // The host renders matched spans as clickable buttons that open the 'files'
 // panel with the ide-private intent {kind:'open-file', path}.
 
-const _cache = new Map(); // sessionId -> { ts, set }
+const _cache = new Map(); // sessionId -> { ts, set, ok }
 const _inflight = new Map(); // sessionId -> Promise (dedup concurrent fetches)
+const _failures = new Map(); // sessionId -> consecutive failure count
 const _TTL = 60_000;
+const _ERROR_TTL_BASE = 10_000; // 10s base, doubles per consecutive failure
+const _ERROR_TTL_MAX = 300_000; // cap at 5 minutes
+
+function _errorTTL(sid) {
+  const count = _failures.get(sid) || 0;
+  return Math.min(_ERROR_TTL_BASE * Math.pow(2, count), _ERROR_TTL_MAX);
+}
 
 async function _fileSet(sid) {
   const cached = _cache.get(sid);
-  if (cached && Date.now() - cached.ts < _TTL) return cached.set;
-  // Dedup: if a fetch for this sid is already in-flight, piggyback on it.
-  const pending = _inflight.get(sid);
-  if (pending) return pending;
-  // The annotator module runs in the host page main world; callHostAction is
-  // not importable from a blob module. The host passes api through ctx — but
-  // annotators receive { role, sessionId } only. File-set loading therefore
-  // uses the composer's session via a lazily-imported host module path is not
-  // available either. Simplest correct approach: fetch the tree through the
-  // same api surface slots use — but annotator scripts have no api handle.
-  // Resolution: the host's annotator registry injects nothing; the annotator
-  // instead reads the tree through window.fetch with the admin token from
-  // localStorage (same-origin, same mechanism as supervisorClient).
+  if (cached) {
+    const ttl = cached.ok ? _TTL : _errorTTL(sid);
+    if (Date.now() - cached.ts < ttl) return cached.set;
+  }
   const token = (() => { try { return localStorage.getItem('clonoth_admin_token') || ''; } catch { return ''; } })();
   const q = sid ? `session_id=${encodeURIComponent(sid)}&` : '';
-  const resp = await fetch(`/v1/workspace/tree?${q}depth=8`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
-  if (!resp.ok) return new Set();
+  let resp;
+  try {
+    resp = await fetch(`/v1/workspace/tree?${q}depth=8`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+  } catch (err) {
+    // Network error: cache empty set with error TTL + backoff
+    _failures.set(sid, (_failures.get(sid) || 0) + 1);
+    _cache.set(sid, { ts: Date.now(), set: new Set(), ok: false });
+    return new Set();
+  }
+  if (!resp.ok) {
+    // HTTP error: same treatment
+    _failures.set(sid, (_failures.get(sid) || 0) + 1);
+    _cache.set(sid, { ts: Date.now(), set: new Set(), ok: false });
+    return new Set();
+  }
+  // Success: reset failure counter, cache with normal TTL
+  _failures.delete(sid);
   const data = await resp.json();
   const set = new Set();
   const walk = (n) => {
@@ -39,17 +53,19 @@ async function _fileSet(sid) {
     }
   };
   walk(data && data.tree);
-  _cache.set(sid, { ts: Date.now(), set });
-  _inflight.delete(sid);
+  _cache.set(sid, { ts: Date.now(), set, ok: true });
   return set;
 }
 
-// Wrapper that deduplicates concurrent _fileSet calls for the same session.
+// Deduplicates concurrent _fileSet calls for the same session.
 function _fileSetDedup(sid) {
   const existing = _inflight.get(sid);
   if (existing) return existing;
   const p = _fileSet(sid).catch((err) => {
     console.warn('[annotator] _fileSet failed', err);
+    // Ensure failure is cached even if _fileSet itself throws unexpectedly
+    _failures.set(sid, (_failures.get(sid) || 0) + 1);
+    _cache.set(sid, { ts: Date.now(), set: new Set(), ok: false });
     return new Set();
   }).finally(() => _inflight.delete(sid));
   _inflight.set(sid, p);
@@ -73,9 +89,17 @@ export default function match(text, ctx) {
   // On a cold cache we return no matches this render; the next render (cache
   // warm) picks them up. Trigger the load as a side effect.
   const cached = _cache.get(sid);
-  if (!cached || Date.now() - cached.ts >= _TTL) {
-    void _fileSetDedup(sid); // warm for next render (deduped)
+  if (!cached) {
+    // Absolute cold start: trigger fetch, return empty
+    void _fileSetDedup(sid);
     return out;
+  }
+  const ttl = cached.ok ? _TTL : _errorTTL(sid);
+  if (Date.now() - cached.ts >= ttl) {
+    // Cache expired (success TTL or error backoff TTL): refresh
+    void _fileSetDedup(sid);
+    // If last fetch was an error, don't try to match against empty set
+    if (!cached.ok) return out;
   }
   const set = cached.set;
   let m;
