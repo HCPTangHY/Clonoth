@@ -943,11 +943,49 @@ class TaskRouterMixin:
 
     def _route_fail_locked(self, task: Task, action: dict[str, Any]) -> None:
         error = str(action.get("error") or "未知错误").strip()
+        # [2026-08-26] 失败落盘：错误同步写入 conversation JSONL（message_type=error）。
+        # 此前错误只进 event log（outbound_message），刷新后历史加载时失败轮凭空
+        # 消失，schedule 会话更是完全无人可见。写入与 outbound 同一路由 session，
+        # 前端历史渲染为错误卡片。
+        self._persist_fail_message_locked(task, action, error)
         self._resume_caller_or_output_locked(task, {
             "type": "child_failed",
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "error": error,
         }, {"text": f"[错误] {error}"}, action_type="fail")
+
+    def _persist_fail_message_locked(self, task: Task, action: dict[str, Any], error: str) -> None:
+        """Append one system/error message to the route session's JSONL.
+
+        崩溃安全：落盘失败只记日志，绝不阻断后续 fail 路由（outbound 输出）。
+        """
+        try:
+            route_sid = self._route_session_id_for_task_locked(task)
+            if not route_sid:
+                return
+            from datetime import datetime, timezone
+            from pathlib import Path
+
+            from engine.conversation_store import ConversationStore, Message
+
+            store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
+            _meta: dict[str, Any] = {"task_id": task.task_id}
+            _node_id = str(task.node_id or task.tool_name or "").strip()
+            if _node_id:
+                _meta["node_id"] = _node_id
+            msg = Message(
+                id=str(uuid.uuid4()),
+                role="system",
+                content=error[:4000],
+                message_type="error",
+                created_at=datetime.now(timezone.utc).isoformat(),
+                meta=_meta,
+                source_node_id=_node_id,
+                source_task_id=task.task_id,
+            )
+            store.append(route_sid, msg)
+        except Exception:
+            log.exception("persist fail message failed: task=%s", str(task.task_id or "")[:12])
 
     # ------------------------------------------------------------------ #
     #  统一批量收集

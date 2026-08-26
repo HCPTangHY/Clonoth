@@ -708,6 +708,39 @@ export function hydrateStructuredHistory(
 
       if (INTERNAL_USER_MESSAGE_TYPES.has(message.message_type || '') && message.message_type !== 'summary') continue;
 
+      if (message.message_type === 'error') {
+        // [2026-08-26] fail 落盘：上游 API 报错等失败现写入 JSONL（role=system,
+        // message_type=error），刷新后渲染为错误卡片，不再凭空消失。
+        if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, 'system', text)) continue;
+        const noticeBlock: NoticeBlock = {
+          id: `${messageId}|block:notice:error`,
+          kind: 'notice',
+          level: 'error',
+          title: '任务失败',
+          text: text || '未知错误',
+          eventType: 'task_failed',
+          createdAt,
+          updatedAt: createdAt,
+          eventIds: [historyEventId],
+        };
+        const wsMessage: WsMessage = {
+          id: messageId,
+          conversationId,
+          sessionId,
+          role: 'system',
+          status: 'completed',
+          createdAt,
+          updatedAt: createdAt,
+          source: {},
+          blocks: [noticeBlock],
+          eventIds: [historyEventId],
+          hydratedFromHistory: true,
+        };
+        nextState = appendHistoryMessage(nextState, wsMessage, []);
+        rememberHydratedHistoryMessage(historyEventId, messageId);
+        continue;
+      }
+
       if (message.message_type === 'summary') {
         if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, 'system', text)) continue;
         const isCompactSummary = message.source_task_id === 'compact_summary';
