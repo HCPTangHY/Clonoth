@@ -1296,7 +1296,7 @@ function renderNode(node, depth, container) {
 
 const GIT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M6 9v6"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
 
-let gitState = { is_repo: false, branch: '', changes: [] };
+let gitState = { is_repo: false, branch: '', changes: [], ahead: 0, behind: 0, unpushed: [] };
 let gitPopEl = null;
 let gitBadgeEl = null;
 // 整页 Git 视图的激活状态：gitViewActive 为 true 时 renderView 渲染 Git 页
@@ -1315,7 +1315,7 @@ async function refreshGit() {
   try {
     gitState = await fetchGitStatus();
   } catch {
-    gitState = { is_repo: false, branch: '', changes: [] };
+    gitState = { is_repo: false, branch: '', changes: [], ahead: 0, behind: 0, unpushed: [] };
   }
   updateGitBadge();
   if (gitPopEl) renderGitPop();
@@ -1324,7 +1324,8 @@ async function refreshGit() {
 
 function updateGitBadge() {
   if (!gitBadgeEl) return;
-  const n = gitState.is_repo ? gitState.changes.length : 0;
+  // 工作区变更 + 未推送提交都是用户关心的“变更”
+  const n = gitState.is_repo ? gitState.changes.length + (gitState.ahead || 0) : 0;
   if (n > 0) {
     gitBadgeEl.textContent = n > 99 ? '99+' : String(n);
     gitBadgeEl.style.display = '';
@@ -1546,7 +1547,9 @@ function renderGitView() {
   top.appendChild(back);
   const branch = document.createElement('span');
   branch.className = 'git-page-branch';
-  branch.textContent = gitState.is_repo ? gitState.branch : '';
+  branch.textContent = gitState.is_repo
+    ? gitState.branch + (gitState.ahead > 0 ? ' ↑' + gitState.ahead : '') + (gitState.behind > 0 ? ' ↓' + gitState.behind : '')
+    : '';
   top.appendChild(branch);
   const refresh = document.createElement('button');
   refresh.type = 'button';
@@ -1659,6 +1662,32 @@ function renderGitView() {
     none.className = 'git-pop-empty';
     none.textContent = '没有变更';
     page.appendChild(none);
+  }
+
+  // ── 未推送的提交（与远程的差异）──
+  if (gitState.ahead > 0 && gitState.unpushed && gitState.unpushed.length) {
+    const upGroup = document.createElement('div');
+    upGroup.className = 'git-group';
+    const uh = document.createElement('div');
+    uh.className = 'git-group-head';
+    uh.textContent = '未推送的提交（' + gitState.ahead + '）';
+    upGroup.appendChild(uh);
+    for (const c of gitState.unpushed) {
+      const row = document.createElement('div');
+      row.className = 'git-log-row';
+      row.innerHTML = '<code class="git-log-hash">' + esc(c.hash) + '</code>'
+        + '<span class="git-log-msg">' + esc(c.subject) + '</span>'
+        + '<span class="git-log-time">' + esc(relTime(c.time)) + '</span>';
+      row.title = c.author + ' · ' + new Date(c.time * 1000).toLocaleString();
+      upGroup.appendChild(row);
+    }
+    if (gitState.ahead > gitState.unpushed.length) {
+      const more = document.createElement('div');
+      more.className = 'git-pop-empty';
+      more.textContent = '…另有 ' + (gitState.ahead - gitState.unpushed.length) + ' 条未显示';
+      upGroup.appendChild(more);
+    }
+    page.appendChild(upGroup);
   }
 
   // ── 提交记录时间轴 ──

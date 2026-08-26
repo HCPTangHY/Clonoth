@@ -15,6 +15,7 @@ PUT /v1/plugins/ide/file 端点。
 
 import re
 from pathlib import Path
+from typing import Any
 
 PLUGIN_META = {
     "name": "ide",
@@ -307,10 +308,10 @@ def register(ctx) -> None:
         base = _git_base(request)
         rc, branch, _ = await _git(base, "rev-parse", "--abbrev-ref", "HEAD")
         if rc != 0:
-            return {"is_repo": False, "branch": "", "changes": []}
+            return {"is_repo": False, "branch": "", "changes": [], "ahead": 0, "behind": 0, "unpushed": []}
         rc, out, _ = await _git(base, "status", "--porcelain=v1", "-uall")
         if rc != 0:
-            return {"is_repo": False, "branch": "", "changes": []}
+            return {"is_repo": False, "branch": "", "changes": [], "ahead": 0, "behind": 0, "unpushed": []}
         changes: list[dict[str, str]] = []
         for line in out.splitlines():
             if len(line) < 4:
@@ -321,7 +322,34 @@ def register(ctx) -> None:
             path = raw.split(" -> ")[-1].strip().strip('"')
             status = "?" if xy == "??" else ("A" if "A" in xy else ("D" if "D" in xy else ("R" if "R" in xy else "M")))
             changes.append({"path": path, "status": status, "staged": "true" if xy[0] not in (" ", "?") else ""})
-        return {"is_repo": True, "branch": branch.strip(), "changes": changes}
+
+        # 与远程的差异：upstream 追踪 + ahead/behind + 未推送提交列表。
+        # 无 upstream（本地分支）时三个字段为零值，面板不显示该分组。
+        ahead = 0
+        behind = 0
+        unpushed: list[dict[str, Any]] = []
+        rc, upstream, _ = await _git(base, "rev-parse", "--abbrev-ref", "@{u}")
+        if rc == 0 and upstream.strip():
+            rc, counts, _ = await _git(base, "rev-list", "--left-right", "--count", "@{u}...HEAD")
+            if rc == 0:
+                parts = counts.split()
+                if len(parts) == 2:
+                    try:
+                        behind, ahead = int(parts[0]), int(parts[1])
+                    except ValueError:
+                        pass
+            if ahead > 0:
+                rc, log_out, _ = await _git(base, "log", "@{u}..HEAD", "-20", "--pretty=format:%h%x1f%an%x1f%at%x1f%s")
+                if rc == 0:
+                    for line in log_out.splitlines():
+                        fields = line.split("\x1f")
+                        if len(fields) != 4:
+                            continue
+                        unpushed.append({"hash": fields[0], "author": fields[1], "time": int(fields[2]), "subject": fields[3]})
+        return {
+            "is_repo": True, "branch": branch.strip(), "changes": changes,
+            "ahead": ahead, "behind": behind, "unpushed": unpushed,
+        }
 
     @api.get("/git/diff")
     async def _git_diff(request: Request) -> dict:
