@@ -88,6 +88,7 @@ async def retry_session_inbound(session_id: str, body: dict[str, Any], request: 
     messages = list(store.load(route_session_id))
     with st._lock:
         branch_ids = list(st._entry_branch_ids_for_parent_locked(route_session_id))
+    branch_msg_origin: dict[str, str] = {}
     if branch_ids:
         parent_msg_ids = set(m.id for m in messages)
         for bid in branch_ids:
@@ -95,6 +96,7 @@ async def retry_session_inbound(session_id: str, body: dict[str, Any], request: 
                 for bm in store.load(bid):
                     if bm.id not in parent_msg_ids:
                         messages.append(bm)
+                        branch_msg_origin[bm.id] = bid
             except Exception:
                 pass
         messages.sort(key=lambda m: m.created_at or "")
@@ -118,6 +120,18 @@ async def retry_session_inbound(session_id: str, body: dict[str, Any], request: 
             except (ValueError, TypeError):
                 pass
         if matched:
+            # [2026-08-26] 命中分支消息时拒绝：从父会话路由重试子会话消息会
+            # 删光全部分支 JSONL 再把子会话原文作为新 inbound 注入父会话，
+            # 两边串台。调用方应当用消息所属的子会话 session_id 发起重试。
+            _origin_session = branch_msg_origin.get(m.id)
+            if _origin_session:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"target message belongs to child session {_origin_session}; "
+                        f"retry against that session instead of {route_session_id}"
+                    ),
+                )
             target_msg_idx = i
             target_source_task_id = m.source_task_id or ""
             break
