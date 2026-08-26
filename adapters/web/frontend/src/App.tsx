@@ -38,6 +38,11 @@ const MainApp = () => {
   const exitChildSession = useChatStore((state) => state.exitChildSession);
   const { activeNodeId, entryNodeId, pendingProviderOverride, setPendingProviderOverride } = useSettingsStore();
   const viewMode = useViewStore(state => state.viewMode);
+  // [AutoC 2026-08-26] 订阅 panelOverlay：overlay 开关必须立即反映到布局。
+  // 此前 viewRegistry.rightOverlay 用 getState() 命令式读取，没有任何订阅者，
+  // 关闭面板要等到下一个无关 store 事件（空闲时最坏 10 秒健康检查）才生效，
+  // 表现为「从面板返回仪表盘很慢」。这里订阅后，App 在 overlay 变化时立即重渲染。
+  const panelOverlay = useViewStore(state => state.panelOverlay);
   const viewingChildNode = viewingChildSessionId ? childNodes[viewingChildSessionId] : undefined;
   const activeSessionId = viewingChildSessionId || activeConversation?.sessionId || '';
   // [2026-06-03] Why: child-session navigation renders a different chat stream while
@@ -101,6 +106,9 @@ const MainApp = () => {
   };
 
   const view = viewRegistry[viewMode];
+  // panelOverlay 在上面订阅，这里引用一次避免 lint 报未使用；
+  // viewRegistry 槽位内的 getState() 读取会在本次重渲染中拿到新值。
+  void panelOverlay;
   const viewContext: AppViewContext = {
     sessionId: activeSessionId,
     title: activeTitle,
