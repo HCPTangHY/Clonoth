@@ -567,6 +567,58 @@ body {
   color: var(--text);
 }
 .git-log-time { flex-shrink: 0; font-size: 10px; color: var(--tertiary); }
+
+/* 远程信息行 */
+.git-remote-line {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 12px;
+  font-size: 10px; color: var(--tertiary);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+}
+.git-remote-line .git-ic svg { width: 11px; height: 11px; display: block; }
+.git-remote-url { color: var(--secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-remote-up { flex-shrink: 0; }
+.git-fork-hash { color: #4078f2; font-size: 10px; }
+.git-fork-subj { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 提交行展开 */
+.git-commit-wrap { }
+.git-log-row { cursor: pointer; }
+.git-log-row.expanded { background: var(--bg); }
+.git-commit-detail {
+  padding: 8px 12px;
+  border-left: 2px solid var(--border);
+  margin: 0 12px 4px;
+  font-size: 11px;
+}
+.git-detail-meta {
+  font-family: var(--mono); font-size: 10px; color: var(--secondary);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.git-detail-meta code { color: #4078f2; }
+.git-detail-msg {
+  margin: 6px 0 0;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text);
+  white-space: pre-wrap; overflow-wrap: break-word;
+}
+.git-detail-file {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 2px 0;
+  border: 0; background: transparent;
+  font-family: var(--mono); font-size: 11px; color: var(--text);
+  cursor: pointer; text-align: left;
+}
+.git-detail-file:hover .p { color: #4078f2; text-decoration: underline; }
+.git-detail-file .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-fstat { flex-shrink: 0; font-size: 10px; font-family: var(--mono); }
+.git-fstat .add { color: #50a14f; }
+.git-fstat .del { color: #e45649; }
+/* 状态码 SVG 图标尺寸 */
+.git-row .st svg, .git-page-row .st svg { width: 12px; height: 12px; display: block; }
+.git-row-act svg { width: 10px; height: 10px; display: block; }
+.git-iconbtn svg { width: 13px; height: 13px; display: block; }
 </style>
 </head>
 <body>
@@ -1295,8 +1347,24 @@ function renderNode(node, depth, container) {
 // renderDiff 的红绿对比渲染）。非 git 仓库时徽章不显示，浮层内显示提示。
 
 const GIT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M6 9v6"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
+// 状态码与操作按钮的 SVG 图标（12×12 显示，stroke 继承 currentColor）
+const _SVG_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">';
+const STATUS_ICONS = {
+  M: _SVG_OPEN + '<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>',
+  A: _SVG_OPEN + '<path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+  D: _SVG_OPEN + '<path d="M5 12h14"/></svg>',
+  R: _SVG_OPEN + '<path d="M17 8l4 4-4 4"/><path d="M3 12h18"/></svg>',
+  '?': _SVG_OPEN + '<circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>',
+};
+const ICON_PLUS = _SVG_OPEN + '<path d="M12 5v14"/><path d="M5 12h14"/></svg>';
+const ICON_MINUS = _SVG_OPEN + '<path d="M5 12h14"/></svg>';
+const ICON_REFRESH = _SVG_OPEN + '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>';
+const ICON_COMMIT = _SVG_OPEN + '<circle cx="12" cy="12" r="3"/><path d="M12 2v7"/><path d="M12 15v7"/></svg>';
+const ICON_REMOTE = _SVG_OPEN + '<circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>';
+const ICON_FORK = _SVG_OPEN + '<circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M6 9v3a3 3 0 0 0 3 3h3"/><path d="M18 9v3a3 3 0 0 1-3 3h-3"/></svg>';
 
 let gitState = { is_repo: false, branch: '', changes: [], ahead: 0, behind: 0, unpushed: [] };
+let gitRemote = null;   // {remote, upstream, fork_point}，openGitView 时加载
 let gitPopEl = null;
 let gitBadgeEl = null;
 // 整页 Git 视图的激活状态：gitViewActive 为 true 时 renderView 渲染 Git 页
@@ -1305,6 +1373,9 @@ let gitViewActive = false;
 let gitTreeBackup = null;
 let gitLogCache = null;
 let gitCommitMsg = '';
+// 展开的提交 hash 与其详情数据（点击提交行展开/收起）
+let expandedCommitHash = '';
+let expandedCommitData = null;
 
 async function fetchGitStatus() {
   const resp = await api('/plugins/ide/git/status?session_id=' + encodeURIComponent(SESSION_ID));
@@ -1407,7 +1478,7 @@ function renderGitPop() {
       row.title = ch.path;
       const st = document.createElement('span');
       st.className = 'st ' + ch.status + (ch.staged ? ' staged' : '');
-      st.textContent = ch.status;
+      st.innerHTML = STATUS_ICONS[ch.status] || ch.status;
       st.title = ch.staged ? '已暂存' : '未暂存';
       row.appendChild(st);
       const p = document.createElement('span');
@@ -1495,11 +1566,22 @@ async function openGitView() {
     gitViewActive = true;
   }
   closeGitPop();
-  // 并行拉 status 和 log
+  // 并行拉 status、log 和远程信息
   void refreshGit();
   void loadGitLog();
+  void loadGitRemote();
   renderGitView();
   renderStatusbar();
+}
+
+async function loadGitRemote() {
+  try {
+    const resp = await api('/plugins/ide/git/remote?session_id=' + encodeURIComponent(SESSION_ID));
+    gitRemote = await resp.json();
+  } catch {
+    gitRemote = null;
+  }
+  if (gitViewActive) renderGitView();
 }
 
 function closeGitView() {
@@ -1555,10 +1637,26 @@ function renderGitView() {
   refresh.type = 'button';
   refresh.className = 'git-iconbtn';
   refresh.title = '刷新';
-  refresh.textContent = '↻';
+  refresh.innerHTML = ICON_REFRESH;
   refresh.addEventListener('click', () => { void refreshGit(); void loadGitLog(); });
   top.appendChild(refresh);
   page.appendChild(top);
+
+  // ── 远程仓库信息行（origin / upstream / fork 点）──
+  if (gitState.is_repo && gitRemote) {
+    const rl = document.createElement('div');
+    rl.className = 'git-remote-line';
+    let html = '<span class="git-ic">' + ICON_REMOTE + '</span>';
+    if (gitRemote.remote) html += '<span class="git-remote-url">' + esc(gitRemote.remote) + '</span>';
+    if (gitRemote.upstream) html += '<span class="git-remote-up">跟踪 ' + esc(gitRemote.upstream) + '</span>';
+    if (gitRemote.fork_point) {
+      html += '<span class="git-ic">' + ICON_FORK + '</span>'
+        + '<code class="git-fork-hash">' + esc(gitRemote.fork_point.hash) + '</code>'
+        + '<span class="git-fork-subj">' + esc(gitRemote.fork_point.subject) + '</span>';
+    }
+    rl.innerHTML = html;
+    page.appendChild(rl);
+  }
 
   if (!gitState.is_repo) {
     const empty = document.createElement('div');
@@ -1626,7 +1724,7 @@ function renderGitView() {
       row.className = 'git-page-row';
       const st = document.createElement('span');
       st.className = 'st ' + ch.status;
-      st.textContent = ch.status;
+      st.innerHTML = STATUS_ICONS[ch.status] || ch.status;
       row.appendChild(st);
       const p = document.createElement('span');
       p.className = 'p';
@@ -1636,7 +1734,7 @@ function renderGitView() {
       const act = document.createElement('button');
       act.type = 'button';
       act.className = 'git-row-act';
-      act.textContent = actionLabel;
+      act.innerHTML = actionLabel === '+' ? ICON_PLUS : ICON_MINUS;
       act.title = actionLabel === '+' ? '暂存' : '取消暂存';
       act.addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -1673,13 +1771,7 @@ function renderGitView() {
     uh.textContent = '未推送的提交（' + gitState.ahead + '）';
     upGroup.appendChild(uh);
     for (const c of gitState.unpushed) {
-      const row = document.createElement('div');
-      row.className = 'git-log-row';
-      row.innerHTML = '<code class="git-log-hash">' + esc(c.hash) + '</code>'
-        + '<span class="git-log-msg">' + esc(c.subject) + '</span>'
-        + '<span class="git-log-time">' + esc(relTime(c.time)) + '</span>';
-      row.title = c.author + ' · ' + new Date(c.time * 1000).toLocaleString();
-      upGroup.appendChild(row);
+      upGroup.appendChild(buildCommitRow(c));
     }
     if (gitState.ahead > gitState.unpushed.length) {
       const more = document.createElement('div');
@@ -1699,18 +1791,136 @@ function renderGitView() {
     lh.textContent = '提交记录';
     logGroup.appendChild(lh);
     for (const c of gitLogCache.commits) {
-      const row = document.createElement('div');
-      row.className = 'git-log-row';
-      row.innerHTML = '<code class="git-log-hash">' + esc(c.hash) + '</code>'
-        + '<span class="git-log-msg">' + esc(c.subject) + '</span>'
-        + '<span class="git-log-time">' + esc(relTime(c.time)) + '</span>';
-      row.title = c.author + ' · ' + new Date(c.time * 1000).toLocaleString();
-      logGroup.appendChild(row);
+      logGroup.appendChild(buildCommitRow(c));
     }
     page.appendChild(logGroup);
   }
 
   viewEl.appendChild(page);
+}
+
+// 构建一行提交记录（含点击展开详情）。展开时行下方插入详情区：
+// 完整 hash、作者、时间、完整消息、变更文件列表（点击打开 commit diff）。
+function buildCommitRow(c) {
+  const wrap = document.createElement('div');
+  wrap.className = 'git-commit-wrap';
+  const row = document.createElement('div');
+  row.className = 'git-log-row' + (expandedCommitHash === c.hash ? ' expanded' : '');
+  row.innerHTML = '<code class="git-log-hash">' + esc(c.hash) + '</code>'
+    + '<span class="git-log-msg">' + esc(c.subject) + '</span>'
+    + '<span class="git-log-time">' + esc(relTime(c.time)) + '</span>';
+  row.title = c.author + ' · ' + new Date(c.time * 1000).toLocaleString() + '\n点击查看详情';
+  row.addEventListener('click', () => {
+    if (expandedCommitHash === c.hash) {
+      expandedCommitHash = '';
+      expandedCommitData = null;
+      renderGitView();
+    } else {
+      expandedCommitHash = c.hash;
+      expandedCommitData = null;
+      renderGitView();
+      void loadCommitDetail(c.hash);
+    }
+  });
+  wrap.appendChild(row);
+  if (expandedCommitHash === c.hash) {
+    const detail = document.createElement('div');
+    detail.className = 'git-commit-detail';
+    if (!expandedCommitData) {
+      detail.innerHTML = '<div class="git-pop-empty">加载中…</div>';
+    } else {
+      detail.appendChild(buildCommitDetail(expandedCommitData));
+    }
+    wrap.appendChild(detail);
+  }
+  return wrap;
+}
+
+async function loadCommitDetail(hash) {
+  try {
+    const resp = await api('/plugins/ide/git/show?session_id=' + encodeURIComponent(SESSION_ID)
+      + '&hash=' + encodeURIComponent(hash));
+    const data = await resp.json();
+    if (expandedCommitHash === hash) {
+      expandedCommitData = data;
+      renderGitView();
+    }
+  } catch {
+    if (expandedCommitHash === hash) {
+      expandedCommitData = { error: true };
+      renderGitView();
+    }
+  }
+}
+
+function buildCommitDetail(data) {
+  const box = document.createElement('div');
+  if (data.error) {
+    box.innerHTML = '<div class="git-pop-empty">加载失败</div>';
+    return box;
+  }
+  const meta = document.createElement('div');
+  meta.className = 'git-detail-meta';
+  meta.innerHTML = '<div><code>' + esc(data.hash) + '</code></div>'
+    + '<div>' + esc(data.author) + ' &lt;' + esc(data.email) + '&gt;</div>'
+    + '<div>' + new Date(data.time * 1000).toLocaleString() + '</div>';
+  box.appendChild(meta);
+  if (data.message) {
+    const msg = document.createElement('pre');
+    msg.className = 'git-detail-msg';
+    msg.textContent = data.message;
+    box.appendChild(msg);
+  }
+  if (data.files && data.files.length) {
+    const fh = document.createElement('div');
+    fh.className = 'git-group-head';
+    fh.textContent = '变更文件（' + data.files.length + '）';
+    box.appendChild(fh);
+    for (const f of data.files) {
+      const fr = document.createElement('button');
+      fr.type = 'button';
+      fr.className = 'git-detail-file';
+      fr.innerHTML = '<span class="p">' + esc(f.path) + '</span>'
+        + '<span class="git-fstat"><span class="add">+' + f.added + '</span> <span class="del">−' + f.deleted + '</span></span>';
+      fr.title = '打开该文件在此提交的差异';
+      fr.addEventListener('click', () => {
+        void openCommitDiffTab(data.hash, f.path);
+      });
+      box.appendChild(fr);
+    }
+  }
+  return box;
+}
+
+// 打开“提交与父提交的单文件 diff”标签，复用 renderDiff 渲染。
+async function openCommitDiffTab(commitHash, relPath) {
+  const key = relPath + ' @' + commitHash.slice(0, 7) + ' (diff)';
+  let tab = findTab(key);
+  if (!tab) {
+    tab = newDiffTab(key, []);
+    tab.kind = 'gitdiff';
+    tabs.push(tab);
+  }
+  activePath = key;
+  gitViewActive = false;
+  renderTabs();
+  renderView();
+  tab.loaded = false;
+  try {
+    const resp = await api('/plugins/ide/git/commit_diff?session_id=' + encodeURIComponent(SESSION_ID)
+      + '&hash=' + encodeURIComponent(commitHash)
+      + '&path=' + encodeURIComponent(relPath));
+    const data = await resp.json();
+    const parsed = parseUnifiedDiff(data.diff || '');
+    tab.text = parsed.before;
+    tab.afterText = parsed.after;
+    tab.note = '提交 ' + commitHash.slice(0, 7) + ' 的差异（与父提交对比）';
+  } catch (err) {
+    tab.note = '加载 diff 失败：' + err.message;
+    tab.kind = 'binary';
+  }
+  tab.loaded = true;
+  if (activePath === key) { renderFileTab(tab); renderStatusbar(); }
 }
 
 async function bootTree() {

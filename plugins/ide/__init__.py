@@ -400,6 +400,95 @@ def register(ctx) -> None:
             commits.append({"hash": parts[0], "author": parts[1], "time": int(parts[2]), "subject": parts[3]})
         return {"is_repo": True, "commits": commits}
 
+    # ── 提交详情与远程信息 ────────────────────────────────────────────
+
+    def _sanitize_remote_url(url: str) -> str:
+        """剥离 remote URL 中的凭证，只保留 host/path。"""
+        # https://user:token@github.com/org/repo.git -> github.com/org/repo
+        m = re.match(r"https?://(?:[^@/]+@)?([^/]+)(/.*)", url)
+        if m:
+            path = m.group(2)
+            if path.endswith(".git"):
+                path = path[:-4]
+            return m.group(1) + path
+        # git@github.com:org/repo.git -> github.com/org/repo
+        m = re.match(r"git@([^:]+):(.+)", url)
+        if m:
+            path = m.group(2)
+            if path.endswith(".git"):
+                path = path[:-4]
+            return m.group(1) + "/" + path
+        return url
+
+    @api.get("/git/remote")
+    async def _git_remote(request: Request) -> dict:
+        base = _git_base(request)
+        rc, url, _ = await _git(base, "config", "--get", "remote.origin.url")
+        remote = _sanitize_remote_url(url.strip()) if rc == 0 and url.strip() else ""
+        rc, upstream, _ = await _git(base, "rev-parse", "--abbrev-ref", "@{u}")
+        upstream_name = upstream.strip() if rc == 0 else ""
+        fork_point: dict[str, Any] | None = None
+        if upstream_name:
+            rc, mb, _ = await _git(base, "merge-base", "HEAD", "@{u}")
+            if rc == 0 and mb.strip():
+                rc2, subj, _ = await _git(base, "log", "-1", "--pretty=format:%s", mb.strip())
+                fork_point = {"hash": mb.strip()[:10], "subject": subj.strip() if rc2 == 0 else ""}
+        return {"remote": remote, "upstream": upstream_name, "fork_point": fork_point}
+
+    @api.get("/git/show")
+    async def _git_show(request: Request) -> dict:
+        base = _git_base(request)
+        commit_hash = str(request.query_params.get("hash") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{4,40}", commit_hash):
+            raise HTTPException(status_code=400, detail="invalid hash")
+        # 提交元信息
+        rc, meta, _ = await _git(base, "log", "-1", "--pretty=format:%H%x1f%an%x1f%ae%x1f%at%x1f%B", commit_hash)
+        if rc != 0:
+            raise HTTPException(status_code=404, detail="commit not found")
+        parts = meta.split("\x1f", 4)
+        if len(parts) < 5:
+            raise HTTPException(status_code=500, detail="unexpected git log output")
+        # 变更文件列表（--numstat：added deleted path）
+        rc2, stat, _ = await _git(base, "show", "--numstat", "--pretty=format:", commit_hash)
+        files: list[dict[str, Any]] = []
+        if rc2 == 0:
+            for line in stat.splitlines():
+                fields = line.split("\t")
+                if len(fields) != 3:
+                    continue
+                try:
+                    added = int(fields[0]) if fields[0] != "-" else 0
+                    deleted = int(fields[1]) if fields[1] != "-" else 0
+                except ValueError:
+                    continue
+                files.append({"path": fields[2], "added": added, "deleted": deleted})
+        return {
+            "hash": parts[0],
+            "author": parts[1],
+            "email": parts[2],
+            "time": int(parts[3]),
+            "message": parts[4].strip(),
+            "files": files,
+        }
+
+    @api.get("/git/commit_diff")
+    async def _git_commit_diff(request: Request) -> dict:
+        base = _git_base(request)
+        commit_hash = str(request.query_params.get("hash") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{4,40}", commit_hash):
+            raise HTTPException(status_code=400, detail="invalid hash")
+        raw_path = str(request.query_params.get("path") or "").strip()
+        if not raw_path:
+            raise HTTPException(status_code=400, detail="empty path")
+        rel = _git_rel(base, raw_path)
+        rc, out, err = await _git(base, "diff", commit_hash + "^", commit_hash, "--", rel)
+        if rc != 0:
+            # 根提交没有父提交，用空树对比
+            rc, out, _ = await _git(base, "diff", "4b825dc642cb6eb9a060e54bf8d69288fbee4904", commit_hash, "--", rel)
+            if rc != 0:
+                raise HTTPException(status_code=500, detail=err.strip() or "git diff 失败")
+        return {"path": rel, "diff": out}
+
     @api.post("/git/stage")
     async def _git_stage(request: Request) -> dict:
         base = _git_base(request)
