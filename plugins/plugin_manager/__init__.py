@@ -16,8 +16,8 @@ from pathlib import Path
 
 PLUGIN_META = {
     "name": "plugin_manager",
-    "version": "1.0.0",
-    "description": "插件管理器：外部插件运行时装卸/启停 + 设置区管理界面",
+    "version": "1.1.0",
+    "description": "插件管理器：外部插件运行时装卸/启停 + 设置区管理界面（搜索/筛选/详情/移动端适配）",
     "author": "clonoth",
     "web": {
         "panels": [
