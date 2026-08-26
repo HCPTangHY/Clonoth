@@ -637,7 +637,12 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
 
     try {
       const result = await retryInbound(sessionId, { inboundSeq, messageId: rawMessageId }, newText);
-      if (!result.ok) return;
+      if (!result.ok) {
+        // [2026-08-26] 失败不再静默：console.error 被 public/error-overlay.js 劫持，
+        // 会以全局弹窗形式展示后端 detail（如子会话守卫的 400）。
+        console.error(`[retry] 重试请求失败：${result.error || '未知错误'}`);
+        return;
+      }
 
       // Remove all messages from the retried message onward in the UI
       const conversationId = message.conversationId;
@@ -670,7 +675,11 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
           };
         });
       }
-    } catch {}
+    } catch (err) {
+      // [2026-08-26] 空改捕获后转发：apiFetch 对非 2xx 抛错（含后端 detail），
+      // 转发给 console.error 使全局错误弹窗可见。
+      console.error(`[retry] 重试请求失败：${err instanceof Error ? err.message : String(err)}`);
+    }
   },
 
   cancelCurrentTask: async () => {
