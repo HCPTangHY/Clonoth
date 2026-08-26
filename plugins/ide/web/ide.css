@@ -1,0 +1,626 @@
+/* [AutoC 2026-08-24] IDE 面板页：单一主页 + 顶部标签栏 + 文本编辑。
+   只写结构与变量名映射，不抄宿主值；主题变量与滚动条规则由宿主
+   themeBridge 在 iframe load 后注入。 */
+:root {
+  /* 与宿主右栏同底：宿主 aside 用 --duties-panel，没有 --duties-card。
+     视图区用更浅的 --duties-bg 区分内容区。 */
+  --bg: var(--duties-panel, #e8e7e5);
+  --card: var(--duties-bg, #f1f0ee);
+  --text: var(--duties-text, #1a1a1a);
+  --secondary: var(--duties-secondary, #5b5b5b);
+  --tertiary: var(--duties-tertiary, #9a9a9a);
+  --border: var(--duties-border, #e2e0dc);
+  --hover: var(--duties-hover, rgba(0,0,0,0.04));
+  --accent: var(--duties-accent, #feaf2c);
+  --mono: var(--duties-font-mono, ui-monospace, monospace);
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.5 Inter, system-ui, sans-serif;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── tab bar ── */
+.tabbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  scrollbar-width: thin;
+}
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 6px 0 10px;
+  height: 26px;
+  max-width: 180px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--tertiary);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  user-select: none;
+}
+.tab:hover { background: var(--hover); }
+.tab.active {
+  color: var(--text);
+  background: var(--card);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.tab.preview-tab .nm { font-style: italic; }
+.tab .nm {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tab .dot { display: none; color: var(--accent); font-size: 9px; }
+.tab.dirty .dot { display: inline; }
+.tab .close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  opacity: 0;
+}
+.tab:hover .close, .tab.active .close { opacity: 1; }
+.tab .close:hover { background: var(--hover); color: var(--text); }
+
+/* ── single main view ── */
+.view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--card);
+  display: flex;
+  flex-direction: column;
+}
+.status { padding: 12px; font-size: 11px; color: var(--tertiary); }
+
+/* file tree rows */
+.node {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 1px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--secondary);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+}
+.node:hover { background: var(--hover); }
+.node.active { color: var(--text); background: var(--hover); }
+.node .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node .sz { margin-left: auto; flex-shrink: 0; font-size: 9px; color: var(--tertiary); }
+.node .tw { flex-shrink: 0; width: 12px; text-align: center; color: var(--tertiary); }
+.tree-root { padding: 6px 0; }
+.tree-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tertiary);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+}
+.tree-path .ws {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* git 入口按钮与浮层 */
+.git-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--tertiary);
+  cursor: pointer;
+}
+.git-btn:hover { color: var(--text); }
+.git-btn svg { width: 12px; height: 12px; display: block; }
+.git-badge {
+  font-size: 9px;
+  font-family: var(--mono);
+  color: var(--bg);
+  background: var(--tertiary);
+  border-radius: 6px;
+  padding: 0 4px;
+  line-height: 12px;
+  min-width: 12px;
+  text-align: center;
+}
+.git-pop {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 40;
+  width: 260px;
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+.git-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text);
+}
+.git-pop-head .branch { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.git-pop-head button {
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: var(--tertiary);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+}
+.git-pop-head button:hover { color: var(--text); }
+.git-pop-body { overflow-y: auto; flex: 1; min-height: 0; }
+.git-pop-empty { padding: 12px 10px; font-size: 11px; color: var(--tertiary); }
+.git-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 10px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text);
+  cursor: pointer;
+}
+.git-row:hover { background: var(--bg); }
+.git-row .st {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+  font-weight: 700;
+}
+.git-row .st.M { color: #b76d01; }
+.git-row .st.A { color: #50a14f; }
+.git-row .st.D { color: #e45649; }
+.git-row .st.R { color: #4078f2; }
+.git-row .st.\? { color: var(--tertiary); }
+.git-row .st.staged { opacity: 0.55; }
+.git-row .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* file content */
+.pv-img { display: block; max-width: 100%; margin: 8px auto; }
+/* CodeMirror 容器撑满视图区 */
+.cm-host {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--card);
+}
+.cm-host .cm-editor {
+  flex: 1;
+  min-height: 0;
+  font-size: 12px;
+}
+.cm-host .cm-scroller {
+  font-family: var(--mono);
+  line-height: 1.5;
+  overflow: auto;
+}
+.cm-host .cm-content {
+  padding: 8px 0;
+  caret-color: var(--text);
+}
+.cm-host .cm-gutters {
+  background: var(--bg);
+  color: var(--tertiary);
+  border-right: 1px solid var(--border);
+  border-left: 0;
+}
+.cm-host .cm-activeLineGutter {
+  background: var(--hover);
+}
+.cm-host .cm-activeLine {
+  background: var(--hover);
+}
+.cm-host .cm-selectionBackground,
+.cm-host.cm-focused .cm-selectionBackground {
+  background: rgba(128, 128, 128, 0.25) !important;
+}
+.cm-host .cm-cursor {
+  border-left-color: var(--text);
+}
+.cm-host .cm-editor.cm-focused {
+  outline: none;
+}
+
+/* ── CodeMirror 面板（搜索替换等）上妆：宿主变量重绘 ── */
+.cm-host .cm-panels {
+  background: var(--bg);
+  color: var(--text);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.cm-host .cm-panel {
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cm-host .cm-textfield {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 2px 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  outline: none;
+}
+.cm-host .cm-textfield:focus {
+  border-color: var(--accent);
+}
+.cm-host .cm-button {
+  background: var(--card);
+  color: var(--secondary);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  cursor: pointer;
+  background-image: none;
+}
+.cm-host .cm-button:hover {
+  color: var(--text);
+  border-color: var(--text);
+  background-image: none;
+}
+.cm-host .cm-panel label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--secondary);
+  font-size: 10px;
+  margin: 0;
+}
+.cm-host .cm-panel input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+.cm-host .cm-searchMatch {
+  background: rgba(254, 175, 44, 0.18);
+  outline: 1px solid rgba(254, 175, 44, 0.35);
+}
+.cm-host .cm-searchMatch-selected {
+  background: rgba(254, 175, 44, 0.4);
+}
+
+/* ── status bar：等高同色点击分栏，无独立按钮 ── */
+.statusbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tertiary);
+  background: var(--bg);
+  height: 22px;
+}
+.statusbar .seg {
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+.statusbar .seg.grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.statusbar .seg.clickable {
+  cursor: pointer;
+  color: var(--secondary);
+}
+.statusbar .seg.clickable:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.statusbar .hint-dirty { color: var(--accent); }
+.statusbar .hint-error { color: #c0392b; }
+
+/* ── tabbar 右端常驻保存 ── */
+.tabbar .bar-end {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.tabbar .save-btn {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  height: 100%;
+  padding: 0 10px;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--secondary);
+  cursor: pointer;
+}
+.tabbar .save-btn.show { display: flex; }
+.tabbar .save-btn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.tabbar .save-btn:disabled { opacity: 0.35; cursor: default; }
+.tabbar .save-btn svg { width: 14px; height: 14px; display: block; }
+.tabbar .save-btn .dirty-dot { color: var(--accent); font-size: 9px; line-height: 1; }
+
+/* ── Markdown 渲染视图 ── */
+.md-body {
+  padding: 12px 18px 24px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text);
+  overflow-wrap: break-word;
+}
+.md-body h1, .md-body h2, .md-body h3, .md-body h4, .md-body h5, .md-body h6 {
+  margin: 1em 0 0.5em;
+  line-height: 1.3;
+  color: var(--text);
+}
+.md-body h1 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
+.md-body h2 { font-size: 1.3em; border-bottom: 1px solid var(--border); padding-bottom: 0.2em; }
+.md-body h3 { font-size: 1.15em; }
+.md-body p { margin: 0.5em 0; }
+.md-body a { color: var(--accent); text-decoration: none; }
+.md-body a:hover { text-decoration: underline; }
+.md-body code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+}
+.md-body pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  margin: 0.6em 0;
+}
+.md-body pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.md-body blockquote {
+  margin: 0.6em 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--border);
+  color: var(--secondary);
+}
+.md-body ul, .md-body ol { margin: 0.5em 0; padding-left: 1.6em; }
+.md-body li { margin: 0.15em 0; }
+.md-body table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 11px;
+}
+.md-body th, .md-body td {
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  text-align: left;
+}
+.md-body th { background: var(--bg); }
+.md-body hr { border: 0; border-top: 1px solid var(--border); margin: 1em 0; }
+.md-body img { max-width: 100%; }
+
+/* git 整页视图 */
+.git-page { padding: 0 0 12px; font-size: 12px; }
+.git-page-top {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.git-back {
+  border: 0; background: transparent; color: var(--secondary);
+  font-size: 11px; cursor: pointer; padding: 2px 4px;
+}
+.git-back:hover { color: var(--text); }
+.git-page-branch {
+  flex: 1; min-width: 0; font-family: var(--mono); font-size: 11px;
+  font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.git-iconbtn {
+  border: 0; background: transparent; color: var(--tertiary);
+  cursor: pointer; font-size: 13px; padding: 0 4px;
+}
+.git-iconbtn:hover { color: var(--text); }
+.git-commit {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.git-commit-msg {
+  width: 100%; resize: vertical;
+  font-family: var(--mono); font-size: 11px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  box-sizing: border-box;
+}
+.git-commit-msg:focus { outline: none; border-color: var(--text); }
+.git-commit-btn {
+  align-self: flex-start;
+  padding: 4px 14px;
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  font-size: 11px; cursor: pointer;
+}
+.git-commit-btn:hover:not(:disabled) { border-color: var(--text); }
+.git-commit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.git-group { margin-top: 4px; }
+.git-group-head {
+  padding: 4px 12px;
+  font-size: 10px; color: var(--tertiary);
+  border-bottom: 1px solid var(--border);
+}
+.git-page-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 12px;
+  font-family: var(--mono); font-size: 11px;
+}
+.git-page-row:hover { background: var(--bg); }
+.git-page-row .st { flex-shrink: 0; width: 14px; text-align: center; font-weight: 700; }
+.git-page-row .st.M { color: #b76d01; }
+.git-page-row .st.A { color: #50a14f; }
+.git-page-row .st.D { color: #e45649; }
+.git-page-row .st.R { color: #4078f2; }
+.git-page-row .st.\? { color: var(--tertiary); }
+.git-page-row .p {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text);
+}
+.git-page-row .p:hover { color: #4078f2; text-decoration: underline; }
+.git-row-act {
+  flex-shrink: 0;
+  width: 18px; height: 18px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--secondary); font-size: 12px; line-height: 1;
+  cursor: pointer; padding: 0;
+}
+.git-row-act:hover { color: var(--text); border-color: var(--text); }
+.git-log-row {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 3px 12px;
+  font-size: 11px;
+}
+.git-log-row:hover { background: var(--bg); }
+.git-log-hash {
+  flex-shrink: 0;
+  font-family: var(--mono); font-size: 10px;
+  color: #4078f2;
+}
+.git-log-msg {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text);
+}
+.git-log-time { flex-shrink: 0; font-size: 10px; color: var(--tertiary); }
+
+/* 远程信息行 */
+.git-remote-line {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 12px;
+  font-size: 10px; color: var(--tertiary);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+}
+.git-remote-line .git-ic svg { width: 11px; height: 11px; display: block; }
+.git-remote-url { color: var(--secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-remote-up { flex-shrink: 0; }
+.git-fork-hash { color: #4078f2; font-size: 10px; }
+.git-fork-subj { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 提交行展开 */
+.git-commit-wrap { }
+.git-log-row { cursor: pointer; }
+.git-log-row.expanded { background: var(--bg); }
+.git-commit-detail {
+  padding: 8px 12px;
+  border-left: 2px solid var(--border);
+  margin: 0 12px 4px;
+  font-size: 11px;
+}
+.git-detail-meta {
+  font-family: var(--mono); font-size: 10px; color: var(--secondary);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.git-detail-meta code { color: #4078f2; }
+.git-detail-msg {
+  margin: 6px 0 0;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text);
+  white-space: pre-wrap; overflow-wrap: break-word;
+}
+.git-detail-file {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 2px 0;
+  border: 0; background: transparent;
+  font-family: var(--mono); font-size: 11px; color: var(--text);
+  cursor: pointer; text-align: left;
+}
+.git-detail-file:hover .p { color: #4078f2; text-decoration: underline; }
+.git-detail-file .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-fstat { flex-shrink: 0; font-size: 10px; font-family: var(--mono); }
+.git-fstat .add { color: #50a14f; }
+.git-fstat .del { color: #e45649; }
+/* 状态码 SVG 图标尺寸 */
+.git-row .st svg, .git-page-row .st svg { width: 12px; height: 12px; display: block; }
+.git-row-act svg { width: 10px; height: 10px; display: block; }
+.git-iconbtn svg { width: 13px; height: 13px; display: block; }
+
+/* diff 视图（CodeMirror 行装饰）：红绿行底 + ::before 标记列 */
+.cm-line.cm-diff-add { background: rgba(80, 161, 79, 0.12); }
+.cm-line.cm-diff-del { background: rgba(228, 86, 73, 0.12); }
+.cm-line.cm-diff-add::before, .cm-line.cm-diff-del::before, .cm-line.cm-diff-ctx::before {
+  display: inline-block;
+  width: 1.2em;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tertiary);
+}
+.cm-line.cm-diff-add::before { content: '+'; color: #50a14f; }
+.cm-line.cm-diff-del::before { content: '\2212'; color: #e45649; }
+.cm-line.cm-diff-ctx::before { content: ' '; }
