@@ -627,8 +627,12 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       : message.id;
     if (!inboundSeq && !rawMessageId) return;
 
-    const activeConversation = getActiveConversation(state);
-    const sessionId = activeConversation?.sessionId || '';
+    // [2026-08-26] sessionId 优先取消息自身：子会话（临时会话）视图下
+    // activeConversation 是父会话，用它会把重试发进父会话——父会话的
+    // 分支合并查找能命中子会话消息，还会删掉全部分支 JSONL 再把子会话
+    // 原文作为新 inbound 注入父会话，两边串台。消息属于哪个 session
+    // 就在哪个 session 内重试。
+    const sessionId = message.sessionId || getActiveConversation(state)?.sessionId || '';
     if (!sessionId) return;
 
     try {
