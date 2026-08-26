@@ -24,17 +24,23 @@ if __name__ == "__main__":
     _input = json.loads(sys.stdin.read())
     def output(result): print(json.dumps(result, ensure_ascii=False)); sys.exit(0)
     def fail(error):
-        # [AutoC 2026-05-31] Why: clear_context validation failures should match
-        # the unified tool response schema. How: include data.result with the error
-        # message before exiting non-zero. Purpose: keep failed context resets
-        # readable in history.
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
     args = _input
     import httpx
+    from pathlib import Path
 
     channel_id = str(args.get("channel_id", "")).strip()
     if not channel_id:
         fail("channel_id is required")
+
+    # ── Read admin token for supervisor API auth ──
+    admin_token = ""
+    try:
+        token_file = Path(__file__).resolve().parent.parent / "data" / ".admin_token"
+        if token_file.exists():
+            admin_token = token_file.read_text().strip()
+    except Exception:
+        pass
 
     results = {}
 
@@ -52,11 +58,16 @@ if __name__ == "__main__":
 
     # 2. 调用 supervisor 的 conversation reset API
     #    这会：移除 conversation_map 映射（下次消息创建新 session）+ 清理 node_contexts
+    #    + 级联清理 fork/dispatch 子 session
     conversation_key = f"discord:{channel_id}"
+    headers = {}
+    if admin_token:
+        headers["Authorization"] = f"Bearer {admin_token}"
     try:
         resp = httpx.post(
             "http://127.0.0.1:8765/v1/conversations/reset",
             json={"conversation_key": conversation_key},
+            headers=headers,
             timeout=10.0,
         )
         if resp.status_code == 200:
@@ -64,18 +75,18 @@ if __name__ == "__main__":
             results["session_reset"] = "ok"
             results["old_session_id"] = data.get("old_session_id", "")
             results["context_files_cleaned"] = data.get("context_files_cleaned", 0)
-        else:
+            results["cleared_children"] = data.get("cleared_children", 0)
+        elif resp.status_code == 404:
             # 404 = conversation not found (already clean)
-            if resp.status_code == 404:
-                results["session_reset"] = "already clean (no active session)"
-            else:
-                results["session_reset"] = f"failed: {resp.status_code}"
+            results["session_reset"] = "already clean (no active session)"
+        elif resp.status_code == 401:
+            fail("supervisor API auth failed (401). admin_token may be missing or invalid.")
+        else:
+            fail(f"supervisor reset failed: HTTP {resp.status_code}")
+    except SystemExit:
+        raise
     except Exception as e:
-        results["session_reset"] = f"error: {e}"
+        fail(f"supervisor reset error: {e}")
 
     results["conversation_key"] = conversation_key
-    # [AutoC 2026-05-31] Why: clear_context previously returned only top-level
-    # fields, which bypasses the new data.result contract. How: move the existing
-    # status fields under data and add a concise readable result string. Purpose:
-    # make context reset output consistent with all migrated tools.
     output({"ok": True, "data": {"result": "Context cleared", **results}})

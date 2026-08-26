@@ -19,7 +19,7 @@ from typing import Any
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.11.0",
+    "version": "0.12.0",
     "description": "Web IDE：文件面板 + 编辑器 + @文件引用（输入框补全与请求时展开）",
     "author": "clonoth",
     # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。

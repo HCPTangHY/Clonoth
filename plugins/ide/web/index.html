@@ -619,6 +619,20 @@ body {
 .git-row .st svg, .git-page-row .st svg { width: 12px; height: 12px; display: block; }
 .git-row-act svg { width: 10px; height: 10px; display: block; }
 .git-iconbtn svg { width: 13px; height: 13px; display: block; }
+
+/* diff 视图（CodeMirror 行装饰）：红绿行底 + ::before 标记列 */
+.cm-line.cm-diff-add { background: rgba(80, 161, 79, 0.12); }
+.cm-line.cm-diff-del { background: rgba(228, 86, 73, 0.12); }
+.cm-line.cm-diff-add::before, .cm-line.cm-diff-del::before, .cm-line.cm-diff-ctx::before {
+  display: inline-block;
+  width: 1.2em;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tertiary);
+}
+.cm-line.cm-diff-add::before { content: '+'; color: #50a14f; }
+.cm-line.cm-diff-del::before { content: '\2212'; color: #e45649; }
+.cm-line.cm-diff-ctx::before { content: ' '; }
 </style>
 </head>
 <body>
@@ -930,12 +944,17 @@ function showStatus(text) {
 
 function stashScroll() {
   const tab = viewPath && viewPath !== TREE_TAB ? findTab(viewPath) : null;
-  if (!tab || tab.kind !== 'text') return;
-  if (tab._view) {
+  if (!tab) return;
+  if (tab.kind === 'text') {
+    if (tab._view) {
+      tab.scroll = scrollFraction(tab._view.scrollDOM);
+      tab.cursor = tab._view.state.selection.main.head;
+    } else if (isMarkdown(tab.path) && tab.mode === 'render') {
+      tab.scroll = scrollFraction(viewEl);
+    }
+  } else if ((tab.kind === 'diff' || tab.kind === 'gitdiff') && tab._view) {
+    // diff 视图现在是 CodeMirror，滚动容器从 viewEl 换为编辑器 scroller。
     tab.scroll = scrollFraction(tab._view.scrollDOM);
-    tab.cursor = tab._view.state.selection.main.head;
-  } else if (isMarkdown(tab.path) && tab.mode === 'render') {
-    tab.scroll = scrollFraction(viewEl);
   }
 }
 
@@ -982,6 +1001,7 @@ function renderFileTab(tab) {
 
 function renderDiff(tab) {
   viewEl.innerHTML = '';
+  if (tab._view) { tab._view.destroy(); tab._view = null; }
   const before = tab.text;
   const after = tab.afterText;
   if (!before && !after) { showStatus('加载中…'); return; }
@@ -994,29 +1014,97 @@ function renderDiff(tab) {
   while (suf < aLines.length - pre && suf < bLines.length - pre
          && aLines[aLines.length - 1 - suf] === bLines[bLines.length - 1 - suf]) suf++;
 
-  const ctxBefore = aLines.slice(0, pre);
-  const delLines = aLines.slice(pre, aLines.length - suf);
-  const addLines = bLines.slice(pre, bLines.length - suf);
-  const ctxAfter = aLines.slice(aLines.length - suf);
+  // 统一 diff 文档：上下文行 + 删除行 + 新增行 + 上下文行，逐行记录类别，
+  // 行内容不带 +/- 前缀（前缀由 CSS ::before 呈现），语法高亮作用于原文。
+  const kinds = [];
+  const lines = [];
+  for (let i = 0; i < pre; i++) { lines.push(aLines[i]); kinds.push('ctx'); }
+  for (let i = pre; i < aLines.length - suf; i++) { lines.push(aLines[i]); kinds.push('del'); }
+  for (let i = pre; i < bLines.length - suf; i++) { lines.push(bLines[i]); kinds.push('add'); }
+  for (let i = aLines.length - suf; i < aLines.length; i++) { lines.push(aLines[i]); kinds.push('ctx'); }
 
-  const body = document.createElement('div');
-  body.className = 'ide-diff-body';
-  const addLine = (cls, text) => {
-    const div = document.createElement('div');
-    div.className = 'ide-diff-line ide-diff-' + cls;
-    div.textContent = (cls === 'del' ? '- ' : cls === 'add' ? '+ ' : '  ') + text;
-    body.appendChild(div);
+  const host = document.createElement('div');
+  host.className = 'cm-host';
+  viewEl.appendChild(host);
+  const { EditorState, EditorView, Decoration, ViewPlugin } = CM;
+  const lineClass = {
+    add: Decoration.line({ class: 'cm-diff-add' }),
+    del: Decoration.line({ class: 'cm-diff-del' }),
+    ctx: Decoration.line({ class: 'cm-diff-ctx' }),
   };
-  ctxBefore.forEach(l => addLine('ctx', l));
-  delLines.forEach(l => addLine('del', l));
-  addLines.forEach(l => addLine('add', l));
-  ctxAfter.forEach(l => addLine('ctx', l));
-  viewEl.appendChild(body);
-  // 滚动容器是 viewEl，与普通文件标签（MD 渲染态）一致
-  applyScrollFraction(viewEl, tab.scroll);
+  // 只读文档构建后不变，装饰在视图创建时一次性计算即可。
+  const decoPlugin = ViewPlugin.fromClass(class {
+    constructor(view) {
+      const ranges = [];
+      const n = Math.min(kinds.length, view.state.doc.lines);
+      for (let i = 0; i < n; i++) {
+        const mark = lineClass[kinds[i]];
+        if (mark) ranges.push(mark.range(view.state.doc.line(i + 1).from));
+      }
+      this.decorations = Decoration.set(ranges, true);
+    }
+  }, { decorations: (v) => v.decorations });
+
+  const view = new EditorView({
+    parent: host,
+    state: EditorState.create({
+      doc: lines.join('\n'),
+      extensions: [
+        // 与普通文件标签同一渲染层：行号、语法高亮、折叠、缩进、主题
+        ...codeCommonExtensions(tab.path),
+        decoPlugin,
+        EditorState.readOnly.of(true),
+        EditorView.editable.of(false),
+      ],
+    }),
+  });
+  tab._view = view;
+  applyScrollFraction(view.scrollDOM, tab.scroll || 0);
+  view.requestMeasure();
 }
 
 // ── editor ───────────────────────────────────────────────────────────────
+
+// ── 共享代码视图层 ────────────────────────────────────────────────────────
+// 普通文件标签与 diff 标签（apply_diff 逆推 / git 变更 / 提交差异）共用同一
+// CodeMirror 构造路径：行号、语法高亮、括号匹配、折叠、缩进、基础主题都在
+// 这里。可编辑差异（history/keymap/脏跟踪/失焦切换）由 renderEditor 追加，
+// diff 视图追加只读与行级红绿装饰。
+
+function diffBasePath(p) {
+  // diff 标签路径形如 'a/b.py (diff)' 或 'a/b.py @1a2b3c4 (diff)'，
+  // 语法匹配前剥掉后缀取真实文件路径。
+  return String(p).replace(/(?:\s*@[0-9a-f]{7,40})?\s*\(diff\)\s*$/, '');
+}
+
+function codeCommonExtensions(path) {
+  const { EditorState, EditorView, lineNumbers, highlightActiveLine, highlightActiveLineGutter,
+          drawSelection, bracketMatching, foldGutter, syntaxHighlighting,
+          indentUnit, markdown, markdownLanguage } = CM;
+  const base = diffBasePath(path);
+  const langExts = isMarkdown(base)
+    ? [markdown({ base: markdownLanguage })]
+    : (() => { const d = languageFor(base); return d && d.support ? [d.support] : []; })();
+  return [
+    lineNumbers(),
+    highlightActiveLine(),
+    highlightActiveLineGutter(),
+    drawSelection(),
+    bracketMatching(),
+    foldGutter(),
+    // [AutoC 2026-08-24] 高对比浅色配色（Atom One Light 色系）。
+    syntaxHighlighting(hlStyle()),
+    highlightSelectionMatches(),
+    ...langExts,
+    // tabSize 决定 Tab 字符显示宽度，indentUnit 决定 Tab 命令插入的空白。
+    EditorState.tabSize.of(indentWidth),
+    indentUnit.of(' '.repeat(indentWidth)),
+    EditorView.theme({
+      '&': { height: '100%' },
+      '.cm-scroller': { overflow: 'auto' },
+    }),
+  ];
+}
 
 function markEdited(tab, text) {
   tab.text = text;
@@ -1038,29 +1126,17 @@ function renderEditor(tab) {
   host.className = 'cm-host';
   viewEl.appendChild(host);
 
-  const { EditorState, EditorView, keymap, lineNumbers, highlightActiveLine,
-          highlightActiveLineGutter, drawSelection, defaultKeymap, history,
-          historyKeymap, indentWithTab, syntaxHighlighting,
-          defaultHighlightStyle, bracketMatching, foldGutter, indentUnit,
-          searchKeymap, highlightSelectionMatches } = CM;
-  void defaultHighlightStyle;
+  const { EditorState, EditorView, keymap, defaultKeymap, history,
+          historyKeymap, indentWithTab, searchKeymap } = CM;
 
   const view = new EditorView({
     parent: host,
     state: EditorState.create({
       doc: tab.text,
       extensions: [
-        lineNumbers(),
-        highlightActiveLine(),
-        highlightActiveLineGutter(),
-        drawSelection(),
+        // 共享代码视图层：行号、高亮、括号、折叠、缩进、主题
+        ...codeCommonExtensions(tab.path),
         history(),
-        bracketMatching(),
-        foldGutter(),
-        // [AutoC 2026-08-24] 默认高亮配色饱和度低、在纸张底上不明显，
-        // 换用高对比浅色配色（Atom One Light 色系），注释与正文跟随宿主变量。
-        syntaxHighlighting(hlStyle()),
-        highlightSelectionMatches(),
         keymap.of([
           ...defaultKeymap,
           ...historyKeymap,
@@ -1087,19 +1163,6 @@ function renderEditor(tab) {
             }, 0);
           },
         })] : []),
-        // MD 文件编辑时启用 Markdown 语法高亮；其他文件按扩展名匹配
-        // 语言包，未命中则无高亮。
-        ...(isMarkdown(tab.path)
-          ? [CM.markdown({ base: CM.markdownLanguage })]
-          : (() => { const d = languageFor(tab.path); return d && d.support ? [d.support] : []; })()),
-        // tabSize 决定 Tab 字符显示宽度，indentUnit 决定 Tab 命令插入的空白，
-        // 两者都跟随状态栏的缩进偏好。
-        EditorState.tabSize.of(indentWidth),
-        indentUnit.of(' '.repeat(indentWidth)),
-        EditorView.theme({
-          '&': { height: '100%' },
-          '.cm-scroller': { overflow: 'auto' },
-        }),
       ],
     }),
   });
