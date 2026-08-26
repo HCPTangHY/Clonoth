@@ -472,6 +472,101 @@ body {
 .md-body th { background: var(--bg); }
 .md-body hr { border: 0; border-top: 1px solid var(--border); margin: 1em 0; }
 .md-body img { max-width: 100%; }
+
+/* git 整页视图 */
+.git-page { padding: 0 0 12px; font-size: 12px; }
+.git-page-top {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.git-back {
+  border: 0; background: transparent; color: var(--secondary);
+  font-size: 11px; cursor: pointer; padding: 2px 4px;
+}
+.git-back:hover { color: var(--text); }
+.git-page-branch {
+  flex: 1; min-width: 0; font-family: var(--mono); font-size: 11px;
+  font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.git-iconbtn {
+  border: 0; background: transparent; color: var(--tertiary);
+  cursor: pointer; font-size: 13px; padding: 0 4px;
+}
+.git-iconbtn:hover { color: var(--text); }
+.git-commit {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.git-commit-msg {
+  width: 100%; resize: vertical;
+  font-family: var(--mono); font-size: 11px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  box-sizing: border-box;
+}
+.git-commit-msg:focus { outline: none; border-color: var(--text); }
+.git-commit-btn {
+  align-self: flex-start;
+  padding: 4px 14px;
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  font-size: 11px; cursor: pointer;
+}
+.git-commit-btn:hover:not(:disabled) { border-color: var(--text); }
+.git-commit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.git-group { margin-top: 4px; }
+.git-group-head {
+  padding: 4px 12px;
+  font-size: 10px; color: var(--tertiary);
+  border-bottom: 1px solid var(--border);
+}
+.git-page-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 12px;
+  font-family: var(--mono); font-size: 11px;
+}
+.git-page-row:hover { background: var(--bg); }
+.git-page-row .st { flex-shrink: 0; width: 14px; text-align: center; font-weight: 700; }
+.git-page-row .st.M { color: #b76d01; }
+.git-page-row .st.A { color: #50a14f; }
+.git-page-row .st.D { color: #e45649; }
+.git-page-row .st.R { color: #4078f2; }
+.git-page-row .st.\? { color: var(--tertiary); }
+.git-page-row .p {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text);
+}
+.git-page-row .p:hover { color: #4078f2; text-decoration: underline; }
+.git-row-act {
+  flex-shrink: 0;
+  width: 18px; height: 18px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--secondary); font-size: 12px; line-height: 1;
+  cursor: pointer; padding: 0;
+}
+.git-row-act:hover { color: var(--text); border-color: var(--text); }
+.git-log-row {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 3px 12px;
+  font-size: 11px;
+}
+.git-log-row:hover { background: var(--bg); }
+.git-log-hash {
+  flex-shrink: 0;
+  font-family: var(--mono); font-size: 10px;
+  color: #4078f2;
+}
+.git-log-msg {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text);
+}
+.git-log-time { flex-shrink: 0; font-size: 10px; color: var(--tertiary); }
 </style>
 </head>
 <body>
@@ -796,6 +891,8 @@ function renderView() {
   stashScroll();
   viewPath = activePath;
   if (activePath === TREE_TAB) {
+    // Git 整页视图激活时替换文件树显示
+    if (gitViewActive) { renderGitView(); renderStatusbar(); return; }
     if (treeBooted) {
       viewEl.innerHTML = '';
       viewEl.appendChild(treeRootEl);
@@ -1044,7 +1141,7 @@ document.addEventListener('keydown', (e) => {
 function renderStatusbar() {
   const tab = findTab(activePath);
   if (!tab || tab.path === TREE_TAB) {
-    statusbarEl.innerHTML = '<div class="seg grow">工作区文件</div>';
+    statusbarEl.innerHTML = '<div class="seg grow">' + (gitViewActive ? '源代码管理' : '工作区文件') + '</div>';
     barSaveBtn.classList.remove('show');
     return;
   }
@@ -1202,6 +1299,12 @@ const GIT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 let gitState = { is_repo: false, branch: '', changes: [] };
 let gitPopEl = null;
 let gitBadgeEl = null;
+// 整页 Git 视图的激活状态：gitViewActive 为 true 时 renderView 渲染 Git 页
+// 而不是文件树/文件内容。gitTreeBackup 暂存文件树 DOM，返回时恢复。
+let gitViewActive = false;
+let gitTreeBackup = null;
+let gitLogCache = null;
+let gitCommitMsg = '';
 
 async function fetchGitStatus() {
   const resp = await api('/plugins/ide/git/status?session_id=' + encodeURIComponent(SESSION_ID));
@@ -1216,6 +1319,7 @@ async function refreshGit() {
   }
   updateGitBadge();
   if (gitPopEl) renderGitPop();
+  if (gitViewActive) renderGitView();
 }
 
 function updateGitBadge() {
@@ -1238,8 +1342,8 @@ function buildGitButton() {
   gitBadgeEl = btn.querySelector('.git-badge');
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
-    if (gitPopEl) { closeGitPop(); return; }
-    openGitPop(btn);
+    // 整页 Git 视图：替换文件树显示，右上角返回
+    openGitView();
   });
   // 首次构造时拉一次 status 填徽章
   void refreshGit();
@@ -1372,6 +1476,212 @@ function parseUnifiedDiff(text) {
     after.push(body);
   }
   return { before: before.join('\n'), after: after.join('\n') };
+}
+
+// ── 整页 Git 视图 ─────────────────────────────────────────────────────
+// 点击文件树 git 按钮后，视图区整体切换为 Git 页（提交区 + 变更列表 +
+// 提交记录时间轴），右上角返回文件树。文件树 DOM 由 gitTreeBackup 暂存，
+// 返回时原样恢复，树的展开状态不丢。
+
+async function openGitView() {
+  if (activePath !== TREE_TAB) {
+    // 从文件标签进入：先切回文件树标签，再替换视图
+    activePath = TREE_TAB;
+    renderTabs();
+  }
+  if (!gitViewActive) {
+    gitTreeBackup = viewEl.firstChild;
+    gitViewActive = true;
+  }
+  closeGitPop();
+  // 并行拉 status 和 log
+  void refreshGit();
+  void loadGitLog();
+  renderGitView();
+  renderStatusbar();
+}
+
+function closeGitView() {
+  gitViewActive = false;
+  gitLogCache = null;
+  if (activePath === TREE_TAB) {
+    renderView();
+    renderStatusbar();
+  }
+}
+
+async function loadGitLog() {
+  try {
+    const resp = await api('/plugins/ide/git/log?session_id=' + encodeURIComponent(SESSION_ID));
+    gitLogCache = await resp.json();
+  } catch {
+    gitLogCache = { is_repo: false, commits: [] };
+  }
+  if (gitViewActive) renderGitView();
+}
+
+function relTime(ts) {
+  const diff = Math.floor(Date.now() / 1000) - ts;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+  if (diff < 86400 * 30) return Math.floor(diff / 86400) + ' 天前';
+  const d = new Date(ts * 1000);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function renderGitView() {
+  viewEl.innerHTML = '';
+  const page = document.createElement('div');
+  page.className = 'git-page';
+
+  // ── 顶行：返回 + 分支名 + 刷新 ──
+  const top = document.createElement('div');
+  top.className = 'git-page-top';
+  const back = document.createElement('button');
+  back.type = 'button';
+  back.className = 'git-back';
+  back.textContent = '← 返回';
+  back.addEventListener('click', closeGitView);
+  top.appendChild(back);
+  const branch = document.createElement('span');
+  branch.className = 'git-page-branch';
+  branch.textContent = gitState.is_repo ? gitState.branch : '';
+  top.appendChild(branch);
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.className = 'git-iconbtn';
+  refresh.title = '刷新';
+  refresh.textContent = '↻';
+  refresh.addEventListener('click', () => { void refreshGit(); void loadGitLog(); });
+  top.appendChild(refresh);
+  page.appendChild(top);
+
+  if (!gitState.is_repo) {
+    const empty = document.createElement('div');
+    empty.className = 'status';
+    empty.textContent = '当前工作区不是 git 仓库';
+    page.appendChild(empty);
+    viewEl.appendChild(page);
+    return;
+  }
+
+  // ── 提交区 ──
+  const commitBox = document.createElement('div');
+  commitBox.className = 'git-commit';
+  const ta = document.createElement('textarea');
+  ta.className = 'git-commit-msg';
+  ta.placeholder = '提交信息';
+  ta.value = gitCommitMsg;
+  ta.rows = 2;
+  ta.addEventListener('input', () => { gitCommitMsg = ta.value; });
+  commitBox.appendChild(ta);
+  const commitBtn = document.createElement('button');
+  commitBtn.type = 'button';
+  commitBtn.className = 'git-commit-btn';
+  const stagedCount = gitState.changes.filter(c => c.staged).length;
+  commitBtn.textContent = stagedCount > 0 ? '提交（' + stagedCount + ' 项已暂存）' : '提交';
+  commitBtn.disabled = stagedCount === 0;
+  commitBtn.addEventListener('click', async () => {
+    const msg = gitCommitMsg.trim();
+    if (!msg) { ta.focus(); return; }
+    commitBtn.disabled = true;
+    commitBtn.textContent = '提交中…';
+    try {
+      const resp = await api('/plugins/ide/git/commit?session_id=' + encodeURIComponent(SESSION_ID), {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        body: msg,
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || '提交失败');
+      gitCommitMsg = '';
+      void refreshGit();
+      void loadGitLog();
+    } catch (err) {
+      alert('提交失败：' + err.message);
+      commitBtn.disabled = false;
+      commitBtn.textContent = '提交';
+    }
+  });
+  commitBox.appendChild(commitBtn);
+  page.appendChild(commitBox);
+
+  // ── 变更列表：暂存的变更 / 变更 两个分组 ──
+  const staged = gitState.changes.filter(c => c.staged);
+  const unstaged = gitState.changes.filter(c => !c.staged);
+  const mkGroup = (title, items, actionLabel, actionFn) => {
+    if (!items.length) return;
+    const g = document.createElement('div');
+    g.className = 'git-group';
+    const gh = document.createElement('div');
+    gh.className = 'git-group-head';
+    gh.textContent = title + '（' + items.length + '）';
+    g.appendChild(gh);
+    for (const ch of items) {
+      const row = document.createElement('div');
+      row.className = 'git-page-row';
+      const st = document.createElement('span');
+      st.className = 'st ' + ch.status;
+      st.textContent = ch.status;
+      row.appendChild(st);
+      const p = document.createElement('span');
+      p.className = 'p';
+      p.textContent = ch.path;
+      p.title = ch.path;
+      row.appendChild(p);
+      const act = document.createElement('button');
+      act.type = 'button';
+      act.className = 'git-row-act';
+      act.textContent = actionLabel;
+      act.title = actionLabel === '+' ? '暂存' : '取消暂存';
+      act.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        try {
+          await api('/plugins/ide/git/' + actionFn + '?session_id=' + encodeURIComponent(SESSION_ID)
+            + '&path=' + encodeURIComponent(ch.path), { method: 'POST' });
+          void refreshGit();
+        } catch (err) {
+          alert('操作失败：' + err.message);
+        }
+      });
+      row.appendChild(act);
+      p.addEventListener('click', () => { void openGitDiffTab(ch.path); });
+      p.style.cursor = 'pointer';
+      g.appendChild(row);
+    }
+    page.appendChild(g);
+  };
+  mkGroup('暂存的变更', staged, '−', 'unstage');
+  mkGroup('变更', unstaged, '+', 'stage');
+  if (!staged.length && !unstaged.length) {
+    const none = document.createElement('div');
+    none.className = 'git-pop-empty';
+    none.textContent = '没有变更';
+    page.appendChild(none);
+  }
+
+  // ── 提交记录时间轴 ──
+  if (gitLogCache && gitLogCache.is_repo && gitLogCache.commits.length) {
+    const logGroup = document.createElement('div');
+    logGroup.className = 'git-group';
+    const lh = document.createElement('div');
+    lh.className = 'git-group-head';
+    lh.textContent = '提交记录';
+    logGroup.appendChild(lh);
+    for (const c of gitLogCache.commits) {
+      const row = document.createElement('div');
+      row.className = 'git-log-row';
+      row.innerHTML = '<code class="git-log-hash">' + esc(c.hash) + '</code>'
+        + '<span class="git-log-msg">' + esc(c.subject) + '</span>'
+        + '<span class="git-log-time">' + esc(relTime(c.time)) + '</span>';
+      row.title = c.author + ' · ' + new Date(c.time * 1000).toLocaleString();
+      logGroup.appendChild(row);
+    }
+    page.appendChild(logGroup);
+  }
+
+  viewEl.appendChild(page);
 }
 
 async function bootTree() {

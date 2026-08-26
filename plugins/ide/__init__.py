@@ -346,6 +346,77 @@ def register(ctx) -> None:
                 out = ""
         return {"path": rel, "diff": out}
 
+    def _git_rel(base: Path, raw_path: str) -> str:
+        """路径守卫 + 转为仓库相对路径，供 stage/unstage/diff 共用。"""
+        raw = raw_path.replace("\\", "/").strip()
+        if not raw:
+            raise HTTPException(status_code=400, detail="empty path")
+        target = (base / raw).resolve() if not raw.startswith("/") else Path(raw).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path outside session workspace")
+        return target.relative_to(base).as_posix()
+
+    @api.get("/git/log")
+    async def _git_log(request: Request) -> dict:
+        base = _git_base(request)
+        rc, out, _ = await _git(base, "log", "-30", "--pretty=format:%h%x1f%an%x1f%at%x1f%s")
+        if rc != 0:
+            return {"is_repo": False, "commits": []}
+        commits = []
+        for line in out.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) != 4:
+                continue
+            commits.append({"hash": parts[0], "author": parts[1], "time": int(parts[2]), "subject": parts[3]})
+        return {"is_repo": True, "commits": commits}
+
+    @api.post("/git/stage")
+    async def _git_stage(request: Request) -> dict:
+        base = _git_base(request)
+        rel = _git_rel(base, str(request.query_params.get("path") or ""))
+        rc, _, err = await _git(base, "add", "--", rel)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=err.strip() or "git add 失败")
+        return {"ok": True, "path": rel}
+
+    @api.post("/git/unstage")
+    async def _git_unstage(request: Request) -> dict:
+        base = _git_base(request)
+        rel = _git_rel(base, str(request.query_params.get("path") or ""))
+        rc, _, err = await _git(base, "reset", "-q", "--", rel)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=err.strip() or "git reset 失败")
+        return {"ok": True, "path": rel}
+
+    @api.post("/git/commit")
+    async def _git_commit(request: Request) -> dict:
+        base = _git_base(request)
+        body = await request.body()
+        message = body.decode("utf-8", "replace").strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="empty commit message")
+        if len(message) > 4096:
+            raise HTTPException(status_code=400, detail="commit message too long")
+        # 提交信息经 stdin 传入，不经过命令行拼接，无注入面
+        proc = await asyncio.create_subprocess_exec(
+            "git", "commit", "-F", "-",
+            cwd=str(base),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(message.encode("utf-8")), timeout=15.0)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise HTTPException(status_code=504, detail="git commit 超时")
+        if proc.returncode != 0:
+            raise HTTPException(status_code=500, detail=err.decode("utf-8", "replace").strip() or "git commit 失败")
+        return {"ok": True, "output": out.decode("utf-8", "replace").strip()}
+
     # register 必须在所有路由定义之后：已 attach 状态下 register 立即
     # include_router，只拷贝当时已存在的路由；之后定义的路由不会追加。
     routes.register(api, description="ide 写文件与 git 端点（默认鉴权）")
