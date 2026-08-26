@@ -22,19 +22,21 @@ function render(ctx) {
   if (path) {
     const head = document.createElement('div');
     head.className = 'ide-tc-filehead';
-    const label = document.createElement('button');
-    label.type = 'button';
-    label.className = 'ide-tc-filechip';
+    const label = document.createElement('code');
     label.textContent = path;
-    label.title = '在 IDE 打开';
-    label.addEventListener('click', () => {
-      void ctx.api?.call?.('openPanel', 'files', { kind: 'open-file', path });
-    });
     head.appendChild(label);
     const size = document.createElement('span');
     size.className = 'ide-tc-k';
     size.textContent = content ? content.length + ' 字符' : '';
     head.appendChild(size);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ide-tc-openbtn';
+    btn.textContent = '在 IDE 打开';
+    btn.addEventListener('click', () => {
+      void ctx.api?.call?.('openPanel', 'files', { kind: 'open-file', path });
+    });
+    head.appendChild(btn);
     ctx.el.appendChild(head);
   }
 
