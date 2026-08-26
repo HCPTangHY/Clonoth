@@ -130,15 +130,112 @@ body {
 .node .tw { flex-shrink: 0; width: 12px; text-align: center; color: var(--tertiary); }
 .tree-root { padding: 6px 0; }
 .tree-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 4px 12px;
   font-family: var(--mono);
   font-size: 10px;
   color: var(--tertiary);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+}
+.tree-path .ws {
+  flex: 1;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  border-bottom: 1px solid var(--border);
 }
+/* git 入口按钮与浮层 */
+.git-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--tertiary);
+  cursor: pointer;
+}
+.git-btn:hover { color: var(--text); }
+.git-btn svg { width: 12px; height: 12px; display: block; }
+.git-badge {
+  font-size: 9px;
+  font-family: var(--mono);
+  color: var(--bg);
+  background: var(--tertiary);
+  border-radius: 6px;
+  padding: 0 4px;
+  line-height: 12px;
+  min-width: 12px;
+  text-align: center;
+}
+.git-pop {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 40;
+  width: 260px;
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+.git-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text);
+}
+.git-pop-head .branch { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.git-pop-head button {
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: var(--tertiary);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+}
+.git-pop-head button:hover { color: var(--text); }
+.git-pop-body { overflow-y: auto; flex: 1; min-height: 0; }
+.git-pop-empty { padding: 12px 10px; font-size: 11px; color: var(--tertiary); }
+.git-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 10px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text);
+  cursor: pointer;
+}
+.git-row:hover { background: var(--bg); }
+.git-row .st {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+  font-weight: 700;
+}
+.git-row .st.M { color: #b76d01; }
+.git-row .st.A { color: #50a14f; }
+.git-row .st.D { color: #e45649; }
+.git-row .st.R { color: #4078f2; }
+.git-row .st.\? { color: var(--tertiary); }
+.git-row .st.staged { opacity: 0.55; }
+.git-row .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* file content */
 .pv-img { display: block; max-width: 100%; margin: 8px auto; }
@@ -710,7 +807,9 @@ function renderView() {
   }
   const tab = findTab(activePath);
   if (!tab) { renderStatusbar(); return; }
-  if (!tab.loaded) {
+    if (!tab.loaded) {
+    // gitdiff 的数据由 openGitDiffTab 主动加载，renderView 不触发
+    if (tab.kind === 'gitdiff') { renderStatusbar(); return; }
     if (tab.kind === 'diff') { loadDiffTab(tab); return; }
     loadFileTab(tab);
     return;
@@ -721,6 +820,7 @@ function renderView() {
 
 function renderFileTab(tab) {
   if (tab.kind === 'diff') renderDiff(tab);
+  else if (tab.kind === 'gitdiff') renderDiff(tab);
   else if (tab.kind === 'text') {
     if (isMarkdown(tab.path) && tab.mode === 'render') renderMarkdown(tab);
     else renderEditor(tab);
@@ -957,6 +1057,9 @@ function renderStatusbar() {
   } else if (tab.kind === 'diff') {
     hint = tab.note || '修改前后对比（逆推重建，仅供参考）';
     hintClass = 'hint-diff';
+  } else if (tab.kind === 'gitdiff') {
+    hint = tab.note || '工作区变更对比（git diff）';
+    hintClass = 'hint-diff';
   } else if (tab.kind === 'text') {
     hint = tab.dirty ? '未保存 · Ctrl+S' : '已保存';
     hintClass = tab.dirty ? 'hint-dirty' : '';
@@ -1088,6 +1191,189 @@ function renderNode(node, depth, container) {
   });
 }
 
+// ── git ─────────────────────────────────────────────────────────────────
+// 入口是文件树路径栏右侧的分支按钮（buildGitButton，bootTree 时挂载）。
+// 点击展开下拉浮层：分支名 + 刷新按钮 + 变更文件列表。列表项点击经
+// openDiffTab 打开该文件的 unified diff 对比标签（kind:'gitdiff'，复用
+// renderDiff 的红绿对比渲染）。非 git 仓库时徽章不显示，浮层内显示提示。
+
+const GIT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M6 9v6"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
+
+let gitState = { is_repo: false, branch: '', changes: [] };
+let gitPopEl = null;
+let gitBadgeEl = null;
+
+async function fetchGitStatus() {
+  const resp = await api('/plugins/ide/git/status?session_id=' + encodeURIComponent(SESSION_ID));
+  return resp.json();
+}
+
+async function refreshGit() {
+  try {
+    gitState = await fetchGitStatus();
+  } catch {
+    gitState = { is_repo: false, branch: '', changes: [] };
+  }
+  updateGitBadge();
+  if (gitPopEl) renderGitPop();
+}
+
+function updateGitBadge() {
+  if (!gitBadgeEl) return;
+  const n = gitState.is_repo ? gitState.changes.length : 0;
+  if (n > 0) {
+    gitBadgeEl.textContent = n > 99 ? '99+' : String(n);
+    gitBadgeEl.style.display = '';
+  } else {
+    gitBadgeEl.style.display = 'none';
+  }
+}
+
+function buildGitButton() {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'git-btn';
+  btn.title = '源代码管理';
+  btn.innerHTML = GIT_ICON + '<span class="git-badge" style="display:none"></span>';
+  gitBadgeEl = btn.querySelector('.git-badge');
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (gitPopEl) { closeGitPop(); return; }
+    openGitPop(btn);
+  });
+  // 首次构造时拉一次 status 填徽章
+  void refreshGit();
+  return btn;
+}
+
+function openGitPop(anchorBtn) {
+  closeGitPop();
+  const pop = document.createElement('div');
+  pop.className = 'git-pop';
+  gitPopEl = pop;
+  anchorBtn.parentElement.appendChild(pop);
+  renderGitPop();
+  const onDocDown = (ev) => {
+    if (!gitPopEl) return;
+    if (gitPopEl.contains(ev.target) || anchorBtn.contains(ev.target)) return;
+    closeGitPop();
+  };
+  // 延迟一帧挂监听，避免本次点击立即触发关闭
+  setTimeout(() => document.addEventListener('pointerdown', onDocDown), 0);
+  pop._onDocDown = onDocDown;
+}
+
+function closeGitPop() {
+  if (!gitPopEl) return;
+  if (gitPopEl._onDocDown) document.removeEventListener('pointerdown', gitPopEl._onDocDown);
+  gitPopEl.remove();
+  gitPopEl = null;
+}
+
+function renderGitPop() {
+  const pop = gitPopEl;
+  if (!pop) return;
+  pop.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'git-pop-head';
+  const branch = document.createElement('span');
+  branch.className = 'branch';
+  branch.textContent = gitState.is_repo ? gitState.branch : '源代码管理';
+  head.appendChild(branch);
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.title = '刷新';
+  refresh.textContent = '↻';
+  refresh.addEventListener('click', (e) => { e.stopPropagation(); void refreshGit(); });
+  head.appendChild(refresh);
+  pop.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'git-pop-body';
+  if (!gitState.is_repo) {
+    body.innerHTML = '<div class="git-pop-empty">当前工作区不是 git 仓库</div>';
+  } else if (gitState.changes.length === 0) {
+    body.innerHTML = '<div class="git-pop-empty">没有变更</div>';
+  } else {
+    for (const ch of gitState.changes) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'git-row';
+      row.title = ch.path;
+      const st = document.createElement('span');
+      st.className = 'st ' + ch.status + (ch.staged ? ' staged' : '');
+      st.textContent = ch.status;
+      st.title = ch.staged ? '已暂存' : '未暂存';
+      row.appendChild(st);
+      const p = document.createElement('span');
+      p.className = 'p';
+      p.textContent = ch.path;
+      row.appendChild(p);
+      row.addEventListener('click', () => {
+        closeGitPop();
+        void openGitDiffTab(ch.path);
+      });
+      body.appendChild(row);
+    }
+  }
+  pop.appendChild(body);
+}
+
+async function openGitDiffTab(relPath) {
+  const key = relPath + ' (diff)';
+  let tab = findTab(key);
+  if (!tab) {
+    tab = newDiffTab(key, []);
+    tab.kind = 'gitdiff';
+    tabs.push(tab);
+  }
+  activePath = key;
+  renderTabs();
+  renderView();
+  // 加载 unified diff 并解析为 renderDiff 的 {search, replace} 结构
+  tab.loaded = false;
+  let diffText = '';
+  try {
+    const resp = await api('/plugins/ide/git/diff?session_id=' + encodeURIComponent(SESSION_ID)
+      + '&path=' + encodeURIComponent(relPath));
+    const data = await resp.json();
+    diffText = data.diff || '';
+  } catch (err) {
+    tab.note = '加载 diff 失败：' + err.message;
+    tab.kind = 'binary';
+    tab.loaded = true;
+    if (activePath === key) { renderFileTab(tab); renderStatusbar(); }
+    return;
+  }
+  const parsed = parseUnifiedDiff(diffText);
+  tab.text = parsed.before;
+  tab.afterText = parsed.after;
+  tab.loaded = true;
+  if (activePath === key) { renderFileTab(tab); renderStatusbar(); }
+}
+
+// 解析 unified diff 为整块 before/after 文本，复用 renderDiff 的行级对比。
+// 只处理常规 @@ 块；多文件 diff 只取第一个文件（git diff -- <path> 只会有一个）。
+function parseUnifiedDiff(text) {
+  const before = [];
+  const after = [];
+  let inHunk = false;
+  for (const line of text.split('\n')) {
+    if (line.startsWith('@@')) { inHunk = true; continue; }
+    if (!inHunk) continue;
+    if (line.startsWith('diff --git')) break;
+    if (line.startsWith('---') || line.startsWith('+++')) continue;
+    if (line.startsWith('\\')) continue; // "No newline at end of file"
+    if (line.startsWith('-')) { before.push(line.slice(1)); continue; }
+    if (line.startsWith('+')) { after.push(line.slice(1)); continue; }
+    // 上下文行同时进两侧
+    const body = line.startsWith(' ') ? line.slice(1) : line;
+    before.push(body);
+    after.push(body);
+  }
+  return { before: before.join('\n'), after: after.join('\n') };
+}
+
 async function bootTree() {
   if (!SESSION_ID) {
     if (activePath === TREE_TAB) viewEl.innerHTML = '<div class="status">缺少会话上下文</div>';
@@ -1101,8 +1387,12 @@ async function bootTree() {
     if (data.workspace_path) {
       const p = document.createElement('div');
       p.className = 'tree-path';
-      p.textContent = data.workspace_path;
-      p.title = data.workspace_path;
+      const ws = document.createElement('span');
+      ws.className = 'ws';
+      ws.textContent = data.workspace_path;
+      ws.title = data.workspace_path;
+      p.appendChild(ws);
+      p.appendChild(buildGitButton());
       treeRootEl.appendChild(p);
     }
     const children = (data.tree && data.tree.children) || [];

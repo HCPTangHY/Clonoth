@@ -271,7 +271,84 @@ def register(ctx) -> None:
         target.write_bytes(body)
         return {"path": raw_path, "bytes": len(body)}
 
-    routes.register(api, description="ide 写文件端点（默认鉴权）")
+    # ── git 只读端点 ─────────────────────────────────────────────────
+    # 会话工作区内的 git status 与单文件 unified diff。子进程超时 10s，
+    # 非 git 仓库返回 is_repo=False 而不是错误，面板据此显示提示文案。
+    import asyncio
+
+    async def _git(cwd: Path, *git_args: str) -> tuple[int, str, str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *git_args,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return -1, "", "git 命令超时"
+            return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+        except FileNotFoundError:
+            return -1, "", "git 未安装"
+
+    def _git_base(request: Request) -> Path:
+        st = _state(request)
+        session_id = str(request.query_params.get("session_id") or "").strip()
+        ws_info = st.get_session_workspace(session_id) if session_id else None
+        if ws_info and ws_info.get("path"):
+            return Path(ws_info["path"]).resolve()
+        return st.workspace_root.resolve()
+
+    @api.get("/git/status")
+    async def _git_status(request: Request) -> dict:
+        base = _git_base(request)
+        rc, branch, _ = await _git(base, "rev-parse", "--abbrev-ref", "HEAD")
+        if rc != 0:
+            return {"is_repo": False, "branch": "", "changes": []}
+        rc, out, _ = await _git(base, "status", "--porcelain=v1", "-uall")
+        if rc != 0:
+            return {"is_repo": False, "branch": "", "changes": []}
+        changes: list[dict[str, str]] = []
+        for line in out.splitlines():
+            if len(line) < 4:
+                continue
+            xy = line[:2]
+            raw = line[3:]
+            # 重命名格式 "R  old -> new"，取新路径
+            path = raw.split(" -> ")[-1].strip().strip('"')
+            status = "?" if xy == "??" else ("A" if "A" in xy else ("D" if "D" in xy else ("R" if "R" in xy else "M")))
+            changes.append({"path": path, "status": status, "staged": "true" if xy[0] not in (" ", "?") else ""})
+        return {"is_repo": True, "branch": branch.strip(), "changes": changes}
+
+    @api.get("/git/diff")
+    async def _git_diff(request: Request) -> dict:
+        base = _git_base(request)
+        raw_path = str(request.query_params.get("path") or "").replace("\\", "/").strip()
+        if not raw_path:
+            raise HTTPException(status_code=400, detail="empty path")
+        target = (base / raw_path).resolve() if not raw_path.startswith("/") else Path(raw_path).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path outside session workspace")
+        rel = target.relative_to(base).as_posix()
+        rc, out, err = await _git(base, "diff", "--", rel)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=err.strip() or "git diff 失败")
+        if not out.strip():
+            # 未跟踪文件没有 diff 输出；用 no-index 对比空文件得到全量新增视图
+            rc, out, _ = await _git(base, "diff", "--no-index", "--", "/dev/null", rel)
+            # --no-index 有差异时退出码为 1，不是错误
+            if rc not in (0, 1):
+                out = ""
+        return {"path": rel, "diff": out}
+
+    # register 必须在所有路由定义之后：已 attach 状态下 register 立即
+    # include_router，只拷贝当时已存在的路由；之后定义的路由不会追加。
+    routes.register(api, description="ide 写文件与 git 端点（默认鉴权）")
 
     # ── 面板静态资源 ─────────────────────────────────────────────────
     client = APIRouter()

@@ -14,29 +14,31 @@ function render(ctx) {
   const args = d.arguments || {};
   ctx.el.innerHTML = '';
 
-  // ── 参数：文件列表 ──
+  // ── 参数：文件列表（code 路径 + 在 IDE 打开按钮，与 write/apply_diff 一致）──
   const files = Array.isArray(args.files) && args.files.length
     ? args.files
     : (args.path ? [{ path: args.path, startLine: args.startLine, endLine: args.endLine }] : []);
-  if (files.length) {
-    const wrap = document.createElement('div');
-    wrap.className = 'ide-tc-files';
-    for (const f of files) {
-      if (!f || typeof f !== 'object') continue;
-      const chip = document.createElement('button');
-      chip.type = 'button';
-      chip.className = 'ide-tc-filechip';
-      const range = (f.startLine || f.endLine)
-        ? ':' + (f.startLine || '') + (f.endLine && f.endLine !== f.startLine ? '-' + f.endLine : '')
-        : '';
-      chip.textContent = String(f.path || '?') + range;
-      chip.title = '在 IDE 打开';
-      chip.addEventListener('click', () => {
-        void ctx.api?.call?.('openPanel', 'files', { kind: 'open-file', path: String(f.path || '') });
-      });
-      wrap.appendChild(chip);
-    }
-    ctx.el.appendChild(wrap);
+  for (const f of files) {
+    if (!f || typeof f !== 'object') continue;
+    const path = String(f.path || '');
+    if (!path) continue;
+    const range = (f.startLine || f.endLine)
+      ? ':' + (f.startLine || '') + (f.endLine && f.endLine !== f.startLine ? '-' + f.endLine : '')
+      : '';
+    const head = document.createElement('div');
+    head.className = 'ide-tc-filehead';
+    const label = document.createElement('code');
+    label.textContent = path + range;
+    head.appendChild(label);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ide-tc-openbtn';
+    btn.textContent = '在 IDE 打开';
+    btn.addEventListener('click', () => {
+      void ctx.api?.call?.('openPanel', 'files', { kind: 'open-file', path });
+    });
+    head.appendChild(btn);
+    ctx.el.appendChild(head);
   }
 
   // ── 结果：按 ── path ── 分节 ──

@@ -79,14 +79,19 @@ function render(ctx) {
   for (const g of groups) {
     const gEl = document.createElement('div');
     gEl.className = 'ide-tc-grep-group';
-    const fileBtn = document.createElement('button');
-    fileBtn.type = 'button';
+    const fileBtn = document.createElement('div');
     fileBtn.className = 'ide-tc-grep-file';
-    fileBtn.textContent = g.file;
-    fileBtn.title = '在 IDE 打开';
-    fileBtn.addEventListener('click', () => {
+    const label = document.createElement('code');
+    label.textContent = g.file;
+    fileBtn.appendChild(label);
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'ide-tc-openbtn';
+    openBtn.textContent = '在 IDE 打开';
+    openBtn.addEventListener('click', () => {
       void ctx.api?.call?.('openPanel', 'files', { kind: 'open-file', path: g.file });
     });
+    fileBtn.appendChild(openBtn);
     gEl.appendChild(fileBtn);
     for (const item of g.items) {
       const row = document.createElement('div');

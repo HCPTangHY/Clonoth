@@ -275,19 +275,18 @@
 }
 .ide-tc-grep-group { margin: 4px 0; border: 1px solid var(--duties-border); }
 .ide-tc-grep-file {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   width: 100%;
-  text-align: left;
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-size: 10px;
   padding: 3px 8px;
-  border: 0;
   border-bottom: 1px solid var(--duties-border);
   background: var(--duties-bg);
   color: var(--duties-text);
-  cursor: pointer;
 }
-.ide-tc-grep-file:hover { color: #4078f2; }
+.ide-tc-grep-file code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .ide-tc-grep-row {
   display: flex;
   gap: 8px;
