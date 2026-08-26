@@ -1090,10 +1090,10 @@ function renderNode(node, depth, container) {
 
 async function bootTree() {
   if (!SESSION_ID) {
-    viewEl.innerHTML = '<div class="status">缺少会话上下文</div>';
+    if (activePath === TREE_TAB) viewEl.innerHTML = '<div class="status">缺少会话上下文</div>';
     return;
   }
-  viewEl.innerHTML = '<div class="status">加载中…</div>';
+  if (activePath === TREE_TAB) viewEl.innerHTML = '<div class="status">加载中…</div>';
   try {
     const data = await fetchTree('');
     treeRootEl = document.createElement('div');
@@ -1115,10 +1115,16 @@ async function bootTree() {
       children.forEach((c) => renderNode(c, 0, treeRootEl));
     }
     treeBooted = true;
-    viewEl.innerHTML = '';
-    viewEl.appendChild(treeRootEl);
+    // [AutoC 2026-08-26] 竞态修复：bootTree 与 loadFileTab 并发时，树请求
+    // 后完成会无条件把树塞进 viewEl，覆盖已激活的文件标签视图（首次点击
+    // “在 IDE 打开”只出标签不跳转的根因）。只在当前仍是文件树标签时才渲染，
+    // 否则只缓存树数据，切回文件树时由 renderView 正常挂载。
+    if (activePath === TREE_TAB) {
+      viewEl.innerHTML = '';
+      viewEl.appendChild(treeRootEl);
+    }
   } catch (err) {
-    viewEl.innerHTML = '<div class="status">加载失败：' + esc(err.message) + '</div>';
+    if (activePath === TREE_TAB) viewEl.innerHTML = '<div class="status">加载失败：' + esc(err.message) + '</div>';
   }
 }
 
