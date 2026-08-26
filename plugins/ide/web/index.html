@@ -1080,7 +1080,7 @@ function diffBasePath(p) {
 function codeCommonExtensions(path) {
   const { EditorState, EditorView, lineNumbers, highlightActiveLine, highlightActiveLineGutter,
           drawSelection, bracketMatching, foldGutter, syntaxHighlighting,
-          indentUnit, markdown, markdownLanguage } = CM;
+          highlightSelectionMatches, indentUnit, markdown, markdownLanguage } = CM;
   const base = diffBasePath(path);
   const langExts = isMarkdown(base)
     ? [markdown({ base: markdownLanguage })]
