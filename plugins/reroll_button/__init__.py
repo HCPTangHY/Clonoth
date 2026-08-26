@@ -12,12 +12,13 @@
   （supervisor/task_store.py _event_task_snapshot），带 session_id 字段。
 """
 
+# [AutoC 2026-08-26] 图标换成 Material Symbols fill 版 refresh（与宿主审批按钮、
+# message_retry 重试按钮同一族），viewBox 0 -960 960 960、fill currentColor，
+# 尺寸由 CSS 控制 16px。
 _ICON_SVG = (
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
-    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
-    'aria-hidden="true">'
-    '<path d="M21 12a9 9 0 1 1-2.64-6.36" />'
-    '<path d="M21 3v6h-6" />'
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" '
+    'fill="currentColor" aria-hidden="true">'
+    '<path d="M480-160q-133 0-226.5-93.5T160-480q0-133 93.5-226.5T480-800q85 0 149 34.5T740-671v-99q0-13 8.5-21.5T770-800q13 0 21.5 8.5T800-770v194q0 13-8.5 21.5T770-546H576q-13 0-21.5-8.5T546-576q0-13 8.5-21.5T576-606h138q-38-60-97-97t-137-37q-109 0-184.5 75.5T220-480q0 109 75.5 184.5T480-220q75 0 140-39.5T717-366q5-11 16.5-16.5t22.5-.5q12 5 16 16.5t-1 23.5q-39 84-117.5 133.5T480-160Z"/>'
     '</svg>'
 )
 
@@ -84,12 +85,15 @@ export default {
 """
 
 _STYLES = """
+/* [AutoC 2026-08-26] 尺寸与配色对齐宿主工具栏按钮（审批级别切换钮）的公式：
+   h-8 + 1px border + px-2 + --duties-secondary，悬停色 --duties-text。
+   图标 Material Symbols fill 16px，与宿主 Icon size={16} 一致。 */
 .clonoth-reroll-btn {
   display: inline-flex;
+  height: 32px;
   align-items: center;
   justify-content: center;
-  height: 32px;
-  width: 32px;
+  padding: 0 8px;
   border: 1px solid var(--duties-border);
   background: transparent;
   color: var(--duties-secondary);
@@ -117,7 +121,7 @@ _STYLES = """
 
 PLUGIN_META = {
     "name": "reroll_button",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "输入栏快捷重 roll 按钮（撤回上一条用户消息并重发）",
     "author": "clonoth",
     "web": {
