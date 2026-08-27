@@ -374,35 +374,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return {"ok": True}
 
     # ----- MCP Clients -----
-    @router.get("/mcp-clients")
-    def list_mcp_clients() -> list[dict[str, Any]]:
-        p = workspace_root / "data" / "mcp_clients.yaml"
-        if not p.exists():
-            return []
-        data = _read_yaml(p)
-        clients = data.get("clients")
-        if not isinstance(clients, dict):
-            return []
-        res = []
-        for cid, spec in sorted(clients.items()):
-            if not isinstance(spec, dict):
-                continue
-            item = {"id": str(cid)}
-            item.update(spec)
-            res.append(item)
-        return res
-
-    @router.get("/mcp-clients/raw")
-    def get_mcp_clients_raw() -> dict[str, str]:
-        p = workspace_root / "data" / "mcp_clients.yaml"
-        if not p.exists():
-            return {"content": "version: 1\nclients: {}\n"}
-        return _read_text(p)
-
-    @router.put("/mcp-clients/raw")
-    def update_mcp_clients_raw(payload: RawContent) -> dict[str, Any]:
-        p = workspace_root / "data" / "mcp_clients.yaml"
-        return _write_text(p, payload.content)
+    # [AutoC 2026-08-27] 三个 mcp-clients 端点迁移到 engine/builtin/mcp 插件
+    # （mount="admin/config"，路径与响应形状不变），此处不再持有 MCP 专属代码。
 
     # ----- All tool names (builtin + external) -----
     @router.get("/all-tool-names")

@@ -597,10 +597,11 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         # Token should already be resolved from env or shared file above.
         # Register no longer returns admin_token to avoid API-based token leakage.
 
-        mcp_count = await registry.load_mcp_tools()
         remote_count = await registry.load_remote_tools(supervisor_url)
-        if mcp_count or remote_count:
-            print(f"[engine] loaded {mcp_count} MCP tools, {remote_count} remote tools", flush=True)
+        if remote_count:
+            print(f"[engine] loaded {remote_count} remote tools", flush=True)
+        # [AutoC 2026-08-27] MCP 工具预载移除：发现职责归 engine/builtin/mcp 插件，
+        # 其后台桥在首个 AI 任务启动时做首次发现（首个任务可能赶不上，第二个起可见）。
 
         # Direction 1: graceful shutdown via signal handling
         stop_event = asyncio.Event()
@@ -639,14 +640,15 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                         if new_seq > _last_reload_seq:
                             _last_reload_seq = new_seq
                             count = registry.reload()
-                            # [AutoC 2026-08-01] Reload MCP and remote tools after script reload.
-                            # Why: Supervisor bumps reload-seq when worker tool pools change, and
-                            # registry.reload() resets dynamic entries back to builtin/script tools.
-                            # How: re-run MCP discovery and remote broker discovery in the same hot
-                            # reload branch. Purpose: engine tool tables track live remote workers.
-                            mcp_count = await registry.load_mcp_tools()
+                            # [AutoC 2026-08-01] Reload remote tools after script reload.
+                            # Why: Supervisor bumps reload-seq when worker tool pools change.
+                            # How: re-run remote broker discovery in the same hot reload branch;
+                            # MCP tools live in the reload snapshots (registered via
+                            # register_builtin_tool by the mcp builtin plugin) and survive
+                            # reload without re-discovery. Purpose: engine tool tables track
+                            # live remote workers.
                             remote_count = await registry.load_remote_tools(supervisor_url)
-                            print(f"[engine] tools reloaded ({count} local tools, {mcp_count} MCP tools, {remote_count} remote tools)", flush=True)
+                            print(f"[engine] tools reloaded ({count} local tools, {remote_count} remote tools)", flush=True)
                 except Exception:
                     pass
 

@@ -157,6 +157,8 @@ supervisor 进程（sync fire）：`on_inbound_message`、`on_schedule_tick`、`
 
 内置 handler 统一放在 `engine/builtin/`。AI 节点和 supervisor 启动时通过 `auto_discover_and_register(hook_registry)` 扫描 `PLUGIN_META` 并注册。注册是幂等的，因为 `HookRegistry` 会按 handler 名称替换旧实例。
 
+[AutoC 2026-08-27] 条目可以是单文件（`xxx.py`）或目录包（`xxx/__init__.py`）：一个含 `__init__.py` 的子目录是一个插件，内部模块（如 `mcp/mcp_runtime.py`）保持私有，与外部插件的目录包规则一致。下划线开头或无 `__init__.py` 的目录不参与发现。
+
 | handler 类 | name | hook point | priority | 说明 |
 | --- | --- | --- | ---: | --- |
 | `PreemptChecker` | `preempt_checker` | `before_step`、`terminal_tool` | 100 | 检查取消请求和软打断状态。需要注入新用户消息时，调用 `rebuild_dynamic_context` 重建动态上下文（经 prompt sections）并追加新消息。 |
@@ -171,6 +173,7 @@ supervisor 进程（sync fire）：`on_inbound_message`、`on_schedule_tick`、`
 | `SpillPolicy` | `spill_policy` | `after_tool_call` | 0 | 工具结果截断与 artifact 溢出策略，经 `result_override` 通道改写结果呈现。 |
 | `AsyncScheduler` | `async_scheduler` | `execute_tool` | 100 | 异步工具分派与 execute_command 自适应升级，经 `execution` 通道接管执行。 |
 | `RetryApiPlugin` | `retry_api` | 无（路由） | 100 | `POST /v1/sessions/{id}/retry` 端点（supervisor 进程，routes face，`wants_context`）。 |
+| `McpPlugin` | `mcp` | 无（目录插件） | 50 | MCP 工具桥：engine 进程声明三个配置 CRUD 元工具并后台发现注册 `mcp_*` 工具（写入 reload 快照，mtime 监视配置变更）；supervisor 进程挂 `admin/config` 下三个 mcp-clients 端点。 |
 | `AgentManage` | `agent_manage` | 无 | 100 | 提供 create_agent 工具。 |
 
 无 hook 点的插件（knowledge_inject、retry_api、agent_manage）通过 `wants_context: true` 声明接收 EngineContext，在构造时注册 face 内容。
@@ -409,7 +412,7 @@ if routes is not None:
 - 静态界面资源用 `routes.register(static_router(dir), public=True)`。
 - 路由插件（如 retry_api、plugin_manager）在 PLUGIN_META 声明 `"wants_context": true`，构造时注册路由；engine 进程无 routes face，构造器取不到即跳过。
 
-### 前端贡献（PLUGIN_META.client）
+### 前端贡献（PLUGIN_META.web）
 
 插件可声明前端贡献，web 前端启动时从 `/v1/plugins` 读取 manifest 消费：
 

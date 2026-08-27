@@ -13,7 +13,6 @@ from clonoth_runtime import get_float, load_runtime_config
 from . import builtins as _builtins
 from ._common import kill_process_group as _kill_process_group
 from ._common import safe_subprocess_env as _safe_subprocess_env
-from . import mcp_runtime
 
 
 ToolFunc = Callable[[dict[str, Any], Any], Awaitable[dict[str, Any]]]
@@ -509,44 +508,6 @@ class ToolRegistry:
                 _builtins.search_in_files,
             ),
             (
-                "create_or_update_mcp_client",
-                "Create or update an MCP client config in data/mcp_clients.yaml. Supports stdio, sse, and streamable_http transports.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "description": {"type": "string"},
-                        "enabled": {"type": "boolean"},
-                        "transport": {"type": "string", "enum": ["stdio", "sse", "streamable_http", "streamable-http", "http"]},
-                        "command": {"type": "string"},
-                        "args": {"type": "array", "items": {"type": "string"}},
-                        "env": {"type": "object"},
-                        "url": {"type": "string"},
-                        "headers": {"type": "object"},
-                    },
-                    "required": ["id", "transport"],
-                },
-                _builtins.create_or_update_mcp_client,
-            ),
-            (
-                "list_mcp_clients",
-                "List configured MCP clients.",
-                {"type": "object", "properties": {}, "required": []},
-                _builtins.list_mcp_clients,
-            ),
-            (
-                "delete_mcp_client",
-                "Delete an MCP client config by id.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                    },
-                    "required": ["id"],
-                },
-                _builtins.delete_mcp_client,
-            ),
-            (
                 "create_or_update_tool",
                 "Create/update an external tool under tools/. "
                 "Provide 'script' (Python code body). "
@@ -566,7 +527,7 @@ class ToolRegistry:
             ),
             (
                 "reload_tools",
-                "Reload tools/ directory and MCP tools.",
+                "Reload tools/ directory (MCP tools live in reload snapshots).",
                 {"type": "object", "properties": {}, "required": []},
                 _builtins.reload_tools,
             ),
@@ -793,62 +754,6 @@ class ToolRegistry:
             count += 1
         return count
 
-    async def load_mcp_tools(self) -> int:
-        """Scan enabled MCP clients and register their tools as first-class tools."""
-        count = 0
-        try:
-            clients = mcp_runtime.list_clients(self.workspace_root)
-        except Exception:
-            return 0
-
-        for client in clients:
-            if not isinstance(client, dict):
-                continue
-            cid = str(client.get("id") or "").strip()
-            if not cid or not client.get("enabled", True):
-                continue
-
-            try:
-                result = await mcp_runtime.list_tools(self.workspace_root, cid)
-                # [AutoC 2026-05-31] Why: MCP list_tools may be migrated to the
-                # unified data wrapper while older code returns top-level tools.
-                # How: read data.tools first, then fall back to result.tools.
-                # Purpose: keep dynamic MCP registration working across schemas.
-                result_data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else {}
-                tools = result_data.get("tools") if isinstance(result_data.get("tools"), list) else (result.get("tools") if isinstance(result, dict) else [])
-                if not isinstance(tools, list):
-                    continue
-            except Exception:
-                logging.warning(f"[registry] MCP client '{cid}' tool list unavailable, skipping")
-                continue
-
-            for tool in tools:
-                if not isinstance(tool, dict):
-                    continue
-                raw_name = str(tool.get("name") or "").strip()
-                if not raw_name:
-                    continue
-
-                reg_name = f"mcp_{cid}_{raw_name}"
-                if reg_name in self._tool_specs:
-                    continue
-
-                desc = str(tool.get("description") or "").strip()
-                schema = tool.get("input_schema")
-                if not isinstance(schema, dict):
-                    schema = {"type": "object", "properties": {}, "required": []}
-
-                self._tool_specs[reg_name] = {
-                    "name": reg_name,
-                    "description": f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
-                    "input_schema": schema,
-                }
-                self._tool_funcs[reg_name] = _make_mcp_tool(self.workspace_root, cid, raw_name)
-                count += 1
-
-        return count
-
-
 def _make_remote_tool(registered_name: str, timeout_sec: float, supervisor_url: str) -> ToolFunc:
     async def _call(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         # [AutoC 2026-08-01] Defer remote runtime import until execution. Why: the
@@ -859,39 +764,4 @@ def _make_remote_tool(registered_name: str, timeout_sec: float, supervisor_url: 
         from . import remote_runtime
 
         return await remote_runtime.call_remote_tool(ctx, registered_name, args or {}, timeout_sec, supervisor_url)
-    return _call
-
-
-def _make_mcp_tool(workspace_root: Path, client_id: str, tool_name: str) -> ToolFunc:
-    async def _call(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
-        # [2026-06-10] Why: MCP tool calls previously had no cancel support — the
-        # engine loop only checks cancel between tools, not during a tool's await.
-        # How: run the MCP call in a background task and poll check_cancelled every
-        # 2 seconds. If cancel is detected, cancel the background task and return a
-        # cancelled result. Purpose: users can stop stuck MCP calls without restarting.
-        import asyncio
-        try:
-            mcp_task = asyncio.ensure_future(
-                mcp_runtime.call_tool(workspace_root, client_id, tool_name, args)
-            )
-            while not mcp_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(mcp_task), timeout=2.0)
-                except asyncio.TimeoutError:
-                    pass
-                if mcp_task.done():
-                    break
-                # Check cancel
-                if hasattr(ctx, "check_cancelled") and await ctx.check_cancelled():
-                    mcp_task.cancel()
-                    try:
-                        await mcp_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    return {"ok": False, "error": f"MCP tool '{tool_name}' cancelled by user", "cancelled": True}
-            return mcp_task.result()
-        except asyncio.CancelledError:
-            return {"ok": False, "error": f"MCP tool '{tool_name}' cancelled", "cancelled": True}
-        except Exception as e:
-            return _error_tool_response(str(e), mcp_client=client_id, mcp_tool=tool_name)
     return _call

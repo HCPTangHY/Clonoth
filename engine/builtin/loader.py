@@ -36,6 +36,13 @@ def auto_discover_and_register(
     Two-phase loading: first collect all modules and their PLUGIN_META, then
     instantiate in dependency order. A plugin whose `requires` list references
     a handler_name that failed or is missing will be skipped with a clear error.
+
+    [AutoC 2026-08-27] Directory plugins: an entry under base_dir may be a single
+    .py file or a package directory with __init__.py. Why: a plugin that owns a
+    real library (e.g. the MCP protocol runtime) should not be forced into one
+    file. How: mirror the external loader's package rule — one directory with
+    __init__.py is one plugin; internal modules stay private to the package.
+    Purpose: keep one-plugin-one-entry for both shapes.
     """
     base_dir = Path(directory) if directory is not None else Path(__file__).parent
     handlers: dict[str, Any] = {}
@@ -44,13 +51,19 @@ def auto_discover_and_register(
 
     # Phase 1: import all modules, collect metadata
     # Why: we need the full set of plugin names before resolving dependencies.
-    # How: scan once, store (module, meta, py_file) tuples keyed by handler_name.
+    # How: scan once, store (module, meta, entry) tuples keyed by handler_name.
     # Purpose: enable Phase 2 to check `requires` against the complete set.
-    pending: dict[str, tuple[Any, dict, Path]] = {}  # handler_name -> (module, meta, py_file)
-    for py_file in sorted(base_dir.glob("*.py")):
-        if _should_skip(py_file):
-            continue
-        module_name = f"{package}.{py_file.stem}"
+    pending: dict[str, tuple[Any, dict, Path]] = {}  # handler_name -> (module, meta, entry)
+    for entry in sorted(base_dir.iterdir()):
+        if entry.is_dir():
+            if _should_skip_package(entry):
+                continue
+            entry_name = entry.name
+        else:
+            if _should_skip(entry):
+                continue
+            entry_name = entry.stem
+        module_name = f"{package}.{entry_name}"
         try:
             module = importlib.import_module(module_name)
             meta = getattr(module, "PLUGIN_META", None)
@@ -62,8 +75,8 @@ def auto_discover_and_register(
                 continue
             cls = getattr(module, class_name, None)
             preview_name = str(getattr(cls, "name", "") or "") if cls else ""
-            handler_name = preview_name or py_file.stem
-            pending[handler_name] = (module, meta, py_file)
+            handler_name = preview_name or entry_name
+            pending[handler_name] = (module, meta, entry)
         except Exception as exc:
             logger.error("Failed to import built-in hook %s: %s", module_name, exc, exc_info=True)
 
@@ -136,6 +149,22 @@ def _resolve_load_order(pending: dict[str, tuple]) -> list[str]:
     for name in pending:
         _visit(name)
     return order
+
+
+def _should_skip_package(path: Path) -> bool:
+    """Return whether a directory entry should be ignored by built-in discovery."""
+    # Why: built-in plugins may now split into directory packages (e.g. mcp/
+    # carrying its protocol runtime next to __init__.py). How: mirror the
+    # external loader's package rule — skip private/hidden names and entries
+    # without __init__.py. Purpose: one built-in plugin may own internal
+    # modules without flattening them into a single file.
+    if not path.is_dir():
+        return True
+    if path.name.startswith(("_", ".")):
+        return True
+    if path.name in _SKIP_MODULES:
+        return True
+    return not (path / "__init__.py").is_file()
 
 
 def _should_skip(py_file: Path) -> bool:

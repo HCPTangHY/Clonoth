@@ -31,9 +31,6 @@ RESERVED_TOOL_NAMES = {
     "create_or_update_skill",
     "list_skills",
     "delete_skill",
-    "create_or_update_mcp_client",
-    "list_mcp_clients",
-    "delete_mcp_client",
     "create_or_update_tool",
     "reload_tools",
     "request_restart",
@@ -62,7 +59,6 @@ from .search_in_files import search_in_files  # noqa: E402,F401
 # Why: skill CRUD tools moved into engine.builtin.knowledge_inject. How: keep the
 # names reserved above but stop importing the removed skill-tool module.
 # Purpose: registry startup no longer depends on deleted knowledge files.
-from .mcp_clients import create_or_update_mcp_client, list_mcp_clients, delete_mcp_client  # noqa: E402,F401
 from .tool_manage import create_or_update_tool, reload_tools  # noqa: E402,F401
 from .system import request_restart  # noqa: E402,F401
 from .schedules import create_schedule, list_schedules, delete_schedule  # noqa: E402,F401
