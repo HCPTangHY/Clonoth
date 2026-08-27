@@ -172,7 +172,7 @@ body {
   max-height: 320px;
   display: flex;
   flex-direction: column;
-  background: var(--panel);
+  background: var(--bg);
   border: 1px solid var(--border);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
 }
@@ -631,7 +631,7 @@ body {
   z-index: 90;
   min-width: 148px;
   padding: 4px 0;
-  background: var(--panel);
+  background: var(--bg);
   border: 1px solid var(--border);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
   font-family: var(--mono);
