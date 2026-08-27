@@ -337,18 +337,6 @@ export interface AdminSkill {
   error?: string;
 }
 
-export interface McpClient {
-  id: string;
-  description?: string;
-  enabled?: boolean;
-  transport?: string;
-  command?: string;
-  args?: string[];
-  env?: Record<string, unknown>;
-  url?: string;
-  headers?: Record<string, unknown>;
-  [key: string]: unknown;
-}
 
 export interface AdminCreatePayload {
   id: string;
@@ -662,19 +650,6 @@ export async function deleteSkill(token: string, name: string): Promise<any> {
     headers: authHeaders(token),
   });
   return resp.json();
-}
-
-export async function getMcpClients(token: string): Promise<McpClient[]> {
-  const resp = await apiFetch('/admin/config/mcp-clients', { headers: authHeaders(token) });
-  return resp.json();
-}
-
-export function getMcpClientsRaw(token: string): Promise<string> {
-  return readRawConfig('/admin/config/mcp-clients/raw', token);
-}
-
-export function updateMcpClientsRaw(token: string, yaml: string): Promise<any> {
-  return writeRawConfig('/admin/config/mcp-clients/raw', token, yaml);
 }
 
 export async function restartEngine(token: string): Promise<any> {
@@ -1295,6 +1270,8 @@ export interface PluginPanelDecl {
   /** [AutoC 2026-08-24] Take over a built-in overlay (e.g. 'files') instead of
    * appearing as a standalone header entry. */
   replaces?: string;
+  /** [AutoC 2026-08-27] Settings-tab icon (Material Symbol name); falls back to 'extension'. */
+  icon?: string;
   /** [AutoC 2026-08-27] Registry priority for the target overlayId. Higher wins
    * against other contributions (host built-ins sit at 0). Default 50. */
   priority?: number;

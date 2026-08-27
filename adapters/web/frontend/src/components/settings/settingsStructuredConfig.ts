@@ -30,17 +30,6 @@ export interface ScheduleFormState {
   silent: boolean;
 }
 
-export interface McpClientFormState {
-  id: string;
-  description: string;
-  enabled: boolean;
-  transport: 'stdio' | 'sse' | 'streamable_http';
-  command: string;
-  argsText: string;
-  envText: string;
-  url: string;
-  headersText: string;
-}
 
 export interface SkillFormState {
   name: string;
@@ -316,52 +305,6 @@ export function serializeSchedules(schedules: ScheduleFormState[]): string {
   });
   if (items.length === 0) return 'schedules: []\n';
   return yaml.dump({ schedules: items }, DUMP_OPTS);
-}
-
-// ==================== MCP Clients ====================
-
-export function parseMcpClients(raw: string): McpClientFormState[] {
-  const doc = safeLoad(raw);
-  const clients = doc.clients;
-  if (!clients || typeof clients !== 'object' || Array.isArray(clients)) return [];
-  return Object.entries(clients)
-    .filter(([, v]) => v && typeof v === 'object' && !Array.isArray(v))
-    .map(([id, v]) => {
-      const c = v as Record<string, any>;
-      return {
-        id,
-        description: str(c.description),
-        enabled: c.enabled !== false,
-        transport: (c.transport === 'sse' ? 'sse' : c.transport === 'stdio' ? 'stdio' : 'streamable_http') as 'stdio' | 'sse' | 'streamable_http',
-        command: str(c.command),
-        argsText: Array.isArray(c.args) ? c.args.map(String).join('\n') : '',
-        envText: serializeLooseKV(c.env),
-        url: str(c.url),
-        headersText: serializeLooseKV(c.headers),
-      };
-    });
-}
-
-export function serializeMcpClients(clients: McpClientFormState[]): string {
-  if (clients.length === 0) return 'version: 1\nclients: {}\n';
-  const obj: Record<string, any> = {};
-  for (const c of clients) {
-    const entry: Record<string, any> = {
-      transport: c.transport,
-      enabled: c.enabled,
-      description: c.description,
-    };
-    if (c.transport === 'stdio') {
-      entry.command = c.command;
-      entry.args = c.argsText.split('\n').map((s) => s.trim()).filter(Boolean);
-      entry.env = parseLooseKV(c.envText);
-    } else {
-      entry.url = c.url;
-      entry.headers = parseLooseKV(c.headersText);
-    }
-    obj[c.id] = entry;
-  }
-  return yaml.dump({ version: 1, clients: obj }, DUMP_OPTS);
 }
 
 // ==================== Skills ====================

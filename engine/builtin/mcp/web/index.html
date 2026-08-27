@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP Clients</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+  /* 主题值全部由宿主注入（themeBridge 在 iframe load 后把宿主 :root 规则原样
+     写入本页）。本页只声明别名与宿主变量名的映射，不持有任何宿主值。 */
+  :root {
+    --bg: var(--duties-bg); --panel: var(--duties-panel); --muted: var(--duties-muted);
+    --text: var(--duties-text); --secondary: var(--duties-secondary); --tertiary: var(--duties-tertiary);
+    --border: var(--duties-border); --accent: var(--duties-accent);
+    --ok: #2e7d32; --danger: #a33c3c;
+    --mono: 'Geist Mono', ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 12px/1.6 'Inter', ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+
+  .bar {
+    position: sticky; top: 0; z-index: 5; background: var(--bg);
+    padding: 14px 20px 10px; border-bottom: 1px solid var(--muted);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  .bar h1 { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: -0.02em; }
+  .bar .count { flex: 1; color: var(--tertiary); font: 10.5px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button.op {
+    font: 10.5px var(--mono); cursor: pointer; white-space: nowrap;
+    color: var(--secondary); background: transparent;
+    border: 1px solid var(--border); border-radius: 4px; padding: 3px 10px;
+    transition: color .15s, border-color .15s;
+  }
+  button.op:hover:not(:disabled) { color: var(--text); border-color: var(--secondary); }
+  button.op:disabled { opacity: .4; cursor: not-allowed; }
+  button.op.danger { color: var(--danger); }
+  button.op.danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
+  button.op.primary { color: var(--accent); border-color: var(--accent); }
+
+  .cols { display: flex; gap: 0; min-height: calc(100vh - 44px); }
+  .list-pane { flex: 0 0 300px; border-right: 1px solid var(--muted); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .new-row { display: flex; gap: 6px; }
+  .new-row input {
+    flex: 1; min-width: 0; font: 11px var(--mono); color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; outline: none;
+  }
+  .new-row input:focus { border-color: var(--secondary); }
+  .new-row input::placeholder { color: var(--tertiary); }
+  .client-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .client {
+    text-align: left; cursor: pointer; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px;
+    transition: border-color .15s;
+  }
+  .client:hover { border-color: var(--secondary); }
+  .client.sel { border-color: var(--text); background: var(--panel); }
+  .client .row1 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .client .id { font: 600 11px var(--mono); }
+  .badge { font: 9px var(--mono); border-radius: 3px; padding: 1px 5px; border: 1px solid; }
+  .badge.on { color: var(--ok); border-color: var(--ok); }
+  .badge.off { color: var(--danger); border-color: var(--danger); }
+  .badge.tr { color: var(--tertiary); border-color: var(--border); }
+  .client .prev { margin-top: 2px; font: 10px var(--mono); color: var(--tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .empty { color: var(--tertiary); font-size: 11px; padding: 8px 2px; }
+
+  .editor-pane { flex: 1; min-width: 0; padding: 16px 20px; overflow-y: auto; }
+  .editor-pane .placeholder { color: var(--tertiary); font-size: 11px; }
+  .form { display: flex; flex-direction: column; gap: 12px; max-width: 560px; }
+  .form .kv { display: flex; align-items: center; gap: 8px; }
+  .form .fid { font: 600 12px var(--mono); }
+  label.f { display: block; }
+  label.f .lb { display: block; margin-bottom: 3px; color: var(--tertiary); font: 10px var(--mono); }
+  label.f input[type=text], label.f select, textarea.f {
+    width: 100%; font: 11px var(--mono); color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 8px; outline: none;
+  }
+  label.f input:focus, label.f select:focus, textarea.f:focus { border-color: var(--secondary); }
+  textarea.f { resize: vertical; min-height: 54px; line-height: 1.5; }
+  .check { display: flex; align-items: center; gap: 6px; color: var(--secondary); font-size: 11px; cursor: pointer; }
+  .form-actions { display: flex; gap: 8px; align-items: center; border-top: 1px solid var(--muted); padding-top: 12px; }
+  .msg { font: 10.5px var(--mono); }
+  .msg.ok { color: var(--ok); }
+  .msg.err { color: var(--danger); }
+
+  @media (max-width: 720px) {
+    .cols { flex-direction: column; }
+    .list-pane { flex: none; border-right: none; border-bottom: 1px solid var(--muted); max-height: 40vh; }
+    .editor-pane { padding: 14px 16px; }
+    button.op, .new-row input { min-height: 32px; }
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <h1>MCP Clients</h1>
+  <span class="count" id="count">—</span>
+  <button class="op" id="refresh">刷新</button>
+</header>
+<main class="cols">
+  <section class="list-pane">
+    <div class="new-row">
+      <input id="new-id" placeholder="新 Client ID">
+      <button class="op" id="new-btn" title="创建一个新的 MCP Client（默认 streamable_http）">创建</button>
+    </div>
+    <div class="client-list" id="list"><p class="empty">加载中。</p></div>
+  </section>
+  <section class="editor-pane" id="editor"><p class="placeholder">选择左侧的 MCP Client 后在此编辑连接配置。</p></section>
+</main>
+<script src="vendor/js-yaml.min.js"></script>
+<script>
+'use strict';
+
+// ── boot / api ─────────────────────────────────────────────
+function boot() {
+  try {
+    const b = window.parent.__CLONOTH_BOOT__;
+    if (b && b.token) return b;
+  } catch (e) { /* cross-origin */ }
+  return { token: '' };
+}
+async function api(path, init) {
+  const b = boot();
+  const resp = await fetch('/v1' + path, Object.assign({}, init, {
+    headers: Object.assign({
+      'Content-Type': 'application/json',
+      ...(b.token ? { Authorization: 'Bearer ' + b.token } : {}),
+    }, (init && init.headers) || {}),
+  }));
+  if (!resp.ok) {
+    let detail = '';
+    try { detail = (await resp.json()).detail || ''; } catch (e) { /* ignore */ }
+    throw new Error(resp.status + (detail ? ' ' + detail : ''));
+  }
+  return resp.json();
+}
+
+// ── state ──────────────────────────────────────────────────
+const S = {
+  clients: [],      // parsed list from GET /admin/config/mcp-clients
+  rawDoc: null,     // jsyaml-parsed document of the raw config (save round-trip)
+  selectedId: null,
+  form: null,       // editing form state
+  dirty: false,
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '');
+
+function normTransport(v) {
+  if (v === 'stdio' || v === 'sse') return v;
+  return 'streamable_http';
+}
+function kvToText(obj) {
+  // env/headers 对象 → 每行一条 "KEY: VALUE"
+  const out = [];
+  if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+    for (const [k, v] of Object.entries(obj)) out.push(`${k}: ${esc(v)}`);
+  }
+  return out.join('\n');
+}
+function textToKv(text) {
+  const out = {};
+  for (const line of String(text || '').split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const idx = t.indexOf(':');
+    if (idx <= 0) continue;
+    out[t.slice(0, idx).trim()] = t.slice(idx + 1).trim();
+  }
+  return out;
+}
+function listToText(arr) {
+  return Array.isArray(arr) ? arr.map(String).join('\n') : '';
+}
+function textToList(text) {
+  return String(text || '').split('\n').map((s) => s.trim()).filter(Boolean);
+}
+
+function clientToForm(c) {
+  return {
+    id: esc(c.id),
+    description: esc(c.description),
+    enabled: c.enabled !== false,
+    transport: normTransport(c.transport),
+    command: esc(c.command),
+    argsText: listToText(c.args),
+    envText: kvToText(c.env),
+    url: esc(c.url),
+    headersText: kvToText(c.headers),
+  };
+}
+function formToEntry(f) {
+  const entry = {
+    transport: f.transport,
+    enabled: !!f.enabled,
+    description: f.description,
+  };
+  if (f.transport === 'stdio') {
+    entry.command = f.command;
+    entry.args = textToList(f.argsText);
+    entry.env = textToKv(f.envText);
+  } else {
+    entry.url = f.url;
+    entry.headers = textToKv(f.headersText);
+  }
+  return entry;
+}
+
+// ── data ───────────────────────────────────────────────────
+async function loadAll() {
+  const [clients, raw] = await Promise.all([
+    api('/admin/config/mcp-clients'),
+    api('/admin/config/mcp-clients/raw'),
+  ]);
+  S.clients = Array.isArray(clients) ? clients : [];
+  try {
+    S.rawDoc = jsyaml.load(raw.content) || {};
+  } catch (e) {
+    S.rawDoc = {};
+  }
+  if (!S.rawDoc.clients || typeof S.rawDoc.clients !== 'object') S.rawDoc.clients = {};
+  if (S.selectedId && !S.clients.some((c) => c.id === S.selectedId)) {
+    S.selectedId = null; S.form = null;
+  }
+  renderList();
+  renderEditor();
+}
+
+async function saveRaw(doc) {
+  const content = jsyaml.dump({ version: 1, clients: doc.clients }, { indent: 2, lineWidth: -1, noRefs: true, sortKeys: false });
+  await api('/admin/config/mcp-clients/raw', { method: 'PUT', body: JSON.stringify({ content }) });
+}
+
+// ── list pane ──────────────────────────────────────────────
+function renderList() {
+  const el = $('list');
+  el.innerHTML = '';
+  $('count').textContent = S.clients.length + ' 个 Client';
+  if (S.clients.length === 0) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '暂无 MCP Client。在上方输入 ID 创建。';
+    el.appendChild(p);
+    return;
+  }
+  for (const c of S.clients) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'client' + (c.id === S.selectedId ? ' sel' : '');
+    const row1 = document.createElement('div');
+    row1.className = 'row1';
+    const idSpan = document.createElement('span');
+    idSpan.className = 'id';
+    idSpan.textContent = c.id;
+    const onBadge = document.createElement('span');
+    onBadge.className = 'badge ' + (c.enabled === false ? 'off' : 'on');
+    onBadge.textContent = c.enabled === false ? '禁用' : '启用';
+    const trBadge = document.createElement('span');
+    trBadge.className = 'badge tr';
+    trBadge.textContent = normTransport(c.transport);
+    row1.append(idSpan, onBadge, trBadge);
+    const prev = document.createElement('div');
+    prev.className = 'prev';
+    prev.textContent = c.transport === 'stdio' ? (c.command || '未设置命令') : (c.url || '未设置 URL');
+    btn.append(row1, prev);
+    btn.addEventListener('click', () => { select(c.id); });
+    el.appendChild(btn);
+  }
+}
+
+function select(id) {
+  if (S.dirty && !confirm('当前编辑未保存，切换将丢弃修改。继续？')) return;
+  S.selectedId = id;
+  const c = S.clients.find((x) => x.id === id);
+  S.form = c ? clientToForm(c) : null;
+  S.dirty = false;
+  renderList();
+  renderEditor();
+}
+
+// ── editor pane ────────────────────────────────────────────
+function field(labelText, inputEl) {
+  const label = document.createElement('label');
+  label.className = 'f';
+  const lb = document.createElement('span');
+  lb.className = 'lb';
+  lb.textContent = labelText;
+  label.append(lb, inputEl);
+  return label;
+}
+function textInput(value, onInput) {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = value;
+  input.addEventListener('input', () => onInput(input.value));
+  return input;
+}
+function textArea(value, rows, onInput) {
+  const ta = document.createElement('textarea');
+  ta.className = 'f';
+  ta.rows = rows;
+  ta.value = value;
+  ta.addEventListener('input', () => onInput(ta.value));
+  return ta;
+}
+
+function renderEditor() {
+  const el = $('editor');
+  el.innerHTML = '';
+  if (!S.form) {
+    const p = document.createElement('p');
+    p.className = 'placeholder';
+    p.textContent = '选择左侧的 MCP Client 后在此编辑连接配置。';
+    el.appendChild(p);
+    return;
+  }
+  const f = S.form;
+  const form = document.createElement('div');
+  form.className = 'form';
+
+  const idRow = document.createElement('div');
+  idRow.className = 'kv';
+  const idLabel = document.createElement('span');
+  idLabel.className = 'lb';
+  idLabel.textContent = 'ID';
+  const idVal = document.createElement('span');
+  idVal.className = 'fid';
+  idVal.textContent = f.id;
+  idRow.append(idLabel, idVal);
+  form.appendChild(idRow);
+
+  form.appendChild(field('description', textInput(f.description, (v) => { f.description = v; markDirty(); })));
+
+  const checkLabel = document.createElement('label');
+  checkLabel.className = 'check';
+  const check = document.createElement('input');
+  check.type = 'checkbox';
+  check.checked = f.enabled;
+  check.addEventListener('change', () => { f.enabled = check.checked; markDirty(); });
+  const checkText = document.createElement('span');
+  checkText.textContent = 'enabled';
+  checkLabel.append(check, checkText);
+  form.appendChild(checkLabel);
+
+  const transportSel = document.createElement('select');
+  for (const t of ['stdio', 'sse', 'streamable_http']) {
+    const opt = document.createElement('option');
+    opt.value = t;
+    opt.textContent = t;
+    if (t === f.transport) opt.selected = true;
+  }
+  transportSel.addEventListener('change', () => { f.transport = transportSel.value; markDirty(); renderEditor(); });
+  form.appendChild(field('transport', transportSel));
+
+  if (f.transport === 'stdio') {
+    form.appendChild(field('command', textInput(f.command, (v) => { f.command = v; markDirty(); })));
+    form.appendChild(field('args（每行一个）', textArea(f.argsText, 3, (v) => { f.argsText = v; markDirty(); })));
+    form.appendChild(field('env（每行一条 KEY: VALUE）', textArea(f.envText, 3, (v) => { f.envText = v; markDirty(); })));
+  } else {
+    form.appendChild(field('url', textInput(f.url, (v) => { f.url = v; markDirty(); })));
+    form.appendChild(field('headers（每行一条 KEY: VALUE）', textArea(f.headersText, 3, (v) => { f.headersText = v; markDirty(); })));
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'form-actions';
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'op primary';
+  saveBtn.textContent = '保存';
+  saveBtn.addEventListener('click', save);
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'op danger';
+  delBtn.textContent = '删除此 Client';
+  delBtn.addEventListener('click', removeSelected);
+  const msg = document.createElement('span');
+  msg.className = 'msg';
+  msg.id = 'editor-msg';
+  actions.append(saveBtn, delBtn, msg);
+  form.appendChild(actions);
+
+  el.appendChild(form);
+}
+
+function markDirty() {
+  S.dirty = true;
+  const msg = $('editor-msg');
+  if (msg) { msg.className = 'msg'; msg.textContent = '未保存'; }
+}
+function setMsg(text, ok) {
+  const msg = $('editor-msg');
+  if (!msg) return;
+  msg.className = 'msg ' + (ok ? 'ok' : 'err');
+  msg.textContent = text;
+}
+
+async function save() {
+  if (!S.form) return;
+  try {
+    // 只替换被编辑的条目，其余条目（含未知字段）原样保留。
+    S.rawDoc.clients[S.form.id] = formToEntry(S.form);
+    await saveRaw(S.rawDoc);
+    S.dirty = false;
+    setMsg('已保存。工具变更约 10 秒内生效（引擎按配置文件变更自动重发现）。', true);
+    await loadAll();
+  } catch (e) {
+    setMsg('保存失败：' + e.message, false);
+  }
+}
+
+async function removeSelected() {
+  if (!S.form || !S.selectedId) return;
+  if (!confirm(`确定要删除 MCP Client ${S.selectedId} 吗？`)) return;
+  try {
+    delete S.rawDoc.clients[S.selectedId];
+    await saveRaw(S.rawDoc);
+    S.selectedId = null;
+    S.form = null;
+    S.dirty = false;
+    await loadAll();
+  } catch (e) {
+    setMsg('删除失败：' + e.message, false);
+  }
+}
+
+async function createClient() {
+  const input = $('new-id');
+  const id = input.value.trim();
+  if (!id) { alert('请输入 Client ID'); return; }
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id)) { alert('Client ID 需匹配 ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$'); return; }
+  if (S.clients.some((c) => c.id === id)) { alert('该 Client 已存在'); return; }
+  try {
+    S.rawDoc.clients[id] = {
+      transport: 'streamable_http',
+      enabled: true,
+      description: '通过设置页面创建的 MCP Client。',
+      url: '',
+      headers: {},
+    };
+    await saveRaw(S.rawDoc);
+    input.value = '';
+    await loadAll();
+    select(id);
+  } catch (e) {
+    alert('创建失败：' + e.message);
+  }
+}
+
+// ── wire up ────────────────────────────────────────────────
+$('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
+$('new-btn').addEventListener('click', createClient);
+$('new-id').addEventListener('keydown', (e) => { if (e.key === 'Enter') createClient(); });
+
+loadAll().catch((e) => {
+  $('list').innerHTML = '';
+  const p = document.createElement('p');
+  p.className = 'empty';
+  p.textContent = '加载失败：' + e.message;
+  $('list').appendChild(p);
+});
+</script>
+</body>
+</html>

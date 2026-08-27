@@ -173,7 +173,7 @@ supervisor 进程（sync fire）：`on_inbound_message`、`on_schedule_tick`、`
 | `SpillPolicy` | `spill_policy` | `after_tool_call` | 0 | 工具结果截断与 artifact 溢出策略，经 `result_override` 通道改写结果呈现。 |
 | `AsyncScheduler` | `async_scheduler` | `execute_tool` | 100 | 异步工具分派与 execute_command 自适应升级，经 `execution` 通道接管执行。 |
 | `RetryApiPlugin` | `retry_api` | 无（路由） | 100 | `POST /v1/sessions/{id}/retry` 端点（supervisor 进程，routes face，`wants_context`）。 |
-| `McpPlugin` | `mcp` | 无（目录插件） | 50 | MCP 工具桥：engine 进程声明三个配置 CRUD 元工具并后台发现注册 `mcp_*` 工具（写入 reload 快照，mtime 监视配置变更）；supervisor 进程挂 `admin/config` 下三个 mcp-clients 端点。 |
+| `McpPlugin` | `mcp` | 无（目录插件） | 50 | MCP 工具桥：engine 进程声明三个配置 CRUD 元工具并后台发现注册 `mcp_*` 工具（写入 reload 快照，mtime 监视配置变更）；supervisor 进程挂 `admin/config` 下三个 mcp-clients 端点与设置面板静态资源（`web` 声明 settings 槽位 tab，icon 可声明）。 |
 | `AgentManage` | `agent_manage` | 无 | 100 | 提供 create_agent 工具。 |
 
 无 hook 点的插件（knowledge_inject、retry_api、agent_manage）通过 `wants_context: true` 声明接收 EngineContext，在构造时注册 face 内容。

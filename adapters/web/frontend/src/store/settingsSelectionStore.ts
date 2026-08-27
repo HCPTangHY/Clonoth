@@ -5,7 +5,7 @@
 // pages can update contextual right-panel data without changing the settings host.
 import { create } from 'zustand';
 
-import type { AdminApproval, AdminNode, AdminSkill, AdminTool, McpClient } from '../api/supervisorClient';
+import type { AdminApproval, AdminNode, AdminSkill, AdminTool } from '../api/supervisorClient';
 
 export interface SettingsSelectionState {
   systemLogs: string[];
@@ -14,7 +14,6 @@ export interface SettingsSelectionState {
   selectedTool: AdminTool | null;
   allToolNames: string[];
   selectedSkill: AdminSkill | null;
-  selectedMcpClient: McpClient | null;
   selectedScheduleId: string | null;
   advancedFile: 'runtime' | 'policy';
   addSystemLog: (message: string) => void;
@@ -23,7 +22,6 @@ export interface SettingsSelectionState {
   setSelectedTool: (tool: AdminTool | null) => void;
   setAllToolNames: (names: string[]) => void;
   setSelectedSkill: (skill: AdminSkill | null) => void;
-  setSelectedMcpClient: (client: McpClient | null) => void;
   setSelectedScheduleId: (scheduleId: string | null) => void;
   setAdvancedFile: (file: 'runtime' | 'policy') => void;
 }
@@ -35,7 +33,6 @@ export const useSettingsSelectionStore = create<SettingsSelectionState>((set) =>
   selectedTool: null,
   allToolNames: [],
   selectedSkill: null,
-  selectedMcpClient: null,
   // [2026-06-02] Store the selected automation task id for the right-panel form.
   // Why: the Automation page and SettingsRightPanel are mounted as separate siblings.
   // How: keep only the id, while the panel reloads raw schedules before editing.
@@ -55,7 +52,6 @@ export const useSettingsSelectionStore = create<SettingsSelectionState>((set) =>
   setSelectedTool: (tool) => set({ selectedTool: tool }),
   setAllToolNames: (names) => set({ allToolNames: names }),
   setSelectedSkill: (skill) => set({ selectedSkill: skill }),
-  setSelectedMcpClient: (client) => set({ selectedMcpClient: client }),
   setSelectedScheduleId: (scheduleId) => set({ selectedScheduleId: scheduleId }),
   setAdvancedFile: (file) => set({ advancedFile: file }),
 }));

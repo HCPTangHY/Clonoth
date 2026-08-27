@@ -11,13 +11,13 @@ import { useEffect, useState, type ReactNode } from 'react';
 // through full raw YAML reloads. How: import only the existing raw read/write wrappers
 // alongside the earlier node, skill, and tool helpers. Purpose: the panel can update
 // one selected item without introducing new API contracts or touching other panels.
-import { getMcpClientsRaw, getNodeRaw, getSchedulesRaw, getSkillRaw, getToolRaw, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw } from '../../../api/supervisorClient';
+import { getNodeRaw, getSchedulesRaw, getSkillRaw, getToolRaw, reloadTools, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw } from '../../../api/supervisorClient';
 // [2026-06-02] Use shared lightweight structured YAML helpers in the two requested panels.
 // Why: MCP clients and automation schedules already have parse and serialize helpers
 // that preserve the expected config shape. How: import the form state types and
 // parser/serializer functions from settingsStructuredConfig. Purpose: the new forms
 // can edit structured fields while writing valid raw YAML back to Supervisor.
-import { parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules, type McpClientFormState, type NodeConfigFormState, type NodeConfigType, type ScheduleFormState, type ToolAccessMode } from '../settingsStructuredConfig';
+import { parseNodeConfig, parseSchedules, serializeNodeConfig, serializeSchedules, type NodeConfigFormState, type NodeConfigType, type ScheduleFormState, type ToolAccessMode } from '../settingsStructuredConfig';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
@@ -643,186 +643,6 @@ export const SkillsSettingsRightPanel = () => {
 const fieldClass = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs';
 const labelClass = 'block mb-1 text-[var(--duties-tertiary)] text-[0.65rem]';
 const buttonClass = 'border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50';
-
-function displayMcpArgs(argsText: string): string {
-  // [2026-06-02] Convert parsed newline-separated MCP args into the requested comma field.
-  // Why: serializeMcpClients stores argsText as newline-delimited text, but this right
-  // panel must present a single comma-separated input. How: split existing lines,
-  // trim empty entries, and join them with comma-space for editing. Purpose: selected
-  // stdio clients reset into the format requested by the user without changing the
-  // shared serializer contract.
-  return argsText.split('\n').map((item) => item.trim()).filter(Boolean).join(', ');
-}
-
-function serializeMcpArgsForYaml(argsText: string): string {
-  // [2026-06-02] Convert the comma-separated MCP args input back for serialization.
-  // Why: the shared MCP serializer expects newline-delimited argsText and then writes
-  // a YAML list. How: split the input on commas, trim whitespace, remove empty items,
-  // and rejoin with newlines. Purpose: the UI follows the requested comma input while
-  // saved YAML still contains an args array.
-  return argsText.split(',').map((item) => item.trim()).filter(Boolean).join('\n');
-}
-
-function displayEnvText(envText: string): string {
-  // [2026-06-02] Convert parsed MCP env rows from object style to KEY=VALUE rows.
-  // Why: parseMcpClients returns loose objects as `key: value`, while this panel must
-  // show stdio env as one KEY=VALUE pair per line. How: replace only the first colon
-  // separator on each non-empty row. Purpose: users can edit environment variables in
-  // the requested shell-like format without changing the shared parser.
-  return envText.split('\n').map((line) => {
-    const index = line.indexOf(':');
-    if (index < 0) return line;
-    return `${line.slice(0, index).trim()}=${line.slice(index + 1).trim()}`;
-  }).join('\n');
-}
-
-function serializeEnvTextForYaml(envText: string): string {
-  // [2026-06-02] Convert KEY=VALUE MCP env rows back to loose object rows.
-  // Why: serializeMcpClients parses envText with colon separators. How: replace the
-  // first equals sign in each non-empty row with `: ` and leave already-colon rows
-  // unchanged for operator tolerance. Purpose: environment variables save as a YAML
-  // mapping while the visible form remains KEY=VALUE based.
-  return envText.split('\n').map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed) return '';
-    if (trimmed.includes(':') && !trimmed.includes('=')) return trimmed;
-    const index = trimmed.indexOf('=');
-    if (index < 0) return trimmed;
-    return `${trimmed.slice(0, index).trim()}: ${trimmed.slice(index + 1).trim()}`;
-  }).join('\n');
-}
-
-export const McpSettingsRightPanel = () => {
-  const adminToken = useSettingsStore(state => state.adminToken);
-  const client = useSettingsSelectionStore(state => state.selectedMcpClient);
-  const [form, setForm] = useState<McpClientFormState | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState('');
-
-  useEffect(() => {
-    let cancelled = false;
-    setForm(null);
-    setMessage('');
-    if (!client) return () => { cancelled = true; };
-    if (!adminToken) {
-      setMessage('缺少管理员令牌，无法加载 MCP Client。');
-      return () => { cancelled = true; };
-    }
-    setLoading(true);
-    // [2026-06-02] Reload raw MCP YAML whenever the selected client changes.
-    // Why: the form must edit the latest persisted YAML rather than only the list
-    // snapshot stored in selection state. How: fetch all raw clients, parse them, and
-    // copy the matching id into local component state with display-format conversions.
-    // Purpose: switching selections resets the editor and avoids saving stale fields.
-    getMcpClientsRaw(adminToken)
-      .then((raw) => {
-        if (cancelled) return;
-        const selected = parseMcpClients(raw).find((item) => item.id === client.id) || null;
-        if (!selected) {
-          setMessage('未在 MCP YAML 中找到此 Client。');
-          setForm(null);
-          return;
-        }
-        setForm({ ...selected, argsText: displayMcpArgs(selected.argsText), envText: displayEnvText(selected.envText) });
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        setMessage(error instanceof Error ? error.message : '加载 MCP Client 失败');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [adminToken, client?.id]);
-
-  const save = async () => {
-    if (!adminToken || !client || !form) return;
-    setSaving(true);
-    setMessage('保存中。');
-    try {
-      // [2026-06-02] Save one MCP client by replacing it inside the parsed raw list.
-      // Why: the backend stores one YAML file, so saving a single form must preserve
-      // the other clients. How: reload raw YAML, parse all forms, replace the selected
-      // id with the local form converted back to serializer format, serialize, save,
-      // and emit the settings:mcp-updated event. Purpose: the main MCP list can refresh
-      // after a successful edit without an engine restart.
-      const raw = await getMcpClientsRaw(adminToken);
-      const forms = parseMcpClients(raw);
-      const index = forms.findIndex((item) => item.id === client.id);
-      if (index < 0) throw new Error('未在 MCP YAML 中找到此 Client。');
-      forms[index] = { ...form, argsText: serializeMcpArgsForYaml(form.argsText), envText: serializeEnvTextForYaml(form.envText) };
-      await updateMcpClientsRaw(adminToken, serializeMcpClients(forms));
-      window.dispatchEvent(new Event('settings:mcp-updated'));
-      setMessage('MCP Client 已保存。');
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存 MCP Client 失败');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <PanelShell eyebrow="MCP" title="连接信息">
-      {!client ? (
-        <p className="text-xs leading-5 text-[var(--duties-secondary)]">选择一个 MCP Client 后，这里会显示连接配置。</p>
-      ) : loading ? (
-        <p className="text-xs leading-5 text-[var(--duties-secondary)]">正在加载 MCP Client。</p>
-      ) : !form ? (
-        <p className="text-xs leading-5 text-[var(--duties-secondary)]">{message || '未找到可编辑的 MCP Client。'}</p>
-      ) : (
-        <div className="space-y-3 text-xs leading-5">
-          <p><span className="text-[var(--duties-tertiary)]">ID：</span><span className="font-mono">{form.id}</span></p>
-          <label className="block">
-            <span className={labelClass}>description</span>
-            <input className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, description: event.target.value }))} value={form.description} />
-          </label>
-          <label className="flex items-center gap-2">
-            <input checked={form.enabled} onChange={(event) => setForm((current) => current && ({ ...current, enabled: event.target.checked }))} type="checkbox" />
-            <span>enabled</span>
-          </label>
-          <label className="block">
-            <span className={labelClass}>transport</span>
-            <select className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, transport: event.target.value as McpClientFormState['transport'] }))} value={form.transport}>
-              <option value="stdio">stdio</option>
-              <option value="sse">sse</option>
-              <option value="streamable_http">streamable_http</option>
-            </select>
-          </label>
-          {form.transport === 'stdio' ? (
-            <div className="space-y-3">
-              <label className="block">
-                <span className={labelClass}>command</span>
-                <input className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, command: event.target.value }))} value={form.command} />
-              </label>
-              <label className="block">
-                <span className={labelClass}>args，使用英文逗号分隔</span>
-                <input className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, argsText: event.target.value }))} value={form.argsText} />
-              </label>
-              <label className="block">
-                <span className={labelClass}>env，每行 KEY=VALUE</span>
-                <textarea className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, envText: event.target.value }))} rows={6} value={form.envText} />
-              </label>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <label className="block">
-                <span className={labelClass}>url</span>
-                <input className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, url: event.target.value }))} value={form.url} />
-              </label>
-              <label className="block">
-                <span className={labelClass}>headers，每行 Key: Value</span>
-                <textarea className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, headersText: event.target.value }))} rows={6} value={form.headersText} />
-              </label>
-            </div>
-          )}
-          <button className={buttonClass} disabled={saving} onClick={save} type="button">保存</button>
-          {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
-        </div>
-      )}
-    </PanelShell>
-  );
-};
 
 export const AutomationSettingsRightPanel = () => {
   const adminToken = useSettingsStore(state => state.adminToken);

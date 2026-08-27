@@ -327,11 +327,22 @@ def update_mcp_clients_raw_endpoint(payload: RawContent, request: Request) -> di
 
 
 def _register_admin_routes(routes: Any) -> None:
+    from engine.faces.routes import static_router
+
     router = APIRouter()
     router.add_api_route("/mcp-clients", list_mcp_clients_endpoint, methods=["GET"])
     router.add_api_route("/mcp-clients/raw", get_mcp_clients_raw_endpoint, methods=["GET"])
     router.add_api_route("/mcp-clients/raw", update_mcp_clients_raw_endpoint, methods=["PUT"])
     routes.register(router, mount="admin/config", description="MCP 客户端配置端点")
+
+    # 设置面板静态资源。public：iframe 无法携带 Authorization 头，页面本身不含
+    # 秘密，数据全部经鉴权 XHR 获取。
+    client = APIRouter()
+    client.include_router(
+        static_router(Path(__file__).parent / "web"),
+        prefix="/web",
+    )
+    routes.register(client, public=True, description="MCP 设置面板静态资源")
 
 
 # ---------------------------------------------------------------------------
@@ -360,8 +371,19 @@ PLUGIN_META = {
     "hook_points": [],
     "priority": 50,
     "wants_context": True,
-    "description": "MCP 客户端工具桥：动态工具发现（engine）、配置 CRUD 元工具、admin/config 端点（supervisor）",
+    "description": "MCP 客户端工具桥：动态工具发现（engine）、配置 CRUD 元工具、admin/config 端点与设置面板（supervisor）",
     "author": "core",
+    "web": {
+        "panels": [
+            {
+                "id": "settings",
+                "slot": "settings",
+                "title": "MCP",
+                "icon": "cable",
+                "entry": "/v1/plugins/mcp/web/",
+            }
+        ],
+    },
     "tools": [
         {
             "name": "create_or_update_mcp_client",

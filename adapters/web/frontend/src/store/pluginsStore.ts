@@ -26,6 +26,7 @@ export interface ResolvedPanel {
   panelId: string;
   title: string;
   entry: string;
+  icon: string;
 }
 
 /** Props every react-kind panel contribution receives from the overlay host. */
@@ -141,7 +142,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
         if (replaces && (!panel.slot || panel.slot === 'right')) {
           manifestPanels.push({ key, owner, overlayId: replaces, title, priority, standalone: false, kind: 'iframe', entry: panel.entry });
         } else if (panel.slot === 'settings') {
-          settingsPanels.push({ key, owner, panelId: panel.id, title, entry: panel.entry });
+          settingsPanels.push({ key, owner, panelId: panel.id, title, entry: panel.entry, icon: typeof panel.icon === 'string' && panel.icon ? panel.icon : 'extension' });
         } else if (!panel.slot || panel.slot === 'right') {
           manifestPanels.push({ key, owner, overlayId: key, title, priority, standalone: true, kind: 'iframe', entry: panel.entry });
         }

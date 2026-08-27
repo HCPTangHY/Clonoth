@@ -13,14 +13,12 @@ import { AdvancedSettingsPage } from './pages/AdvancedSettingsPage';
 import { AgentsSettingsPage } from './pages/AgentsSettingsPage';
 import { ApprovalsSettingsPage } from './pages/ApprovalsSettingsPage';
 import { AutomationSettingsPage } from './pages/AutomationSettingsPage';
-import { McpSettingsPage } from './pages/McpSettingsPage';
 import { SkillsSettingsPage } from './pages/SkillsSettingsPage';
 import { SystemSettingsPage } from './pages/SystemSettingsPage';
 import { ToolsSettingsPage } from './pages/ToolsSettingsPage';
 import {
   AgentsSettingsRightPanel,
   AutomationSettingsRightPanel,
-  McpSettingsRightPanel,
   SkillsSettingsRightPanel,
   ToolsSettingsRightPanel,
 } from './panels/SettingsContextPanels';
@@ -66,7 +64,6 @@ export const settingsTabs: SettingsTabDefinition[] = [
   { id: 'agents', label: '节点', icon: 'smart_toy', order: 6, Page: AgentsSettingsPage, RightPanel: AgentsSettingsRightPanel },
   { id: 'tools', label: '工具', icon: 'build', order: 7, Page: ToolsSettingsPage, RightPanel: ToolsSettingsRightPanel },
   { id: 'skills', label: '技能', icon: 'menu_book', order: 8, Page: SkillsSettingsPage, RightPanel: SkillsSettingsRightPanel },
-  { id: 'mcp', label: 'MCP', icon: 'cable', order: 9, Page: McpSettingsPage, RightPanel: McpSettingsRightPanel },
   { id: 'automation', label: '自动化', icon: 'schedule', order: 10, Page: AutomationSettingsPage, RightPanel: AutomationSettingsRightPanel },
   { id: 'advanced', label: '高级', icon: 'code', order: 11, Page: AdvancedSettingsPage },
 ].sort((a, b) => a.order - b.order);
@@ -102,7 +99,7 @@ function pluginSettingsTabs(): SettingsTabDefinition[] {
   return panels.map((panel) => ({
     id: panel.key,
     label: panel.title,
-    icon: 'extension',
+    icon: panel.icon || 'extension',
     order: 100,
     Page: () =>
       createElement(PluginPanel, {
