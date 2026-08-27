@@ -1295,6 +1295,9 @@ export interface PluginPanelDecl {
   /** [AutoC 2026-08-24] Take over a built-in overlay (e.g. 'files') instead of
    * appearing as a standalone header entry. */
   replaces?: string;
+  /** [AutoC 2026-08-27] Registry priority for the target overlayId. Higher wins
+   * against other contributions (host built-ins sit at 0). Default 50. */
+  priority?: number;
 }
 
 export interface PluginSlotDecl {

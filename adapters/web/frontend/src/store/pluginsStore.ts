@@ -5,7 +5,12 @@
 // three tiers into lookup structures, and group by owner so unload/disappear
 // semantics mirror the backend DisposalLedger. Purpose: plugin UI appears and
 // disappears with the backend plugin list, with no frontend build involved.
+// [AutoC 2026-08-27] Unified panel registry: host built-in overlays and plugin
+// panels register into one PanelContribution list. Same overlayId competes by
+// priority (host built-ins at 0, plugins at 50 by default); replaces: is just
+// "register at that overlayId with higher priority" — no override table.
 import { create } from 'zustand';
+import type { ComponentType } from 'react';
 
 import {
   listPlugins,
@@ -21,6 +26,31 @@ export interface ResolvedPanel {
   panelId: string;
   title: string;
   entry: string;
+}
+
+/** Props every react-kind panel contribution receives from the overlay host. */
+export interface HostPanelProps {
+  sessionId: string;
+  onClose: () => void;
+}
+
+/** One panel contribution in the unified registry (host or plugin). */
+export interface PanelContribution {
+  /** unique key: 'host:files' | 'plugin:{owner}:{panel-id}' */
+  key: string;
+  owner: string;
+  /** overlay id this entry serves: built-in id ('files') or the standalone key */
+  overlayId: string;
+  title: string;
+  /** same overlayId: higher wins; ties keep the earlier (host) entry */
+  priority: number;
+  /** listed as a standalone Header entry */
+  standalone: boolean;
+  kind: 'react' | 'iframe';
+  /** iframe entry URL (kind='iframe') */
+  entry?: string;
+  /** host react component (kind='react') */
+  Component?: ComponentType<HostPanelProps>;
 }
 
 export interface SlotContribution {
@@ -40,21 +70,24 @@ export interface SlotContribution {
 interface PluginsState {
   loaded: boolean;
   plugins: PluginListItem[];
-  /** right-overlay panels (chat view) */
-  panels: ResolvedPanel[];
+  /** host built-in overlays (React components), registered at module init */
+  hostPanels: PanelContribution[];
+  /** panels from the plugin manifest (iframe entries) */
+  manifestPanels: PanelContribution[];
+  /** standalone header entries, derived from host + manifest panels */
+  standalonePanels: PanelContribution[];
   /** settings-view panels: full-page iframe tabs in the settings sidebar */
   settingsPanels: ResolvedPanel[];
-  /** [AutoC 2026-08-24] Plugin panels replacing a built-in overlay. Key is
-   * the built-in overlay id (e.g. 'files'); the built-in implementation stays
-   * the fallback when no plugin replaces it. Replacement panels activate
-   * through the built-in trigger and are not listed as header entries. */
-  overlayOverrides: Record<string, ResolvedPanel>;
   slotsBySlot: Record<string, SlotContribution[]>;
   stylesByOwner: Record<string, string>;
   clientScriptsEnabled: boolean;
   refresh: () => Promise<void>;
-  panelByKey: (key: string) => ResolvedPanel | null;
+  panelWinner: (overlayId: string) => PanelContribution | null;
   setClientScripts: (enabled: boolean) => void;
+}
+
+function deriveStandalone(host: PanelContribution[], manifest: PanelContribution[]): PanelContribution[] {
+  return [...host, ...manifest].filter((p) => p.standalone);
 }
 
 const LS_CLIENT_SCRIPTS = 'clonoth_client_scripts';
@@ -70,9 +103,10 @@ function readClientScriptsPref(): boolean {
 export const usePluginsStore = create<PluginsState>((set, get) => ({
   loaded: false,
   plugins: [],
-  panels: [],
+  hostPanels: [],
+  manifestPanels: [],
+  standalonePanels: [],
   settingsPanels: [],
-  overlayOverrides: {},
   slotsBySlot: {},
   stylesByOwner: {},
   clientScriptsEnabled: readClientScriptsPref(),
@@ -86,9 +120,8 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       return;
     }
     const scriptsOn = get().clientScriptsEnabled;
-    const panels: ResolvedPanel[] = [];
+    const manifestPanels: PanelContribution[] = [];
     const settingsPanels: ResolvedPanel[] = [];
-    const overlayOverrides: Record<string, ResolvedPanel> = {};
     const slotsBySlot: Record<string, SlotContribution[]> = {};
     const stylesByOwner: Record<string, string> = {};
     for (const plugin of plugins) {
@@ -97,24 +130,21 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       const owner = plugin.name;
       for (const panel of web.panels || []) {
         if (!panel?.id || !panel.entry) continue;
-        const resolved: ResolvedPanel = {
-          key: `plugin:${owner}:${panel.id}`,
-          owner,
-          panelId: panel.id,
-          title: panel.title || panel.id,
-          entry: panel.entry,
-        };
-        // [plugin-admin 2026-08-23] Two panel destinations: the chat right
-        // overlay ('right', the original slot) and the settings view — a
-        // settings panel becomes one full-page tab in the settings sidebar.
-        // [AutoC 2026-08-24] A panel may declare replaces:'<builtin overlay id>'
-        // to take over that overlay instead of appearing as its own entry;
-        // first declarer wins, the built-in implementation remains the fallback.
+        const key = `plugin:${owner}:${panel.id}`;
+        const title = panel.title || panel.id;
+        const priority = Number.isFinite(panel.priority) ? Number(panel.priority) : 50;
+        // [AutoC 2026-08-27] Three destinations, one registry: a replaces-
+        // declaration registers at the built-in overlayId with its own priority
+        // and competes with the host entry; settings panels stay tab-shaped;
+        // everything else is a standalone overlay under its own key.
         const replaces = typeof panel.replaces === 'string' ? panel.replaces.trim() : '';
         if (replaces && (!panel.slot || panel.slot === 'right')) {
-          if (!overlayOverrides[replaces]) overlayOverrides[replaces] = resolved;
-        } else if (panel.slot === 'settings') settingsPanels.push(resolved);
-        else if (!panel.slot || panel.slot === 'right') panels.push(resolved);
+          manifestPanels.push({ key, owner, overlayId: replaces, title, priority, standalone: false, kind: 'iframe', entry: panel.entry });
+        } else if (panel.slot === 'settings') {
+          settingsPanels.push({ key, owner, panelId: panel.id, title, entry: panel.entry });
+        } else if (!panel.slot || panel.slot === 'right') {
+          manifestPanels.push({ key, owner, overlayId: key, title, priority, standalone: true, kind: 'iframe', entry: panel.entry });
+        }
       }
       if (scriptsOn) {
         for (const slot of web.slots || []) {
@@ -137,17 +167,34 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     for (const list of Object.values(slotsBySlot)) {
       list.sort((a, b) => b.priority - a.priority);
     }
-    set({ loaded: true, plugins, panels, settingsPanels, overlayOverrides, slotsBySlot, stylesByOwner });
+    set((s) => ({
+      loaded: true,
+      plugins,
+      manifestPanels,
+      settingsPanels,
+      standalonePanels: deriveStandalone(s.hostPanels, manifestPanels),
+      slotsBySlot,
+      stylesByOwner,
+    }));
     // annotators are rebuilt from the same manifest fetch; fire-and-forget so a
     // slow annotator script never blocks slot/panel rendering.
     void refreshAnnotators();
   },
 
-  panelByKey: (key) =>
-    get().panels.find((p) => p.key === key)
-    || get().settingsPanels.find((p) => p.key === key)
-    || Object.values(get().overlayOverrides).find((p) => p.key === key)
-    || null,
+  panelWinner: (overlayId) => {
+    const { hostPanels, manifestPanels } = get();
+    let winner: PanelContribution | null = null;
+    for (const entry of hostPanels) {
+      if (entry.overlayId !== overlayId) continue;
+      if (winner === null || entry.priority > winner.priority) winner = entry;
+    }
+    for (const entry of manifestPanels) {
+      if (entry.overlayId !== overlayId) continue;
+      // strict > keeps the host entry on ties (host listed first)
+      if (winner === null || entry.priority > winner.priority) winner = entry;
+    }
+    return winner;
+  },
 
   setClientScripts: (enabled) => {
     try {
@@ -167,3 +214,21 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
 // re-pull the manifest whenever a plugin lifecycle event arrives.
 subscribePluginEvent('plugin_loaded', () => void usePluginsStore.getState().refresh());
 subscribePluginEvent('plugin_unloaded', () => void usePluginsStore.getState().refresh());
+
+/**
+ * [AutoC 2026-08-27] Register a host built-in overlay into the same panel
+ * registry the plugin manifest feeds. Why: built-in overlays and plugin
+ * panels should travel one path — the host is just the first contributor, its
+ * entries carry priority 0 so any plugin entry (default 50) outranks them and
+ * unloading the plugin falls back automatically. How: idempotent append keyed
+ * by contribution key; standalone entries refresh alongside. Purpose: kill the
+ * hardcoded overlay switch and the replaces override table.
+ */
+export function registerHostPanel(entry: Omit<PanelContribution, 'owner' | 'kind'>): void {
+  const full: PanelContribution = { ...entry, owner: 'host', kind: 'react' };
+  usePluginsStore.setState((s) => {
+    if (s.hostPanels.some((p) => p.key === full.key)) return s;
+    const hostPanels = [...s.hostPanels, full];
+    return { hostPanels, standalonePanels: deriveStandalone(hostPanels, s.manifestPanels) };
+  });
+}

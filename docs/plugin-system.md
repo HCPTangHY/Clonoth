@@ -199,7 +199,7 @@ supervisor 进程（sync fire）：`on_inbound_message`、`on_schedule_tick`、`
 | `priority` | 可选。hook 执行优先级，缺省读实例的 `priority` 属性。 |
 | `wants_context` | 可选。为 true 时 handler 类构造收到 EngineContext；不声明则零参构造。 |
 | `tools` | 可选。工具声明列表，注册进 ToolRegistry。 |
-| `client` | 可选。前端贡献（panels/slots/styles），见后文。 |
+| `web` | 可选。前端贡献（panels/slots/annotators/styles），见后文。 |
 | `requires` | 可选。依赖的插件名列表，按依赖序加载，缺失则跳过并记录。 |
 | `processes` | 可选。`["engine"]` / `["supervisor"]`，限定加载进程；不匹配的进程跳过（不算失败）。 |
 | `hooks` | 展示用。插件注册的 hook point 列表（供管理界面展示）。 |
@@ -413,7 +413,7 @@ if routes is not None:
 
 插件可声明前端贡献，web 前端启动时从 `/v1/plugins` 读取 manifest 消费：
 
-- `panels`：iframe 面板，`slot: "right"`（聊天右栏）或 `"settings"`（设置区独立 tab）。面板内用 `window.parent.__CLONOTH_BOOT__` 取 token/sessionId；宿主自动注入主题变量与滚动条规则。
+- `panels`：iframe 面板，`slot: "right"`（聊天右栏）或 `"settings"`（设置区独立 tab）。面板内用 `window.parent.__CLONOTH_BOOT__` 取 token/sessionId；宿主自动注入主题变量与滚动条规则。声明 `replaces: "files"` 时在同一 overlayId 上与宿主内置面板竞争，`priority` 缺省 50，高于宿主内置的 0，卸载后自动回落内置实现。
 - `slots`：槽位脚本，`script` 为 ES module 源码（或 `{"file": "client/x.js"}` 引用文件）。上下文 `{ el, data, api, state, events }`；`mode: "replace"` 可接管整个槽位。
 - `styles`：全局 CSS（或 `{"file": ...}` 引用）。
 

@@ -16,7 +16,6 @@ import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { WorkspaceFileTree } from '../components/workspace/WorkspaceFileTree';
 import type { ConversationMeta } from '../store/chatStore';
-import { usePluginsStore } from '../store/pluginsStore';
 import { useViewStore, type ViewMode, type PanelOverlayState } from '../store/viewStore';
 import type { Attachment } from '../types';
 import type { ToolExecution, WsMessage } from '../types/message';
@@ -57,45 +56,43 @@ const safeSessionId = (sessionId: string) => sessionId || 'no-session';
 // must not require a frontend rebuild. How: the plugin:{owner}:{id} namespace reads
 // the resolved panel from pluginsStore. Purpose: plugin UI mounts through the same
 // overlay channel as built-in overlays, with identical close semantics.
+// [AutoC 2026-08-27] The built-in files overlay is itself a host contribution in
+// the unified panel registry — no compiled switch arm and no override table left.
+// A plugin declaring replaces:'files' registers at the same overlayId with higher
+// priority and wins; unloading it restores the host entry on the next manifest
+// refresh.
 import { PluginPanel } from '../components/plugins/PluginPanel';
+import { registerHostPanel, usePluginsStore } from '../store/pluginsStore';
 
-/** Resolve a panel overlay id to a React element. Add new overlays here. */
+// host seeding: built-in overlays as registry contributions (priority 0)
+registerHostPanel({
+  key: 'host:files',
+  overlayId: 'files',
+  title: '工作区文件',
+  priority: 0,
+  standalone: false,
+  Component: WorkspaceFileTree,
+});
+
+/** Resolve a panel overlay id through the unified panel registry. */
 function resolveOverlay(id: string, ctx: AppViewContext): ReactNode {
   const close = () => useViewStore.getState().clearPanelOverlays();
-  if (id.startsWith('plugin:')) {
-    const panel = usePluginsStore.getState().panelByKey(id);
-    if (!panel) return null;
-    return (
-      <PluginPanel
-        entry={panel.entry}
-        overlayId={id}
-        sessionId={safeSessionId(ctx.sessionId)}
-        title={panel.title}
-        onClose={close}
-      />
-    );
+  const winner = usePluginsStore.getState().panelWinner(id);
+  if (!winner) return null;
+  if (winner.kind === 'react' && winner.Component) {
+    const Panel = winner.Component;
+    return <Panel sessionId={safeSessionId(ctx.sessionId)} onClose={close} />;
   }
-  // [AutoC 2026-08-24] Plugin replacement of built-in overlays: a plugin panel
-  // declaring replaces:'files' takes over the whole overlay. The built-in
-  // implementation below stays as the fallback when no plugin replaces it.
-  const replacement = usePluginsStore.getState().overlayOverrides[id];
-  if (replacement) {
-    return (
-      <PluginPanel
-        entry={replacement.entry}
-        overlayId={id}
-        sessionId={safeSessionId(ctx.sessionId)}
-        title={replacement.title}
-        onClose={close}
-      />
-    );
-  }
-  switch (id) {
-    case 'files':
-      return <WorkspaceFileTree sessionId={safeSessionId(ctx.sessionId)} onClose={close} />;
-    default:
-      return null;
-  }
+  if (!winner.entry) return null;
+  return (
+    <PluginPanel
+      entry={winner.entry}
+      overlayId={id}
+      sessionId={safeSessionId(ctx.sessionId)}
+      title={winner.title}
+      onClose={close}
+    />
+  );
 }
 
 export const viewRegistry: Record<ViewMode, AppViewDefinition> = {

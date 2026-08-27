@@ -32,8 +32,9 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
   const [configModalFocus, setConfigModalFocus] = useState<'node' | 'model' | 'workspace' | 'title' | null>(null);
   const [draftTitle, setDraftTitle] = useState(title);
   const [workspaceName, setWorkspaceName] = useState('');
-  // [AutoC 2026-08-22] Plugin panel entries come from the runtime manifest.
-  const pluginPanels = usePluginsStore((s) => s.panels);
+  // [AutoC 2026-08-27] Standalone panel entries come from the unified registry
+  // (host built-ins may declare standalone too; today only plugins do).
+  const pluginPanels = usePluginsStore((s) => s.standalonePanels);
 
   // Sync draft when title prop changes from outside
   useEffect(() => { setDraftTitle(title); }, [title]);
