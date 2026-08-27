@@ -9,8 +9,8 @@ PUT /v1/plugins/ide/file 端点。
 
 面板是自含 HTML 页，经 routes face 静态路由服务；数据走 supervisor REST
 （workspace/tree、sessions/{id}/file），鉴权由宿主 boot 对象注入。
-写端点由本插件注册（默认鉴权），写范围比读端点更严格：仅会话工作区内，
-无 workspace_root/data/ 例外。
+写端点由本插件注册（默认鉴权），变更类操作（写/建/移/删/git 变更）仅限
+显式设置的会话工作区，不回退 workspace_root；git 只读端点维持回退。
 """
 
 import re
@@ -229,9 +229,8 @@ def register(ctx) -> None:
     from engine.faces.routes import static_router
 
     # ── 写文件端点 ───────────────────────────────────────────────────
-    # 写范围比读端点（supervisor/api.py session_file）更严格：仅会话工作区
-    # 内（未设工作区时兑底 workspace_root），不给 data/ 例外。鉴权依赖全局
-    # /v1/ 中间件（public 默认 False）。
+    # 写范围仅限显式设置的会话工作区，不回退 workspace_root（未设工作区 400）。
+    # 鉴权依赖全局 /v1/ 中间件（public 默认 False）。
     MAX_WRITE_BYTES = 4 * 1024 * 1024
 
     api = APIRouter()
@@ -244,19 +243,11 @@ def register(ctx) -> None:
 
     @api.put("/file")
     async def _save_file(request: Request) -> dict:
-        st = _state(request)
-        session_id = str(request.query_params.get("session_id") or "").strip()
         raw_path = str(request.query_params.get("path") or "").replace("\\", "/").strip()
         if not raw_path:
             raise HTTPException(status_code=400, detail="empty path")
 
-        ws_root = st.workspace_root.resolve()
-        session_workspace: Path | None = None
-        ws_info = st.get_session_workspace(session_id) if session_id else None
-        if ws_info and ws_info.get("path"):
-            session_workspace = Path(ws_info["path"]).resolve()
-
-        base = session_workspace or ws_root
+        base = _ws_base(request)
         if raw_path.startswith("/"):
             target = Path(raw_path).resolve()
         else:
@@ -274,14 +265,15 @@ def register(ctx) -> None:
         return {"path": raw_path, "bytes": len(body)}
 
     # ── 文件系统操作端点（新建目录/移动/删除） ────────────────────────
-    # 与写端点同一守卫：仅会话工作区内。操作不可逆，确认弹窗在前端。
+    # 变更类操作共用基准：仅显式设置的会话工作区，不回退 workspace_root。
+    # 未绑定工作区的 session 一律拒绝（400），操作不可逆，确认弹窗在前端。
     def _ws_base(request: Request) -> Path:
         st = _state(request)
         session_id = str(request.query_params.get("session_id") or "").strip()
         ws_info = st.get_session_workspace(session_id) if session_id else None
         if ws_info and ws_info.get("path"):
             return Path(ws_info["path"]).resolve()
-        return st.workspace_root.resolve()
+        raise HTTPException(status_code=400, detail="session has no workspace; set one before modifying files")
 
     def _ws_path(base: Path, raw_path: str) -> Path:
         """守卫 + 解析：拒绝空路径/根，穿越与工作区外返回 403。"""
@@ -557,7 +549,7 @@ def register(ctx) -> None:
 
     @api.post("/git/stage")
     async def _git_stage(request: Request) -> dict:
-        base = _git_base(request)
+        base = _ws_base(request)  # git 变更操作同样仅限显式工作区
         rel = _git_rel(base, str(request.query_params.get("path") or ""))
         rc, _, err = await _git(base, "add", "--", rel)
         if rc != 0:
@@ -566,7 +558,7 @@ def register(ctx) -> None:
 
     @api.post("/git/unstage")
     async def _git_unstage(request: Request) -> dict:
-        base = _git_base(request)
+        base = _ws_base(request)  # 同上
         rel = _git_rel(base, str(request.query_params.get("path") or ""))
         rc, _, err = await _git(base, "reset", "-q", "--", rel)
         if rc != 0:
@@ -575,7 +567,7 @@ def register(ctx) -> None:
 
     @api.post("/git/commit")
     async def _git_commit(request: Request) -> dict:
-        base = _git_base(request)
+        base = _ws_base(request)  # 同上
         body = await request.body()
         message = body.decode("utf-8", "replace").strip()
         if not message:
