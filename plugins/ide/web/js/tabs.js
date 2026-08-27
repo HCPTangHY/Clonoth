@@ -108,6 +108,27 @@ function closeTab(path) {
   renderView();
 }
 
+// [AutoC 2026-08-27] 删除/移动后关闭路径下所有标签（含 diff 标签后缀）。
+// 文件已不存在，脏状态确认无意义，直接释放。
+function closeTabsUnder(path) {
+  const p = String(path);
+  let removed = false;
+  for (let i = tabs.length - 1; i >= 0; i--) {
+    const t = tabs[i];
+    if (t.path === TREE_TAB) continue;
+    const tp = t.path.replace(/ \(diff\)$/, '');
+    if (tp === p || tp.startsWith(p + '/')) {
+      releaseTab(t);
+      tabs.splice(i, 1);
+      removed = true;
+    }
+  }
+  if (!removed) return;
+  if (!findTab(activePath)) activePath = TREE_TAB;
+  renderTabs();
+  renderView();
+}
+
 function renderTabs() {
   // [AutoC 2026-08-24] 不能 innerHTML 清空整个 tabbar：右端的 bar-end
   // 保存按钮容器会被销毁，导致按钮永久消失。只移除标签元素，bar-end 保留。

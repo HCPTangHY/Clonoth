@@ -14,13 +14,14 @@ PUT /v1/plugins/ide/file 端点。
 """
 
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.12.1",
-    "description": "Web IDE：文件面板 + 编辑器 + @文件引用（输入框补全与请求时展开）",
+    "version": "0.13.0",
+    "description": "Web IDE：文件面板 + 编辑器 + @文件引用 + 文件管理（新建/重命名/删除/剪切移动）",
     "author": "clonoth",
     # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
     "processes": ["supervisor", "engine"],
@@ -271,6 +272,71 @@ def register(ctx) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(body)
         return {"path": raw_path, "bytes": len(body)}
+
+    # ── 文件系统操作端点（新建目录/移动/删除） ────────────────────────
+    # 与写端点同一守卫：仅会话工作区内。操作不可逆，确认弹窗在前端。
+    def _ws_base(request: Request) -> Path:
+        st = _state(request)
+        session_id = str(request.query_params.get("session_id") or "").strip()
+        ws_info = st.get_session_workspace(session_id) if session_id else None
+        if ws_info and ws_info.get("path"):
+            return Path(ws_info["path"]).resolve()
+        return st.workspace_root.resolve()
+
+    def _ws_path(base: Path, raw_path: str) -> Path:
+        """守卫 + 解析：拒绝空路径/根，穿越与工作区外返回 403。"""
+        raw = raw_path.replace("\\", "/").strip()
+        if not raw or raw == ".":
+            raise HTTPException(status_code=400, detail="empty path")
+        target = (base / raw).resolve() if not raw.startswith("/") else Path(raw).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path outside session workspace")
+        return target
+
+    @api.post("/fs/mkdir")
+    async def _fs_mkdir(request: Request) -> dict:
+        base = _ws_base(request)
+        target = _ws_path(base, str(request.query_params.get("path") or ""))
+        if target.exists():
+            raise HTTPException(status_code=409, detail="already exists")
+        target.mkdir(parents=True)
+        return {"ok": True}
+
+    @api.post("/fs/move")
+    async def _fs_move(request: Request) -> dict:
+        base = _ws_base(request)
+        src = _ws_path(base, str(request.query_params.get("from") or ""))
+        dst = _ws_path(base, str(request.query_params.get("to") or ""))
+        if src == base or dst == base:
+            raise HTTPException(status_code=400, detail="refusing to operate on workspace root")
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="source not found")
+        if dst.exists():
+            raise HTTPException(status_code=409, detail="target already exists")
+        # 目录不能移进自己内部（含自身）
+        try:
+            dst.relative_to(src)
+        except ValueError:
+            pass
+        else:
+            raise HTTPException(status_code=400, detail="cannot move a directory into itself")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        return {"ok": True, "to": dst.relative_to(base).as_posix()}
+
+    @api.post("/fs/delete")
+    async def _fs_delete(request: Request) -> dict:
+        base = _ws_base(request)
+        target = _ws_path(base, str(request.query_params.get("path") or ""))
+        if target == base:
+            raise HTTPException(status_code=400, detail="refusing to delete workspace root")
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink(missing_ok=True)
+        return {"ok": True}
 
     # ── git 只读端点 ─────────────────────────────────────────────────
     # 会话工作区内的 git status 与单文件 unified diff。子进程超时 10s，
