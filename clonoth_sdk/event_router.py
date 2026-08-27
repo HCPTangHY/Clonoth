@@ -682,10 +682,11 @@ class EventRouter:
         # Fallback: 通过 session_conv_map 发送到频道
         conv_key = self._state.get_conversation_key(event.session_id) or ""
         text = strip_protocol_markers((p.get("text") or "").strip())
-        if text:
+        attachments = p.get("attachments") or []
+        if text or attachments:
             try:
                 await self._cb.send_to_channel(
-                    conv_key, text, [], node_id=node_id,
+                    conv_key, text, attachments, node_id=node_id,
                 )
             except Exception as e:
                 logger.error(
