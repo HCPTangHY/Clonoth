@@ -5,7 +5,7 @@
 // pages can update contextual right-panel data without changing the settings host.
 import { create } from 'zustand';
 
-import type { AdminApproval, AdminNode, AdminSkill, AdminTool } from '../api/supervisorClient';
+import type { AdminApproval, AdminNode, AdminTool } from '../api/supervisorClient';
 
 export interface SettingsSelectionState {
   systemLogs: string[];
@@ -13,7 +13,6 @@ export interface SettingsSelectionState {
   selectedNode: AdminNode | null;
   selectedTool: AdminTool | null;
   allToolNames: string[];
-  selectedSkill: AdminSkill | null;
   selectedScheduleId: string | null;
   advancedFile: 'runtime' | 'policy';
   addSystemLog: (message: string) => void;
@@ -21,7 +20,6 @@ export interface SettingsSelectionState {
   setSelectedNode: (node: AdminNode | null) => void;
   setSelectedTool: (tool: AdminTool | null) => void;
   setAllToolNames: (names: string[]) => void;
-  setSelectedSkill: (skill: AdminSkill | null) => void;
   setSelectedScheduleId: (scheduleId: string | null) => void;
   setAdvancedFile: (file: 'runtime' | 'policy') => void;
 }
@@ -32,7 +30,6 @@ export const useSettingsSelectionStore = create<SettingsSelectionState>((set) =>
   selectedNode: null,
   selectedTool: null,
   allToolNames: [],
-  selectedSkill: null,
   // [2026-06-02] Store the selected automation task id for the right-panel form.
   // Why: the Automation page and SettingsRightPanel are mounted as separate siblings.
   // How: keep only the id, while the panel reloads raw schedules before editing.
@@ -51,7 +48,6 @@ export const useSettingsSelectionStore = create<SettingsSelectionState>((set) =>
   setSelectedNode: (node) => set({ selectedNode: node }),
   setSelectedTool: (tool) => set({ selectedTool: tool }),
   setAllToolNames: (names) => set({ allToolNames: names }),
-  setSelectedSkill: (skill) => set({ selectedSkill: skill }),
   setSelectedScheduleId: (scheduleId) => set({ selectedScheduleId: scheduleId }),
   setAdvancedFile: (file) => set({ advancedFile: file }),
 }));

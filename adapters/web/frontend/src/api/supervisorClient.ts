@@ -327,15 +327,6 @@ export interface AdminTool {
   has_spec?: boolean;
 }
 
-export interface AdminSkill {
-  name: string;
-  description?: string;
-  enabled?: boolean;
-  strategy?: string;
-  keywords?: string[];
-  body_preview?: string;
-  error?: string;
-}
 
 
 export interface AdminCreatePayload {
@@ -616,36 +607,6 @@ export async function createTool(token: string, data: AdminCreatePayload): Promi
 
 export async function deleteTool(token: string, name: string): Promise<any> {
   const resp = await apiFetch(`/admin/config/tools/${pathPart(name)}`, {
-    method: 'DELETE',
-    headers: authHeaders(token),
-  });
-  return resp.json();
-}
-
-export async function getSkills(token: string): Promise<AdminSkill[]> {
-  const resp = await apiFetch('/admin/config/skills', { headers: authHeaders(token) });
-  return resp.json();
-}
-
-export function getSkillRaw(token: string, name: string): Promise<string> {
-  return readRawConfig(`/admin/config/skills/${pathPart(name)}/raw`, token);
-}
-
-export function updateSkillRaw(token: string, name: string, content: string): Promise<any> {
-  return writeRawConfig(`/admin/config/skills/${pathPart(name)}/raw`, token, content);
-}
-
-export async function createSkill(token: string, data: AdminCreatePayload): Promise<any> {
-  const resp = await apiFetch('/admin/config/skills', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
-  });
-  return resp.json();
-}
-
-export async function deleteSkill(token: string, name: string): Promise<any> {
-  const resp = await apiFetch(`/admin/config/skills/${pathPart(name)}`, {
     method: 'DELETE',
     headers: authHeaders(token),
   });

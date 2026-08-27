@@ -29,6 +29,19 @@ PLUGIN_META = {
     "hook_points": [],
     "priority": 50,
     "wants_context": True,
+    "description": "知识与记忆插件：skill/memory 声明式 prompt section 注入、六个 CRUD 元工具（engine）、skills admin/config 端点与设置面板（supervisor）",
+    "author": "core",
+    "web": {
+        "panels": [
+            {
+                "id": "settings",
+                "slot": "settings",
+                "title": "技能",
+                "icon": "menu_book",
+                "entry": "/v1/plugins/knowledge_inject/web/",
+            }
+        ],
+    },
     # Why: the six skill and memory CRUD tools now belong to the knowledge
     # plugin rather than toolbox.registry.py. How: the concrete declarations are
     # attached after their functions are defined below. Purpose: keep one source
@@ -1703,6 +1716,133 @@ PLUGIN_META["tools"] = [
     },
 ]
 
+
+# ---------------------------------------------------------------------------
+#  supervisor 侧 skills admin 端点与设置面板静态资源
+# ---------------------------------------------------------------------------
+
+def _ws_root(request: Any) -> Path:
+    return Path(request.app.state.state.workspace_root)
+
+
+def _skill_md_path(workspace_root: Path, name: str) -> Path:
+    """Resolve skills/{name}/SKILL.md with a name whitelist and containment check."""
+    if not SKILL_NAME_RE.match(name or ""):
+        raise _http_exc(400, "Invalid skill name")
+    base = (workspace_root / "skills").resolve()
+    p = (base / name / "SKILL.md").resolve()
+    if not str(p).startswith(str(base)):
+        raise _http_exc(400, "Invalid path")
+    return p
+
+
+def _http_exc(status: int, detail: str) -> Any:
+    from fastapi import HTTPException
+    return HTTPException(status_code=status, detail=detail)
+
+
+def _list_skills_endpoint(request: Any) -> list[dict[str, Any]]:
+    # Why: admin listing shares the injection-side catalog parser. How: call
+    # load_skill_catalog with the cache disabled so writes are immediately
+    # visible. Purpose: one frontmatter parser instead of an admin_api copy.
+    ws = _ws_root(request)
+    res: list[dict[str, Any]] = []
+    for item in load_skill_catalog(ws, _use_cache=False):
+        res.append({
+            "name": str(item.get("name") or ""),
+            "description": str(item.get("description") or ""),
+            "enabled": bool(item.get("enabled", True)),
+            "strategy": str(item.get("strategy") or "normal"),
+            "keywords": [str(k) for k in (item.get("keywords") or []) if k],
+            "body_preview": str(item.get("body") or "")[:200],
+        })
+    return res
+
+
+def _get_skill_raw_endpoint(name: str, request: Any) -> dict[str, str]:
+    p = _skill_md_path(_ws_root(request), name)
+    if not p.exists():
+        raise _http_exc(404, "File not found")
+    return {"content": p.read_text(encoding="utf-8")}
+
+
+def _update_skill_raw_endpoint(name: str, request: Any, payload: Any) -> dict[str, Any]:
+    ws = _ws_root(request)
+    p = _skill_md_path(ws, name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(str(payload.content), encoding="utf-8")
+    _SkillCache.invalidate(ws)
+    return {"ok": True}
+
+
+def _create_skill_endpoint(request: Any, payload: Any) -> dict[str, Any]:
+    from toolbox.builtins import SKILL_NAME_RE as _re
+    ident = str(getattr(payload, "id", "")).strip()
+    if not _re.match(ident):
+        raise _http_exc(400, "Invalid skill name")
+    ws = _ws_root(request)
+    p = _skill_md_path(ws, ident)
+    if p.exists():
+        raise _http_exc(409, "Skill already exists")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(str(getattr(payload, "content", "")), encoding="utf-8")
+    _SkillCache.invalidate(ws)
+    return {"ok": True}
+
+
+def _delete_skill_endpoint(name: str, request: Any) -> dict[str, Any]:
+    import shutil as _shutil
+    ws = _ws_root(request)
+    p = _skill_md_path(ws, name)
+    if p.parent.exists() and p.parent.is_dir() and p.parent != (ws / "skills").resolve():
+        _shutil.rmtree(p.parent)
+    _SkillCache.invalidate(ws)
+    return {"ok": True}
+
+
+def _register_admin_routes(routes: Any) -> None:
+    from fastapi import APIRouter
+    from pydantic import BaseModel
+
+    class RawContent(BaseModel):
+        content: str
+
+    class CreatePayload(BaseModel):
+        id: str
+        content: str
+
+    from engine.faces.routes import static_router
+
+    def _raw(name: str, request: Any) -> dict[str, str]:
+        return _get_skill_raw_endpoint(name, request)
+
+    def _update(name: str, request: Any, payload: RawContent) -> dict[str, Any]:
+        return _update_skill_raw_endpoint(name, request, payload)
+
+    def _create(request: Any, payload: CreatePayload) -> dict[str, Any]:
+        return _create_skill_endpoint(request, payload)
+
+    def _delete(name: str, request: Any) -> dict[str, Any]:
+        return _delete_skill_endpoint(name, request)
+
+    router = APIRouter()
+    router.add_api_route("/skills", _list_skills_endpoint, methods=["GET"])
+    router.add_api_route("/skills/{name}/raw", _raw, methods=["GET"])
+    router.add_api_route("/skills/{name}/raw", _update, methods=["PUT"])
+    router.add_api_route("/skills", _create, methods=["POST"])
+    router.add_api_route("/skills/{name}", _delete, methods=["DELETE"])
+    routes.register(router, mount="admin/config", description="skills 配置端点")
+
+    # 设置面板静态资源。public：iframe 无法携带 Authorization 头，页面本身
+    # 不含秘密，数据全部经鉴权 XHR 获取。
+    client = APIRouter()
+    client.include_router(
+        static_router(Path(__file__).parent / "web"),
+        prefix="/web",
+    )
+    routes.register(client, public=True, description="knowledge_inject 设置面板静态资源")
+
+
 class KnowledgeInjector:
     """Declarative skill and memory prompt sections.
 
@@ -1721,15 +1861,19 @@ class KnowledgeInjector:
         self._cache_key: tuple | None = None
         self._cache_val: tuple | None = None
         sections = ctx.contributions.get("prompt_sections") if ctx is not None else None
-        if sections is None:
-            logger.warning("knowledge_inject: prompt_sections face not mounted; injection disabled")
-            return
-        # Why: order 50 keeps knowledge content ahead of later sections. How:
-        # static scope lands before history (cache-friendly), dynamic before
-        # the instruction (per-turn). Purpose: preserve the historical prompt
-        # layout after moving off the rebuild hook.
-        sections.register_section("knowledge_static", self.render_static, order=50, scope="static")
-        sections.register_section("knowledge_dynamic", self.render_dynamic, order=50, scope="dynamic")
+        if sections is not None:
+            # Why: order 50 keeps knowledge content ahead of later sections. How:
+            # static scope lands before history (cache-friendly), dynamic before
+            # the instruction (per-turn). Purpose: preserve the historical prompt
+            # layout after moving off the rebuild hook.
+            sections.register_section("knowledge_static", self.render_static, order=50, scope="static")
+            sections.register_section("knowledge_dynamic", self.render_dynamic, order=50, scope="dynamic")
+        # supervisor 进程：挂 skills admin 端点与设置面板静态资源。
+        routes = ctx.contributions.get("routes") if ctx is not None else None
+        if routes is not None:
+            _register_admin_routes(routes)
+        if sections is None and routes is None:
+            logger.warning("knowledge_inject: neither prompt_sections nor routes face mounted; plugin inactive")
 
     def _compute(self, sctx: Any) -> tuple | None:
         """Run the unified pipeline once per turn, cached by turn fingerprint."""

@@ -31,17 +31,6 @@ export interface ScheduleFormState {
 }
 
 
-export interface SkillFormState {
-  name: string;
-  description: string;
-  enabled: boolean;
-  strategy: 'normal' | 'constant';
-  keywordsText: string;
-  order: string;
-  priority: string;
-  scan_depth: string;
-  body: string;
-}
 
 export type NodeConfigType = 'ai' | 'tool' | 'router';
 export type ToolAccessMode = 'all' | 'allow' | 'deny' | 'none';
@@ -309,45 +298,4 @@ export function serializeSchedules(schedules: ScheduleFormState[]): string {
 
 // ==================== Skills ====================
 
-export function parseSkillMarkdown(raw: string, fallbackName: string): SkillFormState {
-  let meta: Record<string, any> = {};
-  let body = raw;
-  if (raw.startsWith('---\n')) {
-    const end = raw.indexOf('\n---\n', 4);
-    if (end >= 0) {
-      try {
-        const parsed = yaml.load(raw.slice(4, end));
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) meta = parsed as Record<string, any>;
-      } catch { /* ignore frontmatter parse errors */ }
-      body = raw.slice(end + 5);
-    }
-  }
-  const keywords = Array.isArray(meta.keywords) ? meta.keywords.map(String) : [];
-  return {
-    name: str(meta.name, fallbackName),
-    description: str(meta.description),
-    enabled: meta.enabled !== false,
-    strategy: meta.strategy === 'constant' ? 'constant' : 'normal',
-    keywordsText: keywords.join('\n'),
-    order: meta.order === undefined ? '0' : String(meta.order),
-    priority: meta.priority === undefined ? '0' : String(meta.priority),
-    scan_depth: meta.scan_depth === undefined ? '0' : String(meta.scan_depth),
-    body,
-  };
-}
 
-export function serializeSkillMarkdown(form: SkillFormState): string {
-  const keywords = form.keywordsText.split('\n').map((s) => s.trim()).filter(Boolean);
-  const meta: Record<string, any> = {
-    name: form.name,
-    description: form.description,
-    enabled: form.enabled,
-    strategy: form.strategy,
-    keywords,
-    order: Number(form.order) || 0,
-    priority: Number(form.priority) || 0,
-    scan_depth: Number(form.scan_depth) || 0,
-  };
-  const frontmatter = yaml.dump(meta, DUMP_OPTS);
-  return `---\n${frontmatter}---\n\n${form.body.replace(/^\n+/, '')}`;
-}

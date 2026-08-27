@@ -163,7 +163,7 @@ supervisor 进程（sync fire）：`on_inbound_message`、`on_schedule_tick`、`
 | --- | --- | --- | ---: | --- |
 | `PreemptChecker` | `preempt_checker` | `before_step`、`terminal_tool` | 100 | 检查取消请求和软打断状态。需要注入新用户消息时，调用 `rebuild_dynamic_context` 重建动态上下文（经 prompt sections）并追加新消息。 |
 | `CompactChecker` | `compact_checker` | `before_step` | 50 | 在循环顶部执行 microcompact、闲置后的 proactive snip，并在上下文超过阈值时触发系统压缩节点。 |
-| `KnowledgeInjector` | `knowledge_inject` | 无（声明型） | 50 | 在 `__init__` 中通过 `ctx.contributions.prompt_sections` 注册 `knowledge_static` / `knowledge_dynamic` 两个 section，统一构建 skill、memory 的静态与动态注入内容；同时提供六个 skill/memory CRUD 工具。 |
+| `KnowledgeInjector` | `knowledge_inject` | 无（目录插件） | 50 | 在 `__init__` 中通过 `ctx.contributions.prompt_sections` 注册 `knowledge_static` / `knowledge_dynamic` 两个 section，统一构建 skill、memory 的静态与动态注入内容；同时提供六个 skill/memory CRUD 工具（engine）；supervisor 进程挂 `admin/config` 下五个 skills 端点与设置面板静态资源（`web` 声明 settings 槽位 tab，icon 可声明），端点复用插件内的 catalog 解析器。 |
 | `FinishGuardHandler` | `finish_guard` | `before_tool_call` | 100 | 拒绝 `finish()` 与其他非 `intermediate_reply()` 工具在同一轮同时调用，避免任务终止后遗漏其他工具结果。 |
 | `ApprovalHandler` | `approval` | `before_tool_call` | 90 | 在真实工具执行前调用 `RunContext` 上可用的审批接口，并把审批结果归一化为 `HookResult`。 |
 | `AttachmentCollector` | `attachment_collector` | `after_tool_call` | 0 | 从真实工具结果中收集附件，写入局部附件列表和 loop state，供最终输出选择。 |

@@ -117,22 +117,6 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         p.write_text(content, encoding="utf-8")
         return {"ok": True}
 
-    def _parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-        if not text.startswith("---\n"):
-            return {}, text
-        end = text.find("\n---\n", 4)
-        if end < 0:
-            return {}, text
-        head = text[4:end]
-        body = text[end + 5:]
-        try:
-            meta = yaml.safe_load(head) or {}
-        except Exception:
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
-        return meta, body
-
     def _extract_tool_spec_ast(py_path: Path) -> tuple[dict[str, Any] | None, float | None]:
         try:
             text = py_path.read_text(encoding="utf-8")
@@ -272,58 +256,6 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     def update_schedules(payload: RawContent) -> dict[str, Any]:
         p = workspace_root / "data" / "schedules.yaml"
         return _write_text(p, payload.content)
-
-    # ----- Skills -----
-    @router.get("/skills")
-    def list_skills() -> list[dict[str, Any]]:
-        skills_dir = workspace_root / "skills"
-        if not skills_dir.exists():
-            return []
-        res = []
-        for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
-            try:
-                text = skill_md.read_text(encoding="utf-8")
-                meta, body = _parse_skill_frontmatter(text)
-                res.append({
-                    "name": str(meta.get("name") or skill_md.parent.name),
-                    "description": str(meta.get("description") or ""),
-                    "enabled": bool(meta.get("enabled", True)),
-                    "strategy": str(meta.get("strategy") or "normal"),
-                    "keywords": [str(k) for k in (meta.get("keywords") or []) if isinstance(k, str)],
-                    "body_preview": body.strip()[:200] if body else "",
-                })
-            except Exception:
-                res.append({"name": skill_md.parent.name, "error": "parse failed"})
-        return res
-
-    @router.get("/skills/{name}/raw")
-    def get_skill_raw(name: str) -> dict[str, str]:
-        p = _safe_path(workspace_root / "skills", name)
-        md = p / "SKILL.md"
-        return _read_text(md)
-
-    @router.put("/skills/{name}/raw")
-    def update_skill_raw(name: str, payload: RawContent) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "skills", name)
-        md = p / "SKILL.md"
-        md.parent.mkdir(parents=True, exist_ok=True)
-        return _write_text(md, payload.content)
-
-    @router.post("/skills")
-    def create_skill(payload: NodeCreate) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "skills", payload.id)
-        md = p / "SKILL.md"
-        if md.exists():
-            raise HTTPException(status_code=409, detail="Skill already exists")
-        md.parent.mkdir(parents=True, exist_ok=True)
-        return _write_text(md, payload.content)
-
-    @router.delete("/skills/{name}")
-    def delete_skill(name: str) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "skills", name)
-        if p.exists() and p.is_dir():
-            shutil.rmtree(p)
-        return {"ok": True}
 
     # ----- Tools (external scripts) -----
     @router.get("/tools")

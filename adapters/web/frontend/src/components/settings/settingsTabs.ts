@@ -13,13 +13,11 @@ import { AdvancedSettingsPage } from './pages/AdvancedSettingsPage';
 import { AgentsSettingsPage } from './pages/AgentsSettingsPage';
 import { ApprovalsSettingsPage } from './pages/ApprovalsSettingsPage';
 import { AutomationSettingsPage } from './pages/AutomationSettingsPage';
-import { SkillsSettingsPage } from './pages/SkillsSettingsPage';
 import { SystemSettingsPage } from './pages/SystemSettingsPage';
 import { ToolsSettingsPage } from './pages/ToolsSettingsPage';
 import {
   AgentsSettingsRightPanel,
   AutomationSettingsRightPanel,
-  SkillsSettingsRightPanel,
   ToolsSettingsRightPanel,
 } from './panels/SettingsContextPanels';
 import { SessionConfigPanel } from './SessionConfigPanel';
@@ -63,7 +61,6 @@ export const settingsTabs: SettingsTabDefinition[] = [
   { id: 'approvals', label: '审批', icon: 'approval', order: 5, Page: ApprovalsSettingsPage },
   { id: 'agents', label: '节点', icon: 'smart_toy', order: 6, Page: AgentsSettingsPage, RightPanel: AgentsSettingsRightPanel },
   { id: 'tools', label: '工具', icon: 'build', order: 7, Page: ToolsSettingsPage, RightPanel: ToolsSettingsRightPanel },
-  { id: 'skills', label: '技能', icon: 'menu_book', order: 8, Page: SkillsSettingsPage, RightPanel: SkillsSettingsRightPanel },
   { id: 'automation', label: '自动化', icon: 'schedule', order: 10, Page: AutomationSettingsPage, RightPanel: AutomationSettingsRightPanel },
   { id: 'advanced', label: '高级', icon: 'code', order: 11, Page: AdvancedSettingsPage },
 ].sort((a, b) => a.order - b.order);

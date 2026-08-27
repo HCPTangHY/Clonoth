@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>技能管理</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+  /* 主题值全部由宿主注入（themeBridge 在 iframe load 后把宿主 :root 规则
+     原样写入本页）。本页只声明别名与宿主变量名的映射，不持有任何宿主值。 */
+  :root {
+    --bg: var(--duties-bg); --panel: var(--duties-panel); --muted: var(--duties-muted);
+    --text: var(--duties-text); --secondary: var(--duties-secondary); --tertiary: var(--duties-tertiary);
+    --border: var(--duties-border); --accent: var(--duties-accent);
+    --ok: #2e7d32; --danger: #a33c3c;
+    --mono: 'Geist Mono', ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 12px/1.6 'Inter', ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+
+  .bar {
+    position: sticky; top: 0; z-index: 5; background: var(--bg);
+    padding: 14px 20px 10px; border-bottom: 1px solid var(--muted);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  .bar h1 { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: -0.02em; }
+  .bar .count { flex: 1; color: var(--tertiary); font: 10.5px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button.op {
+    font: 10.5px var(--mono); cursor: pointer; white-space: nowrap;
+    color: var(--secondary); background: transparent;
+    border: 1px solid var(--border); border-radius: 4px; padding: 3px 10px;
+    transition: color .15s, border-color .15s;
+  }
+  button.op:hover:not(:disabled) { color: var(--text); border-color: var(--secondary); }
+  button.op:disabled { opacity: .4; cursor: not-allowed; }
+  button.op.danger { color: var(--danger); }
+  button.op.danger:hover:not(:disabled) { border-color: var(--danger); }
+  button.op.primary { color: var(--accent); border-color: var(--accent); }
+
+  .cols { display: flex; gap: 0; min-height: calc(100vh - 44px); }
+  .list-pane { flex: 0 0 300px; border-right: 1px solid var(--muted); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .new-row { display: flex; gap: 6px; }
+  .new-row input {
+    flex: 1; min-width: 0; font: 11px var(--mono); color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; outline: none;
+  }
+  .new-row input:focus { border-color: var(--secondary); }
+  .new-row input::placeholder { color: var(--tertiary); }
+  .skill-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .skill {
+    text-align: left; cursor: pointer; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px;
+    transition: border-color .15s;
+  }
+  .skill:hover { border-color: var(--secondary); }
+  .skill.sel { border-color: var(--text); background: var(--panel); }
+  .skill .row1 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .skill .name { font: 600 11px var(--mono); }
+  .badge { font: 9px var(--mono); border-radius: 3px; padding: 1px 5px; border: 1px solid; }
+  .badge.on { color: var(--ok); border-color: var(--ok); }
+  .badge.off { color: var(--danger); border-color: var(--danger); }
+  .badge.tr { color: var(--tertiary); border-color: var(--border); }
+  .skill .desc { margin-top: 2px; color: var(--secondary); font-size: 10.5px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .skill .kws { margin-top: 2px; font: 9.5px var(--mono); color: var(--tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .empty { color: var(--tertiary); font-size: 11px; padding: 8px 2px; }
+
+  .editor-pane { flex: 1; min-width: 0; padding: 16px 20px; overflow-y: auto; }
+  .editor-pane .placeholder { color: var(--tertiary); font-size: 11px; }
+  .form { display: flex; flex-direction: column; gap: 12px; max-width: 640px; }
+  .form .kv { display: flex; align-items: center; gap: 8px; }
+  .form .fid { font: 600 12px var(--mono); }
+  label.f { display: block; }
+  label.f .lb { display: block; margin-bottom: 3px; color: var(--tertiary); font: 10px var(--mono); }
+  label.f input[type=text], label.f select {
+    width: 100%; font: 11px var(--mono); color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 8px; outline: none;
+  }
+  label.f input:focus, label.f select:focus { border-color: var(--secondary); }
+  .trio { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .check { display: flex; align-items: center; gap: 6px; color: var(--secondary); font-size: 11px; cursor: pointer; }
+  textarea.body {
+    width: 100%; font: 11px/1.6 var(--mono); color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+    padding: 8px 10px; outline: none; resize: vertical; min-height: 260px;
+  }
+  textarea.body:focus { border-color: var(--secondary); }
+  .form-actions { display: flex; gap: 8px; align-items: center; border-top: 1px solid var(--muted); padding-top: 12px; }
+  .msg { font: 10.5px var(--mono); }
+  .msg.ok { color: var(--ok); }
+  .msg.err { color: var(--danger); }
+
+  @media (max-width: 720px) {
+    .cols { flex-direction: column; }
+    .list-pane { flex: none; border-right: none; border-bottom: 1px solid var(--muted); max-height: 40vh; }
+    .editor-pane { padding: 14px 16px; }
+    .trio { grid-template-columns: 1fr; }
+    button.op, .new-row input { min-height: 32px; }
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <h1>技能</h1>
+  <span class="count" id="count">—</span>
+  <button class="op" id="refresh">刷新</button>
+</header>
+<main class="cols">
+  <section class="list-pane">
+    <div class="new-row">
+      <input id="new-name" placeholder="新技能目录名">
+      <button class="op" id="new-btn" title="创建 skills/{name}/SKILL.md（默认模板）">创建</button>
+    </div>
+    <div class="skill-list" id="list"><p class="empty">加载中。</p></div>
+  </section>
+  <section class="editor-pane" id="editor"><p class="placeholder">选择左侧的技能后在此编辑 frontmatter 与正文。</p></section>
+</main>
+<script src="vendor/js-yaml.min.js"></script>
+<script>
+'use strict';
+
+// ── boot / api ─────────────────────────────────────────────
+function boot() {
+  try {
+    const b = window.parent.__CLONOTH_BOOT__;
+    if (b && b.token) return b;
+  } catch (e) { /* cross-origin */ }
+  return { token: '' };
+}
+async function api(path, init) {
+  const b = boot();
+  const resp = await fetch('/v1' + path, Object.assign({}, init, {
+    headers: Object.assign({
+      'Content-Type': 'application/json',
+      ...(b.token ? { Authorization: 'Bearer ' + b.token } : {}),
+    }, (init && init.headers) || {}),
+  }));
+  if (!resp.ok) {
+    let detail = '';
+    try { detail = (await resp.json()).detail || ''; } catch (e) { /* ignore */ }
+    throw new Error(resp.status + (detail ? ' ' + detail : ''));
+  }
+  return resp.json();
+}
+
+// ── state ──────────────────────────────────────────────────
+const S = {
+  skills: [],        // 列表（GET /admin/config/skills）
+  selectedName: null,
+  raw: '',           // 选中技能的 SKILL.md 全文
+  fm: null,          // 解析出的 frontmatter（jsyaml）
+  form: null,        // 表单状态（快捷字段 + body）
+  dirty: false,
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '');
+
+function splitFrontmatter(raw) {
+  if (!raw.startsWith('---\n')) return { head: null, body: raw };
+  const end = raw.indexOf('\n---\n', 4);
+  if (end < 0) return { head: null, body: raw };
+  return { head: raw.slice(4, end), body: raw.slice(end + 5) };
+}
+
+function replaceFmValue(raw, key, value) {
+  // 在 frontmatter 内逐键替换；键不存在则插在 frontmatter 首行之后。
+  // 未识别的键原样保留。
+  let { head, body } = splitFrontmatter(raw);
+  if (head === null) {
+    head = `name: \ndescription: \n`;
+  }
+  const lines = head.split('\n');
+  const re = new RegExp('^' + key + ':');
+  let hit = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (re.test(lines[i])) {
+      lines[i] = `${key}: ${value}`;
+      hit = true;
+      break;
+    }
+  }
+  if (!hit) {
+    // 插在首个非注释行之后
+    let at = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i].startsWith('#')) { at = i + 1; break; }
+    }
+    lines.splice(at, 0, `${key}: ${value}`);
+  }
+  return '---\n' + lines.join('\n') + '\n---\n' + body;
+}
+
+// ── data ───────────────────────────────────────────────────
+async function loadAll() {
+  S.skills = await api('/admin/config/skills');
+  if (S.selectedName && !S.skills.some((s) => s.name === S.selectedName)) {
+    S.selectedName = null; S.form = null; S.raw = '';
+  }
+  renderList();
+  renderEditor();
+}
+
+async function select(name) {
+  if (S.dirty && !confirm('当前编辑未保存，切换将丢弃修改。继续？')) return;
+  S.selectedName = name;
+  S.form = null;
+  S.raw = '';
+  S.dirty = false;
+  renderList();
+  renderEditor();
+  try {
+    const resp = await api('/admin/config/skills/' + encodeURIComponent(name) + '/raw');
+    S.raw = resp.content;
+    S.fm = splitFrontmatter(S.raw);
+    let meta = {};
+    try { meta = jsyaml.load(S.fm.head) || {}; } catch (e) { /* frontmatter 损坏时按空处理 */ }
+    S.form = {
+      description: esc(meta.description),
+      enabled: meta.enabled !== false,
+      strategy: meta.strategy === 'constant' ? 'constant' : 'normal',
+      keywords: Array.isArray(meta.keywords) ? meta.keywords.join(', ') : '',
+      order: esc(meta.order ?? '0'),
+      priority: esc(meta.priority ?? '0'),
+      scan_depth: esc(meta.scan_depth ?? '0'),
+      body: S.fm.body,
+    };
+    renderEditor();
+  } catch (e) {
+    setMsg('加载失败：' + e.message, false);
+  }
+}
+
+async function save() {
+  if (!S.form || !S.selectedName) return;
+  const f = S.form;
+  try {
+    // 快捷字段逐键替换（保留未知键），正文整体替换。
+    let next = S.raw || '---\nname: ' + S.selectedName + '\n---\n';
+    next = replaceFmValue(next, 'description', JSON.stringify(f.description));
+    next = replaceFmValue(next, 'enabled', f.enabled ? 'true' : 'false');
+    next = replaceFmValue(next, 'strategy', f.strategy || 'normal');
+    const kwItems = f.keywords.split(',').map((s) => s.trim()).filter(Boolean)
+      .map((s) => '"' + s.replace(/"/g, '\\"') + '"');
+    next = replaceFmValue(next, 'keywords', '[' + kwItems.join(', ') + ']');
+    next = replaceFmValue(next, 'order', f.order || '0');
+    next = replaceFmValue(next, 'priority', f.priority || '0');
+    next = replaceFmValue(next, 'scan_depth', f.scan_depth || '0');
+    // 正文替换：frontmatter 块之后的内容整体换成 body
+    const parts = splitFrontmatter(next);
+    const headText = parts.head !== null ? '---\n' + parts.head + '\n---\n' : '';
+    next = headText + f.body;
+    await api('/admin/config/skills/' + encodeURIComponent(S.selectedName) + '/raw', {
+      method: 'PUT',
+      body: JSON.stringify({ content: next }),
+    });
+    S.raw = next;
+    S.dirty = false;
+    setMsg('已保存。注入内容随下一轮对话生效。', true);
+    await loadAll();
+  } catch (e) {
+    setMsg('保存失败：' + e.message, false);
+  }
+}
+
+async function removeSelected() {
+  if (!S.selectedName) return;
+  if (!confirm(`确定要删除技能 ${S.selectedName} 吗？skills/${S.selectedName}/ 目录将被整体移除。`)) return;
+  try {
+    await api('/admin/config/skills/' + encodeURIComponent(S.selectedName), { method: 'DELETE' });
+    S.selectedName = null;
+    S.form = null;
+    S.dirty = false;
+    await loadAll();
+  } catch (e) {
+    setMsg('删除失败：' + e.message, false);
+  }
+}
+
+async function createSkill() {
+  const input = $('new-name');
+  const name = input.value.trim();
+  if (!name) { alert('请输入技能目录名'); return; }
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) { alert('名称需匹配 ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$'); return; }
+  if (S.skills.some((s) => s.name === name)) { alert('该技能已存在'); return; }
+  const content = `---\nname: ${name}\ndescription: 通过设置页面创建的技能。\nenabled: true\nstrategy: normal\nkeywords: []\norder: 0\npriority: 0\nscan_depth: 0\n---\n\n# ${name}\n\n请在这里编写技能内容。\n`;
+  try {
+    await api('/admin/config/skills', { method: 'POST', body: JSON.stringify({ id: name, content }) });
+    input.value = '';
+    await loadAll();
+    await select(name);
+  } catch (e) {
+    alert('创建失败：' + e.message);
+  }
+}
+
+// ── list pane ──────────────────────────────────────────────
+function renderList() {
+  const el = $('list');
+  el.innerHTML = '';
+  $('count').textContent = S.skills.length + ' 个技能';
+  if (S.skills.length === 0) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '暂无技能。在上方输入目录名创建。';
+    el.appendChild(p);
+    return;
+  }
+  for (const s of S.skills) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'skill' + (s.name === S.selectedName ? ' sel' : '');
+    const row1 = document.createElement('div');
+    row1.className = 'row1';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'name';
+    nameSpan.textContent = s.name;
+    const onBadge = document.createElement('span');
+    onBadge.className = 'badge ' + (s.enabled === false ? 'off' : 'on');
+    onBadge.textContent = s.enabled === false ? '禁用' : '启用';
+    const trBadge = document.createElement('span');
+    trBadge.className = 'badge tr';
+    trBadge.textContent = s.strategy || 'normal';
+    row1.append(nameSpan, onBadge, trBadge);
+    btn.appendChild(row1);
+    if (s.description || s.body_preview) {
+      const desc = document.createElement('div');
+      desc.className = 'desc';
+      desc.textContent = s.description || s.body_preview;
+      btn.appendChild(desc);
+    }
+    if ((s.keywords || []).length > 0) {
+      const kws = document.createElement('div');
+      kws.className = 'kws';
+      kws.textContent = s.keywords.join(', ');
+      btn.appendChild(kws);
+    }
+    btn.addEventListener('click', () => { select(s.name); });
+    el.appendChild(btn);
+  }
+}
+
+// ── editor pane ────────────────────────────────────────────
+function field(labelText, inputEl) {
+  const label = document.createElement('label');
+  label.className = 'f';
+  const lb = document.createElement('span');
+  lb.className = 'lb';
+  lb.textContent = labelText;
+  label.append(lb, inputEl);
+  return label;
+}
+function textInput(value, onInput) {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = value;
+  input.addEventListener('input', () => onInput(input.value));
+  return input;
+}
+
+function renderEditor() {
+  const el = $('editor');
+  el.innerHTML = '';
+  if (!S.form) {
+    const p = document.createElement('p');
+    p.className = 'placeholder';
+    p.textContent = '选择左侧的技能后在此编辑 frontmatter 与正文。';
+    el.appendChild(p);
+    return;
+  }
+  const f = S.form;
+  const form = document.createElement('div');
+  form.className = 'form';
+
+  const idRow = document.createElement('div');
+  idRow.className = 'kv';
+  const idLb = document.createElement('span');
+  idLb.className = 'lb';
+  idLb.textContent = '目录名';
+  const idVal = document.createElement('span');
+  idVal.className = 'fid';
+  idVal.textContent = S.selectedName || '';
+  idRow.append(idLb, idVal);
+  form.appendChild(idRow);
+
+  form.appendChild(field('description', textInput(f.description, (v) => { f.description = v; markDirty(); })));
+
+  const checkLabel = document.createElement('label');
+  checkLabel.className = 'check';
+  const check = document.createElement('input');
+  check.type = 'checkbox';
+  check.checked = f.enabled;
+  check.addEventListener('change', () => { f.enabled = check.checked; markDirty(); });
+  const checkText = document.createElement('span');
+  checkText.textContent = 'enabled';
+  checkLabel.append(check, checkText);
+  form.appendChild(checkLabel);
+
+  const strategySel = document.createElement('select');
+  for (const t of ['normal', 'constant']) {
+    const opt = document.createElement('option');
+    opt.value = t;
+    opt.textContent = t;
+    if (t === f.strategy) opt.selected = true;
+  }
+  strategySel.addEventListener('change', () => { f.strategy = strategySel.value; markDirty(); });
+  form.appendChild(field('strategy（normal=关键词触发，constant=常驻注入）', strategySel));
+
+  form.appendChild(field('keywords（逗号分隔，支持 /regex/flags）', textInput(f.keywords, (v) => { f.keywords = v; markDirty(); })));
+
+  const trio = document.createElement('div');
+  trio.className = 'trio';
+  for (const key of ['order', 'priority', 'scan_depth']) {
+    trio.appendChild(field(key, textInput(f[key], (v) => { f[key] = v; markDirty(); })));
+  }
+  form.appendChild(trio);
+
+  const bodyLabel = document.createElement('label');
+  bodyLabel.className = 'f';
+  const bodyLb = document.createElement('span');
+  bodyLb.className = 'lb';
+  bodyLb.textContent = '正文（Markdown）';
+  const bodyTa = document.createElement('textarea');
+  bodyTa.className = 'body';
+  bodyTa.spellcheck = false;
+  bodyTa.value = f.body;
+  bodyTa.addEventListener('input', () => { f.body = bodyTa.value; markDirty(); });
+  bodyLabel.append(bodyLb, bodyTa);
+  form.appendChild(bodyLabel);
+
+  const actions = document.createElement('div');
+  actions.className = 'form-actions';
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'op primary';
+  saveBtn.textContent = '保存';
+  saveBtn.addEventListener('click', save);
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'op danger';
+  delBtn.textContent = '删除此技能';
+  delBtn.addEventListener('click', removeSelected);
+  const msg = document.createElement('span');
+  msg.className = 'msg';
+  msg.id = 'editor-msg';
+  actions.append(saveBtn, delBtn, msg);
+  form.appendChild(actions);
+
+  el.appendChild(form);
+}
+
+function markDirty() {
+  S.dirty = true;
+  const msg = $('editor-msg');
+  if (msg) { msg.className = 'msg'; msg.textContent = '未保存'; }
+}
+function setMsg(text, ok) {
+  const msg = $('editor-msg');
+  if (!msg) return;
+  msg.className = 'msg ' + (ok ? 'ok' : 'err');
+  msg.textContent = text;
+}
+
+// ── wire up ────────────────────────────────────────────────
+$('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
+$('new-btn').addEventListener('click', createSkill);
+$('new-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') createSkill(); });
+
+loadAll().catch((e) => {
+  $('list').innerHTML = '';
+  const p = document.createElement('p');
+  p.className = 'empty';
+  p.textContent = '加载失败：' + e.message;
+  $('list').appendChild(p);
+});
+</script>
+</body>
+</html>
