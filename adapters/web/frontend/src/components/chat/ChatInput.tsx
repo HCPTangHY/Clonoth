@@ -74,9 +74,11 @@ const contextUsageColorClass = (utilization: number): string => {
   // [2026-06-05] Why: the indicator should become more prominent as compaction gets
   // closer. How: apply the requested gray, yellow, and red text classes by threshold.
   // Purpose: token pressure is visible without adding borders or disrupting toolbar layout.
+  // [AutoC 2026-08-27] 低档从三级灰改为次级正文色：三级灰（#6e6e73）与相邻
+  // 工具栏按钮（次级 #4a4a4a）相比明显发虚，视觉上像半透明。
   if (utilization >= 0.75) return 'text-red-500';
   if (utilization >= 0.5) return 'text-yellow-500';
-  return 'text-[var(--duties-tertiary)]';
+  return 'text-[var(--duties-secondary)]';
 };
 
 const revokeLocalAttachmentUrls = (items: readonly Attachment[]) => {
@@ -413,7 +415,7 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
                     const circumference = 2 * Math.PI * r;
                     const arcLen = (totalDeg / 360) * circumference;
                     const fillLen = arcLen * Math.min(1, Math.max(0, contextUsage.utilization));
-                    const strokeColor = contextUsage.utilization >= 0.75 ? '#ef4444' : contextUsage.utilization >= 0.5 ? '#eab308' : 'var(--duties-tertiary)';
+                    const strokeColor = contextUsage.utilization >= 0.75 ? '#ef4444' : contextUsage.utilization >= 0.5 ? '#eab308' : 'var(--duties-secondary)';
                     const toRad = (deg: number) => (deg * Math.PI) / 180;
                     const sx = cx + r * Math.cos(toRad(startAngle));
                     const sy = cy + r * Math.sin(toRad(startAngle));
