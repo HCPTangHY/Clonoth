@@ -94,7 +94,7 @@ const KNOWN_TOOL_RULES: KnownToolInfo[] = [
   { toolName: 'list_schedules', label: 'list_schedules', description: '列出定时任务。智能模式默认自动放行。' },
   { toolName: 'delete_schedule', label: 'delete_schedule', description: '删除定时任务。智能模式默认自动放行，可以在这里关闭。' },
   { toolName: 'create_or_update_tool', label: 'create_or_update_tool', description: '创建或更新外部工具。智能模式默认自动放行，可以在这里关闭。' },
-  { toolName: 'reload_tools', label: 'reload_tools', description: '重载工具目录和 MCP 工具。智能模式默认自动放行，可以在这里关闭。' },
+  { toolName: 'reload_tools', label: 'reload_tools', description: '重载工具目录。智能模式默认自动放行，可以在这里关闭。' },
   { toolName: 'create_or_update_mcp_client', label: 'create_or_update_mcp_client', description: '创建或更新 MCP 客户端配置。智能模式默认自动放行，可以在这里关闭。' },
   { toolName: 'list_mcp_clients', label: 'list_mcp_clients', description: '列出 MCP 客户端配置。智能模式默认自动放行。' },
   { toolName: 'delete_mcp_client', label: 'delete_mcp_client', description: '删除 MCP 客户端配置。智能模式默认自动放行，可以在这里关闭。' },
