@@ -624,3 +624,30 @@ body {
 .cm-line.cm-diff-add::before { content: '+'; color: #50a14f; }
 .cm-line.cm-diff-del::before { content: '\2212'; color: #e45649; }
 .cm-line.cm-diff-ctx::before { content: ' '; }
+
+/* ── 右键菜单（文件树 / 标签栏共用）── */
+.ctx-menu {
+  position: fixed;
+  z-index: 90;
+  min-width: 148px;
+  padding: 4px 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.ctx-item {
+  display: block;
+  width: 100%;
+  padding: 5px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  white-space: nowrap;
+}
+.ctx-item:hover { background: var(--hover); }
+.ctx-item.danger { color: #c0392b; }

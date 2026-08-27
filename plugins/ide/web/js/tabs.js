@@ -145,6 +145,37 @@ function renderTabs() {
       el.addEventListener('dblclick', () => {
         if (!tab.pinned) { tab.pinned = true; renderTabs(); }
       });
+      // [AutoC 2026-08-27] 右键菜单：固定/关闭/关闭其他/关闭右侧/复制路径。
+      // 只挂在文件标签上，文件树标签回落浏览器默认菜单。
+      el.addEventListener('contextmenu', (e) => {
+        const items = [];
+        items.push(tab.pinned
+          ? { label: '取消固定', action: () => { tab.pinned = false; renderTabs(); } }
+          : { label: '固定标签', action: () => { tab.pinned = true; renderTabs(); } });
+        items.push({ label: '关闭', action: () => closeTab(tab.path) });
+        const idx = tabs.indexOf(tab);
+        const others = tabs.filter((t) => t.path !== TREE_TAB && t.path !== tab.path);
+        if (others.length) {
+          items.push({
+            label: '关闭其他',
+            action: () => { for (const t of others) closeTab(t.path); },
+          });
+        }
+        const rights = tabs.slice(idx + 1).filter((t) => t.path !== TREE_TAB);
+        if (rights.length) {
+          items.push({
+            label: '关闭右侧',
+            action: () => { for (const t of rights.slice().reverse()) closeTab(t.path); },
+          });
+        }
+        items.push({
+          label: '复制路径',
+          action: () => copyText(String(tab.path).replace(/ \(diff\)$/, '')),
+        });
+        e.preventDefault();
+        e.stopPropagation();
+        showContextMenu(e.clientX, e.clientY, items);
+      });
     }
     el.addEventListener('click', () => activate(tab.path));
     tabbarEl.insertBefore(el, tabbarEl.querySelector('.bar-end'));

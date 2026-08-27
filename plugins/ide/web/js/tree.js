@@ -69,6 +69,23 @@ function renderNode(node, depth, container) {
   btn.addEventListener('dblclick', () => {
     if (!isDir) openFileTab(node.path, true);
   });
+
+  // [AutoC 2026-08-27] 右键菜单：目录提供展开/折叠，文件提供打开/固定/复制。
+  // 编辑器区域不拦截，保留浏览器原生菜单（复制粘贴仍可用）。
+  btn.addEventListener('contextmenu', (e) => {
+    const items = [];
+    if (isDir) {
+      items.push({ label: expanded ? '折叠' : '展开', action: () => btn.click() });
+    } else {
+      items.push({ label: '打开', action: () => openFileTab(node.path, false) });
+      items.push({ label: '固定打开', action: () => openFileTab(node.path, true) });
+    }
+    items.push({ label: '复制相对路径', action: () => copyText(node.path) });
+    items.push({ label: '复制名称', action: () => copyText(node.name) });
+    e.preventDefault();
+    e.stopPropagation();
+    showContextMenu(e.clientX, e.clientY, items);
+  });
 }
 
 async function bootTree() {
