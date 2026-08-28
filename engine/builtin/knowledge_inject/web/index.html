@@ -37,7 +37,9 @@
   button.op.danger:hover:not(:disabled) { border-color: var(--danger); }
   button.op.primary { color: var(--accent); border-color: var(--accent); }
 
-  .cols { display: flex; gap: 0; min-height: calc(100vh - 44px); }
+  .cols { display: flex; gap: 0; height: calc(100vh - 44px); }
+  /* [AutoC 2026-08-28] 固定高度而非 min-height：列表/树面板各自内部滚动，
+     页面本体不再被内容撑高（此前树面板被撑到数千像素高）。 */
   .list-pane { flex: 0 0 300px; border-right: 1px solid var(--muted); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
   .new-row { display: flex; gap: 6px; }
   .new-row input {
@@ -69,7 +71,7 @@
      列表，编辑器由宿主右栏承担。与 memory/MCP 页同一模式。 */
   body.editor-only .cols { display: block; }
   body.editor-only .list-pane { display: none; }
-  body.editor-only .editor-pane { padding: 14px 16px; }
+  body.editor-only .editor-pane { padding: 14px 16px; height: calc(100vh - 44px); }
   body.editor-only .bar .count, body.editor-only .bar #refresh { display: none; }
   body:not(.editor-only) .editor-pane { display: none; }
   body:not(.editor-only) .list-pane { flex: 1; border-right: none; }
@@ -98,13 +100,10 @@
   .msg.ok { color: var(--ok); }
   .msg.err { color: var(--danger); }
 
-  @media (max-width: 720px) {
-    .cols { flex-direction: column; }
-    .list-pane { flex: none; border-right: none; border-bottom: 1px solid var(--muted); max-height: 40vh; }
-    .editor-pane { padding: 14px 16px; }
-    .trio { grid-template-columns: 1fr; }
-    button.op, .new-row input { min-height: 32px; }
-  }
+  /* [AutoC 2026-08-28] 旧移动端断点在插件面板形态下失效：iframe 宽度是
+     宿主主区/右栏宽度而非视口，主区窄于 720px 时断点把列表错切为上下
+     堆叠。删除堆叠规则；编辑器形态的右栏天然窄，单列网格按形态常开。 */
+  body.editor-only .trio { grid-template-columns: 1fr; }
 </style>
 </head>
 <body>

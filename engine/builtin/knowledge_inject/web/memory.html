@@ -28,7 +28,9 @@
   button.op.danger:hover:not(:disabled) { border-color: var(--danger); }
   button.op.primary { color: var(--accent); border-color: var(--accent); }
 
-  .cols { display: flex; gap: 0; min-height: calc(100vh - 44px); }
+  .cols { display: flex; gap: 0; height: calc(100vh - 44px); }
+  /* [AutoC 2026-08-28] 固定高度而非 min-height：列表/树面板各自内部滚动，
+     页面本体不再被内容撑高（此前树面板被撑到数千像素高）。 */
   .tree-pane { flex: 0 0 260px; border-right: 1px solid var(--muted); overflow-y: auto; padding: 10px 10px 20px; }
   .ns { margin-bottom: 8px; }
   .ns-head { display: flex; align-items: baseline; gap: 6px; padding: 4px 6px; color: var(--tertiary); font: 10px var(--mono); letter-spacing: .02em; }
@@ -89,19 +91,16 @@
   body.editor-only .bar .count, body.editor-only .bar #refresh, body.editor-only .bar #new-entry { display: none; }
   body.editor-only .cols { display: block; min-height: 0; }
   body.editor-only .tree-pane, body.editor-only .entries, body.editor-only .book-bar { display: none; }
-  body.editor-only .editor { display: block; border-top: none; max-height: none; min-height: calc(100vh - 45px); }
+  body.editor-only .editor { display: block; border-top: none; max-height: none; height: calc(100vh - 44px); }
   /* 列表形态：条目区占满整页，编辑器节点不渲染 */
   body:not(.editor-only) .main-pane { display: contents; }
   body:not(.editor-only) .book-bar, body:not(.editor-only) .editor { display: none; }
   body:not(.editor-only) .entries { height: 100%; }
 
-  @media (max-width: 720px) {
-    .cols { flex-direction: column; }
-    .tree-pane { flex: none; border-right: none; border-bottom: 1px solid var(--muted); max-height: 32vh; }
-    .duo { grid-template-columns: 1fr; }
-    .entries, .editor { padding-left: 14px; padding-right: 14px; }
-    button.op { min-height: 32px; }
-  }
+  /* [AutoC 2026-08-28] 旧移动端断点在插件面板形态下失效：iframe 宽度是
+     宿主主区/右栏宽度而非视口，主区窄于 720px 时断点把列表错切为上下
+     堆叠。删除堆叠规则；编辑器形态的右栏天然窄，单列网格按形态常开。 */
+  body.editor-only .duo { grid-template-columns: 1fr; }
 </style>
 </head>
 <body>
