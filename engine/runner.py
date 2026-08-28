@@ -816,6 +816,10 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     _mr = input_data.get("_memory_route")
     if isinstance(_mr, dict) and _mr:
         ctx["_memory_route"] = _mr
+    # [AutoC 2026-08-28] Forward _memory_route_ns for memory_extractor tasks.
+    _mrns = input_data.get("_memory_route_ns")
+    if isinstance(_mrns, str) and _mrns:
+        ctx["_memory_route_ns"] = _mrns
     return ctx
 
 

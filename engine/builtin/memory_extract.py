@@ -304,6 +304,10 @@ class MemoryExtractHandler:
             return None
 
         extractor_node = get_str(runtime_cfg, "memory.auto_extract.node_id", "system.memory_extractor").strip()
+        # [AutoC 2026-08-28] Capture the source node_id so the dream_router
+        # hook can redirect save_memory writes to the correct namespace.
+        _entry_nid = get_entry_node_id(runtime_cfg)
+        source_node_id = str(getattr(task, "node_id", "") or "").strip() or _entry_nid
         return {
             "session_id": session_id,
             "session_generation": int(getattr(task, "session_generation", 0) or 0),
@@ -312,6 +316,7 @@ class MemoryExtractHandler:
             "pending_task_ids": pending_task_ids,
             "extractor_node": extractor_node,
             "kind": getattr(task, "kind", "node"),
+            "_source_node_id": source_node_id,
         }
 
     def _schedule_memory_extract_idle_locked(
@@ -412,6 +417,12 @@ class MemoryExtractHandler:
             # [2026-04-26] child_session_id isolation prevents the system task's
             # instruction from being written into the main session JSONL history.
             child_sid = f"child_{uuid.uuid4().hex[:12]}"
+            # [AutoC 2026-08-28] Pass _memory_route_ns so dream_router hook
+            # redirects save_memory writes to the source node's directory.
+            _source_nid = str(pending_extract.get("_source_node_id") or "").strip()
+            _extra_input: dict[str, Any] = {}
+            if _source_nid:
+                _extra_input["_memory_route_ns"] = _source_nid
             create_task(
                 session_id=sid,
                 session_generation=session_generation,
@@ -421,6 +432,7 @@ class MemoryExtractHandler:
                     "instruction": book_list_header + transcript,
                     "child_session_id": child_sid,
                     "_system_task": True,
+                    **_extra_input,
                 },
                 continuation={},
                 source_inbound_seq=None,

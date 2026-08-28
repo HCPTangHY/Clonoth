@@ -135,8 +135,33 @@ class AsyncScheduler:
         if threshold is None:
             return None  # default synchronous execution
 
+        # [AutoC 2026-08-28] 惰性协程：task 在第一次 await 时才创建，审批与
+        # 阈值定时由协程体内控制。Why: 旧形态在任务创建时即启动真实执行，
+        # 审批（before_tool_call）出现在执行开始之后，命令未经批准已在跑。
+        # How: 协程体内先等阈值计时器、再做 before_tool_call 检查、最后才
+        # create_task 启动执行。Purpose: 审批拒绝的命令零执行，审批时间不算
+        # 入升级阈值——阈值表示"已批准的实际执行超过 X 秒才升级"。
         async def _adaptive() -> Any:
             exec_ctx = _snapshot_tool_context(tool_ctx)
+
+            # 审批（升级前阻塞语义）：执行开始前检查，拒绝则直接返回拒绝标记
+            approval_result = await hook_registry.afire("before_tool_call", ctx)
+            if approval_result.action is not None:
+                return {"approval_blocked": True, "action": approval_result.action}
+            if approval_result.block or approval_result.skip_step:
+                reason = (
+                    approval_result.error_message
+                    or approval_result.reason
+                    or "Tool call blocked by before_tool_call approval."
+                )
+                return {
+                    "approval_blocked": True,
+                    "blocked": True,
+                    "reason": reason,
+                    "summary": reason[:200],
+                }
+
+            # 审批通过后才启动执行与阈值定时
             exec_task = asyncio.create_task(
                 _execute_registry_tool_with_span(ls.registry, tool_name, tool_args, exec_ctx),
                 name=f"execute_command_adaptive_{tool_call_id[:24] or 'call'}",
