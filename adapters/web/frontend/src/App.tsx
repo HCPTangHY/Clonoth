@@ -43,6 +43,10 @@ const MainApp = () => {
   // 关闭面板要等到下一个无关 store 事件（空闲时最坏 10 秒健康检查）才生效，
   // 表现为「从面板返回仪表盘很慢」。这里订阅后，App 在 overlay 变化时立即重渲染。
   const panelOverlay = useViewStore(state => state.panelOverlay);
+  // [AutoC 2026-08-28] 订阅 activeSettingsTab：设置视图的右栏随页签类型增减
+  // （插件 iframe 页签无右栏）。viewRegistry.rightTop 用 getState() 命令式读取，
+  // 不订阅的话切页签要等下一个无关 store 事件才重渲染，右栏残留或延迟消失。
+  const activeSettingsTab = useViewStore(state => state.activeSettingsTab);
   const viewingChildNode = viewingChildSessionId ? childNodes[viewingChildSessionId] : undefined;
   const activeSessionId = viewingChildSessionId || activeConversation?.sessionId || '';
   // [2026-06-03] Why: child-session navigation renders a different chat stream while

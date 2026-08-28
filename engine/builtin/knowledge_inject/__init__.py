@@ -1801,7 +1801,11 @@ def _delete_skill_endpoint(name: str, request: Any) -> dict[str, Any]:
 
 
 def _register_admin_routes(routes: Any) -> None:
-    from fastapi import APIRouter
+    # request 参数必须以 Request 类型注解：FastAPI 只认该注解并注入请求对象，
+    # Any 会被当作必填 query 参数，导致所有端点 422（missing field request）。
+    # 路由处理函数在本函数内包装并注解；底层实现函数保持 Any，engine 进程
+    # 不触发 fastapi 导入。
+    from fastapi import APIRouter, Request
     from pydantic import BaseModel
 
     class RawContent(BaseModel):
@@ -1813,20 +1817,23 @@ def _register_admin_routes(routes: Any) -> None:
 
     from engine.faces.routes import static_router
 
-    def _raw(name: str, request: Any) -> dict[str, str]:
+    def _list(request: Request) -> list[dict[str, Any]]:
+        return _list_skills_endpoint(request)
+
+    def _raw(name: str, request: Request) -> dict[str, str]:
         return _get_skill_raw_endpoint(name, request)
 
-    def _update(name: str, request: Any, payload: RawContent) -> dict[str, Any]:
+    def _update(name: str, request: Request, payload: RawContent) -> dict[str, Any]:
         return _update_skill_raw_endpoint(name, request, payload)
 
-    def _create(request: Any, payload: CreatePayload) -> dict[str, Any]:
+    def _create(request: Request, payload: CreatePayload) -> dict[str, Any]:
         return _create_skill_endpoint(request, payload)
 
-    def _delete(name: str, request: Any) -> dict[str, Any]:
+    def _delete(name: str, request: Request) -> dict[str, Any]:
         return _delete_skill_endpoint(name, request)
 
     router = APIRouter()
-    router.add_api_route("/skills", _list_skills_endpoint, methods=["GET"])
+    router.add_api_route("/skills", _list, methods=["GET"])
     router.add_api_route("/skills/{name}/raw", _raw, methods=["GET"])
     router.add_api_route("/skills/{name}/raw", _update, methods=["PUT"])
     router.add_api_route("/skills", _create, methods=["POST"])

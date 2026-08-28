@@ -170,7 +170,17 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     sidebar: () => <SettingsSidebar />,
     header: () => <SettingsHeader />,
     main: () => <SettingsPageHost />,
-    rightTop: () => <SettingsRightPanel />,
+    // [AutoC 2026-08-28] 插件 iframe 设置页不占右栏。Why: 插件面板（MCP、插件
+    // 管理器、技能）是自包含 iframe，列表与编辑器都在页内；此前右栏对它们渲染
+    // 通用「设置帮助」占位，把 iframe 挤在中间栏，形成无意义的三栏分剖。How:
+    // 面向 plugin: 前缀的页签返回 undefined，AppLayout 的 hasRightPanel 为假，
+    // 右栏整体卸载、主区占满；内置页签仍保留右栏（上下文编辑器或帮助）。
+    // Purpose: 自包含面板拿到全部主区宽度，内置页签的双栏结构不变。
+    rightTop: () => {
+      const active = useViewStore.getState().activeSettingsTab;
+      if (typeof active === 'string' && active.startsWith('plugin:')) return undefined;
+      return <SettingsRightPanel />;
+    },
     // [2026-06-02] Settings no longer reserves a lower EventLog slot. Why: contextual
     // settings editors need the full right rail, especially on narrow screens. How:
     // leave rightBottom undefined for settings while chat keeps EventLogPanel. Purpose:
