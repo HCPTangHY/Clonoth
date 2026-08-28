@@ -5,6 +5,8 @@
 // modal booleans or business conditionals.
 import { create } from 'zustand';
 
+import { usePluginsStore } from './pluginsStore';
+
 export type ViewMode = 'chat' | 'settings';
 
 // Panel overlay — temporarily replaces the default left/right panel content.
@@ -50,9 +52,14 @@ export const useViewStore = create<ViewState>((set) => ({
     viewMode: 'chat',
   }),
 
-  setSettingsTab: (tab) => set({
-    activeSettingsTab: tab,
-  }),
+  setSettingsTab: (tab) => {
+    // [AutoC 2026-08-28] 切换页签时清除上一页签的编辑器目标，插件页右栏
+    // 回到提示文本（与内置页签的“未选中显示帮助”行为一致）。
+    try {
+      usePluginsStore.getState().setPluginEditorTarget(null);
+    } catch { /* store 不可用时忽略 */ }
+    set({ activeSettingsTab: tab });
+  },
 
   setPanelOverlay: (panel, id, intent) => set((s) => {
     const next: PanelOverlayState = { ...s.panelOverlay, [panel]: id };

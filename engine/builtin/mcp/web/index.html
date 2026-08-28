@@ -65,11 +65,13 @@
 
   .editor-pane { flex: 1; min-width: 0; padding: 16px 20px; overflow-y: auto; }
   /* [AutoC 2026-08-28] mode=editor：宿主右栏中的编辑器形态，只保留编辑区。
-     列表形态不再内联渲染编辑器，条目编辑请求经 postMessage 交给宿主。 */
+     列表形态是纯列表（无内联编辑器、无分栏），条目编辑由宿主右栏承担。 */
   body.editor-only .cols { display: block; }
   body.editor-only .list-pane { display: none; }
   body.editor-only .editor-pane { padding: 14px 16px; }
   body.editor-only .bar .count, body.editor-only .bar #refresh { display: none; }
+  /* 列表形态：编辑器节点不渲染 */
+  body:not(.editor-only) .editor-pane { display: none; }
   .editor-pane .placeholder { color: var(--tertiary); font-size: 11px; }
   .form { display: flex; flex-direction: column; gap: 12px; max-width: 560px; }
   .form .kv { display: flex; align-items: center; gap: 8px; }
@@ -117,6 +119,17 @@
 <script src="vendor/js-yaml.min.js"></script>
 <script>
 'use strict';
+// 诊断浮层：任何未捕获异常直接显示在页面上（排查 iframe 脚本启动失败）
+window.addEventListener('error', (e) => {
+  let d = document.getElementById('errbox');
+  if (!d) {
+    d = document.createElement('div');
+    d.id = 'errbox';
+    d.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:9999;background:#a33c3c;color:#fff;font:11px monospace;padding:6px 10px;border-radius:4px;max-width:90%;';
+    document.body.appendChild(d);
+  }
+  d.textContent = 'JS ERROR: ' + e.message + ' @ ' + (e.filename || '').split('/').pop() + ':' + e.lineno;
+});
 
 // [AutoC 2026-08-28] 双形态：list（默认，主区整页列表）与 editor（宿主右栏
 // 编辑器）。列表点击条目时 postMessage 请宿主在右栏打开本页的 editor 形态；
@@ -252,7 +265,7 @@ async function loadAll() {
     S.selectedId = null; S.form = null;
   }
   renderList();
-  renderEditor();
+  if (MODE === 'editor') renderEditor();
 }
 
 async function saveRaw(doc) {
@@ -275,7 +288,7 @@ function renderList() {
   for (const c of S.clients) {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'client' + (c.id === S.selectedId ? ' sel' : '');
+    btn.className = 'client';
     const row1 = document.createElement('div');
     row1.className = 'row1';
     const idSpan = document.createElement('span');

@@ -152,6 +152,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   event_busy: EventBusyW400,
   explore: ExploreW400,
   extension: ExtensionW400,
+  psychology: PsychologyW400,
   expand_more: KeyboardArrowDownW400,
   folder_off: FolderOffW400,
   folder_open: FolderOpenW400,

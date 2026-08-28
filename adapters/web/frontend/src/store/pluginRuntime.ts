@@ -108,9 +108,8 @@ export function installPluginEditorBus(): void {
         }
       }
       store.setPluginEditorTarget({ panelKey: data.panel, params });
-      // [AutoC 2026-08-28] 右栏可见性是持久化用户偏好（AppLayout 只在
-      // rightPanelOpen 为真时渲染右栏）。只设置编辑器目标而不展开右栏，
-      // 用户收起过右栏时编辑器永远不可见——表现为“没有用上右边栏”。
+      // [AutoC 2026-08-28] 右栏常驻后，仍需保证未收起状态下的用户可见性；
+      // 持久化偏好为收起时主动展开。
       useSettingsStore.getState().setRightPanelOpen(true);
     } else if (data.type === 'close-settings-editor') {
       const current = store.pluginEditorTarget;

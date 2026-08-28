@@ -85,11 +85,15 @@
   details.raw-wrap summary { cursor: pointer; font: 600 10px var(--mono); color: var(--tertiary); }
 
   /* [AutoC 2026-08-28] mode=editor：宿主右栏中的编辑器形态，只保留编辑区。
-     列表形态（默认）不再内联渲染编辑器，条目编辑请求经 postMessage 交给宿主。 */
+     列表形态是纯列表（无内联编辑器、无分栏），条目编辑由宿主右栏承担。 */
   body.editor-only .bar .count, body.editor-only .bar #refresh, body.editor-only .bar #new-entry { display: none; }
   body.editor-only .cols { display: block; min-height: 0; }
   body.editor-only .tree-pane, body.editor-only .entries, body.editor-only .book-bar { display: none; }
   body.editor-only .editor { display: block; border-top: none; max-height: none; min-height: calc(100vh - 45px); }
+  /* 列表形态：条目区占满整页，编辑器节点不渲染 */
+  body:not(.editor-only) .main-pane { display: contents; }
+  body:not(.editor-only) .book-bar, body:not(.editor-only) .editor { display: none; }
+  body:not(.editor-only) .entries { height: 100%; }
 
   @media (max-width: 720px) {
     .cols { flex-direction: column; }
@@ -124,6 +128,17 @@
 <script src="vendor/js-yaml.min.js"></script>
 <script>
 'use strict';
+// 诊断浮层：任何未捕获异常直接显示在页面上（排查 iframe 脚本启动失败）
+window.addEventListener('error', (e) => {
+  let d = document.getElementById('errbox');
+  if (!d) {
+    d = document.createElement('div');
+    d.id = 'errbox';
+    d.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:9999;background:#a33c3c;color:#fff;font:11px monospace;padding:6px 10px;border-radius:4px;max-width:90%;';
+    document.body.appendChild(d);
+  }
+  d.textContent = 'JS ERROR: ' + e.message + ' @ ' + (e.filename || '').split('/').pop() + ':' + e.lineno;
+});
 
 // [AutoC 2026-08-28] 双形态：list（默认，主区整页列表）与 editor（宿主右栏
 // 编辑器）。列表点击条目时 postMessage 请宿主在右栏打开本页的 editor 形态；
@@ -309,7 +324,6 @@ function renderTree() {
 }
 
 async function selectBook(ns, book) {
-  if (S.editingId && !confirm('编辑中的条目未保存，切换将丢弃修改。继续？')) return;
   S.ns = ns;
   S.book = book;
   S.raw = null;
@@ -349,7 +363,7 @@ function renderEntries() {
   for (const e of b.entries) {
     const card = document.createElement('button');
     card.type = 'button';
-    card.className = 'entry' + (e.id === S.editingId ? ' sel' : '');
+    card.className = 'entry';
     const row1 = document.createElement('div');
     row1.className = 'row1';
     const idSpan = document.createElement('span');

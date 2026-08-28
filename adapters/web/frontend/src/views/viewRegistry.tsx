@@ -179,11 +179,11 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     rightTop: () => {
       const active = useViewStore.getState().activeSettingsTab;
       if (typeof active === 'string' && active.startsWith('plugin:')) {
-        // [AutoC 2026-08-28] 插件页编辑进右栏。Why: 列表页（iframe）点击条目
-        // 时 postMessage 请求宿主打开编辑器，宿主在右栏渲染同一面板页的
-        // mode=editor 形态；未打开编辑器时右栏整体卸载、列表占满主区。
-        // How: 读 pluginsStore.pluginEditorTarget，匹配当前页签才渲染。
-        // Purpose: 与内置设置页「主区列表 + 右栏编辑」的布局约定一致。
+        // [AutoC 2026-08-28] 插件页右栏常驻，与内置页签一致。Why: 用户明确
+        // 要求插件设置页的布局与内置页签没有区别——右栏始终存在，未选中
+        // 条目时显示提示，点击条目后渲染编辑器。How: 无编辑器目标时渲染
+        // 提示块，有目标时渲染同一面板页的 mode=editor 形态。Purpose:
+        // 布局行为与节点、工具等内置页签完全相同。
         const target = usePluginsStore.getState().pluginEditorTarget;
         if (target && target.panelKey === active) {
           const panel = usePluginsStore.getState().settingsPanels.find((p) => p.key === active);
@@ -201,7 +201,12 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
             );
           }
         }
-        return undefined;
+        return (
+          <section className="flex h-full min-h-0 flex-col overflow-y-auto p-3">
+            <h2 className="mb-3 font-mono text-[0.65rem] font-semibold uppercase tracking-[0.16em] text-[var(--duties-tertiary)]">编辑器</h2>
+            <p className="text-xs leading-5 text-[var(--duties-secondary)]">在主区选择一个条目后，在此编辑其内容。</p>
+          </section>
+        );
       }
       return <SettingsRightPanel />;
     },
