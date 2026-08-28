@@ -607,9 +607,44 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
                             display = v if k != "api_key" else ("✅ ..." + str(v)[-4:] if v else "❌")
                             lines.append(f"{k}: `{display}`")
                     else:
-                        lines.append("\n📌 Session override: none (using global)")
+                        lines.append("\n📌 Session override: none")
                 except Exception:
                     lines.append("\n📌 Session override: unavailable")
+                # Effective resolved config from /active_node (same as web frontend)
+                try:
+                    _http = rt.clonoth_client._http()
+                    _base = rt.clonoth_client._base_url
+                    _an_resp = await _http.get(f"{_base}/v1/sessions/{session_id}/active_node")
+                    if _an_resp.status_code == 200:
+                        _an = _an_resp.json()
+                        lines.append("")
+                        lines.append("🎯 **Effective (resolved)**")
+                        lines.append(f"Provider: `{_an.get('effective_provider', '?')}`")
+                        lines.append(f"Model: `{_an.get('effective_model', '?')}`")
+                        if _an.get('effective_base_url'):
+                            lines.append(f"Base URL: `{_an.get('effective_base_url')}`")
+                        if _an.get('node_provider'):
+                            lines.append(f"Node provider: `{_an.get('node_provider')}`")
+                        if _an.get('node_model'):
+                            lines.append(f"Node model: `{_an.get('node_model')}`")
+                except Exception:
+                    pass
+            # Fallback chain from /config/providers
+            try:
+                _http = rt.clonoth_client._http()
+                _base = rt.clonoth_client._base_url
+                _prov_resp = await _http.get(f"{_base}/v1/config/providers")
+                if _prov_resp.status_code == 200:
+                    _prov = _prov_resp.json()
+                    _fbs = _prov.get("fallbacks", [])
+                    if _fbs:
+                        lines.append("")
+                        lines.append("🔄 **Fallback chain**")
+                        for _i, _fb in enumerate(_fbs):
+                            _fb_label = _fb.get("provider", "") or _fb.get("model", "") or str(_fb)
+                            lines.append(f"{_i + 1}. `{_fb_label}`")
+            except Exception:
+                pass
             await message.reply("\n".join(lines), mention_author=False)
         except Exception as e:
             await message.reply(f"❌ Error: {e}", mention_author=False)
