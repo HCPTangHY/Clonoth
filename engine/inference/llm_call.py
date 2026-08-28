@@ -444,6 +444,12 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             resp = None
             continue  # 重试
 
+        # empty_response retries exhausted → mark as failed so
+        # fallback_provider can pick it up instead of looping forever.
+        if _retry_reason == "empty_response":
+            resp.ok = False
+            resp.error = "empty response from provider"
+
         # ---------------------------------------------------------------
         # P5a Reactive Compact: 检测 "request too long" 类错误时，剥离旧
         # tool_result 内容并重试一次。目的是在 413 / context_length_exceeded
