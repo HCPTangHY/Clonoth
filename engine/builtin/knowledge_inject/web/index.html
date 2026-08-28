@@ -74,7 +74,11 @@
   body.editor-only .editor-pane { padding: 14px 16px; height: calc(100vh - 44px); }
   body.editor-only .bar .count, body.editor-only .bar #refresh { display: none; }
   body:not(.editor-only) .editor-pane { display: none; }
-  body:not(.editor-only) .list-pane { flex: 1; border-right: none; }
+  body:not(.editor-only) .list-pane { flex: 1; min-width: 0; border-right: none; }
+  /* [AutoC 2026-08-28] 横向约束：.kws 关键词行 nowrap，长串把弹性链的
+     min-content 撑到 ~1600px（视口 510px），页面出现横向滚动条。
+     .cols 裁断 + min-width:0 放行收缩，ellipsis 恢复生效。 */
+  .cols { overflow: hidden; }
   .editor-pane .placeholder { color: var(--tertiary); font-size: 11px; }
   .form { display: flex; flex-direction: column; gap: 12px; max-width: 640px; }
   .form .kv { display: flex; align-items: center; gap: 8px; }

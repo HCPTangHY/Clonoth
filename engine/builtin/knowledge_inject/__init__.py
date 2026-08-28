@@ -1871,14 +1871,62 @@ def _memory_book_path(workspace_root: Path, ns: str, book: str) -> Path:
     return rp
 
 
-def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
-    """列出全部 namespace/book 及条目摘要，供管理面板一次拉取。
+def _entry_summary(e: dict[str, Any]) -> dict[str, Any]:
+    """条目管理摘要（不含正文全文）。"""
+    return {
+        "id": str(e.get("id") or ""),
+        "content_preview": str(e.get("content") or "")[:120],
+        "keywords": [str(k) for k in (e.get("keywords") or []) if isinstance(k, str)][:12],
+        "constant": bool(e.get("constant", False)),
+        "enabled": bool(e.get("enabled", True)),
+        "priority": int(e.get("priority") or 0),
+        "scan_depth": int(e.get("scan_depth") or 0),
+        "node_ids": [str(n) for n in (e.get("node_ids") or []) if isinstance(n, str)],
+        "source": str(e.get("source") or ""),
+        "created_at": str(e.get("created_at") or ""),
+        "updated_at": str(e.get("updated_at") or ""),
+    }
 
-    [AutoC 2026-08-28] 懒加载参数：?lazy=1 时全部 book 只返回计数不含
-    entries；同时给 ns/book 时仅该 book 附带 entries。Why: 生产已有 35
-    个命名空间、1380 条记忆，整包摘要体积大而树面板只需要计数。How:
-    扫描逻辑不变，按参数裁剪 entries 数组，默认形态（无参数）与旧版
-    完全一致。Purpose: 面板先拉树，选中 book 时再取条目。
+
+# [AutoC 2026-08-28] 管理列表的按文件缓存：path -> (mtime, size, listing)。
+# Why: 生产 260 个 yaml / 2.8MB，每次请求全量解析 ~3.3s，lazy 只裁剪了
+# 响应体积没减少解析量，点击 book 也触发全树扫描。How: stat 命中
+# (mtime, size) 直接复用解析结果；文件写入（含 PUT/DELETE 端点）必然
+# 改变 mtime，无需显式失效。Purpose: 重复扫描毫秒级返回。
+_book_scan_cache: dict[Path, tuple[float, int, dict[str, Any]]] = {}
+
+
+def _book_listing(yf: Path) -> dict[str, Any]:
+    """单个 book 的列表数据（名称/计数/条目摘要），带 mtime+size 缓存。"""
+    try:
+        st = yf.stat()
+    except OSError:
+        return {"book": yf.stem, "file": yf.name, "count": 0, "enabled_count": 0, "entries": []}
+    hit = _book_scan_cache.get(yf)
+    if hit is not None and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        return hit[2]
+    data = _load_book(yf)
+    entries = [e for e in data.get("entries", []) if isinstance(e, dict)]
+    listing = {
+        "book": str(data.get("book") or yf.stem),
+        "file": yf.name,
+        "count": len(entries),
+        "enabled_count": sum(1 for e in entries if bool(e.get("enabled", True))),
+        "entries": [_entry_summary(e) for e in entries],
+    }
+    _book_scan_cache[yf] = (st.st_mtime, st.st_size, listing)
+    return listing
+
+
+def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
+    """列出 namespace/book 及条目摘要，供管理面板拉取。
+
+    [AutoC 2026-08-28] 两级性能路径：
+    - 解析层：_book_listing 按 (mtime, size) 缓存每个 yaml 的解析结果，
+      重复扫描不再重复解析（此前 260 文件全量解析每次 ~3.3s）。
+    - 请求层：?lazy=1 只返回计数；ns+book 同给时走直达路径——只扫描
+      目标 ns 目录，且响应里只有该 ns/book（前端只取匹配项，整树数据
+      无意义）。无参数形态与旧版完全一致。
     """
     q = getattr(request, "query_params", None) or {}
 
@@ -1894,40 +1942,36 @@ def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
     want_book = _q("book")
     ws = _ws_root(request)
     base = ws / "data" / "memory"
-    out: list[dict[str, Any]] = []
     if not base.is_dir():
-        return out
+        return []
+
+    base_resolved = base.resolve()
 
     def _scan(ns_dir: Path, ns: str) -> list[dict[str, Any]]:
         books = []
         for yf in sorted(ns_dir.glob("*.yaml")):
-            data = _load_book(yf)
-            entries = [e for e in data.get("entries", []) if isinstance(e, dict)]
-            book_name = str(data.get("book") or yf.stem)
-            include = (not lazy) or (ns == want_ns and book_name == want_book)
-            books.append({
-                "book": book_name,
-                "file": yf.name,
-                "count": len(entries),
-                "enabled_count": sum(1 for e in entries if bool(e.get("enabled", True))),
-                "entries": [
-                    {
-                        "id": str(e.get("id") or ""),
-                        "content_preview": str(e.get("content") or "")[:120],
-                        "keywords": [str(k) for k in (e.get("keywords") or []) if isinstance(k, str)][:12],
-                        "constant": bool(e.get("constant", False)),
-                        "enabled": bool(e.get("enabled", True)),
-                        "priority": int(e.get("priority") or 0),
-                        "scan_depth": int(e.get("scan_depth") or 0),
-                        "node_ids": [str(n) for n in (e.get("node_ids") or []) if isinstance(n, str)],
-                        "source": str(e.get("source") or ""),
-                        "created_at": str(e.get("created_at") or ""),
-                        "updated_at": str(e.get("updated_at") or ""),
-                    }
-                    for e in entries
-                ] if include else [],
-            })
+            b = _book_listing(yf)
+            include = (not lazy) or (ns == want_ns and b["book"] == want_book)
+            books.append(b if include else {**b, "entries": []})
         return books
+
+    # 直达路径：ns+book 命中时只扫目标 ns 目录，响应只含该 ns
+    if lazy and want_ns and want_book:
+        ns_dir = (base / want_ns) if want_ns else base
+        try:
+            resolved = ns_dir.resolve()
+        except OSError:
+            resolved = ns_dir
+        if resolved != base_resolved and base_resolved not in resolved.parents:
+            return {"total": 0, "namespaces": []}
+        books = _scan(ns_dir, want_ns) if ns_dir.is_dir() else []
+        for b in books:
+            if b["book"] == want_book:
+                return {
+                    "total": b["count"],
+                    "namespaces": [{"ns": want_ns, "total": b["count"], "books": [b]}],
+                }
+        return {"total": 0, "namespaces": []}
 
     # 根级 books（ns=""）
     root_books = _scan(base, "")

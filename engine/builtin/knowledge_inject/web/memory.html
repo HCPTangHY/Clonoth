@@ -28,7 +28,7 @@
   button.op.danger:hover:not(:disabled) { border-color: var(--danger); }
   button.op.primary { color: var(--accent); border-color: var(--accent); }
 
-  .cols { display: flex; gap: 0; height: calc(100vh - 44px); }
+  .cols { display: flex; gap: 0; height: calc(100vh - 44px); } overflow: hidden;
   /* [AutoC 2026-08-28] 固定高度而非 min-height：列表/树面板各自内部滚动，
      页面本体不再被内容撑高（此前树面板被撑到数千像素高）。 */
   .tree-pane { flex: 0 0 260px; border-right: 1px solid var(--muted); overflow-y: auto; padding: 10px 10px 20px; }
