@@ -378,6 +378,7 @@ PLUGIN_META = {
             {
                 "id": "settings",
                 "slot": "settings",
+                "order": 10,
                 "title": "MCP",
                 "icon": "cable",
                 "entry": "/v1/plugins/mcp/web/",

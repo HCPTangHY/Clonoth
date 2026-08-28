@@ -101,6 +101,17 @@
      宿主主区/右栏宽度而非视口，主区窄于 720px 时断点把列表错切为上下
      堆叠。删除堆叠规则；编辑器形态的右栏天然窄，单列网格按形态常开。 */
   body.editor-only .duo { grid-template-columns: 1fr; }
+  /* [AutoC 2026-08-28] 中窄宽度：树列收窄（主区 510~680px 时 260px 太占） */
+  @media (max-width: 680px) { .tree-pane { flex-basis: 208px; } }
+  /* [AutoC 2026-08-28] 移动端（iframe 宽 <=520px 即手机宽度）：树变顶部
+     区段（限高内部滚动），条目区自然向下生长，页面整体滚动。 */
+  @media (max-width: 520px) {
+    .cols { flex-direction: column; height: auto; }
+    .tree-pane { flex: none; max-height: 30vh; border-right: none; border-bottom: 1px solid var(--muted); }
+    body:not(.editor-only) .entries { height: auto; }
+    .duo { grid-template-columns: 1fr; }
+    button.op, .book { min-height: 32px; }
+  }
 </style>
 </head>
 <body>
@@ -186,8 +197,10 @@ async function api(path, init) {
 
 // ── state ──────────────────────────────────────────────────
 const S = {
-  data: null,            // GET /admin/config/memory 的完整载荷
+  data: null,            // GET /admin/config/memory?lazy=1 的树载荷（仅计数）
   ns: null, book: null,  // 当前选中
+  entryCache: {},        // [AutoC 2026-08-28] ns\u0000book -> entries[]（选中时才拉取）
+  entriesError: null,    // 最近一次条目拉取错误
   raw: null,             // 当前 book 原文（懒加载）
   editingId: null,       // 正在编辑的条目 id；'__new__' 表示新建
   form: null,
@@ -206,7 +219,7 @@ function q(params) {
 
 // ── data ───────────────────────────────────────────────────
 async function loadAll(keepSelection = true) {
-  S.data = await api('/admin/config/memory');
+  S.data = await api('/admin/config/memory?lazy=1');
   if (keepSelection && S.book) {
     const still = findBook(S.ns, S.book);
     if (!still) { S.ns = null; S.book = null; S.raw = null; S.editingId = null; S.form = null; }
@@ -222,6 +235,27 @@ function findBook(ns, book) {
     for (const b of g.books) if (b.book === book) return b;
   }
   return null;
+}
+
+function entriesKey(ns, book) { return ns + '\u0000' + book; }
+function cachedEntries(ns, book) { return S.entryCache[entriesKey(ns, book)] || null; }
+async function ensureEntries(ns, book) {
+  const k = entriesKey(ns, book);
+  if (S.entryCache[k]) return S.entryCache[k];
+  const resp = await api('/admin/config/memory?lazy=1&' + q({ ns: ns || '', book }));
+  let items = [];
+  for (const g of (resp.namespaces || [])) {
+    if (g.ns !== ns) continue;
+    for (const b of g.books) {
+      if (b.book === book) { items = b.entries || []; break; }
+    }
+  }
+  S.entryCache[k] = items;
+  return items;
+}
+function dropEntryCache(ns, book) {
+  if (ns === null) { S.entryCache = {}; return; }
+  delete S.entryCache[entriesKey(ns, book)];
 }
 
 async function loadRaw() {
@@ -294,21 +328,24 @@ function renderTree() {
     nsEl.className = 'ns';
     const head = document.createElement('div');
     head.className = 'ns-head';
-    const slash = g.ns.indexOf('/');
+    // [AutoC 2026-08-28] 按 ns 路径深度缩进：根 ns 顶格，每多一级路径
+    // 加 14px。book 永远比所属 ns 再深一级（+14px 起步）。此前嵌套 ns 的
+    // 标题缩进 16px 而其 book 只缩 14px，视觉上级反了。
+    const depth = g.ns ? g.ns.split('/').length : 1;
     const nm = document.createElement('span');
     nm.className = 'n';
-    nm.textContent = slash > 0 ? '  '.repeat(0) + g.ns : nsLabel(g.ns);
+    nm.textContent = nsLabel(g.ns);
     const cnt = document.createElement('span');
     cnt.className = 'c';
     cnt.textContent = g.total;
     head.append(nm, cnt);
-    if (slash > 0) head.style.paddingLeft = '16px';
+    if (depth > 1) head.style.paddingLeft = (6 + (depth - 1) * 14) + 'px';
     nsEl.appendChild(head);
     for (const b of g.books) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'book' + (g.ns === S.ns && b.book === S.book ? ' sel' : '');
-      if (slash > 0) btn.classList.add('sub');
+      btn.style.paddingLeft = (20 + (depth - 1) * 14) + 'px';
       const nm2 = document.createElement('span');
       nm2.textContent = b.book;
       const c2 = document.createElement('span');
@@ -328,9 +365,16 @@ async function selectBook(ns, book) {
   S.raw = null;
   S.editingId = null;
   S.form = null;
+  S.entriesError = null;
   renderTree();
   renderEntries();
   renderEditor();
+  try {
+    await ensureEntries(ns, book);
+  } catch (e) {
+    S.entriesError = e.message;
+  }
+  if (S.ns === ns && S.book === book) renderEntries();
 }
 
 // ── entries pane ───────────────────────────────────────────
@@ -352,14 +396,29 @@ function renderEntries() {
   const b = findBook(S.ns, S.book);
   $('book-path').textContent = (S.ns === '' ? '' : S.ns + ' / ') + S.book;
   $('book-meta').textContent = b ? b.count + ' 条 · ' + b.enabled_count + ' 启用' : '';
-  if (!b || !b.entries.length) {
+  if (S.entriesError) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '条目加载失败：' + S.entriesError;
+    el.appendChild(p);
+    return;
+  }
+  const cached = cachedEntries(S.ns, S.book);
+  if (!cached) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '条目加载中…';
+    el.appendChild(p);
+    return;
+  }
+  if (!cached.length) {
     const p = document.createElement('p');
     p.className = 'empty';
     p.textContent = '此 book 暂无条目。';
     el.appendChild(p);
     return;
   }
-  for (const e of b.entries) {
+  for (const e of cached) {
     const card = document.createElement('button');
     card.type = 'button';
     card.className = 'entry';
@@ -420,8 +479,8 @@ function startNew() {
   const id = prompt('新条目 id（[A-Za-z0-9][A-Za-z0-9_.-]{0,127}）：');
   if (!id) return;
   if (!/^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$/.test(id)) { alert('id 不符合规范'); return; }
-  const b = findBook(S.ns, S.book);
-  if (b && b.entries.some((e) => e.id === id)) { alert('该 book 下已存在同名 id'); return; }
+  const cached = cachedEntries(S.ns, S.book);
+  if (cached && cached.some((e) => e.id === id)) { alert('该 book 下已存在同名 id'); return; }
   railOpen({ ns: S.ns || '', book: S.book, id, fresh: '1' });
 }
 
@@ -510,6 +569,7 @@ function renderEditor(isNew = false, newId = '') {
   saveBtn.addEventListener('click', async () => {
     try {
       await saveEntry(buildEntry(f));
+      dropEntryCache(S.ns, S.book);
       broadcastChanged();
       S.editingId = f.id;
       S.form = null;
@@ -527,6 +587,7 @@ function renderEditor(isNew = false, newId = '') {
     if (!confirm(`确定删除条目 ${f.id}？（${src && src.constant ? '注意：这是常驻记忆' : '不可恢复'}）`)) return;
     try {
       await deleteEntry(f.id);
+      dropEntryCache(S.ns, S.book);
       broadcastChanged();
       if (MODE === 'editor') { railClose(); return; }
       await loadAll();
@@ -560,6 +621,7 @@ function renderEditor(isNew = false, newId = '') {
   rawBtn.addEventListener('click', async () => {
     try {
       await saveRaw(rawTa.value);
+      dropEntryCache(S.ns, S.book);
       broadcastChanged();
       if (MODE !== 'editor') await loadAll();
       setMsg('Raw YAML 已保存。', true);
@@ -690,7 +752,17 @@ if (MODE === 'editor') {
   })();
 } else {
   if (CHAN) {
-    CHAN.onmessage = (ev) => { if (ev.data === 'changed') loadAll().catch(() => undefined); };
+    CHAN.onmessage = (ev) => {
+      if (ev.data !== 'changed') return;
+      loadAll().catch(() => undefined);
+      if (S.book !== null) {
+        dropEntryCache(S.ns, S.book);
+        S.entriesError = null;
+        ensureEntries(S.ns, S.book)
+          .then(() => { if (MODE === 'list') renderEntries(); })
+          .catch((e) => { S.entriesError = e.message; if (MODE === 'list') renderEntries(); });
+      }
+    };
   }
   $('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
   $('new-entry').addEventListener('click', startNew);

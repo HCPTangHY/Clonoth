@@ -25,6 +25,7 @@ PLUGIN_META = {
                 "id": "manager",
                 # settings 槽位：出现在 web 设置侧栏，独占主区视图
                 "slot": "settings",
+                "order": 100,
                 "title": "插件",
                 "entry": "/v1/plugins/plugin_manager/web/",
             }

@@ -58,6 +58,7 @@ PLUGIN_META = {
             {
                 "id": "settings",
                 "slot": "settings",
+                "order": 30,
                 "title": "技能",
                 "icon": "menu_book",
                 "entry": "/v1/plugins/knowledge_inject/web/",
@@ -65,6 +66,7 @@ PLUGIN_META = {
             {
                 "id": "memory",
                 "slot": "settings",
+                "order": 40,
                 "title": "记忆",
                 "icon": "psychology",
                 "entry": "/v1/plugins/knowledge_inject/web/memory.html",
@@ -1870,7 +1872,26 @@ def _memory_book_path(workspace_root: Path, ns: str, book: str) -> Path:
 
 
 def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
-    """列出全部 namespace/book 及条目摘要，供管理面板一次拉取。"""
+    """列出全部 namespace/book 及条目摘要，供管理面板一次拉取。
+
+    [AutoC 2026-08-28] 懒加载参数：?lazy=1 时全部 book 只返回计数不含
+    entries；同时给 ns/book 时仅该 book 附带 entries。Why: 生产已有 35
+    个命名空间、1380 条记忆，整包摘要体积大而树面板只需要计数。How:
+    扫描逻辑不变，按参数裁剪 entries 数组，默认形态（无参数）与旧版
+    完全一致。Purpose: 面板先拉树，选中 book 时再取条目。
+    """
+    q = getattr(request, "query_params", None) or {}
+
+    def _q(name: str) -> str:
+        try:
+            v = q.get(name)
+        except Exception:
+            return ""
+        return str(v) if v is not None else ""
+
+    lazy = _q("lazy") == "1"
+    want_ns = _q("ns")
+    want_book = _q("book")
     ws = _ws_root(request)
     base = ws / "data" / "memory"
     out: list[dict[str, Any]] = []
@@ -1882,8 +1903,10 @@ def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
         for yf in sorted(ns_dir.glob("*.yaml")):
             data = _load_book(yf)
             entries = [e for e in data.get("entries", []) if isinstance(e, dict)]
+            book_name = str(data.get("book") or yf.stem)
+            include = (not lazy) or (ns == want_ns and book_name == want_book)
             books.append({
-                "book": str(data.get("book") or yf.stem),
+                "book": book_name,
                 "file": yf.name,
                 "count": len(entries),
                 "enabled_count": sum(1 for e in entries if bool(e.get("enabled", True))),
@@ -1902,7 +1925,7 @@ def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
                         "updated_at": str(e.get("updated_at") or ""),
                     }
                     for e in entries
-                ],
+                ] if include else [],
             })
         return books
 
@@ -1923,7 +1946,7 @@ def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
             if sub_books:
                 groups.append((f"{d.name}/{sub.name}", sub_books))
 
-    total = sum(len(b["entries"]) for _, books in groups for b in books)
+    total = sum(b["count"] for _, books in groups for b in books)
     return {
         "total": total,
         "namespaces": [

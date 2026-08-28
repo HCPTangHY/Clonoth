@@ -27,6 +27,8 @@ export interface ResolvedPanel {
   title: string;
   entry: string;
   icon: string;
+  /** [AutoC 2026-08-28] settings-tab sort key; plugin-declared, defaults to 100 */
+  order: number;
 }
 
 /** Props every react-kind panel contribution receives from the overlay host. */
@@ -153,7 +155,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
         if (replaces && (!panel.slot || panel.slot === 'right')) {
           manifestPanels.push({ key, owner, overlayId: replaces, title, priority, standalone: false, kind: 'iframe', entry: panel.entry });
         } else if (panel.slot === 'settings') {
-          settingsPanels.push({ key, owner, panelId: panel.id, title, entry: panel.entry, icon: typeof panel.icon === 'string' && panel.icon ? panel.icon : 'extension' });
+          settingsPanels.push({ key, owner, panelId: panel.id, title, entry: panel.entry, icon: typeof panel.icon === 'string' && panel.icon ? panel.icon : 'extension', order: Number.isFinite(panel.order) ? Number(panel.order) : 100 });
         } else if (!panel.slot || panel.slot === 'right') {
           manifestPanels.push({ key, owner, overlayId: key, title, priority, standalone: true, kind: 'iframe', entry: panel.entry });
         }
@@ -179,6 +181,10 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     for (const list of Object.values(slotsBySlot)) {
       list.sort((a, b) => b.priority - a.priority);
     }
+    // [AutoC 2026-08-28] 插件页签确定性排序。Why: /v1/plugins 的顺序继承
+    // hook 注册顺序，随挂载时机波动，四个设置页签顺序每次刷新都可能变。
+    // How: 按面板声明的 order（缺省 100）排序，同级再按 key 字典序。
+    settingsPanels.sort((a, b) => (a.order - b.order) || a.key.localeCompare(b.key));
     set((s) => ({
       loaded: true,
       plugins,

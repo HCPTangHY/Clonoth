@@ -104,6 +104,11 @@
      宿主主区/右栏宽度而非视口，主区窄于 720px 时断点把列表错切为上下
      堆叠。删除堆叠规则；编辑器形态的右栏天然窄，单列网格按形态常开。 */
   body.editor-only .trio { grid-template-columns: 1fr; }
+
+  /* [AutoC 2026-08-28] 移动端触控目标（iframe 宽 <=520px 即手机宽度） */
+  @media (max-width: 520px) {
+    button.op, .new-row input { min-height: 32px; }
+  }
 </style>
 </head>
 <body>

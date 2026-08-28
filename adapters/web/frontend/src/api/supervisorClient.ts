@@ -1236,6 +1236,9 @@ export interface PluginPanelDecl {
   /** [AutoC 2026-08-27] Registry priority for the target overlayId. Higher wins
    * against other contributions (host built-ins sit at 0). Default 50. */
   priority?: number;
+  /** [AutoC 2026-08-28] Settings-tab sort key: tabs order by (order, key).
+   * Registration order fluctuates with hook mount timing; this pins it. */
+  order?: number;
 }
 
 export interface PluginSlotDecl {
