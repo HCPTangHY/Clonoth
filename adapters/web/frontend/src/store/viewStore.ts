@@ -6,6 +6,7 @@
 import { create } from 'zustand';
 
 import { usePluginsStore } from './pluginsStore';
+import { useSettingsStore } from './settingsStore';
 
 export type ViewMode = 'chat' | 'settings';
 
@@ -58,6 +59,14 @@ export const useViewStore = create<ViewState>((set) => ({
     try {
       usePluginsStore.getState().setPluginEditorTarget(null);
     } catch { /* store 不可用时忽略 */ }
+    // [AutoC 2026-08-28] 移动端：插件页签无编辑器时右栏常驻提示块会以
+    // 全屏遮罩盖住主区。Why: AppLayout 在 <768px 把右栏渲染为 fixed
+    // overlay，常驻提示块没有信息量却每次盖屏。How: 进入插件页签时
+    // 主动收起；点开条目时由 editor bus 重新展开。桌面不受影响。
+    if (typeof tab === 'string' && tab.startsWith('plugin:')
+      && window.matchMedia('(max-width: 767px)').matches) {
+      try { useSettingsStore.getState().setRightPanelOpen(false); } catch { /* ignore */ }
+    }
     set({ activeSettingsTab: tab });
   },
 

@@ -70,7 +70,11 @@ export function getSettingsTab(tabId: string): SettingsTabDefinition {
   // Why: stale links or future removed tabs should not blank the settings view. How:
   // resolve through the registry and return settingsTabs[0] as a safe default.
   // Purpose: the host and right panel share identical fallback behavior.
-  return settingsTabs.find(tab => tab.id === tabId) || settingsTabs[0];
+  // [AutoC 2026-08-28] 插件页签也参与解析：plugin: 前缀的 id 在静态表中
+  // 必然不存在，此前回退到第一项“通用”，header 副标题永远显示“通用”。
+  return pluginSettingsTabs().find(tab => tab.id === tabId)
+    || settingsTabs.find(tab => tab.id === tabId)
+    || settingsTabs[0];
 }
 
 // [plugin-admin 2026-08-23] Plugin-declared settings pages.

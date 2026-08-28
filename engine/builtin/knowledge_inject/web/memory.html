@@ -103,12 +103,20 @@
   body.editor-only .duo { grid-template-columns: 1fr; }
   /* [AutoC 2026-08-28] 中窄宽度：树列收窄（主区 510~680px 时 260px 太占） */
   @media (max-width: 680px) { .tree-pane { flex-basis: 208px; } }
-  /* [AutoC 2026-08-28] 移动端（iframe 宽 <=520px 即手机宽度）：树变顶部
-     区段（限高内部滚动），条目区自然向下生长，页面整体滚动。 */
+  /* [AutoC 2026-08-28] 移动端（iframe 宽 <=520px 即手机宽度）：树与条目
+     做视图切换——默认全屏树，点选 book 后切到全屏条目列表（book-bar 顶
+     栏含返回按钮）。Why: 上下堆叠把树压缩到 30vh，两段各自滚动，交互
+     割裂；切换式是窄屏主从列表的常规形态。How: body.show-entries 控制
+     两个视图互斥显示，桌面不受影响（规则仅在媒体查询内）。 */
+  #back-to-tree { display: none; }
   @media (max-width: 520px) {
-    .cols { flex-direction: column; height: auto; }
-    .tree-pane { flex: none; max-height: 30vh; border-right: none; border-bottom: 1px solid var(--muted); }
-    body:not(.editor-only) .entries { height: auto; }
+    .cols { display: block; height: auto; }
+    .tree-pane { flex: none; height: calc(100vh - 44px); max-height: none; border-right: none; }
+    body:not(.show-entries):not(.editor-only) .main-pane { display: none; }
+    body.show-entries:not(.editor-only) .tree-pane { display: none; }
+    body.show-entries:not(.editor-only) .book-bar:not([hidden]) { display: flex; }
+    body.show-entries:not(.editor-only) #back-to-tree { display: inline-block; }
+    body:not(.editor-only) .entries { height: auto; min-height: calc(100vh - 88px); }
     .duo { grid-template-columns: 1fr; }
     button.op, .book { min-height: 32px; }
   }
@@ -126,6 +134,7 @@
   <nav class="tree-pane" id="tree"><p class="empty">加载中。</p></nav>
   <section class="main-pane">
     <div class="book-bar" id="book-bar" hidden>
+      <button class="op" id="back-to-tree" title="返回命名空间树">‹ 返回</button>
       <span class="path" id="book-path"></span>
       <span class="meta" id="book-meta"></span>
       <span class="sp"></span>
@@ -222,7 +231,10 @@ async function loadAll(keepSelection = true) {
   S.data = await api('/admin/config/memory?lazy=1');
   if (keepSelection && S.book) {
     const still = findBook(S.ns, S.book);
-    if (!still) { S.ns = null; S.book = null; S.raw = null; S.editingId = null; S.form = null; }
+    if (!still) {
+      S.ns = null; S.book = null; S.raw = null; S.editingId = null; S.form = null;
+      document.body.classList.remove('show-entries');  // book 已失效，回到树视图
+    }
   }
   renderTree();
   renderEntries();
@@ -374,7 +386,11 @@ async function selectBook(ns, book) {
   } catch (e) {
     S.entriesError = e.message;
   }
-  if (S.ns === ns && S.book === book) renderEntries();
+  if (S.ns === ns && S.book === book) {
+    renderEntries();
+    // 移动端：点选 book 后切换到条目视图（桌面无影响，规则在媒体查询内）
+    document.body.classList.add('show-entries');
+  }
 }
 
 // ── entries pane ───────────────────────────────────────────
@@ -766,6 +782,9 @@ if (MODE === 'editor') {
   }
   $('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
   $('new-entry').addEventListener('click', startNew);
+  $('back-to-tree').addEventListener('click', () => {
+    document.body.classList.remove('show-entries');
+  });
   loadAll().catch((e) => {
     $('tree').innerHTML = '';
     const p = document.createElement('p');
