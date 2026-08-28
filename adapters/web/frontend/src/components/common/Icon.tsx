@@ -33,6 +33,7 @@ import { ModelTrainingW400 } from '@material-symbols-svg/react/icons/model-train
 import { OpenInNewW400 } from '@material-symbols-svg/react/icons/open-in-new';
 import { PendingW400 } from '@material-symbols-svg/react/icons/pending';
 import { ProgressActivityW400 } from '@material-symbols-svg/react/icons/progress-activity';
+import { PsychologyW400 } from '@material-symbols-svg/react/icons/psychology';
 import { RefreshW400 } from '@material-symbols-svg/react/icons/refresh';
 import { ScheduleW400 } from '@material-symbols-svg/react/icons/schedule';
 import { SettingsW400 } from '@material-symbols-svg/react/icons/settings';

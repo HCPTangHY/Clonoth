@@ -1,6 +1,24 @@
 from __future__ import annotations
 
 import logging
+
+# [AutoC 2026-08-28] supervisor 端点路由所需。engine 进程同样可导入（与 mcp
+# 插件一致），routes face 缺席时不注册任何端点。关键约束：本文件启用
+# from __future__ import annotations，全部注解是字符串，FastAPI 在模块
+# globals 中解析——Request 与 payload 模型必须 import/定义在模块层。此前
+# 它们在 _register_admin_routes 函数体内，注解解析失败，request/payload 被
+# 当作必填 query 参数，所有端点 422。
+from fastapi import APIRouter, Request
+from pydantic import BaseModel
+
+
+class RawContent(BaseModel):
+    content: str
+
+
+class CreatePayload(BaseModel):
+    id: str
+    content: str
 import re
 import shutil
 import threading
@@ -205,6 +223,21 @@ class _SkillCache:
         key = str(workspace_root)
         with cls._lock:
             cls._entries[key] = (time.monotonic(), items)
+
+    @classmethod
+    def invalidate(cls, workspace_root: Path) -> None:
+        """Drop the cached catalog after a skill CRUD write.
+
+        Why: create/delete endpoints mutated skills/ but called a method that
+        did not exist (AttributeError → 500); the catalog then also served stale
+        data for the remaining TTL. How: mirror _MemoryCache.invalidate and
+        also drop the unused mtime bookkeeping. Purpose: CRUD is visible to the
+        next prompt build immediately.
+        """
+        key = str(workspace_root)
+        with cls._lock:
+            cls._entries.pop(key, None)
+            cls._mtimes.pop(key, None)
 
 
 def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list[dict[str, Any]]:
@@ -1952,63 +1985,62 @@ def _memory_delete_entry_endpoint(ns: str, book: str, id: str, request: Any) -> 
     return {"ok": True, "deleted": id}
 
 
+# [AutoC 2026-08-28] 路由函数定义在模块层：PEP 563 字符串注解需要在模块
+# globals 解析 Request / RawContent / CreatePayload。旧形态在函数体内定义
+# 包装，注解解析失败导致 422。
+def _skills_list_route(request: Request) -> list[dict[str, Any]]:
+    return _list_skills_endpoint(request)
+
+
+def _skills_raw_route(name: str, request: Request) -> dict[str, str]:
+    return _get_skill_raw_endpoint(name, request)
+
+
+def _skills_update_route(name: str, request: Request, payload: RawContent) -> dict[str, Any]:
+    return _update_skill_raw_endpoint(name, request, payload)
+
+
+def _skills_create_route(request: Request, payload: CreatePayload) -> dict[str, Any]:
+    return _create_skill_endpoint(request, payload)
+
+
+def _skills_delete_route(name: str, request: Request) -> dict[str, Any]:
+    return _delete_skill_endpoint(name, request)
+
+
+def _memory_list_route(request: Request) -> Any:
+    return _memory_list_endpoint(request)
+
+
+def _memory_raw_route(ns: str = "", book: str = "", request: Request = None) -> dict[str, str]:  # noqa: RUF013
+    return _memory_raw_get_endpoint(ns, book, request)
+
+
+def _memory_raw_put_route(ns: str = "", book: str = "", request: Request = None, payload: RawContent = None) -> dict[str, Any]:  # noqa: RUF013
+    return _memory_raw_put_endpoint(ns, book, payload, request)
+
+
+def _memory_delete_route(ns: str = "", book: str = "", id: str = "", request: Request = None) -> dict[str, Any]:  # noqa: RUF013
+    return _memory_delete_entry_endpoint(ns, book, id, request)
+
+
 def _register_admin_routes(routes: Any) -> None:
-    # request 参数必须以 Request 类型注解：FastAPI 只认该注解并注入请求对象，
-    # Any 会被当作必填 query 参数，导致所有端点 422（missing field request）。
-    # 路由处理函数在本函数内包装并注解；底层实现函数保持 Any，engine 进程
-    # 不触发 fastapi 导入。
-    from fastapi import APIRouter, Request
-    from pydantic import BaseModel
-
-    class RawContent(BaseModel):
-        content: str
-
-    class CreatePayload(BaseModel):
-        id: str
-        content: str
-
+    """组装 admin/config 端点与设置面板静态资源（纯注册，无注解）。"""
     from engine.faces.routes import static_router
 
-    def _list(request: Request) -> list[dict[str, Any]]:
-        return _list_skills_endpoint(request)
-
-    def _raw(name: str, request: Request) -> dict[str, str]:
-        return _get_skill_raw_endpoint(name, request)
-
-    def _update(name: str, request: Request, payload: RawContent) -> dict[str, Any]:
-        return _update_skill_raw_endpoint(name, request, payload)
-
-    def _create(request: Request, payload: CreatePayload) -> dict[str, Any]:
-        return _create_skill_endpoint(request, payload)
-
-    def _delete(name: str, request: Request) -> dict[str, Any]:
-        return _delete_skill_endpoint(name, request)
-
     router = APIRouter()
-    router.add_api_route("/skills", _list, methods=["GET"])
-    router.add_api_route("/skills/{name}/raw", _raw, methods=["GET"])
-    router.add_api_route("/skills/{name}/raw", _update, methods=["PUT"])
-    router.add_api_route("/skills", _create, methods=["POST"])
-    router.add_api_route("/skills/{name}", _delete, methods=["DELETE"])
+    router.add_api_route("/skills", _skills_list_route, methods=["GET"])
+    router.add_api_route("/skills/{name}/raw", _skills_raw_route, methods=["GET"])
+    router.add_api_route("/skills/{name}/raw", _skills_update_route, methods=["PUT"])
+    router.add_api_route("/skills", _skills_create_route, methods=["POST"])
+    router.add_api_route("/skills/{name}", _skills_delete_route, methods=["DELETE"])
     routes.register(router, mount="admin/config", description="skills 配置端点")
 
-    def _mem_list(request: Request) -> Any:
-        return _memory_list_endpoint(request)
-
-    def _mem_raw(ns: str = "", book: str = "", request: Request = None) -> dict[str, str]:  # noqa: RUF013
-        return _memory_raw_get_endpoint(ns, book, request)
-
-    def _mem_raw_put(ns: str = "", book: str = "", request: Request = None, payload: RawContent = None) -> dict[str, Any]:  # noqa: RUF013
-        return _memory_raw_put_endpoint(ns, book, payload, request)
-
-    def _mem_del(ns: str = "", book: str = "", id: str = "", request: Request = None) -> dict[str, Any]:  # noqa: RUF013
-        return _memory_delete_entry_endpoint(ns, book, id, request)
-
     mem_router = APIRouter()
-    mem_router.add_api_route("/memory", _mem_list, methods=["GET"])
-    mem_router.add_api_route("/memory/raw", _mem_raw, methods=["GET"])
-    mem_router.add_api_route("/memory/raw", _mem_raw_put, methods=["PUT"])
-    mem_router.add_api_route("/memory/entry", _mem_del, methods=["DELETE"])
+    mem_router.add_api_route("/memory", _memory_list_route, methods=["GET"])
+    mem_router.add_api_route("/memory/raw", _memory_raw_route, methods=["GET"])
+    mem_router.add_api_route("/memory/raw", _memory_raw_put_route, methods=["PUT"])
+    mem_router.add_api_route("/memory/entry", _memory_delete_route, methods=["DELETE"])
     routes.register(mem_router, mount="admin/config", description="memory 配置端点")
 
     # 设置面板静态资源。public：iframe 无法携带 Authorization 头，页面本身
