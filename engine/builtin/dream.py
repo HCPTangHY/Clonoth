@@ -315,6 +315,11 @@ class DreamHandler:
         # time so files created during preprocessing are visible. Purpose: guide
         # save/delete decisions with live book names.
         book_list = self._build_book_list(workspace_root)
+        # [AutoC 2026-08-28] Build memory route table from topology entries.
+        # Maps book name to (source_ns, source_ws) so the dream_router hook
+        # can redirect save_memory/delete_memory writes to the correct target.
+        topology_entries = self._load_memory_topology_entries(workspace_root)
+        memory_route = self._build_memory_route(topology_entries)
         instruction = self._build_dream_instruction(
             run_id=str(uuid.uuid4()),
             now=now,
@@ -329,6 +334,7 @@ class DreamHandler:
             runtime_cfg=runtime_cfg,
             now=now,
             instruction=instruction,
+            memory_route=memory_route,
         )
         if dream_task_id:
             # [AutoC 2026-06-01] Why: clearing pending here loses the only link
@@ -351,6 +357,7 @@ class DreamHandler:
         runtime_cfg: dict[str, Any],
         now: datetime,
         instruction: str,
+        memory_route: dict[str, dict[str, str]] | None = None,
     ) -> str:
         """Create the final system.dream task and return its task id."""
         create_task = ctx.get("create_task")
@@ -361,10 +368,6 @@ class DreamHandler:
         channel = conv_key.split(":", 1)[0] if ":" in conv_key else "system"
         msg_id = f"dream:{uuid.uuid4()}"
         try:
-            # [AutoC 2026-06-01] Why: the scheduler must later know which final
-            # Dream task finished. How: keep using the generic create_task hook but
-            # capture the returned Task object's task_id. Purpose: make lock-file
-            # updates depend on actual task completion rather than task creation.
             task = create_task(
                 channel=channel,
                 conversation_key=conv_key,
@@ -376,6 +379,11 @@ class DreamHandler:
                     "resume_data": {},
                     "use_context": False,
                     "_system_task": True,
+                    # [AutoC 2026-08-28] Route table for dream_router hook.
+                    # Maps book name to {ns, ws} so save_memory/delete_memory
+                    # writes land in the correct node/workspace directory.
+                    # LLM never sees this; only the hook reads it.
+                    "_memory_route": memory_route or {},
                     "task_context": {
                         "conversation_key": conv_key,
                         "channel": channel,
@@ -639,16 +647,47 @@ class DreamHandler:
 {transcript}"""
 
     def _build_book_list(self, workspace_root: Path) -> str:
-        """Return current memory book names from data/memory YAML files."""
-        # [AutoC 2026-05-31] Why: memory books are deployment data and can change
-        # without code changes. How: scan data/memory/*.yaml and return sorted
-        # stems, with an explicit empty-state marker. Purpose: centralize dynamic
-        # book-list formatting for Dream instructions.
+        """Return current memory book names from all node subdirectories.
+
+        [AutoC 2026-08-28] Scan all node ns and workspace sub-dirs to give
+        Dream a complete picture of available books.
+        """
         mem_dir = workspace_root / "data" / "memory"
         if not mem_dir.exists():
             return "(no books found)"
-        books = sorted(p.stem for p in mem_dir.glob("*.yaml"))
-        return ", ".join(books) if books else "(no books found)"
+        _SKIP_NS = {"system.dream", "system.memory_extractor"}
+        books: set[str] = set()
+        for node_dir in sorted(mem_dir.iterdir()):
+            if not node_dir.is_dir() or node_dir.name.startswith(".") or node_dir.name in _SKIP_NS:
+                continue
+            for p in node_dir.glob("*.yaml"):
+                books.add(p.stem)
+            for ws_dir in node_dir.iterdir():
+                if ws_dir.is_dir() and ws_dir.name.startswith("@"):
+                    for p in ws_dir.glob("*.yaml"):
+                        books.add(p.stem)
+        # Legacy root-level
+        for p in mem_dir.glob("*.yaml"):
+            books.add(p.stem)
+        return ", ".join(sorted(books)) if books else "(no books found)"
+
+    @staticmethod
+    def _build_memory_route(entries: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+        """Build book-name → {ns, ws} route table from topology entries.
+
+        [AutoC 2026-08-28] When the same book name appears in multiple
+        namespaces (unlikely but possible), the first occurrence wins.
+        The route table is passed via input_data._memory_route so the
+        dream_router hook can redirect writes without touching save_memory.
+        """
+        route: dict[str, dict[str, str]] = {}
+        for e in entries:
+            book = str(e.get("book") or "").strip()
+            ns = str(e.get("_source_ns") or "").strip()
+            ws = str(e.get("_source_ws") or "").strip()
+            if book and book not in route:
+                route[book] = {"ns": ns, "ws": ws}
+        return route
 
     def _build_keyword_topology_json(self, workspace_root: Path) -> str:
         """Build Jaccard keyword clusters from existing memory books."""
@@ -724,54 +763,78 @@ class DreamHandler:
         return json.dumps(payload, ensure_ascii=False)
 
     def _load_memory_topology_entries(self, workspace_root: Path) -> list[dict[str, Any]]:
-        """Read minimal memory fields required for topology clustering."""
+        """Read minimal memory fields required for topology clustering.
+
+        [AutoC 2026-08-28] Scans all node subdirectories under data/memory/
+        (e.g. ereuna_main/, bootstrap.coder/) and their workspace sub-dirs
+        (@guild-xxx/, @dm-xxx/). Each entry carries _source_ns and _source_ws
+        so the dream memory router can write results back to the correct target.
+        Skips system.dream/ and system.memory_extractor/ (dream's own scratch).
+        """
         mem_dir = workspace_root / "data" / "memory"
         if not mem_dir.exists() or not mem_dir.is_dir():
             return []
 
+        _SKIP_NS = {"system.dream", "system.memory_extractor"}
         result: list[dict[str, Any]] = []
-        for yaml_path in sorted(mem_dir.glob("*.yaml")):
-            try:
-                data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                log.warning("[scheduler] dream topology skipped %s: %s", yaml_path.name, exc)
-                continue
-            if not isinstance(data, dict):
-                continue
-            book = str(data.get("book") or yaml_path.stem).strip() or yaml_path.stem
-            raw_entries = data.get("entries")
-            if not isinstance(raw_entries, list):
-                continue
-            for entry in raw_entries:
-                if not isinstance(entry, dict):
+
+        def _scan_dir(dir_path: Path, source_ns: str, source_ws: str) -> None:
+            for yaml_path in sorted(dir_path.glob("*.yaml")):
+                try:
+                    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    log.warning("[scheduler] dream topology skipped %s: %s", yaml_path, exc)
                     continue
-                eid = str(entry.get("id") or "").strip()
-                if not eid:
+                if not isinstance(data, dict):
                     continue
-                raw_keywords = entry.get("keywords")
-                if isinstance(raw_keywords, list):
-                    keywords = [str(keyword).strip() for keyword in raw_keywords if str(keyword).strip()]
-                elif isinstance(raw_keywords, str) and raw_keywords.strip():
-                    keywords = [raw_keywords.strip()]
-                else:
-                    keywords = []
-                content = str(entry.get("content") or "").strip()
-                # [AutoC 2026-05-31] Why: the final Dream node must not scan full
-                # memory files, but it still needs enough metadata to avoid
-                # deleting protected entries. How: expose a small preview plus the
-                # source/constant protection fields, not the full Task or raw YAML.
-                # Purpose: make topology cleanup precise and safe.
-                result.append(
-                    {
-                        "book": book,
-                        "id": eid,
-                        "content_preview": content[:50],
-                        "keywords": keywords,
-                        "keyword_set": set(keywords),
-                        "constant": bool(entry.get("constant", False)),
-                        "source": str(entry.get("source") or ""),
-                    }
-                )
+                book = str(data.get("book") or yaml_path.stem).strip() or yaml_path.stem
+                raw_entries = data.get("entries")
+                if not isinstance(raw_entries, list):
+                    continue
+                for entry in raw_entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    eid = str(entry.get("id") or "").strip()
+                    if not eid:
+                        continue
+                    raw_keywords = entry.get("keywords")
+                    if isinstance(raw_keywords, list):
+                        keywords = [str(keyword).strip() for keyword in raw_keywords if str(keyword).strip()]
+                    elif isinstance(raw_keywords, str) and raw_keywords.strip():
+                        keywords = [raw_keywords.strip()]
+                    else:
+                        keywords = []
+                    content = str(entry.get("content") or "").strip()
+                    result.append(
+                        {
+                            "book": book,
+                            "id": eid,
+                            "content_preview": content[:50],
+                            "keywords": keywords,
+                            "keyword_set": set(keywords),
+                            "constant": bool(entry.get("constant", False)),
+                            "source": str(entry.get("source") or ""),
+                            "_source_ns": source_ns,
+                            "_source_ws": source_ws,
+                        }
+                    )
+
+        # Scan node-level subdirectories
+        for node_dir in sorted(mem_dir.iterdir()):
+            if not node_dir.is_dir() or node_dir.name.startswith("."):
+                continue
+            ns = node_dir.name
+            if ns in _SKIP_NS:
+                continue
+            # Node-level yaml (scope=node)
+            _scan_dir(node_dir, source_ns=ns, source_ws="")
+            # Workspace sub-dirs (@guild-xxx, @dm-xxx, @thread-xxx)
+            for ws_dir in sorted(node_dir.iterdir()):
+                if ws_dir.is_dir() and ws_dir.name.startswith("@"):
+                    _scan_dir(ws_dir, source_ns=ns, source_ws=ws_dir.name)
+
+        # Legacy: root-level yaml files (pre-namespace migration)
+        _scan_dir(mem_dir, source_ns="", source_ws="")
         return result
 
     def _pending_expired(self, pending: dict[str, Any], *, now: datetime) -> bool:

@@ -517,7 +517,7 @@ async def _execute_real_tools(
             step=step,
             tool_call=_current_tool_call,
             tool_calls=_hook_real_tool_calls,
-            extra={"real_tool_calls": real_tool_calls},
+            extra={"real_tool_calls": real_tool_calls, "tool_ctx": _tool_ctx, "tool_args": _t_args},
         )
         _tool_hook_result = await hook_registry.afire("before_tool_call", _tool_hook_ctx)
         if _tool_hook_result.action is not None:

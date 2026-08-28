@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>记忆管理</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+  /* 主题值全部由宿主注入（themeBridge 在 iframe load 后写入宿主 :root 规则）。
+     本页只声明别名与宿主变量名的映射，不持有任何宿主值。 */
+  :root {
+    --bg: var(--duties-bg); --panel: var(--duties-panel); --muted: var(--duties-muted);
+    --text: var(--duties-text); --secondary: var(--duties-secondary); --tertiary: var(--duties-tertiary);
+    --border: var(--duties-border); --accent: var(--duties-accent);
+    --ok: #2e7d32; --warn: #8a6d3b; --danger: #a33c3c;
+    --mono: 'Geist Mono', ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 12px/1.6 'Inter', ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+
+  .bar { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 14px 20px 10px; border-bottom: 1px solid var(--muted); display: flex; align-items: baseline; gap: 12px; }
+  .bar h1 { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: -0.02em; }
+  .bar .count { flex: 1; color: var(--tertiary); font: 10.5px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button.op { font: 10.5px var(--mono); cursor: pointer; white-space: nowrap; color: var(--secondary); background: transparent; border: 1px solid var(--border); border-radius: 4px; padding: 3px 10px; transition: color .15s, border-color .15s; }
+  button.op:hover:not(:disabled) { color: var(--text); border-color: var(--secondary); }
+  button.op:disabled { opacity: .4; cursor: not-allowed; }
+  button.op.danger { color: var(--danger); }
+  button.op.danger:hover:not(:disabled) { border-color: var(--danger); }
+  button.op.primary { color: var(--accent); border-color: var(--accent); }
+
+  .cols { display: flex; gap: 0; min-height: calc(100vh - 44px); }
+  .tree-pane { flex: 0 0 260px; border-right: 1px solid var(--muted); overflow-y: auto; padding: 10px 10px 20px; }
+  .ns { margin-bottom: 8px; }
+  .ns-head { display: flex; align-items: baseline; gap: 6px; padding: 4px 6px; color: var(--tertiary); font: 10px var(--mono); letter-spacing: .02em; }
+  .ns-head .n { color: var(--secondary); font-weight: 600; }
+  .ns-head .c { margin-left: auto; }
+  .book { display: flex; align-items: baseline; gap: 6px; width: 100%; text-align: left; cursor: pointer; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 4px 8px; color: var(--text); font: 11px var(--mono); }
+  .book:hover { border-color: var(--border); }
+  .book.sel { border-color: var(--text); background: var(--panel); }
+  .book .cnt { margin-left: auto; color: var(--tertiary); font-size: 9.5px; }
+  .book .sub { padding-left: 14px; opacity: .85; }
+
+  .main-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .book-bar { display: flex; align-items: center; gap: 8px; padding: 10px 20px; border-bottom: 1px solid var(--muted); background: var(--bg); position: sticky; top: 0; z-index: 4; }
+  .book-bar .path { font: 600 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .book-bar .meta { color: var(--tertiary); font: 10px var(--mono); white-space: nowrap; }
+  .book-bar .sp { flex: 1; }
+
+  .entries { flex: 1; overflow-y: auto; padding: 12px 20px 30px; display: flex; flex-direction: column; gap: 8px; }
+  .entry { text-align: left; cursor: pointer; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; transition: border-color .15s; }
+  .entry:hover { border-color: var(--secondary); }
+  .entry.sel { border-color: var(--text); background: var(--panel); }
+  .entry .row1 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .entry .id { font: 600 11px var(--mono); }
+  .badge { font: 9px var(--mono); border-radius: 3px; padding: 1px 5px; border: 1px solid; }
+  .badge.on { color: var(--ok); border-color: var(--ok); }
+  .badge.off { color: var(--danger); border-color: var(--danger); }
+  .badge.tr { color: var(--tertiary); border-color: var(--border); }
+  .badge.const { color: var(--warn); border-color: var(--warn); }
+  .entry .preview { margin-top: 3px; color: var(--secondary); font-size: 10.5px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .entry .kws { margin-top: 2px; font: 9.5px var(--mono); color: var(--tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .entry .dates { margin-top: 2px; font: 9px var(--mono); color: var(--tertiary); }
+  .empty { color: var(--tertiary); font-size: 11px; padding: 8px 2px; }
+
+  /* 条目编辑器 */
+  .editor { border-top: 1px solid var(--muted); background: var(--panel); padding: 14px 20px 18px; max-height: 55vh; overflow-y: auto; }
+  .form { display: flex; flex-direction: column; gap: 10px; max-width: 720px; }
+  .form .kv { display: flex; align-items: center; gap: 8px; }
+  .form .fid { font: 600 12px var(--mono); }
+  label.f { display: block; }
+  label.f .lb { display: block; margin-bottom: 3px; color: var(--tertiary); font: 10px var(--mono); }
+  label.f input[type=text], label.f select { width: 100%; font: 11px var(--mono); color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 5px 8px; outline: none; }
+  label.f input:focus, label.f select:focus { border-color: var(--secondary); }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .checks { display: flex; gap: 16px; }
+  .check { display: flex; align-items: center; gap: 6px; color: var(--secondary); font-size: 11px; cursor: pointer; }
+  textarea.content { width: 100%; font: 11px/1.6 var(--mono); color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; outline: none; resize: vertical; min-height: 140px; }
+  textarea.content:focus { border-color: var(--secondary); }
+  textarea.raw { width: 100%; font: 11px/1.5 var(--mono); color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; outline: none; resize: vertical; min-height: 220px; }
+  .actions { display: flex; gap: 8px; align-items: center; border-top: 1px solid var(--muted); padding-top: 10px; flex-wrap: wrap; }
+  .msg { font: 10.5px var(--mono); }
+  .msg.ok { color: var(--ok); }
+  .msg.err { color: var(--danger); }
+  details.raw-wrap { border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; background: var(--bg); }
+  details.raw-wrap summary { cursor: pointer; font: 600 10px var(--mono); color: var(--tertiary); }
+
+  @media (max-width: 720px) {
+    .cols { flex-direction: column; }
+    .tree-pane { flex: none; border-right: none; border-bottom: 1px solid var(--muted); max-height: 32vh; }
+    .duo { grid-template-columns: 1fr; }
+    .entries, .editor { padding-left: 14px; padding-right: 14px; }
+    button.op { min-height: 32px; }
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <h1>记忆</h1>
+  <span class="count" id="count">—</span>
+  <button class="op" id="refresh">刷新</button>
+  <button class="op primary" id="new-entry" disabled title="先在左侧选择一个 book，新条目写入该书">新建条目</button>
+</header>
+<main class="cols">
+  <nav class="tree-pane" id="tree"><p class="empty">加载中。</p></nav>
+  <section class="main-pane">
+    <div class="book-bar" id="book-bar" hidden>
+      <span class="path" id="book-path"></span>
+      <span class="meta" id="book-meta"></span>
+      <span class="sp"></span>
+      <button class="op" id="collapse-editor" hidden>收起编辑</button>
+    </div>
+    <div class="entries" id="entries"><p class="empty">选择左侧的 book 查看条目。</p></div>
+    <div class="editor" id="editor" hidden></div>
+  </section>
+</main>
+<script src="vendor/js-yaml.min.js"></script>
+<script>
+'use strict';
+
+// ── boot / api ─────────────────────────────────────────────
+function boot() {
+  try {
+    const b = window.parent.__CLONOTH_BOOT__;
+    if (b && b.token) return b;
+  } catch (e) { /* cross-origin */ }
+  return { token: '' };
+}
+async function api(path, init) {
+  const b = boot();
+  const resp = await fetch('/v1' + path, Object.assign({}, init, {
+    headers: Object.assign({
+      'Content-Type': 'application/json',
+      ...(b.token ? { Authorization: 'Bearer ' + b.token } : {}),
+    }, (init && init.headers) || {}),
+  }));
+  if (!resp.ok) {
+    let detail = '';
+    try { detail = (await resp.json()).detail || ''; } catch (e) { /* ignore */ }
+    throw new Error(resp.status + (detail ? ' ' + detail : ''));
+  }
+  return resp.json();
+}
+
+// ── state ──────────────────────────────────────────────────
+const S = {
+  data: null,            // GET /admin/config/memory 的完整载荷
+  ns: null, book: null,  // 当前选中
+  raw: null,             // 当前 book 原文（懒加载）
+  editingId: null,       // 正在编辑的条目 id；'__new__' 表示新建
+  form: null,
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '');
+
+function nsLabel(ns) { return ns === '' ? '(全局)' : ns; }
+function q(params) {
+  return Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== null)
+    .map(([k, v]) => k + '=' + encodeURIComponent(v))
+    .join('&');
+}
+
+// ── data ───────────────────────────────────────────────────
+async function loadAll(keepSelection = true) {
+  S.data = await api('/admin/config/memory');
+  if (keepSelection && S.book) {
+    const still = findBook(S.ns, S.book);
+    if (!still) { S.ns = null; S.book = null; S.raw = null; S.editingId = null; S.form = null; }
+  }
+  renderTree();
+  renderEntries();
+  renderEditor();
+}
+
+function findBook(ns, book) {
+  for (const g of (S.data ? S.data.namespaces : [])) {
+    if (g.ns !== ns) continue;
+    for (const b of g.books) if (b.book === book) return b;
+  }
+  return null;
+}
+
+async function loadRaw() {
+  if (S.raw !== null) return S.raw;
+  const resp = await api('/admin/config/memory/raw?' + q({ ns: S.ns || '', book: S.book }));
+  S.raw = resp.content;
+  return S.raw;
+}
+
+async function saveRaw(text) {
+  await api('/admin/config/memory/raw?' + q({ ns: S.ns || '', book: S.book }), {
+    method: 'PUT',
+    body: JSON.stringify({ content: text }),
+  });
+  S.raw = text;
+}
+
+async function deleteEntry(id) {
+  await api('/admin/config/memory/entry?' + q({ ns: S.ns || '', book: S.book, id }), { method: 'DELETE' });
+  if (S.editingId === id) { S.editingId = null; S.form = null; }
+  S.raw = null;
+}
+
+// 条目保存：加载原文 → js-yaml 定位/追加 → 写回。保留 created_at/source。
+async function saveEntry(entry) {
+  let raw = await loadRaw();
+  let data;
+  try { data = jsyaml.load(raw) || {}; } catch (e) { throw new Error('当前 book YAML 解析失败：' + e.message); }
+  if (typeof data !== 'object' || data === null) data = {};
+  if (!Array.isArray(data.entries)) data.entries = [];
+  data.book = S.book;
+  const now = new Date().toISOString();
+  let found = false;
+  for (let i = 0; i < data.entries.length; i++) {
+    const e = data.entries[i];
+    if (e && typeof e === 'object' && String(e.id || '').trim() === entry.id) {
+      const merged = Object.assign({}, e, entry);
+      merged.created_at = String(e.created_at || '') || now;
+      merged.updated_at = now;
+      data.entries[i] = merged;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    entry.created_at = now;
+    entry.updated_at = now;
+    data.entries.push(entry);
+  }
+  await saveRaw(jsyaml.dump(data, { sortKeys: false, noRefs: true, lineWidth: -1 }));
+  return found;
+}
+
+// ── tree pane ──────────────────────────────────────────────
+function renderTree() {
+  const el = $('tree');
+  el.innerHTML = '';
+  if (!S.data || !S.data.namespaces.length) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = 'data/memory 下暂无记忆。';
+    el.appendChild(p);
+    $('count').textContent = '0 条记忆';
+    $('new-entry').disabled = true;
+    return;
+  }
+  $('count').textContent = S.data.total + ' 条记忆 · ' + S.data.namespaces.length + ' 个命名空间';
+  for (const g of S.data.namespaces) {
+    const nsEl = document.createElement('div');
+    nsEl.className = 'ns';
+    const head = document.createElement('div');
+    head.className = 'ns-head';
+    const slash = g.ns.indexOf('/');
+    const nm = document.createElement('span');
+    nm.className = 'n';
+    nm.textContent = slash > 0 ? '  '.repeat(0) + g.ns : nsLabel(g.ns);
+    const cnt = document.createElement('span');
+    cnt.className = 'c';
+    cnt.textContent = g.total;
+    head.append(nm, cnt);
+    if (slash > 0) head.style.paddingLeft = '16px';
+    nsEl.appendChild(head);
+    for (const b of g.books) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'book' + (g.ns === S.ns && b.book === S.book ? ' sel' : '');
+      if (slash > 0) btn.classList.add('sub');
+      const nm2 = document.createElement('span');
+      nm2.textContent = b.book;
+      const c2 = document.createElement('span');
+      c2.className = 'cnt';
+      c2.textContent = b.count;
+      btn.append(nm2, c2);
+      btn.addEventListener('click', () => selectBook(g.ns, b.book));
+      nsEl.appendChild(btn);
+    }
+    el.appendChild(nsEl);
+  }
+}
+
+async function selectBook(ns, book) {
+  if (S.editingId && !confirm('编辑中的条目未保存，切换将丢弃修改。继续？')) return;
+  S.ns = ns;
+  S.book = book;
+  S.raw = null;
+  S.editingId = null;
+  S.form = null;
+  renderTree();
+  renderEntries();
+  renderEditor();
+}
+
+// ── entries pane ───────────────────────────────────────────
+function renderEntries() {
+  const el = $('entries');
+  const bar = $('book-bar');
+  el.innerHTML = '';
+  if (!S.book) {
+    bar.hidden = true;
+    $('new-entry').disabled = true;
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '选择左侧的 book 查看条目。';
+    el.appendChild(p);
+    return;
+  }
+  bar.hidden = false;
+  $('new-entry').disabled = false;
+  const b = findBook(S.ns, S.book);
+  $('book-path').textContent = (S.ns === '' ? '' : S.ns + ' / ') + S.book;
+  $('book-meta').textContent = b ? b.count + ' 条 · ' + b.enabled_count + ' 启用' : '';
+  if (!b || !b.entries.length) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '此 book 暂无条目。';
+    el.appendChild(p);
+    return;
+  }
+  for (const e of b.entries) {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'entry' + (e.id === S.editingId ? ' sel' : '');
+    const row1 = document.createElement('div');
+    row1.className = 'row1';
+    const idSpan = document.createElement('span');
+    idSpan.className = 'id';
+    idSpan.textContent = e.id;
+    row1.appendChild(idSpan);
+    const onB = document.createElement('span');
+    onB.className = 'badge ' + (e.enabled === false ? 'off' : 'on');
+    onB.textContent = e.enabled === false ? '禁用' : '启用';
+    row1.appendChild(onB);
+    if (e.constant) {
+      const cb = document.createElement('span');
+      cb.className = 'badge const';
+      cb.textContent = '常驻';
+      row1.appendChild(cb);
+    }
+    if (e.priority) {
+      const pb = document.createElement('span');
+      pb.className = 'badge tr';
+      pb.textContent = 'P' + e.priority;
+      row1.appendChild(pb);
+    }
+    card.appendChild(row1);
+    if (e.content_preview) {
+      const pv = document.createElement('div');
+      pv.className = 'preview';
+      pv.textContent = e.content_preview;
+      card.appendChild(pv);
+    }
+    if ((e.keywords || []).length) {
+      const kw = document.createElement('div');
+      kw.className = 'kws';
+      kw.textContent = e.keywords.join(', ');
+      card.appendChild(kw);
+    }
+    const dt = document.createElement('div');
+    dt.className = 'dates';
+    const parts = [];
+    if (e.source) parts.push('src:' + e.source);
+    if (e.created_at) parts.push('创建 ' + e.created_at.slice(0, 10));
+    if (e.updated_at) parts.push('更新 ' + e.updated_at.slice(0, 10));
+    dt.textContent = parts.join(' · ');
+    card.appendChild(dt);
+    card.addEventListener('click', () => startEdit(e.id));
+    el.appendChild(card);
+  }
+}
+
+// ── editor pane ────────────────────────────────────────────
+function startEdit(id, isNew = false) {
+  S.editingId = id;
+  S.form = null;
+  renderEntries();
+  renderEditor(isNew);
+}
+function startNew() {
+  if (!S.book) return;
+  const id = prompt('新条目 id（[A-Za-z0-9][A-Za-z0-9_.-]{0,127}）：');
+  if (!id) return;
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$/.test(id)) { alert('id 不符合规范'); return; }
+  const b = findBook(S.ns, S.book);
+  if (b && b.entries.some((e) => e.id === id)) { alert('该 book 下已存在同名 id'); return; }
+  S.editingId = '__new__';
+  S.form = null;
+  renderEntries();
+  renderEditor(true, id);
+}
+
+function renderEditor(isNew = false, newId = '') {
+  const el = $('editor');
+  const collapseBtn = $('collapse-editor');
+  if (!S.editingId) {
+    el.hidden = true;
+    el.innerHTML = '';
+    collapseBtn.hidden = true;
+    return;
+  }
+  collapseBtn.hidden = false;
+  el.hidden = false;
+  const b = findBook(S.ns, S.book);
+  const src = isNew ? null : (b ? b.entries.find((e) => e.id === S.editingId) : null);
+  if (!isNew && !src) {
+    el.innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '条目不存在（可能已被删除）。';
+    el.appendChild(p);
+    return;
+  }
+  const f = S.form || {
+    id: isNew ? newId : src.id,
+    content: isNew ? '' : (findEntryFullContent() || (src.content_preview || '')),
+    keywords: isNew ? '' : (src.keywords || []).join(', '),
+    constant: isNew ? false : !!src.constant,
+    enabled: isNew ? true : src.enabled !== false,
+    priority: isNew ? '0' : String(src.priority || 0),
+    scan_depth: isNew ? '0' : String(src.scan_depth || 0),
+    node_ids: isNew ? '' : (src.node_ids || []).join(', '),
+  };
+  S.form = f;
+
+  el.innerHTML = '';
+  const form = document.createElement('div');
+  form.className = 'form';
+
+  const idRow = document.createElement('div');
+  idRow.className = 'kv';
+  const idLb = document.createElement('span');
+  idLb.className = 'lb';
+  idLb.textContent = '条目 id';
+  const idVal = document.createElement('span');
+  idVal.className = 'fid';
+  idVal.textContent = f.id;
+  idRow.append(idLb, idVal);
+  form.appendChild(idRow);
+
+  const cL = document.createElement('label');
+  cL.className = 'f';
+  const cLb = document.createElement('span');
+  cLb.className = 'lb';
+  cLb.textContent = 'content（完整记忆正文）';
+  const cTa = document.createElement('textarea');
+  cTa.className = 'content';
+  cTa.spellcheck = false;
+  cTa.value = f.content;
+  cTa.addEventListener('input', () => { f.content = cTa.value; markDirty(); });
+  cL.append(cLb, cTa);
+  form.appendChild(cL);
+
+  form.appendChild(mkText('keywords（逗号分隔，支持 /regex/flags）', f.keywords, (v) => { f.keywords = v; }));
+  form.appendChild(mkText('node_ids（逗号分隔，留空对所有节点可见）', f.node_ids, (v) => { f.node_ids = v; }));
+
+  const checks = document.createElement('div');
+  checks.className = 'checks';
+  checks.appendChild(mkCheck('enabled', f.enabled, (v) => { f.enabled = v; }));
+  checks.appendChild(mkCheck('constant（常驻注入）', f.constant, (v) => { f.constant = v; }));
+  form.appendChild(checks);
+
+  const duo = document.createElement('div');
+  duo.className = 'duo';
+  duo.appendChild(mkText('priority（预算优先级）', f.priority, (v) => { f.priority = v; }));
+  duo.appendChild(mkText('scan_depth（关键词回看轮数）', f.scan_depth, (v) => { f.scan_depth = v; }));
+  form.appendChild(duo);
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'op primary';
+  saveBtn.textContent = isNew ? '创建条目' : '保存条目';
+  saveBtn.addEventListener('click', async () => {
+    try {
+      await saveEntry(buildEntry(f));
+      S.raw = null;
+      await loadAll();
+      S.editingId = f.id;
+      S.form = null;
+      renderEntries();
+      renderEditor();
+      setMsg('已保存。注入内容随下一轮对话生效。', true);
+    } catch (e) {
+      setMsg('保存失败：' + e.message, false);
+    }
+  });
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'op danger';
+  delBtn.textContent = '删除条目';
+  delBtn.addEventListener('click', async () => {
+    if (!confirm(`确定删除条目 ${f.id}？（${src && src.constant ? '注意：这是常驻记忆' : '不可恢复'}）`)) return;
+    try {
+      await deleteEntry(f.id);
+      await loadAll();
+    } catch (e) {
+      setMsg('删除失败：' + e.message, false);
+    }
+  });
+  if (isNew) delBtn.disabled = true;
+  const msg = document.createElement('span');
+  msg.className = 'msg';
+  msg.id = 'editor-msg';
+  actions.append(saveBtn, delBtn, msg);
+  form.appendChild(actions);
+
+  // Raw YAML 编辑（高级）
+  const rawWrap = document.createElement('details');
+  rawWrap.className = 'raw-wrap';
+  const summary = document.createElement('summary');
+  summary.textContent = 'Raw YAML 编辑（整本 book）';
+  rawWrap.appendChild(summary);
+  const rawTa = document.createElement('textarea');
+  rawTa.className = 'raw';
+  rawTa.spellcheck = false;
+  rawTa.placeholder = '首次展开时加载原文…';
+  rawTa.addEventListener('input', () => { rawTa.dataset.dirty = '1'; });
+  const rawBtn = document.createElement('button');
+  rawBtn.type = 'button';
+  rawBtn.className = 'op';
+  rawBtn.style.marginTop = '6px';
+  rawBtn.textContent = '保存 Raw YAML';
+  rawBtn.addEventListener('click', async () => {
+    try {
+      await saveRaw(rawTa.value);
+      await loadAll();
+      setMsg('Raw YAML 已保存。', true);
+    } catch (e) {
+      setMsg('保存失败：' + e.message, false);
+    }
+  });
+  rawWrap.addEventListener('toggle', async () => {
+    if (!rawWrap.open || rawTa.value || rawTa.dataset.loading) return;
+    rawTa.dataset.loading = '1';
+    try {
+      rawTa.value = await loadRaw();
+      delete rawTa.dataset.loading;
+    } catch (e) {
+      rawTa.value = '';
+      delete rawTa.dataset.loading;
+      setMsg('加载原文失败：' + e.message, false);
+    }
+  });
+  rawWrap.append(rawTa, rawBtn);
+  form.appendChild(document.createElement('div')).appendChild(rawWrap);
+
+  el.appendChild(form);
+}
+
+// 完整 content 需要从 raw yaml 取（列表接口只给预览）。
+function findEntryFullContent() {
+  // S.raw 已加载时直接查；否则同步退回预览文本，用户保存前 raw 会先加载。
+  if (S.raw === null) return null;
+  try {
+    const data = jsyaml.load(S.raw) || {};
+    for (const e of data.entries || []) {
+      if (e && String(e.id || '').trim() === S.editingId) return String(e.content || '');
+    }
+  } catch (err) { /* fallthrough */ }
+  return null;
+}
+
+function buildEntry(f) {
+  return {
+    id: f.id,
+    content: f.content.trim(),
+    keywords: f.keywords.split(',').map((x) => x.trim()).filter(Boolean),
+    constant: !!f.constant,
+    enabled: f.enabled !== false,
+    priority: parseInt(f.priority || '0', 10) || 0,
+    scan_depth: parseInt(f.scan_depth || '0', 10) || 0,
+    node_ids: f.node_ids.split(',').map((x) => x.trim()).filter(Boolean),
+  };
+}
+
+function mkText(labelText, value, onInput) {
+  const label = document.createElement('label');
+  label.className = 'f';
+  const lb = document.createElement('span');
+  lb.className = 'lb';
+  lb.textContent = labelText;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = value;
+  input.addEventListener('input', () => onInput(input.value));
+  label.append(lb, input);
+  return label;
+}
+function mkCheck(labelText, checked, onChange) {
+  const label = document.createElement('label');
+  label.className = 'check';
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = checked;
+  input.addEventListener('change', () => onChange(input.checked));
+  const span = document.createElement('span');
+  span.textContent = labelText;
+  label.append(input, span);
+  return label;
+}
+function markDirty() {
+  const msg = $('editor-msg');
+  if (msg) { msg.className = 'msg'; msg.textContent = '未保存'; }
+}
+function setMsg(text, ok) {
+  const msg = $('editor-msg');
+  if (!msg) return;
+  msg.className = 'msg ' + (ok ? 'ok' : 'err');
+  msg.textContent = text;
+}
+
+// ── wire up ────────────────────────────────────────────────
+$('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
+$('new-entry').addEventListener('click', startNew);
+$('collapse-editor').addEventListener('click', () => {
+  if (S.editingId && S.form && !confirm('编辑中的条目未保存，收起将丢弃修改。继续？')) return;
+  S.editingId = null;
+  S.form = null;
+  renderEntries();
+  renderEditor();
+});
+
+loadAll().catch((e) => {
+  $('tree').innerHTML = '';
+  const p = document.createElement('p');
+  p.className = 'empty';
+  p.textContent = '加载失败：' + e.message;
+  $('tree').appendChild(p);
+});
+</script>
+</body>
+</html>

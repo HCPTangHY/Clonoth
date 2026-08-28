@@ -811,6 +811,11 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     ctx = input_data.get("task_context") if isinstance(input_data.get("task_context"), dict) else {}
     if input_data.get("_system_task"):
         ctx["is_system_task"] = True
+    # [AutoC 2026-08-28] Forward _memory_route from input_data to task_context
+    # so the dream_router hook can read it from rctx.task_context at runtime.
+    _mr = input_data.get("_memory_route")
+    if isinstance(_mr, dict) and _mr:
+        ctx["_memory_route"] = _mr
     return ctx
 
 

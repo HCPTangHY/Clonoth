@@ -26,7 +26,11 @@ logger = logging.getLogger(__name__)
 # at construction. Purpose: the plugin contributes content; the core assembles.
 PLUGIN_META = {
     "handler_class": "KnowledgeInjector",
-    "hook_points": [],
+    "hook_points": [
+        # [AutoC 2026-08-28] Dream memory router: redirect save_memory/delete_memory
+        # writes from system.dream to the original source node directory.
+        ("before_tool_call", "_dream_route"),
+    ],
     "priority": 50,
     "wants_context": True,
     "description": "知识与记忆插件：skill/memory 声明式 prompt section 注入、六个 CRUD 元工具（engine）、skills admin/config 端点与设置面板（supervisor）",
@@ -39,6 +43,13 @@ PLUGIN_META = {
                 "title": "技能",
                 "icon": "menu_book",
                 "entry": "/v1/plugins/knowledge_inject/web/",
+            },
+            {
+                "id": "memory",
+                "slot": "settings",
+                "title": "记忆",
+                "icon": "psychology",
+                "entry": "/v1/plugins/knowledge_inject/web/memory.html",
             }
         ],
     },
@@ -1800,6 +1811,147 @@ def _delete_skill_endpoint(name: str, request: Any) -> dict[str, Any]:
     return {"ok": True}
 
 
+def _memory_book_path(workspace_root: Path, ns: str, book: str) -> Path:
+    """Resolve data/memory/{ns}/{book}.yaml with containment checks.
+
+    ns 是相对 data/memory 的子目录（可含一级 @workspace 段）。为什么单独
+    校验：ns 来自客户端查询参数，节点 id 与 workspace 名允许的点划线之外
+    还可能有 @ 前缀，白名单过窄会挡住磁盘上真实存在的目录；resolve +
+    前缀包含 + 深度上限即可挡住穿越。
+    """
+    if not _BOOK_NAME_RE.fullmatch(book or ""):
+        raise _http_exc(400, "Invalid book name")
+    ns = (ns or "").strip().strip("/")
+    base = (workspace_root / "data" / "memory").resolve()
+    if not ns:
+        p = base / f"{book}.yaml"
+    else:
+        parts = ns.split("/")
+        if len(parts) > 2 or any(seg in ("", ".", "..") for seg in parts):
+            raise _http_exc(400, "Invalid namespace")
+        p = base.joinpath(*parts) / f"{book}.yaml"
+    rp = p.resolve()
+    if rp != base and not str(rp).startswith(str(base) + "/"):
+        raise _http_exc(400, "Invalid path")
+    return rp
+
+
+def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
+    """列出全部 namespace/book 及条目摘要，供管理面板一次拉取。"""
+    ws = _ws_root(request)
+    base = ws / "data" / "memory"
+    out: list[dict[str, Any]] = []
+    if not base.is_dir():
+        return out
+
+    def _scan(ns_dir: Path, ns: str) -> list[dict[str, Any]]:
+        books = []
+        for yf in sorted(ns_dir.glob("*.yaml")):
+            data = _load_book(yf)
+            entries = [e for e in data.get("entries", []) if isinstance(e, dict)]
+            books.append({
+                "book": str(data.get("book") or yf.stem),
+                "file": yf.name,
+                "count": len(entries),
+                "enabled_count": sum(1 for e in entries if bool(e.get("enabled", True))),
+                "entries": [
+                    {
+                        "id": str(e.get("id") or ""),
+                        "content_preview": str(e.get("content") or "")[:120],
+                        "keywords": [str(k) for k in (e.get("keywords") or []) if isinstance(k, str)][:12],
+                        "constant": bool(e.get("constant", False)),
+                        "enabled": bool(e.get("enabled", True)),
+                        "priority": int(e.get("priority") or 0),
+                        "scan_depth": int(e.get("scan_depth") or 0),
+                        "node_ids": [str(n) for n in (e.get("node_ids") or []) if isinstance(n, str)],
+                        "source": str(e.get("source") or ""),
+                        "created_at": str(e.get("created_at") or ""),
+                        "updated_at": str(e.get("updated_at") or ""),
+                    }
+                    for e in entries
+                ],
+            })
+        return books
+
+    # 根级 books（ns=""）
+    root_books = _scan(base, "")
+    # 一级目录：节点 ns 与（历史遗留的）根级 @ws 目录，一律作为 ns 展开
+    level1 = sorted(d for d in base.iterdir() if d.is_dir() and not d.name.startswith("."))
+    # 二级目录：仅 @workspace 形态
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+    if root_books:
+        groups.append(("", root_books))
+    for d in level1:
+        ns_books = _scan(d, d.name)
+        if ns_books:
+            groups.append((d.name, ns_books))
+        for sub in sorted(x for x in d.iterdir() if x.is_dir()):
+            sub_books = _scan(sub, f"{d.name}/{sub.name}")
+            if sub_books:
+                groups.append((f"{d.name}/{sub.name}", sub_books))
+
+    total = sum(len(b["entries"]) for _, books in groups for b in books)
+    return {
+        "total": total,
+        "namespaces": [
+            {
+                "ns": ns,
+                "total": sum(b["count"] for b in books),
+                "books": books,
+            }
+            for ns, books in groups
+        ],
+    }
+
+
+def _memory_raw_get_endpoint(ns: str, book: str, request: Any) -> dict[str, str]:
+    p = _memory_book_path(_ws_root(request), ns, book)
+    if not p.exists():
+        raise _http_exc(404, "Book not found")
+    return {"content": p.read_text(encoding="utf-8")}
+
+
+def _memory_raw_put_endpoint(ns: str, book: str, payload: Any, request: Any) -> dict[str, Any]:
+    ws = _ws_root(request)
+    p = _memory_book_path(ws, ns, book)
+    try:
+        data = yaml.safe_load(str(payload.content))
+    except Exception as exc:
+        raise _http_exc(400, f"YAML parse failed: {exc}") from exc
+    if not isinstance(data, dict):
+        raise _http_exc(400, "Book yaml must be a mapping")
+    if not isinstance(data.get("entries"), list):
+        data["entries"] = []
+    data.setdefault("book", book)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _save_book(p, data)
+    _invalidate_cache(ws, memory_book=(ns or "").strip("/"))
+    return {"ok": True}
+
+
+def _memory_delete_entry_endpoint(ns: str, book: str, id: str, request: Any) -> dict[str, Any]:
+    ws = _ws_root(request)
+    p = _memory_book_path(ws, ns, book)
+    if not p.exists():
+        raise _http_exc(404, "Book not found")
+    data = _load_book(p)
+    entries = data.get("entries", [])
+    kept = [e for e in entries if not (isinstance(e, dict) and str(e.get("id") or "").strip() == id)]
+    if len(kept) == len(entries):
+        raise _http_exc(404, f"Memory not found: {id}")
+    if kept:
+        data["entries"] = kept
+        _save_book(p, data)
+    else:
+        # 空书随最后一条删除一并移除，与工具侧行为一致
+        try:
+            p.unlink()
+        except Exception:
+            pass
+    _invalidate_cache(ws, memory_book=(ns or "").strip("/"))
+    return {"ok": True, "deleted": id}
+
+
 def _register_admin_routes(routes: Any) -> None:
     # request 参数必须以 Request 类型注解：FastAPI 只认该注解并注入请求对象，
     # Any 会被当作必填 query 参数，导致所有端点 422（missing field request）。
@@ -1839,6 +1991,25 @@ def _register_admin_routes(routes: Any) -> None:
     router.add_api_route("/skills", _create, methods=["POST"])
     router.add_api_route("/skills/{name}", _delete, methods=["DELETE"])
     routes.register(router, mount="admin/config", description="skills 配置端点")
+
+    def _mem_list(request: Request) -> Any:
+        return _memory_list_endpoint(request)
+
+    def _mem_raw(ns: str = "", book: str = "", request: Request = None) -> dict[str, str]:  # noqa: RUF013
+        return _memory_raw_get_endpoint(ns, book, request)
+
+    def _mem_raw_put(ns: str = "", book: str = "", request: Request = None, payload: RawContent = None) -> dict[str, Any]:  # noqa: RUF013
+        return _memory_raw_put_endpoint(ns, book, payload, request)
+
+    def _mem_del(ns: str = "", book: str = "", id: str = "", request: Request = None) -> dict[str, Any]:  # noqa: RUF013
+        return _memory_delete_entry_endpoint(ns, book, id, request)
+
+    mem_router = APIRouter()
+    mem_router.add_api_route("/memory", _mem_list, methods=["GET"])
+    mem_router.add_api_route("/memory/raw", _mem_raw, methods=["GET"])
+    mem_router.add_api_route("/memory/raw", _mem_raw_put, methods=["PUT"])
+    mem_router.add_api_route("/memory/entry", _mem_del, methods=["DELETE"])
+    routes.register(mem_router, mount="admin/config", description="memory 配置端点")
 
     # 设置面板静态资源。public：iframe 无法携带 Authorization 头，页面本身
     # 不含秘密，数据全部经鉴权 XHR 获取。
@@ -1924,3 +2095,15 @@ class KnowledgeInjector:
         _skill_static, skill_dynamic, _memory_static, memory_dynamic = result
         parts = [str(m["content"]) for m in (*skill_dynamic, *memory_dynamic) if m.get("content")]
         return parts or None
+
+    # [AutoC 2026-08-28] Dream memory router hook delegate.
+    # Registered as ("before_tool_call", "_dream_route") in PLUGIN_META.
+    # Delegates to the standalone DreamMemoryRouter handler.
+    _dream_router_instance: Any = None
+
+    async def _dream_route(self, ctx: Any) -> Any:
+        """Redirect dream node save_memory/delete_memory to source namespace."""
+        if self._dream_router_instance is None:
+            from engine.builtin.knowledge_inject.dream_router import DreamMemoryRouter
+            self._dream_router_instance = DreamMemoryRouter()
+        return await self._dream_router_instance.handle(ctx)
