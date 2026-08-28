@@ -72,6 +72,8 @@
   body.editor-only .bar .count, body.editor-only .bar #refresh { display: none; }
   /* 列表形态：编辑器节点不渲染 */
   body:not(.editor-only) .editor-pane { display: none; }
+  /* 列表形态整页铺开：编辑器在宿主右栏，300px 固定宽与右边框不再适用 */
+  body:not(.editor-only) .list-pane { flex: 1; border-right: none; }
   .editor-pane .placeholder { color: var(--tertiary); font-size: 11px; }
   .form { display: flex; flex-direction: column; gap: 12px; max-width: 560px; }
   .form .kv { display: flex; align-items: center; gap: 8px; }

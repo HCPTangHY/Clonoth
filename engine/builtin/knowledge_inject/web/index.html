@@ -65,6 +65,14 @@
   .empty { color: var(--tertiary); font-size: 11px; padding: 8px 2px; }
 
   .editor-pane { flex: 1; min-width: 0; padding: 16px 20px; overflow-y: auto; }
+  /* [AutoC 2026-08-28] 双形态：mode=editor 为宿主右栏编辑器；列表形态为纯
+     列表，编辑器由宿主右栏承担。与 memory/MCP 页同一模式。 */
+  body.editor-only .cols { display: block; }
+  body.editor-only .list-pane { display: none; }
+  body.editor-only .editor-pane { padding: 14px 16px; }
+  body.editor-only .bar .count, body.editor-only .bar #refresh { display: none; }
+  body:not(.editor-only) .editor-pane { display: none; }
+  body:not(.editor-only) .list-pane { flex: 1; border-right: none; }
   .editor-pane .placeholder { color: var(--tertiary); font-size: 11px; }
   .form { display: flex; flex-direction: column; gap: 12px; max-width: 640px; }
   .form .kv { display: flex; align-items: center; gap: 8px; }
@@ -103,6 +111,7 @@
 <header class="bar">
   <h1>技能</h1>
   <span class="count" id="count">—</span>
+  <button class="op" id="rail-close" hidden>关闭</button>
   <button class="op" id="refresh">刷新</button>
 </header>
 <main class="cols">
@@ -118,6 +127,37 @@
 <script src="vendor/js-yaml.min.js"></script>
 <script>
 'use strict';
+window.addEventListener('error', (e) => {
+  let d = document.getElementById('errbox');
+  if (!d) {
+    d = document.createElement('div');
+    d.id = 'errbox';
+    d.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:9999;background:#a33c3c;color:#fff;font:11px monospace;padding:6px 10px;border-radius:4px;max-width:90%;';
+    document.body.appendChild(d);
+  }
+  d.textContent = 'JS ERROR: ' + e.message;
+});
+
+// [AutoC 2026-08-28] 双形态：list（主区整页列表）与 editor（宿主右栏编辑器）。
+// 列表点击条目时 postMessage 请宿主在右栏打开本页 editor 形态；保存/删除经
+// BroadcastChannel 通知列表刷新。与 memory/MCP 页同一套协议。
+const MODE = new URLSearchParams(location.search).get('mode') === 'editor' ? 'editor' : 'list';
+const PANEL_KEY = 'plugin:knowledge_inject:settings';
+const CHAN = ('BroadcastChannel' in window) ? new BroadcastChannel('clonoth-ki-skills') : null;
+
+function railOpen(params) {
+  try {
+    window.parent.postMessage({ source: 'clonoth-plugin', type: 'open-settings-editor', panel: PANEL_KEY, params }, location.origin);
+  } catch (e) { /* not iframed */ }
+}
+function railClose() {
+  try {
+    window.parent.postMessage({ source: 'clonoth-plugin', type: 'close-settings-editor', panel: PANEL_KEY }, location.origin);
+  } catch (e) { /* not iframed */ }
+}
+function broadcastChanged() {
+  try { if (CHAN) CHAN.postMessage('changed'); } catch (e) { /* ignore */ }
+}
 
 // ── boot / api ─────────────────────────────────────────────
 function boot() {
@@ -198,16 +238,15 @@ async function loadAll() {
     S.selectedName = null; S.form = null; S.raw = '';
   }
   renderList();
-  renderEditor();
+  if (MODE === 'editor') renderEditor();
 }
 
 async function select(name) {
-  if (S.dirty && !confirm('当前编辑未保存，切换将丢弃修改。继续？')) return;
+  if (MODE === 'list') { railOpen({ id: name }); return; }
   S.selectedName = name;
   S.form = null;
   S.raw = '';
   S.dirty = false;
-  renderList();
   renderEditor();
   try {
     const resp = await api('/admin/config/skills/' + encodeURIComponent(name) + '/raw');
@@ -227,7 +266,12 @@ async function select(name) {
     };
     renderEditor();
   } catch (e) {
-    setMsg('加载失败：' + e.message, false);
+    const el = $('editor');
+    el.innerHTML = '';
+    const pe = document.createElement('p');
+    pe.className = 'placeholder';
+    pe.textContent = '加载失败：' + e.message;
+    el.appendChild(pe);
   }
 }
 
@@ -256,8 +300,9 @@ async function save() {
     });
     S.raw = next;
     S.dirty = false;
+    broadcastChanged();
     setMsg('已保存。注入内容随下一轮对话生效。', true);
-    await loadAll();
+    if (MODE !== 'editor') await loadAll();
   } catch (e) {
     setMsg('保存失败：' + e.message, false);
   }
@@ -271,6 +316,8 @@ async function removeSelected() {
     S.selectedName = null;
     S.form = null;
     S.dirty = false;
+    broadcastChanged();
+    if (MODE === 'editor') { railClose(); return; }
     await loadAll();
   } catch (e) {
     setMsg('删除失败：' + e.message, false);
@@ -287,8 +334,9 @@ async function createSkill() {
   try {
     await api('/admin/config/skills', { method: 'POST', body: JSON.stringify({ id: name, content }) });
     input.value = '';
+    broadcastChanged();
     await loadAll();
-    await select(name);
+    railOpen({ id: name });
   } catch (e) {
     alert('创建失败：' + e.message);
   }
@@ -309,7 +357,7 @@ function renderList() {
   for (const s of S.skills) {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'skill' + (s.name === S.selectedName ? ' sel' : '');
+    btn.className = 'skill';
     const row1 = document.createElement('div');
     row1.className = 'row1';
     const nameSpan = document.createElement('span');
@@ -462,17 +510,38 @@ function setMsg(text, ok) {
 }
 
 // ── wire up ────────────────────────────────────────────────
-$('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
-$('new-btn').addEventListener('click', createSkill);
-$('new-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') createSkill(); });
-
-loadAll().catch((e) => {
-  $('list').innerHTML = '';
-  const p = document.createElement('p');
-  p.className = 'empty';
-  p.textContent = '加载失败：' + e.message;
-  $('list').appendChild(p);
-});
+if (MODE === 'editor') {
+  document.body.classList.add('editor-only');
+  document.querySelector('.bar h1').textContent = '编辑技能';
+  const closeBtn = $('rail-close');
+  closeBtn.hidden = false;
+  closeBtn.addEventListener('click', railClose);
+  const id = new URLSearchParams(location.search).get('id') || '';
+  if (!id) {
+    const el = $('editor');
+    el.innerHTML = '';
+    const pe = document.createElement('p');
+    pe.className = 'placeholder';
+    pe.textContent = '缺少技能名参数。';
+    el.appendChild(pe);
+  } else {
+    select(id).catch(() => undefined);
+  }
+} else {
+  if (CHAN) {
+    CHAN.onmessage = (ev) => { if (ev.data === 'changed') loadAll().catch(() => undefined); };
+  }
+  $('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
+  $('new-btn').addEventListener('click', createSkill);
+  $('new-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') createSkill(); });
+  loadAll().catch((e) => {
+    $('list').innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '加载失败：' + e.message;
+    $('list').appendChild(p);
+  });
+}
 </script>
 </body>
 </html>
