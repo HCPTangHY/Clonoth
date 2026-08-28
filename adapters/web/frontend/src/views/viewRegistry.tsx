@@ -178,7 +178,31 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     // Purpose: 自包含面板拿到全部主区宽度，内置页签的双栏结构不变。
     rightTop: () => {
       const active = useViewStore.getState().activeSettingsTab;
-      if (typeof active === 'string' && active.startsWith('plugin:')) return undefined;
+      if (typeof active === 'string' && active.startsWith('plugin:')) {
+        // [AutoC 2026-08-28] 插件页编辑进右栏。Why: 列表页（iframe）点击条目
+        // 时 postMessage 请求宿主打开编辑器，宿主在右栏渲染同一面板页的
+        // mode=editor 形态；未打开编辑器时右栏整体卸载、列表占满主区。
+        // How: 读 pluginsStore.pluginEditorTarget，匹配当前页签才渲染。
+        // Purpose: 与内置设置页「主区列表 + 右栏编辑」的布局约定一致。
+        const target = usePluginsStore.getState().pluginEditorTarget;
+        if (target && target.panelKey === active) {
+          const panel = usePluginsStore.getState().settingsPanels.find((p) => p.key === active);
+          if (panel) {
+            const sep = panel.entry.includes('?') ? '&' : '?';
+            const qs = new URLSearchParams({ mode: 'editor', ...target.params }).toString();
+            return (
+              <PluginPanel
+                chrome={false}
+                entry={`${panel.entry}${sep}${qs}`}
+                sessionId=""
+                title={panel.title}
+                onClose={() => usePluginsStore.getState().setPluginEditorTarget(null)}
+              />
+            );
+          }
+        }
+        return undefined;
+      }
       return <SettingsRightPanel />;
     },
     // [2026-06-02] Settings no longer reserves a lower EventLog slot. Why: contextual

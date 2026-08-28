@@ -672,49 +672,6 @@ async def _execute_real_tools(
                 "task_id": ls.rctx.task_id,
             })
             continue
-        # [AutoC 2026-08-28] 惰性执行策略在协程体内做 before_tool_call 审批，
-        # 拒绝时以 approval_blocked 标记返回。处理：写拒绝 entry、发 blocked
-        # 结束事件、配对 tool_result 消息并持久化，保证 assistant 的
-        # tool_use 有对应 tool_result。
-        if isinstance(_t_result, dict) and _t_result.get("approval_blocked"):
-            _block_reason = str(_t_result.get("reason") or "Tool call blocked by approval.")
-            _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1)
-            _tool_entries.append({
-                "id": _rtc.get("id", ""),
-                "name": _t_name,
-                "args": _t_args,
-                "format": "text",
-                "raw_inline": _block_reason,
-                "truncated": False,
-                "ref": "",
-                "summary": _block_reason[:200],
-                "elapsed_ms": _t_elapsed_ms,
-                "attachments": [],
-            })
-            await ls.rctx.emit_event("tool_call_end", {
-                "node_id": ls.node.id,
-                "task_id": ls.rctx.task_id,
-                "tool_call_id": _rtc.get("id", ""),
-                "tool_name": _t_name,
-                "status": "blocked",
-                "summary": _block_reason[:200],
-                "result": None,
-                "raw_inline": _block_reason,
-                "format": "text",
-                "elapsed_ms": _t_elapsed_ms,
-            })
-            _blk_msg = ls.formatter.format_tool_result(_current_tool_call, _block_reason)
-            from engine.conversation_store import MessageMeta, set_message_meta
-            set_message_meta(_blk_msg, MessageMeta(
-                tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
-                message_type="tool_result",
-                tool_rejected=True,
-                tool_rejection_code="approval_blocked",
-                tool_result_visibility="",
-            ))
-            ls.messages.append(_blk_msg)
-            await _shadow_write(ls, _blk_msg)
-            continue
         # [硬取消-场景1] 工具返回 cancelled 时，仍将结果存入 _tool_entries 再 break。
         # 确保 assistant 的 tool_use 有对应 tool_result 配对，
         # 模型下次看到的是「我调了工具但被用户取消了」而非 tool_use 悬空无响应。

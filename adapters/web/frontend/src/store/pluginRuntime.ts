@@ -53,6 +53,8 @@ export interface PluginEventEmitter {
 // Survives host remounts (view switches, conversation switches). Wiped only
 // when the contribution disappears for good (plugin unloaded, scripts off).
 
+import { usePluginsStore } from './pluginsStore';
+
 const pluginStates = new Map<string, Record<string, unknown>>();
 
 /** Return the stable state object for one slot contribution. */
@@ -68,4 +70,46 @@ export function getPluginState(slotId: string): Record<string, unknown> {
 /** Drop the state of a contribution that disappeared for good. */
 export function wipePluginState(slotId: string): void {
   pluginStates.delete(slotId);
+}
+
+// ── settings editor bus ────────────────────────────────────────────────────
+// [AutoC 2026-08-28] Plugin settings pages are same-origin iframes; their list
+// view asks the host to open an item editor in the settings right rail via
+// postMessage, and the host renders the same panel page with mode=editor
+// there. The page-to-page data refresh after a save uses BroadcastChannel
+// directly between the two iframes and never crosses the host.
+
+interface PluginEditorMessage {
+  source?: unknown;
+  type?: unknown;
+  panel?: unknown;
+  params?: unknown;
+}
+
+let editorBusInstalled = false;
+
+/** Install the single window listener for settings-editor open/close requests. */
+export function installPluginEditorBus(): void {
+  if (editorBusInstalled) return;
+  editorBusInstalled = true;
+  window.addEventListener('message', (event: MessageEvent) => {
+    if (event.origin !== window.location.origin) return;
+    const data = event.data as PluginEditorMessage | null;
+    if (!data || data.source !== 'clonoth-plugin') return;
+    if (typeof data.panel !== 'string' || !data.panel.startsWith('plugin:')) return;
+    const store = usePluginsStore.getState();
+    if (data.type === 'open-settings-editor') {
+      const raw = data.params;
+      const params: Record<string, string> = {};
+      if (raw && typeof raw === 'object') {
+        for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+          if (typeof v === 'string' || typeof v === 'number') params[k] = String(v);
+        }
+      }
+      store.setPluginEditorTarget({ panelKey: data.panel, params });
+    } else if (data.type === 'close-settings-editor') {
+      const current = store.pluginEditorTarget;
+      if (current && current.panelKey === data.panel) store.setPluginEditorTarget(null);
+    }
+  });
 }

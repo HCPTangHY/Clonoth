@@ -18,6 +18,7 @@ import { SetupWizard } from './components/setup/SetupWizard';
 import { useChat } from './hooks/useChat';
 import { useChatStore } from './store/chatStore';
 import { usePluginsStore } from './store/pluginsStore';
+import { installPluginEditorBus } from './store/pluginRuntime';
 import { useSettingsStore } from './store/settingsStore';
 import { useViewStore } from './store/viewStore';
 import type { Attachment } from './types';
@@ -47,6 +48,13 @@ const MainApp = () => {
   // （插件 iframe 页签无右栏）。viewRegistry.rightTop 用 getState() 命令式读取，
   // 不订阅的话切页签要等下一个无关 store 事件才重渲染，右栏残留或延迟消失。
   const activeSettingsTab = useViewStore(state => state.activeSettingsTab);
+  // [AutoC 2026-08-28] 订阅插件编辑器目标：列表 iframe postMessage 打开编辑器
+  // 后，右栏必须在本次状态变化中立即渲染（与 panelOverlay 同类响应性修复）。
+  const pluginEditorTarget = usePluginsStore(state => state.pluginEditorTarget);
+  void pluginEditorTarget;
+  useEffect(() => {
+    installPluginEditorBus();
+  }, []);
   const viewingChildNode = viewingChildSessionId ? childNodes[viewingChildSessionId] : undefined;
   const activeSessionId = viewingChildSessionId || activeConversation?.sessionId || '';
   // [2026-06-03] Why: child-session navigation renders a different chat stream while

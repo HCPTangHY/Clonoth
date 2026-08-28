@@ -82,9 +82,17 @@ interface PluginsState {
   slotsBySlot: Record<string, SlotContribution[]>;
   stylesByOwner: Record<string, string>;
   clientScriptsEnabled: boolean;
+  /**
+   * [AutoC 2026-08-28] Active settings-editor target. A plugin settings page
+   * (list-mode iframe) asks the host to edit an item via postMessage; the host
+   * then renders the same panel page with mode=editor in the settings right
+   * rail. null = no editor open (rail stays hidden for plugin tabs).
+   */
+  pluginEditorTarget: { panelKey: string; params: Record<string, string> } | null;
   refresh: () => Promise<void>;
   panelWinner: (overlayId: string) => PanelContribution | null;
   setClientScripts: (enabled: boolean) => void;
+  setPluginEditorTarget: (target: { panelKey: string; params: Record<string, string> } | null) => void;
 }
 
 function deriveStandalone(host: PanelContribution[], manifest: PanelContribution[]): PanelContribution[] {
@@ -111,6 +119,9 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
   slotsBySlot: {},
   stylesByOwner: {},
   clientScriptsEnabled: readClientScriptsPref(),
+  pluginEditorTarget: null,
+
+  setPluginEditorTarget: (target) => set({ pluginEditorTarget: target }),
 
   refresh: async () => {
     let plugins: PluginListItem[] = [];

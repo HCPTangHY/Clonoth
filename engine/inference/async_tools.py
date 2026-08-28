@@ -144,6 +144,7 @@ async def _execute_registry_tool_with_span(
     tool_ctx: ToolContext,
     *,
     async_call: bool = False,
+    authorized: bool = False,
 ) -> Any:
     """Run one registry tool call inside the existing SignalBus span."""
     # [AutoC 2026-06-27] Why: synchronous, declared-async, and adaptive-async paths
@@ -155,7 +156,7 @@ async def _execute_registry_tool_with_span(
     if async_call:
         payload["async"] = True
     with get_bus().span('tool.call', payload=payload):
-        return await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx)
+        return await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx, _authorized=authorized)
 
 
 async def _deliver_async_result(

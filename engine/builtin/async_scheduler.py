@@ -97,6 +97,11 @@ class AsyncScheduler:
             # background task. Purpose: callback artifacts and approvals keep
             # the current tool call identity.
             snapshot = _snapshot_tool_context(tool_ctx)
+            # [AutoC 2026-08-28] 声明式异步同样授权前置：先审批，获批后再
+            # 宣称"已启动"。拒绝时同步返回错误结果，不出现占位。
+            denied = await ls.registry.authorize(name=tool_name, arguments=tool_args, ctx=snapshot)
+            if denied is not None:
+                return hook_result(modified=True, channels={"execution": denied})
             asyncio.create_task(
                 _run_async_tool(
                     registry=ls.registry,
@@ -135,35 +140,20 @@ class AsyncScheduler:
         if threshold is None:
             return None  # default synchronous execution
 
-        # [AutoC 2026-08-28] 惰性协程：task 在第一次 await 时才创建，审批与
-        # 阈值定时由协程体内控制。Why: 旧形态在任务创建时即启动真实执行，
-        # 审批（before_tool_call）出现在执行开始之后，命令未经批准已在跑。
-        # How: 协程体内先等阈值计时器、再做 before_tool_call 检查、最后才
-        # create_task 启动执行。Purpose: 审批拒绝的命令零执行，审批时间不算
-        # 入升级阈值——阈值表示"已批准的实际执行超过 X 秒才升级"。
+        # [AutoC 2026-08-28] 授权先行。Why: 审批卡点（request_guard）在执行
+        # 任务内部，asyncio.wait 的阈值计时把审批等待也算了进去——审批弹窗
+        # 挂超过阈值，命令未经批准就被标成"已自动转为异步"。How: 创建执行
+        # 任务前先调 registry.authorize()（只跑策略与审批，不执行）；获批后
+        # 才 create_task（authorized=True 跳过二次审批）并启动阈值计时。
+        # Purpose: 拒绝的命令零执行；阈值只计量获批后的真实执行时长，即
+        # "审批后执行截断一分钟进入异步"。
         async def _adaptive() -> Any:
             exec_ctx = _snapshot_tool_context(tool_ctx)
-
-            # 审批（升级前阻塞语义）：执行开始前检查，拒绝则直接返回拒绝标记
-            approval_result = await hook_registry.afire("before_tool_call", ctx)
-            if approval_result.action is not None:
-                return {"approval_blocked": True, "action": approval_result.action}
-            if approval_result.block or approval_result.skip_step:
-                reason = (
-                    approval_result.error_message
-                    or approval_result.reason
-                    or "Tool call blocked by before_tool_call approval."
-                )
-                return {
-                    "approval_blocked": True,
-                    "blocked": True,
-                    "reason": reason,
-                    "summary": reason[:200],
-                }
-
-            # 审批通过后才启动执行与阈值定时
+            denied = await ls.registry.authorize(name=tool_name, arguments=tool_args, ctx=exec_ctx)
+            if denied is not None:
+                return denied
             exec_task = asyncio.create_task(
-                _execute_registry_tool_with_span(ls.registry, tool_name, tool_args, exec_ctx),
+                _execute_registry_tool_with_span(ls.registry, tool_name, tool_args, exec_ctx, authorized=True),
                 name=f"execute_command_adaptive_{tool_call_id[:24] or 'call'}",
             )
             done, _pending = await asyncio.wait({exec_task}, timeout=float(threshold))

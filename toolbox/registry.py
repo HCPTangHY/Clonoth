@@ -684,16 +684,23 @@ class ToolRegistry:
         """按名称获取单个工具的 spec，不存在返回 None。"""
         return self._tool_specs.get(name)
 
-    async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    async def authorize(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any] | None:
+        """Run the policy + approval gate without executing the tool.
+
+        [AutoC 2026-08-28] Why: the adaptive async scheduler must finish
+        approval before its execution task — and its upgrade timer — start.
+        Approval waiting used to happen inside the running task, so the
+        threshold counted dialog time and long-pending approvals were
+        mislabeled "auto-upgraded to async". How: extract the request_guard
+        half of execute(); execute() delegates here unless the caller passes
+        _authorized=True after a successful pre-flight. Purpose: denied
+        commands never start, and the threshold measures only approved,
+        actually-running execution time.
+
+        Returns None when the call may proceed, else the error-shaped result.
+        """
         if name not in self._tool_funcs:
             return _error_tool_response(f"tool not found: {name}")
-
-        # [AutoC 2026-08-10] 统一工具级审批：所有真实工具调用先过 supervisor policy。
-        # 伪工具（finish / intermediate_reply 等）不经过 registry，天然跳过。
-        # 内部已有路径/命令级审批的工具（read_file / write_file / execute_command
-        # 等）在 policy.yaml tools.rules 里配 auto，避免双重拦截；其余工具默认
-        # approval_required，由前端/Discord 按 trust_level（空 = 无路径）+ 用户偏好
-        # 自动批准或弹人工审批。
         from ._common import request_guard
         _op, _err = await request_guard(
             ctx, "tool_call",
@@ -706,6 +713,22 @@ class ToolRegistry:
                 "cancelled": _err.get("cancelled", False),
                 "approval_id": _err.get("approval_id"),
             }
+        return None
+
+    async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any, _authorized: bool = False) -> dict[str, Any]:
+        # [AutoC 2026-08-10] 统一工具级审批：所有真实工具调用先过 supervisor policy。
+        # 伪工具（finish / intermediate_reply 等）不经过 registry，天然跳过。
+        # 内部已有路径/命令级审批的工具（read_file / write_file / execute_command
+        # 等）在 policy.yaml tools.rules 里配 auto，避免双重拦截；其余工具默认
+        # approval_required，由前端/Discord 按 trust_level（空 = 无路径）+ 用户偏好
+        # 自动批准或弹人工审批。_authorized=True 供调度器预授权后跳过二次审批。
+        if _authorized:
+            if name not in self._tool_funcs:
+                return _error_tool_response(f"tool not found: {name}")
+        else:
+            denied = await self.authorize(name=name, arguments=arguments, ctx=ctx)
+            if denied is not None:
+                return denied
 
         func = self._tool_funcs[name]
         return _ensure_tool_response_shape(await func(arguments, ctx))

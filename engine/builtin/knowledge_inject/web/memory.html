@@ -84,6 +84,13 @@
   details.raw-wrap { border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; background: var(--bg); }
   details.raw-wrap summary { cursor: pointer; font: 600 10px var(--mono); color: var(--tertiary); }
 
+  /* [AutoC 2026-08-28] mode=editor：宿主右栏中的编辑器形态，只保留编辑区。
+     列表形态（默认）不再内联渲染编辑器，条目编辑请求经 postMessage 交给宿主。 */
+  body.editor-only .bar .count, body.editor-only .bar #refresh, body.editor-only .bar #new-entry { display: none; }
+  body.editor-only .cols { display: block; min-height: 0; }
+  body.editor-only .tree-pane, body.editor-only .entries, body.editor-only .book-bar { display: none; }
+  body.editor-only .editor { display: block; border-top: none; max-height: none; min-height: calc(100vh - 45px); }
+
   @media (max-width: 720px) {
     .cols { flex-direction: column; }
     .tree-pane { flex: none; border-right: none; border-bottom: 1px solid var(--muted); max-height: 32vh; }
@@ -97,6 +104,7 @@
 <header class="bar">
   <h1>记忆</h1>
   <span class="count" id="count">—</span>
+  <button class="op" id="rail-close" hidden>关闭</button>
   <button class="op" id="refresh">刷新</button>
   <button class="op primary" id="new-entry" disabled title="先在左侧选择一个 book，新条目写入该书">新建条目</button>
 </header>
@@ -116,6 +124,27 @@
 <script src="vendor/js-yaml.min.js"></script>
 <script>
 'use strict';
+
+// [AutoC 2026-08-28] 双形态：list（默认，主区整页列表）与 editor（宿主右栏
+// 编辑器）。列表点击条目时 postMessage 请宿主在右栏打开本页的 editor 形态；
+// 保存/删除经 BroadcastChannel 通知列表形态刷新，不经过宿主转发。
+const MODE = new URLSearchParams(location.search).get('mode') === 'editor' ? 'editor' : 'list';
+const PANEL_KEY = 'plugin:knowledge_inject:memory';
+const CHAN = ('BroadcastChannel' in window) ? new BroadcastChannel('clonoth-ki-memory') : null;
+
+function railOpen(params) {
+  try {
+    window.parent.postMessage({ source: 'clonoth-plugin', type: 'open-settings-editor', panel: PANEL_KEY, params }, location.origin);
+  } catch (e) { /* not iframed */ }
+}
+function railClose() {
+  try {
+    window.parent.postMessage({ source: 'clonoth-plugin', type: 'close-settings-editor', panel: PANEL_KEY }, location.origin);
+  } catch (e) { /* not iframed */ }
+}
+function broadcastChanged() {
+  try { if (CHAN) CHAN.postMessage('changed'); } catch (e) { /* ignore */ }
+}
 
 // ── boot / api ─────────────────────────────────────────────
 function boot() {
@@ -370,11 +399,8 @@ function renderEntries() {
 }
 
 // ── editor pane ────────────────────────────────────────────
-function startEdit(id, isNew = false) {
-  S.editingId = id;
-  S.form = null;
-  renderEntries();
-  renderEditor(isNew);
+function startEdit(id) {
+  railOpen({ ns: S.ns || '', book: S.book, id });
 }
 function startNew() {
   if (!S.book) return;
@@ -383,10 +409,7 @@ function startNew() {
   if (!/^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$/.test(id)) { alert('id 不符合规范'); return; }
   const b = findBook(S.ns, S.book);
   if (b && b.entries.some((e) => e.id === id)) { alert('该 book 下已存在同名 id'); return; }
-  S.editingId = '__new__';
-  S.form = null;
-  renderEntries();
-  renderEditor(true, id);
+  railOpen({ ns: S.ns || '', book: S.book, id, fresh: '1' });
 }
 
 function renderEditor(isNew = false, newId = '') {
@@ -401,7 +424,7 @@ function renderEditor(isNew = false, newId = '') {
   collapseBtn.hidden = false;
   el.hidden = false;
   const b = findBook(S.ns, S.book);
-  const src = isNew ? null : (b ? b.entries.find((e) => e.id === S.editingId) : null);
+  const src = isNew ? null : (b ? b.entries.find((e) => e.id === S.editingId) : findEntryInRaw(S.editingId));
   if (!isNew && !src) {
     el.innerHTML = '';
     const p = document.createElement('p');
@@ -412,7 +435,7 @@ function renderEditor(isNew = false, newId = '') {
   }
   const f = S.form || {
     id: isNew ? newId : src.id,
-    content: isNew ? '' : (findEntryFullContent() || (src.content_preview || '')),
+    content: isNew ? '' : (findEntryFullContent() || String(src.content || '') || (src.content_preview || '')),
     keywords: isNew ? '' : (src.keywords || []).join(', '),
     constant: isNew ? false : !!src.constant,
     enabled: isNew ? true : src.enabled !== false,
@@ -474,11 +497,9 @@ function renderEditor(isNew = false, newId = '') {
   saveBtn.addEventListener('click', async () => {
     try {
       await saveEntry(buildEntry(f));
-      S.raw = null;
-      await loadAll();
+      broadcastChanged();
       S.editingId = f.id;
       S.form = null;
-      renderEntries();
       renderEditor();
       setMsg('已保存。注入内容随下一轮对话生效。', true);
     } catch (e) {
@@ -493,6 +514,8 @@ function renderEditor(isNew = false, newId = '') {
     if (!confirm(`确定删除条目 ${f.id}？（${src && src.constant ? '注意：这是常驻记忆' : '不可恢复'}）`)) return;
     try {
       await deleteEntry(f.id);
+      broadcastChanged();
+      if (MODE === 'editor') { railClose(); return; }
       await loadAll();
     } catch (e) {
       setMsg('删除失败：' + e.message, false);
@@ -524,7 +547,8 @@ function renderEditor(isNew = false, newId = '') {
   rawBtn.addEventListener('click', async () => {
     try {
       await saveRaw(rawTa.value);
-      await loadAll();
+      broadcastChanged();
+      if (MODE !== 'editor') await loadAll();
       setMsg('Raw YAML 已保存。', true);
     } catch (e) {
       setMsg('保存失败：' + e.message, false);
@@ -546,6 +570,18 @@ function renderEditor(isNew = false, newId = '') {
   form.appendChild(document.createElement('div')).appendChild(rawWrap);
 
   el.appendChild(form);
+}
+
+// editor 模式下 S.data 为空，条目全量数据直接从 raw 取。
+function findEntryInRaw(id) {
+  if (S.raw === null) return null;
+  try {
+    const data = jsyaml.load(S.raw) || {};
+    for (const e of data.entries || []) {
+      if (e && String(e.id || '').trim() === id) return e;
+    }
+  } catch (err) { /* fallthrough */ }
+  return null;
 }
 
 // 完整 content 需要从 raw yaml 取（列表接口只给预览）。
@@ -611,23 +647,48 @@ function setMsg(text, ok) {
 }
 
 // ── wire up ────────────────────────────────────────────────
-$('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
-$('new-entry').addEventListener('click', startNew);
-$('collapse-editor').addEventListener('click', () => {
-  if (S.editingId && S.form && !confirm('编辑中的条目未保存，收起将丢弃修改。继续？')) return;
-  S.editingId = null;
-  S.form = null;
-  renderEntries();
-  renderEditor();
-});
-
-loadAll().catch((e) => {
-  $('tree').innerHTML = '';
-  const p = document.createElement('p');
-  p.className = 'empty';
-  p.textContent = '加载失败：' + e.message;
-  $('tree').appendChild(p);
-});
+if (MODE === 'editor') {
+  document.body.classList.add('editor-only');
+  document.querySelector('.bar h1').textContent = '编辑记忆条目';
+  const closeBtn = $('rail-close');
+  closeBtn.hidden = false;
+  closeBtn.addEventListener('click', railClose);
+  const params = new URLSearchParams(location.search);
+  const ns = params.get('ns') || '';
+  const book = params.get('book') || '';
+  const id = params.get('id') || '';
+  const isNew = params.get('fresh') === '1';
+  (async () => {
+    try {
+      S.ns = ns;
+      S.book = book;
+      S.raw = (await api('/admin/config/memory/raw?' + q({ ns, book }))).content;
+      S.editingId = isNew ? '__new__' : id;
+      renderEditor(isNew, id);
+    } catch (e) {
+      const el = $('editor');
+      el.hidden = false;
+      el.innerHTML = '';
+      const pe = document.createElement('p');
+      pe.className = 'empty';
+      pe.textContent = '加载失败：' + e.message;
+      el.appendChild(pe);
+    }
+  })();
+} else {
+  if (CHAN) {
+    CHAN.onmessage = (ev) => { if (ev.data === 'changed') loadAll().catch(() => undefined); };
+  }
+  $('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
+  $('new-entry').addEventListener('click', startNew);
+  loadAll().catch((e) => {
+    $('tree').innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '加载失败：' + e.message;
+    $('tree').appendChild(p);
+  });
+}
 </script>
 </body>
 </html>

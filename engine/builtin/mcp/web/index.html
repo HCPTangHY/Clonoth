@@ -64,6 +64,12 @@
   .empty { color: var(--tertiary); font-size: 11px; padding: 8px 2px; }
 
   .editor-pane { flex: 1; min-width: 0; padding: 16px 20px; overflow-y: auto; }
+  /* [AutoC 2026-08-28] mode=editor：宿主右栏中的编辑器形态，只保留编辑区。
+     列表形态不再内联渲染编辑器，条目编辑请求经 postMessage 交给宿主。 */
+  body.editor-only .cols { display: block; }
+  body.editor-only .list-pane { display: none; }
+  body.editor-only .editor-pane { padding: 14px 16px; }
+  body.editor-only .bar .count, body.editor-only .bar #refresh { display: none; }
   .editor-pane .placeholder { color: var(--tertiary); font-size: 11px; }
   .form { display: flex; flex-direction: column; gap: 12px; max-width: 560px; }
   .form .kv { display: flex; align-items: center; gap: 8px; }
@@ -95,6 +101,7 @@
 <header class="bar">
   <h1>MCP Clients</h1>
   <span class="count" id="count">—</span>
+  <button class="op" id="rail-close" hidden>关闭</button>
   <button class="op" id="refresh">刷新</button>
 </header>
 <main class="cols">
@@ -110,6 +117,27 @@
 <script src="vendor/js-yaml.min.js"></script>
 <script>
 'use strict';
+
+// [AutoC 2026-08-28] 双形态：list（默认，主区整页列表）与 editor（宿主右栏
+// 编辑器）。列表点击条目时 postMessage 请宿主在右栏打开本页的 editor 形态；
+// 保存/删除经 BroadcastChannel 通知列表形态刷新，不经过宿主转发。
+const MODE = new URLSearchParams(location.search).get('mode') === 'editor' ? 'editor' : 'list';
+const PANEL_KEY = 'plugin:mcp:settings';
+const CHAN = ('BroadcastChannel' in window) ? new BroadcastChannel('clonoth-mcp-clients') : null;
+
+function railOpen(params) {
+  try {
+    window.parent.postMessage({ source: 'clonoth-plugin', type: 'open-settings-editor', panel: PANEL_KEY, params }, location.origin);
+  } catch (e) { /* not iframed */ }
+}
+function railClose() {
+  try {
+    window.parent.postMessage({ source: 'clonoth-plugin', type: 'close-settings-editor', panel: PANEL_KEY }, location.origin);
+  } catch (e) { /* not iframed */ }
+}
+function broadcastChanged() {
+  try { if (CHAN) CHAN.postMessage('changed'); } catch (e) { /* ignore */ }
+}
 
 // ── boot / api ─────────────────────────────────────────────
 function boot() {
@@ -270,12 +298,11 @@ function renderList() {
 }
 
 function select(id) {
-  if (S.dirty && !confirm('当前编辑未保存，切换将丢弃修改。继续？')) return;
+  if (MODE === 'list') { railOpen({ id }); return; }
   S.selectedId = id;
   const c = S.clients.find((x) => x.id === id);
   S.form = c ? clientToForm(c) : null;
   S.dirty = false;
-  renderList();
   renderEditor();
 }
 
@@ -402,8 +429,9 @@ async function save() {
     S.rawDoc.clients[S.form.id] = formToEntry(S.form);
     await saveRaw(S.rawDoc);
     S.dirty = false;
+    broadcastChanged();
     setMsg('已保存。工具变更约 10 秒内生效（引擎按配置文件变更自动重发现）。', true);
-    await loadAll();
+    if (MODE !== 'editor') await loadAll();
   } catch (e) {
     setMsg('保存失败：' + e.message, false);
   }
@@ -418,6 +446,8 @@ async function removeSelected() {
     S.selectedId = null;
     S.form = null;
     S.dirty = false;
+    broadcastChanged();
+    if (MODE === 'editor') { railClose(); return; }
     await loadAll();
   } catch (e) {
     setMsg('删除失败：' + e.message, false);
@@ -440,25 +470,60 @@ async function createClient() {
     };
     await saveRaw(S.rawDoc);
     input.value = '';
+    broadcastChanged();
     await loadAll();
-    select(id);
+    railOpen({ id });
   } catch (e) {
     alert('创建失败：' + e.message);
   }
 }
 
 // ── wire up ────────────────────────────────────────────────
-$('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
-$('new-btn').addEventListener('click', createClient);
-$('new-id').addEventListener('keydown', (e) => { if (e.key === 'Enter') createClient(); });
-
-loadAll().catch((e) => {
-  $('list').innerHTML = '';
-  const p = document.createElement('p');
-  p.className = 'empty';
-  p.textContent = '加载失败：' + e.message;
-  $('list').appendChild(p);
-});
+if (MODE === 'editor') {
+  document.body.classList.add('editor-only');
+  document.querySelector('.bar h1').textContent = '编辑 MCP Client';
+  const closeBtn = $('rail-close');
+  closeBtn.hidden = false;
+  closeBtn.addEventListener('click', railClose);
+  const id = new URLSearchParams(location.search).get('id') || '';
+  (async () => {
+    try {
+      const [clients, raw] = await Promise.all([
+        api('/admin/config/mcp-clients'),
+        api('/admin/config/mcp-clients/raw'),
+      ]);
+      S.clients = Array.isArray(clients) ? clients : [];
+      try { S.rawDoc = jsyaml.load(raw.content) || {}; } catch (e) { S.rawDoc = {}; }
+      if (!S.rawDoc.clients || typeof S.rawDoc.clients !== 'object') S.rawDoc.clients = {};
+      const c = S.clients.find((x) => x.id === id);
+      if (!c) throw new Error('Client 不存在：' + id);
+      S.selectedId = id;
+      S.form = clientToForm(c);
+      renderEditor();
+    } catch (e) {
+      const el = $('editor');
+      el.innerHTML = '';
+      const pe = document.createElement('p');
+      pe.className = 'placeholder';
+      pe.textContent = '加载失败：' + e.message;
+      el.appendChild(pe);
+    }
+  })();
+} else {
+  if (CHAN) {
+    CHAN.onmessage = (ev) => { if (ev.data === 'changed') loadAll().catch(() => undefined); };
+  }
+  $('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
+  $('new-btn').addEventListener('click', createClient);
+  $('new-id').addEventListener('keydown', (e) => { if (e.key === 'Enter') createClient(); });
+  loadAll().catch((e) => {
+    $('list').innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '加载失败：' + e.message;
+    $('list').appendChild(p);
+  });
+}
 </script>
 </body>
 </html>
