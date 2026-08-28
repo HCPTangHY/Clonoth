@@ -17,6 +17,9 @@ import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
 import { applyHostTheme } from './themeBridge';
 
+// module-level refcount for the shared window.__CLONOTH_BOOT__ (see effect below)
+let bootRefCount = 0;
+
 interface PluginPanelProps {
   entry: string;
   title: string;
@@ -39,12 +42,19 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
 
   useEffect(() => {
     const w = window as unknown as { __CLONOTH_BOOT__?: unknown };
+    // [AutoC 2026-08-28] 引用计数。Why: 设置页编辑器进右栏后，主区列表
+    // iframe 与右栏编辑器 iframe 同时存活，两个 PluginPanel 共享同一全局
+    // boot 对象；面板页在每次 api() 调用时实时读取它。编辑器卸载时若直接
+    // delete，列表页的下一次请求会失去 token 变成 401。How: 挂载 +1、卸载
+    // -1，归零才真正清除。Purpose: 并发面板共存期间 boot 始终可用。
+    bootRefCount += 1;
     w.__CLONOTH_BOOT__ = {
       token: getStoredAdminToken(),
       sessionId,
     };
     return () => {
-      delete w.__CLONOTH_BOOT__;
+      bootRefCount = Math.max(0, bootRefCount - 1);
+      if (bootRefCount === 0) delete w.__CLONOTH_BOOT__;
     };
   }, [sessionId]);
 
