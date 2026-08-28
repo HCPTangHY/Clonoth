@@ -120,6 +120,16 @@ def get_load_error(entry_name: str) -> str:
     return _LOAD_ERRORS.get(Path(entry_name).stem, "")
 
 
+def record_load_error(entry_name: str, exc: BaseException) -> None:
+    """Record one load failure for the admin UI; shared by both loaders."""
+    _LOAD_ERRORS[Path(entry_name).stem] = f"{type(exc).__name__}: {exc}"
+
+
+def clear_load_error(entry_name: str) -> None:
+    """Clear the recorded load error after a successful (re)load."""
+    _LOAD_ERRORS.pop(Path(entry_name).stem, None)
+
+
 def _resolve_client_assets(plugin_dir: Path, meta: dict) -> None:
     """Inline {"file": relative_path} references anywhere inside PLUGIN_META.web.
 

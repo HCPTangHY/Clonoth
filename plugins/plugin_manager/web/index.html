@@ -304,12 +304,22 @@ function badgeHtml(p) {
 /* 操作按钮（行内与移动端展开区共用）。
    危险操作（unload/disable）由点击委托做二次确认。 */
 function opsHtml(p, forMobile) {
-  if (p.builtin) return '';
+  /* [plugin-admin 2026-08-28] 内置条目同样支持运行时重载（supervisor 进程侧）。
+     仅开放 load/unload；enable/disable 是文件后缀操作，对仓库内置代码无意义。 */
   const cls = forMobile ? 'card-ops ops-mobile' : 'card-ops';
   const parts = [];
   const mk = (op, label, danger) =>
     '<button class="op' + (danger ? ' danger' : '') + '" data-op="' + op + '" data-entry="' + esc(p.entry) + '">'
     + label + '</button>';
+  if (p.builtin) {
+    if (p.loaded) {
+      parts.push(mk('unload', '卸载', true));
+      parts.push(mk('load', '重载', false));
+    } else {
+      parts.push(mk('load', '加载', false));
+    }
+    return '<div class="' + cls + '">' + parts.join('') + '</div>';
+  }
   if (p.loaded) {
     parts.push(mk('unload', '卸载', true));
     parts.push(mk('load', '重载', false));

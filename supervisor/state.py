@@ -275,7 +275,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         for name, meta in sorted(loaded.items()):
             if meta.get("version") == "builtin" and name not in seen_entries:
                 entries.append({
-                    "entry": "",
+                    "entry": str(meta.get("module") or ""),
                     "file_name": "",
                     "kind": "builtin",
                     "enabled": True,
@@ -295,9 +295,33 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         return _sink
 
+    def _builtin_meta_name(self, entry_name: str) -> str | None:
+        """Resolve the registry meta name for one built-in entry, or None."""
+        for meta in self.hook_registry.list_plugins():
+            if str(meta.get("version") or "") != "builtin":
+                continue
+            if str(meta.get("module") or "") == entry_name:
+                return str(meta.get("name") or entry_name)
+        return None
+
     def plugin_admin_load(self, entry_name: str) -> dict[str, Any]:
         """Load (or reload) one external plugin entry at runtime."""
+        from engine.builtin.loader import builtin_entry_path, load_single_builtin
         from engine.hooks.loader import drop_plugin_module, load_single_plugin
+
+        # [plugin-admin 2026-08-28] built-in entries reload through the builtin
+        # loader: same register_meta_handler path as the startup scan, disposal
+        # ledger attribution intact. Why: verifying a fix inside engine/builtin/
+        # otherwise required a process restart.
+        if builtin_entry_path(entry_name) is not None:
+            meta_name = self._builtin_meta_name(entry_name)
+            if meta_name is not None:
+                self.hook_registry.unload_plugin(meta_name)
+            result = load_single_builtin(
+                self.hook_registry, entry_name, context=self._supervisor_ctx,
+            )
+            self._emit_plugin_event("plugin_loaded", {"plugin": result["name"], "entry": entry_name})
+            return {"ok": True, "plugin": result["name"], "entry": entry_name}
 
         entry = self._plugin_entry_path(entry_name)
         if entry.name.endswith(".disabled"):
@@ -318,10 +342,22 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
     def plugin_admin_unload(self, entry_name: str) -> dict[str, Any]:
         """Unload one external plugin entry; registrations are replayed in reverse."""
+        from engine.builtin.loader import builtin_entry_path, drop_builtin_module
         from engine.hooks.loader import drop_plugin_module
 
         if entry_name in self._PROTECTED_PLUGIN_ENTRIES:
             raise ValueError("the plugin manager cannot unload itself")
+
+        # built-in entry: registry owns the meta name; no filesystem entry exists
+        if builtin_entry_path(entry_name) is not None:
+            meta_name = self._builtin_meta_name(entry_name)
+            if meta_name is None:
+                raise ValueError(f"built-in plugin {entry_name!r} is not loaded")
+            result = self.hook_registry.unload_plugin(meta_name)
+            drop_builtin_module(entry_name)
+            self._emit_plugin_event("plugin_unloaded", {"plugin": meta_name, "entry": entry_name})
+            return {"ok": True, "plugin": meta_name, "entry": entry_name, **result}
+
         entry = self._plugin_entry_path(entry_name)
         meta_name = self._entry_meta_name(entry)
         known = {str(m.get("name") or ""): m for m in self.hook_registry.list_plugins()}

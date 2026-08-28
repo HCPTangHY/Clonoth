@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..hooks.loader import iter_hook_points, register_meta_handler
+from ..hooks.loader import iter_hook_points, register_meta_handler, clear_load_error, record_load_error
 
 if TYPE_CHECKING:
     from toolbox.registry import ToolRegistry
@@ -208,3 +209,83 @@ def _register_meta(registry: Any, py_file: Path, meta: dict[str, Any], handler_n
     display_meta.setdefault("hooks", [str(point[0]) for point in display_meta.get("hook_points", [])])
     display_meta.setdefault("module", py_file.stem)
     register_plugin_meta(display_meta)
+
+
+# ---------------------------------------------------------------------------
+#  Single-entry runtime reload for built-in plugins
+# ---------------------------------------------------------------------------
+
+def builtin_entry_path(entry_name: str, *, directory: Path | None = None) -> Path | None:
+    """Resolve one built-in plugin entry (file or package) under base_dir."""
+    base_dir = Path(directory) if directory is not None else Path(__file__).parent
+    pkg = base_dir / entry_name
+    if pkg.is_dir() and (pkg / "__init__.py").is_file() and not _should_skip_package(pkg):
+        return pkg
+    py_file = base_dir / f"{entry_name}.py"
+    if py_file.is_file() and not _should_skip(py_file):
+        return py_file
+    return None
+
+
+def drop_builtin_module(entry_name: str, *, package: str = "engine.builtin") -> None:
+    """Remove one built-in plugin module and its submodules from sys.modules.
+
+    Why: reload must re-execute the entry's module code. How: delete the exact
+    module plus every submodule under its prefix (directory plugins own private
+    modules like a vendored runtime). Purpose: import_module after this picks
+    up the on-disk code instead of the cached first import.
+    """
+    full = f"{package}.{entry_name}"
+    prefix = full + "."
+    for name in [n for n in list(sys.modules) if n == full or n.startswith(prefix)]:
+        del sys.modules[name]
+
+
+def load_single_builtin(
+    registry: Any,
+    entry_name: str,
+    *,
+    package: str = "engine.builtin",
+    directory: Path | None = None,
+    context: Any = None,
+    tool_registry: "ToolRegistry | None" = None,
+) -> dict:
+    """(Re)load one built-in plugin entry at runtime and register its PLUGIN_META.
+
+    Why: the plugin manager's runtime reload previously covered only external
+    plugins/ entries, so a code fix inside engine/builtin/ (e.g. a route
+    annotation bug) still required a process restart to verify. How: locate the
+    entry, drop its cached modules, import fresh, and run the same
+    register_meta_handler + _register_meta path the startup scan uses, with the
+    shared disposal ledger attributing every registration. Purpose: built-in
+    plugins become reloadable through the same admin surface as external ones.
+    """
+    entry = builtin_entry_path(entry_name, directory=directory)
+    if entry is None:
+        raise ValueError(f"no built-in plugin entry named {entry_name!r}")
+
+    drop_builtin_module(entry_name, package=package)
+    module_name = f"{package}.{entry_name}"
+    try:
+        module = importlib.import_module(module_name)
+        meta = getattr(module, "PLUGIN_META", None)
+        if not isinstance(meta, dict):
+            raise ValueError(f"{module_name} declares no PLUGIN_META")
+        class_name = str(meta.get("handler_class") or "").strip()
+        if not class_name:
+            raise ValueError(f"{module_name} PLUGIN_META has no handler_class")
+        cls = getattr(module, class_name, None)
+        if cls is None:
+            raise ValueError(f"{module_name} has no class {class_name!r}")
+        handler_name = str(getattr(cls, "name", "") or entry_name)
+        instance = register_meta_handler(
+            registry, module, meta, ledger_name=handler_name,
+            context=context, tool_registry=tool_registry,
+        )
+        handler_name = str(getattr(instance, "name", "") or entry_name)
+        _register_meta(registry, entry, meta, handler_name)
+        clear_load_error(entry_name)
+        return {"name": handler_name, "entry": entry_name}
+    except Exception as exc:
+        record_load_error(entry_name, exc)
+        raise
