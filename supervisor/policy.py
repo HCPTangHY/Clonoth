@@ -108,6 +108,11 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"name": "create_schedule", "decision": "auto", "reason": "内部 write_file 审批 data/schedules.yaml"},
                 {"name": "delete_schedule", "decision": "auto", "reason": "内部 write_file 审批 data/schedules.yaml"},
                 {"name": "delete_skill", "decision": "auto", "reason": "内部 write_file 审批 skills/**"},
+                {"name": "save_memory", "decision": "auto", "reason": "记忆读写是高频操作，dream/extractor 无人值守"},
+                {"name": "delete_memory", "decision": "auto", "reason": "记忆读写是高频操作，dream/extractor 无人值守"},
+                {"name": "list_memories", "decision": "auto", "reason": "只读记忆列表"},
+                {"name": "list_skills", "decision": "auto", "reason": "只读技能列表"},
+                {"name": "create_or_update_skill", "decision": "auto", "reason": "内部 write_file 审批 skills/**"},
             ],
         },
     }
