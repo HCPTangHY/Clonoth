@@ -186,6 +186,29 @@ tool_access:
 - `all`：允许所有工具，可配合 `deny` 排除部分工具。
 - `allowlist`：只允许 `allow` 列表中的工具。
 
+### 控制类伪工具开关
+
+`tool_access` 只控制真实工具。控制类伪工具（`finish`、`ask`、`intermediate_reply`、`compact_context`、`preempt_task`、`switch_node`）由 `control_tools` 字段单独控制：
+
+```yaml
+control_tools: all            # 默认，全部注入（旧行为）
+control_tools: none           # 全部不注入
+control_tools: [finish, intermediate_reply]  # 只注入列出的
+```
+
+注意：`finish` 仅在 `output_mode: tool_only` 下注入；`switch_node` 对系统任务不注入。声明一个只有命令执行能力的最小节点：
+
+```yaml
+tool_access:
+  mode: allowlist
+  allow: [execute_command]
+skills: {mode: none}
+memories: {mode: none}
+control_tools: [finish, intermediate_reply]
+```
+
+`control_tools: none` 搭配 `output_mode: tool_only` 时节点无法正常 finish，需谨慎。
+
 ### Skill 访问控制
 
 ```yaml

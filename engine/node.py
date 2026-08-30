@@ -72,6 +72,12 @@ class Node:
     # 目的：persistent=true 的节点的 child session 能触发自动上下文压缩，
     # 同时 dispatch 该节点时默认使用 accumulate context_mode。
     persistent: bool = False
+    # [AutoC 2026-08-30] control_tools: 控制类伪工具（finish/ask/intermediate_reply/
+    # compact_context/preempt_task/switch_node）的注入开关。Why: 此前这些工具无条件
+    # 注入，无法声明一个只有 execute_command 的最小节点。How: "all"（默认，旧行为）/
+    # "none"（全部不注入）/ 名称列表（只注入列出的）。Purpose: 插件声明的极简节点
+    # 不再被框架强行塞入控制面工具。
+    control_tools: Any = "all"
     # [2026-05-27] extra: 收集节点 yaml 中 core 不认识的字段，供插件层零 IO 读取。
     # 为什么：memory_book 等插件业务配置不应定义在 Node dataclass 上，
     # 但插件每次从 yaml 文件读取也浪费 IO。
@@ -237,6 +243,20 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     # 怎么改：解析 yaml 中的 persistent 字段，非布尔值均视为 False。
     persistent = bool(data.get("persistent", False))
 
+    # control_tools：字符串 "all"/"none"，或工具名列表。非法值回退 "all"。
+    _ct_raw = data.get("control_tools")
+    _CONTROL_NAMES = {"finish", "ask", "intermediate_reply", "compact_context",
+                      "preempt_task", "switch_node"}
+    if isinstance(_ct_raw, str):
+        control_tools: Any = _ct_raw.strip().lower() if _ct_raw.strip().lower() in {"all", "none"} else "all"
+    elif isinstance(_ct_raw, list):
+        control_tools = [
+            str(x).strip() for x in _ct_raw
+            if isinstance(x, str) and x.strip() in _CONTROL_NAMES
+        ]
+    else:
+        control_tools = "all"
+
     # [2026-05-27] extra dict：收集 yaml 中 core 不认识的字段（如 memory_book），
     # 供插件层通过 ToolContext._node_extra 零 IO 读取。
     _KNOWN_KEYS = {
@@ -244,6 +264,7 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
         "base_url", "prompt", "tool_access", "skills", "memories",
         "tool_mode", "output_mode", "output", "provider", "provider_options",
         "delegate_targets", "persistent", "script", "script_timeout_sec",
+        "control_tools",
     }
     extra = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
 
@@ -268,5 +289,6 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
         provider_options=provider_options,
         delegate_targets=delegate_targets,
         persistent=persistent,
+        control_tools=control_tools,
         extra=extra,
     )

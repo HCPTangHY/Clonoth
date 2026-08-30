@@ -512,9 +512,30 @@ def build_node_tool_specs(
         # aggregate dispatch schema. Purpose: keep dynamic dispatch intact.
         openai_tools.extend(_dispatch_delegate_specs(delegate_targets, downstream_info))
 
+    # [AutoC 2026-08-30] control_tools 门控：节点可声明 "none"（不注入任何
+    # 控制类伪工具）或名称列表（只注入列出的）。Why: 极简节点（如只有
+    # execute_command 的命令执行节点）不应被框架强塞 ask/reply/switch 等。
+    # How: 统一收口为一个判定函数；缺省 "all" 保持旧行为。Purpose: 节点的
+    # 工具面完全由节点自己声明。
+    _ct_raw = getattr(node, "control_tools", "all")
+    if isinstance(_ct_raw, str):
+        _ct_none = _ct_raw.strip().lower() == "none"
+        _ct_allow: set[str] | None = None
+    elif isinstance(_ct_raw, list):
+        _ct_none = False
+        _ct_allow = {str(x).strip() for x in _ct_raw if isinstance(x, str)}
+    else:
+        _ct_none = False
+        _ct_allow = None
+
+    def _ctl(name: str) -> bool:
+        if _ct_none:
+            return False
+        return _ct_allow is None or name in _ct_allow
+
     # switch_node 仅对非系统节点注入（系统节点如 memory_extractor 不应切换入口）
     _is_system_task = bool((task_context or {}).get("is_system_task"))
-    if not _is_system_task:
+    if not _is_system_task and _ctl("switch_node"):
         _sw_targets = [info["id"] for info in (switch_info or [])]
         openai_tools.append(_switch_node_spec(
             _sw_targets, switch_info,
@@ -524,11 +545,15 @@ def build_node_tool_specs(
     # [AutoC 2026-08-06] hybrid 模式下不注入 finish 工具：free prose 即隐式 finish。
     # tool_only 模式下保留原行为。
     _output_mode = getattr(node, 'output_mode', 'hybrid')
-    if _output_mode == 'tool_only':
+    if _output_mode == 'tool_only' and _ctl("finish"):
         openai_tools.append(_finish_spec())
     # [AutoC 2026-05-31] ask 在所有模式下都可用：节点需要向上游请求信息时使用。
-    openai_tools.append(_ask_spec())
-    openai_tools.append(_reply_spec())
-    openai_tools.append(_compact_context_spec())
-    openai_tools.append(_preempt_task_spec())
+    if _ctl("ask"):
+        openai_tools.append(_ask_spec())
+    if _ctl("intermediate_reply"):
+        openai_tools.append(_reply_spec())
+    if _ctl("compact_context"):
+        openai_tools.append(_compact_context_spec())
+    if _ctl("preempt_task"):
+        openai_tools.append(_preempt_task_spec())
     return allowed, openai_tools
