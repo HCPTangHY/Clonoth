@@ -71,7 +71,7 @@ Inbound message → Supervisor creates Task → Engine executes Node → Tool ca
 
 - Regular nodes: One-shot execution per task.
 - Persistent nodes (`persistent: true` in YAML): Long-lived agents with accumulating context, own memory namespace, and compression support.
-- System nodes (`engine/system_nodes/`): Built-in nodes for compaction, summarization, memory extraction.
+- System nodes (compaction, summarization, memory extraction): declared by their owning built-in plugins via PLUGIN_META.nodes; declaration files live in `engine/builtin/nodes/`. `engine/system_nodes/` remains only as a legacy fallback directory.
 
 ### Dispatch Modes
 

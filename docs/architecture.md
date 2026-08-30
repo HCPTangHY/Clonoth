@@ -122,7 +122,7 @@ inbound → task_created → node_started → llm_call → tool_call → finish
 
 ## 6. 节点系统
 
-节点由 yaml 配置定义。用户配置目录是 `config/nodes/`，系统内建节点目录是 `engine/system_nodes/`。加载时优先读取系统节点目录，找不到时再读取用户节点目录。
+节点由 yaml 配置定义。用户配置目录是 `config/nodes/`。系统内建节点（压缩、摘要、记忆提取等）自 2026-08-30 起由所属内置插件通过 nodes face 声明（PLUGIN_META.nodes，声明文件在 `engine/builtin/nodes/`），`engine/system_nodes/` 仅作为遗留目录兜底。解析优先级：插件声明 > `engine/system_nodes/` > `config/nodes/`（Paradox 式覆盖语义）。
 
 一个 node yaml 通常描述以下内容：
 

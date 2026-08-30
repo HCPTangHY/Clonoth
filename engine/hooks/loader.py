@@ -12,6 +12,8 @@ engine package.
 import importlib.util
 import logging
 from pathlib import Path
+
+import yaml
 from types import ModuleType
 from typing import Any
 
@@ -74,6 +76,58 @@ def register_declared_tools(module_name: str, meta: dict[str, Any], tool_registr
     return disposers
 
 
+def register_declared_nodes(module_name: str, meta: dict[str, Any], context: Any, module: Any = None) -> None:
+    """Register PLUGIN_META.nodes declarations into the mounted nodes face.
+
+    [AutoC 2026-08-30] Why: plugins ship their own nodes (and override kernel
+    defaults) without writing into config/nodes/. How: each entry is either an
+    inline node dict (same schema as a node YAML) or a {"file": "nodes/x.yaml"}
+    reference resolved against the plugin directory (containment-checked,
+    YAML-parsed). Declarations register on the face mounted as
+    ctx.contributions.nodes; when no face is mounted (process without the
+    face), the declaration is skipped with a warning. Disposers are recorded
+    by the face itself into the shared ledger.
+    """
+    raw_nodes = meta.get("nodes")
+    if raw_nodes is None:
+        return
+    if not isinstance(raw_nodes, list):
+        raise ValueError(f"{module_name} PLUGIN_META.nodes must be a list")
+    face = None
+    contributions = getattr(context, "contributions", None)
+    if contributions is not None:
+        getter = getattr(contributions, "get", None)
+        face = getter("nodes") if callable(getter) else None
+    if face is None:
+        if raw_nodes:
+            logger.warning(
+                "%s declares PLUGIN_META.nodes but no nodes face is mounted in this process",
+                module_name,
+            )
+        return
+    base = None
+    mod_file = getattr(module, "__file__", None) if module is not None else None
+    if mod_file:
+        base = Path(mod_file).resolve().parent
+    for decl in raw_nodes:
+        if isinstance(decl, dict) and set(decl.keys()) == {"file"}:
+            rel = str(decl.get("file") or "").strip()
+            if base is None or not rel:
+                raise ValueError(f"{module_name} node file reference requires a module path")
+            target = (base / rel).resolve()
+            if base != target and base not in target.parents:
+                raise ValueError(f"node declaration file escapes plugin directory: {rel!r}")
+            data = yaml.safe_load(target.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(f"node declaration file {rel!r} did not parse to a dict")
+            # Why: node YAML files conventionally omit id and take the file stem.
+            # How: fill the stem only when the file carries no explicit id.
+            # Purpose: file-ref declarations behave like files under config/nodes/.
+            data.setdefault("id", target.stem)
+            decl = data
+        face.register(decl)
+
+
 def register_meta_handler(
     hook_registry: HookRegistry,
     module: ModuleType,
@@ -104,6 +158,7 @@ def register_meta_handler(
         if callable(teardown):
             hook_registry.add_plugin_disposer(ledger_name, teardown)
         register_declared_tools(module.__name__, meta, tool_registry)
+        register_declared_nodes(module.__name__, meta, context, module)
     return instance
 
 

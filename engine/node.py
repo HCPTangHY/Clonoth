@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import load_yaml_dict, load_runtime_config, resolve_env_ref
 from providers import registry as provider_registry
+
+from engine.faces.nodes import declared_node
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -79,6 +84,17 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     nid = (node_id or "").strip()
     if not nid:
         return None
+    # [AutoC 2026-08-30] 插件声明节点（Paradox 式覆盖语义）：插件声明压过
+    # 一切文件来源。声明损坏（解析失败）时回退到文件来源并告警，不让一个
+    # 坏声明静默摧毁同名节点。
+    decl = declared_node(nid)
+    if decl is not None:
+        node = _node_from_dict(workspace_root, nid, decl)
+        if node is not None:
+            return node
+        logger.warning(
+            "plugin-declared node %r failed to parse; falling back to file sources", nid
+        )
     # 系统节点目录分离：优先从 engine/system_nodes/ 加载内建系统节点，
     # 找不到时回退到 config/nodes/ 用户配置目录。确保系统节点跟随代码仓库同步。
     _sys_path = workspace_root / "engine" / "system_nodes" / f"{nid}.yaml"
@@ -87,6 +103,11 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     data = load_yaml_dict(_node_path)
     if not isinstance(data, dict):
         return None
+    return _node_from_dict(workspace_root, nid, data)
+
+
+def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
+    """Parse one node declaration dict (from a YAML file or a plugin declaration)."""
     # kind 默认 "node"，允许省略
     if str(data.get("kind") or "node").strip() != "node":
         return None

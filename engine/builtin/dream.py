@@ -45,6 +45,8 @@ PLUGIN_META = {
     # How: declare the dependency so loader ensures knowledge_inject loads first.
     # Purpose: fail clearly if knowledge_inject is missing.
     "requires": ["knowledge_inject"],
+    # [AutoC 2026-08-30] system.dream 节点从 engine/system_nodes/ 迁移为插件声明。
+    "nodes": [{"file": "nodes/system.dream.yaml"}],
 }
 
 

@@ -138,16 +138,47 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return (spec if isinstance(spec, dict) else None), timeout
 
     # ----- Nodes -----
+    def _node_row(nid: str, data: dict[str, Any], source: str) -> dict[str, Any]:
+        ta_raw = data.get("tool_access", {})
+        if isinstance(ta_raw, str):
+            ta_raw = {"mode": ta_raw}
+        elif not isinstance(ta_raw, dict):
+            ta_raw = {"mode": "none"}
+        return {
+            "id": nid,
+            "name": data.get("name", ""),
+            "type": data.get("type", ""),
+            "model": data.get("model", ""),
+            "provider": data.get("provider", ""),
+            "base_url": data.get("base_url", ""),
+            "tool_access": ta_raw,
+            "skills": data.get("skills", {}),
+            "description": data.get("description", ""),
+            "delegate_targets": list(data.get("delegate_targets") or []),
+            "source": source,
+        }
+
     @router.get("/nodes")
     def list_nodes() -> list[dict[str, Any]]:
         # 系统节点目录分离：扫描 engine/system_nodes/ 和 config/nodes/ 两个目录，
         # engine 内建目录优先，同 id 节点只保留首次出现的。
+        # [AutoC 2026-08-30] 插件声明节点优先级最高（Paradox 式覆盖），
+        # source 标记为 "plugin"（附带声明者插件名，便于 UI 区分）。
+        from engine.faces.nodes import iter_declared_nodes
         dirs = [
             (workspace_root / "engine" / "system_nodes", "system"),
             (workspace_root / "config" / "nodes", "user"),
         ]
         res = []
         seen_ids: set[str] = set()
+        for entry in iter_declared_nodes():
+            nid = entry["id"]
+            if nid in seen_ids:
+                continue
+            seen_ids.add(nid)
+            row = _node_row(nid, entry["data"], "plugin")
+            row["plugin"] = entry["owner"]
+            res.append(row)
         for nodes_dir, source in dirs:
             if not nodes_dir.exists():
                 continue
@@ -157,24 +188,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 if nid in seen_ids:
                     continue
                 seen_ids.add(nid)
-                ta_raw = data.get("tool_access", {})
-                if isinstance(ta_raw, str):
-                    ta_raw = {"mode": ta_raw}
-                elif not isinstance(ta_raw, dict):
-                    ta_raw = {"mode": "none"}
-                res.append({
-                    "id": nid,
-                    "name": data.get("name", ""),
-                    "type": data.get("type", ""),
-                    "model": data.get("model", ""),
-                    "provider": data.get("provider", ""),
-                    "base_url": data.get("base_url", ""),
-                    "tool_access": ta_raw,
-                    "skills": data.get("skills", {}),
-                    "description": data.get("description", ""),
-                    "delegate_targets": list(data.get("delegate_targets") or []),
-                    "source": source,
-                })
+                res.append(_node_row(nid, data, source))
         return res
 
     def _resolve_node_path(node_id: str) -> Path:

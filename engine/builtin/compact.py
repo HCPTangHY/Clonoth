@@ -85,6 +85,9 @@ PLUGIN_META = {
         ("before_step", "handle"),
     ],
     "priority": 50,
+    # [AutoC 2026-08-30] system.compactor 节点从 engine/system_nodes/ 迁移为
+    # 插件声明（nodes face，Paradox 式覆盖语义，卸载自动回落）。
+    "nodes": [{"file": "nodes/system.compactor.yaml"}],
 }
 
 

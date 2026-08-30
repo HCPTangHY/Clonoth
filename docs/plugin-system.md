@@ -395,7 +395,33 @@ def register(ctx) -> None:
 
 - `ctx.hooks`（拦截型）：HookRegistry，13 个 hook 点。通道语义集中在 `channels` dict（CHANNEL_SEMANTICS 表：execution 单主、result_override 按键合并、intercepted 或聚合、未知键默认 first），支持 stop_chain 断链。
 - `ctx.providers`（渠道型）：ProviderRegistry，模型后端注册。
-- `ctx.contributions`（声明型容器）：按名挂载 face，用 `get(name)` 取用。当前已挂载：`prompt_sections`（engine）、`routes`（supervisor）。新增 face 不需要改框架，调用 `Contributions.mount(name, face)`。
+- `ctx.contributions`（声明型容器）：按名挂载 face，用 `get(name)` 取用。当前已挂载：`prompt_sections`（engine）、`routes`（supervisor）、`nodes`（engine + supervisor）。新增 face 不需要改框架，调用 `Contributions.mount(name, face)`。
+
+### nodes face（engine + supervisor 进程）
+
+插件声明节点，Paradox 式覆盖语义：**插件声明 > engine/system_nodes/ > config/nodes/**。声明即生效，卸载插件自动回落到文件来源。
+
+```python
+# 命令式（register(ctx) 或 wants_context 的 handler 构造里）
+nodes = ctx.contributions.get("nodes")
+if nodes is not None:
+    nodes.register({"id": "my.node", "type": "ai", "name": "My Node", "prompt": "..."})
+
+# 声明式（PLUGIN_META）
+PLUGIN_META = {
+    ...,
+    "nodes": [
+        {"id": "my.node", "type": "ai", "name": "My Node", "prompt": "..."},
+        {"file": "nodes/other.yaml"},   # 包内文件引用，id 缺省取文件名
+    ],
+}
+```
+
+- 声明 dict 与节点 YAML 同构（kind/type/name/prompt/tool_access/...），解析复用 `load_node` 同一条路径。
+- 同 id 声明压过内核默认与用户文件；两个不同插件声明同 id 拒绝（与 routes face 冲突策略一致），同插件重声明（重载）替换。
+- 声明损坏（解析失败）时回退文件来源并告警，不会静默摧毁同名节点。
+- 消费端：`load_node`（dispatch/task_router）、runner 的 switch_node 发现与节点信息缓存（按注册表版本号失效）、supervisor `/v1/admin/config/nodes` 清单（source 标记 `plugin`，附带声明者插件名）。
+- `PLUGIN_META.processes` 照常生效：节点只在插件实际加载的进程里可见。
 
 ### routes face（supervisor 进程）
 

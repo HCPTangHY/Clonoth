@@ -119,6 +119,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self.routes_face = PluginRoutesFace()
         _supervisor_ctx = EngineContext(hooks=self.hook_registry)
         _supervisor_ctx.contributions.mount("routes", self.routes_face)
+        # [AutoC 2026-08-30] nodes face: plugins declare nodes visible to the
+        # supervisor node list and switch-node discovery in this process.
+        from engine.faces.nodes import PluginNodesFace
+        _supervisor_ctx.contributions.mount("nodes", PluginNodesFace())
         _builtin_handlers = auto_discover_and_register(self.hook_registry, context=_supervisor_ctx)
         # Why: the Clonoth runtime may temporarily run with a reduced built-in
         # handler set while features are being rolled out. How: keep optional

@@ -35,6 +35,7 @@ from .context_store import load_context_snapshot
 from .inference.tool_format import sanitize_control_tool_history
 
 from .node import Node, load_node
+from engine.faces import nodes as _plugin_nodes
 from .protocol import TaskAction
 # [2026-04-17] write_artifact 移除：截断机制已废弃
 from .tool_step import result_to_raw, summarize_result
@@ -177,6 +178,27 @@ def _node_info_path_and_mtime(workspace_root: Path, node_id: str) -> tuple[Path 
 
 def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]:
     """Load id/name/description for one node YAML with an mtime cache."""
+    # [AutoC 2026-08-30] Plugin-declared nodes override file sources (same
+    # precedence as load_node). Why: declarations have no file path or mtime.
+    # How: cache under a "plugin://" key with the face's mutation counter as
+    # the invalidation token. Purpose: register/unload/reload invalidate the
+    # cache immediately, exactly like a file mtime change.
+    decl = _plugin_nodes.declared_node(node_id)
+    if decl is not None:
+        cache_key = f"plugin://{node_id}"
+        version = _plugin_nodes.registry_version()
+        cached = _NODE_INFO_CACHE.get(cache_key)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        info = _fallback_node_info(node_id)
+        kind = str(decl.get("kind") or "node").strip()
+        node_type = str(decl.get("type") or "ai").strip().lower()
+        if kind == "node" and node_type in {"ai", "tool", "script"}:
+            name = str(decl.get("name") or node_id).strip() or node_id
+            description = str(decl.get("description") or "").strip() or name
+            info = {"id": node_id, "name": name, "description": description}
+        _NODE_INFO_CACHE[cache_key] = (version, info)
+        return info
     path, mtime = _node_info_path_and_mtime(workspace_root, node_id)
     if path is None:
         # [2026-05-04] Missing delegate YAML must not prevent tool registration.
@@ -234,9 +256,10 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
         workspace_root / "engine" / "system_nodes",
         workspace_root / "config" / "nodes",
     ]
-    all_nodes: list[dict[str, Any]] = []
-    all_targets: set[str] = set()
-    seen_ids: set[str] = set()
+    # [AutoC 2026-08-30] entries keyed by id so plugin declarations can replace
+    # file-sourced nodes wholesale (override semantics); targets are recomputed
+    # from the final set because an override may change delegate_targets.
+    entries: dict[str, dict[str, Any]] = {}
     for nodes_dir in nodes_dirs:
         if not nodes_dir.is_dir():
             continue
@@ -244,11 +267,42 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
             if f.suffix not in (".yaml", ".yml") or f.name.startswith("_"):
                 continue
             n = load_node(workspace_root, f.stem)
-            if n is None or n.type != "ai" or n.id in seen_ids:
+            if n is None or n.type != "ai" or n.id in entries:
                 continue
-            seen_ids.add(n.id)
-            all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
-            all_targets.update(n.delegate_targets)
+            entries[n.id] = {
+                "id": n.id,
+                "name": n.name,
+                "description": n.description or n.name,
+                "targets": set(n.delegate_targets),
+            }
+    # 插件声明节点并入：同 id 覆盖文件来源（Paradox 语义）。
+    for decl_entry in _plugin_nodes.iter_declared_nodes():
+        data = decl_entry["data"]
+        if str(data.get("kind") or "node").strip() != "node":
+            continue
+        if str(data.get("type") or "ai").strip().lower() != "ai":
+            continue
+        nid = decl_entry["id"]
+        name = str(data.get("name") or nid).strip() or nid
+        raw_targets = data.get("delegate_targets")
+        targets = {
+            str(x).strip()
+            for x in (raw_targets if isinstance(raw_targets, list) else [])
+            if isinstance(x, str) and x.strip()
+        }
+        entries[nid] = {
+            "id": nid,
+            "name": name,
+            "description": str(data.get("description") or "").strip() or name,
+            "targets": targets,
+        }
+    all_nodes: list[dict[str, Any]] = [
+        {"id": e["id"], "name": e["name"], "description": e["description"]}
+        for e in entries.values()
+    ]
+    all_targets: set[str] = set()
+    for e in entries.values():
+        all_targets.update(e["targets"])
     # 根节点 = 不被任何节点 delegate 引用的节点
     roots = [n for n in all_nodes if n["id"] not in all_targets]
     if not roots:

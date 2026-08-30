@@ -27,6 +27,8 @@ PLUGIN_META = {
     # How: declare the dependency so loader ensures knowledge_inject loads first.
     # Purpose: fail clearly if knowledge_inject is missing rather than silent runtime errors.
     "requires": ["knowledge_inject"],
+    # [AutoC 2026-08-30] system.memory_extractor 节点从 engine/system_nodes/ 迁移为插件声明。
+    "nodes": [{"file": "nodes/system.memory_extractor.yaml"}],
 }
 
 

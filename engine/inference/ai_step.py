@@ -944,6 +944,11 @@ async def run_ai_node(
     # unloadable through one ledger.
     _engine_ctx.contributions.mount("prompt_sections", _prompt_sections)
     _engine_ctx.contributions.mount("tools", registry)
+    # [AutoC 2026-08-30] nodes face: plugin-declared nodes (Paradox-style
+    # override of file-sourced nodes). Storage is module-level, so mounting a
+    # fresh thin face per ai_step call shares the same declarations.
+    from engine.faces.nodes import PluginNodesFace
+    _engine_ctx.contributions.mount("nodes", PluginNodesFace())
     auto_discover_and_register(hook_registry, tool_registry=registry, context=_engine_ctx)
     # Phase 3 External Hook Plugins：每次进入 AI 节点时扫描工作区 plugins/。
     # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。

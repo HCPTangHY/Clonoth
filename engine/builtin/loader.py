@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..hooks.loader import iter_hook_points, register_meta_handler, clear_load_error, record_load_error
+from ..hooks.loader import (
+    iter_hook_points,
+    register_meta_handler,
+    register_declared_nodes,
+    clear_load_error,
+    record_load_error,
+)
 
 if TYPE_CHECKING:
     from toolbox.registry import ToolRegistry
@@ -73,6 +79,13 @@ def auto_discover_and_register(
             # Peek at handler_class to derive handler_name for dependency keys
             class_name = str(meta.get("handler_class") or "").strip()
             if not class_name:
+                # [AutoC 2026-08-30] Meta-only plugins: PLUGIN_META without a
+                # handler_class is accepted when it carries declarative
+                # surfaces (nodes). Why: some kernel capabilities (e.g. the
+                # turn summarizer node) are dispatched by core code and own no
+                # hooks, but still ship their node through the plugin system.
+                if isinstance(meta.get("nodes"), list):
+                    pending[entry_name] = (module, meta, entry)
                 continue
             cls = getattr(module, class_name, None)
             preview_name = str(getattr(cls, "name", "") or "") if cls else ""
@@ -102,6 +115,15 @@ def auto_discover_and_register(
                 )
                 continue
         try:
+            if not str(meta.get("handler_class") or "").strip():
+                # Meta-only plugin: register declarative surfaces inside
+                # collecting() so their disposers land in the shared ledger.
+                with registry.collecting(handler_name):
+                    register_declared_nodes(handler_name, meta, context, module)
+                handlers[handler_name] = None
+                loaded.add(handler_name)
+                _register_meta(registry, py_file, meta, handler_name)
+                continue
             # Why: every registration a plugin makes must be reversible, including
             # registrations done in __init__ (e.g. prompt sections). How: the
             # shared register_meta_handler runs instantiation, hook registration,
@@ -273,7 +295,15 @@ def load_single_builtin(
             raise ValueError(f"{module_name} declares no PLUGIN_META")
         class_name = str(meta.get("handler_class") or "").strip()
         if not class_name:
-            raise ValueError(f"{module_name} PLUGIN_META has no handler_class")
+            # Meta-only plugin (declarative surfaces only, e.g. turn_summary).
+            if not isinstance(meta.get("nodes"), list):
+                raise ValueError(f"{module_name} PLUGIN_META has no handler_class and no declarations")
+            handler_name = str(meta.get("name") or "").strip() or entry_name
+            with registry.collecting(handler_name):
+                register_declared_nodes(handler_name, meta, context, module)
+            _register_meta(registry, entry, meta, handler_name)
+            clear_load_error(entry_name)
+            return {"name": handler_name, "entry": entry_name}
         cls = getattr(module, class_name, None)
         if cls is None:
             raise ValueError(f"{module_name} has no class {class_name!r}")

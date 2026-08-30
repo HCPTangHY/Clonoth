@@ -134,7 +134,7 @@ tools:
 config/nodes/*.yaml
 ```
 
-系统内建节点优先从 `engine/system_nodes/` 读取，找不到时再读取 `config/nodes/`。
+系统内建节点由所属内置插件通过 PLUGIN_META.nodes 声明（声明文件在 `engine/builtin/nodes/`）；`engine/system_nodes/` 与 `config/nodes/` 为文件来源兜底，优先级低于插件声明。
 
 一个典型节点如下：
 
