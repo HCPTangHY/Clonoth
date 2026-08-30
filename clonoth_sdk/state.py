@@ -180,6 +180,15 @@ class SessionState:
         self.pending_watermarks: dict[int, tuple[int, int]] = {}
         # 对应 _last_ctx_seq: dict[int, int]  (channel_id → high watermark seq, L250)
         self.last_ctx_seq: dict[int, int] = {}
+        # [AutoC 2026-08-30] 先到确认缓冲。Why: supervisor 在 /v1/inbound 请求
+        # 处理内同步广播 inbound_accepted（WS 队列 put_nowait），Bot 的 WS 读
+        # 循环可能在 POST 响应返回（register_watermark 执行）之前消费该事件，
+        # 导致 accept 找不到 pending key、水位永不推进（生产实测 2300+ 条
+        # pending 堆积）。How: accept 未命中时记入此集合；register 时若 seq 已
+        # 确认则立即推进水位。Purpose: 消除时序竞争，两个方向谁先谁后都正确。
+        self.accepted_unmatched: dict[int, None] = {}
+        self._ACCEPTED_UNMATCHED_CAP = 512
+        self._PENDING_WATERMARKS_CAP = 2048
 
         # ---- DM 频道映射 ----
         # trigger 消费后子节点仍能找到 DM 频道
@@ -455,8 +464,23 @@ class SessionState:
 
         水位在 inbound_accepted 事件到达后才正式推进，防止 engine 未接受
         消息时错误地认为历史已发送。
+
+        [AutoC 2026-08-30] 若该 seq 的 inbound_accepted 已经先到（WS 快于
+        POST 响应的时序竞争），立即推进水位而不再挂起。
         """
+        if inbound_seq in self.accepted_unmatched:
+            del self.accepted_unmatched[inbound_seq]
+            self.last_ctx_seq[channel_id] = max(
+                self.last_ctx_seq.get(channel_id, -1), watermark_seq,
+            )
+            return
         self.pending_watermarks[inbound_seq] = (channel_id, watermark_seq)
+        # 防御性上限：确认事件永久丢失时（engine 拒绝、连接中断窗口）避免
+        # 无界增长。超出时丢弃最旧的一半。
+        if len(self.pending_watermarks) > self._PENDING_WATERMARKS_CAP:
+            keys = list(self.pending_watermarks.keys())
+            for key in keys[: len(keys) // 2]:
+                del self.pending_watermarks[key]
 
     def accept_watermark(self, inbound_seq: int) -> tuple[int, int] | None:
         """确认水位标记并推进 last_ctx_seq 高水位。
@@ -470,6 +494,11 @@ class SessionState:
         """
         wm = self.pending_watermarks.pop(inbound_seq, None)
         if wm is None:
+            # [AutoC 2026-08-30] 确认先于注册到达：记入缓冲，register_watermark
+            # 时会消费。缓冲定长 FIFO，防止未知 seq 无限堆积。
+            self.accepted_unmatched[inbound_seq] = None
+            while len(self.accepted_unmatched) > self._ACCEPTED_UNMATCHED_CAP:
+                self.accepted_unmatched.pop(next(iter(self.accepted_unmatched)))
             return None
         channel_id, watermark_seq = wm
         self.last_ctx_seq[channel_id] = max(
