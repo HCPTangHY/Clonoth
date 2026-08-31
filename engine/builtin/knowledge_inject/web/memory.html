@@ -28,10 +28,12 @@
   button.op.danger:hover:not(:disabled) { border-color: var(--danger); }
   button.op.primary { color: var(--accent); border-color: var(--accent); }
 
-  .cols { display: flex; gap: 0; height: calc(100vh - 44px); } overflow: hidden;
+  .cols { display: flex; gap: 0; height: calc(100vh - 44px); overflow: hidden; }
   /* [AutoC 2026-08-28] 固定高度而非 min-height：列表/树面板各自内部滚动，
-     页面本体不再被内容撑高（此前树面板被撑到数千像素高）。 */
-  .tree-pane { flex: 0 0 260px; border-right: 1px solid var(--muted); overflow-y: auto; padding: 10px 10px 20px; }
+     页面本体不再被内容撑高（此前树面板被撑到数千像素高）。
+     [AutoC 2026-08-31] overflow 修复进花括号内（此前误写在规则外被丢弃，
+     内容溢出时整页滚动，两栏一起滚）；flex 子项补 min-height: 0 允许收缩。 */
+  .tree-pane { flex: 0 0 260px; border-right: 1px solid var(--muted); overflow-y: auto; padding: 10px 10px 20px; min-height: 0; }
   .ns { margin-bottom: 8px; }
   .ns-head { display: flex; align-items: baseline; gap: 6px; padding: 4px 6px; color: var(--tertiary); font: 10px var(--mono); letter-spacing: .02em; }
   .ns-head .n { color: var(--secondary); font-weight: 600; }
@@ -42,7 +44,7 @@
   .book .cnt { margin-left: auto; color: var(--tertiary); font-size: 9.5px; }
   .book .sub { padding-left: 14px; opacity: .85; }
 
-  .main-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .main-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
   .book-bar { display: flex; align-items: center; gap: 8px; padding: 10px 20px; border-bottom: 1px solid var(--muted); background: var(--bg); position: sticky; top: 0; z-index: 4; }
   .book-bar .path { font: 600 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .book-bar .meta { color: var(--tertiary); font: 10px var(--mono); white-space: nowrap; }
@@ -93,9 +95,12 @@
   body.editor-only .tree-pane, body.editor-only .entries, body.editor-only .book-bar { display: none; }
   body.editor-only .editor { display: block; border-top: none; max-height: none; height: calc(100vh - 44px); }
   /* 列表形态：条目区占满整页，编辑器节点不渲染 */
+  /* 列表形态：条目区占满整页，编辑器节点不渲染。
+     条目区由 .cols 的定高 flex 布局确定高度（flex: 1 + overflow-y 内部滚动），
+     不要再写 height: 100%——那会把列表撑成与整栏同高并叠加底部内边距，
+     整页被内容撑高后出现页面级滚动，表现为左右两栏一起滚。 */
   body:not(.editor-only) .main-pane { display: contents; }
   body:not(.editor-only) .book-bar, body:not(.editor-only) .editor { display: none; }
-  body:not(.editor-only) .entries { height: 100%; }
 
   /* [AutoC 2026-08-28] 旧移动端断点在插件面板形态下失效：iframe 宽度是
      宿主主区/右栏宽度而非视口，主区窄于 720px 时断点把列表错切为上下
