@@ -190,6 +190,16 @@ class PolicyEngine:
         data = load_yaml_dict(self._policy_path)
         if not isinstance(data, dict):
             data = _default_policy_dict()
+        else:
+            # [AutoC 2026-08-31] 顶层节合并：文件只覆盖它声明的节，缺失的节
+            # 回退到内置默认。Why: 生产的 policy.yaml 写于 tools 节加入默认
+            # 值之前，整体替换导致 tools 缺失时所有杂项工具（含 save_memory）
+            # 回落 approval_required，dream 凌晨卡在人工审批上。How: 浅合并
+            # 顶层键，每节内部仍以文件为准。Purpose: 内置默认新增节（如
+            # tools）对存量部署自动生效。
+            merged = _default_policy_dict()
+            merged.update(data)
+            data = merged
 
         self._cfg = data
         self._cached_mtime = mtime
