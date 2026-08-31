@@ -270,6 +270,7 @@ async function bootTree() {
       ws.textContent = data.workspace_path;
       ws.title = data.workspace_path;
       p.appendChild(ws);
+      p.appendChild(buildSearchButton());
       p.appendChild(buildGitButton());
       treeRootEl.appendChild(p);
     }

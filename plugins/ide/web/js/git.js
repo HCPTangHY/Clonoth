@@ -221,6 +221,8 @@ async function openGitView() {
     activePath = TREE_TAB;
     renderTabs();
   }
+  // 搜索整页视图与 Git 视图互斥：搜索视图激活时先关闭它
+  if (searchViewActive) { searchViewActive = false; searchResults = null; searchTreeBackup = null; }
   if (!gitViewActive) {
     gitTreeBackup = viewEl.firstChild;
     gitViewActive = true;

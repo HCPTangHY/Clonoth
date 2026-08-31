@@ -20,8 +20,8 @@ from typing import Any
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.13.0",
-    "description": "Web IDE：文件面板 + 编辑器 + @文件引用 + 文件管理（新建/重命名/删除/剪切移动）",
+    "version": "0.14.0",
+    "description": "Web IDE：文件面板 + 编辑器 + @文件引用 + 文件管理（新建/重命名/删除/剪切移动）+ 工作区内容搜索",
     "author": "clonoth",
     # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
     "processes": ["supervisor", "engine"],
@@ -592,9 +592,116 @@ def register(ctx) -> None:
             raise HTTPException(status_code=500, detail=err.decode("utf-8", "replace").strip() or "git commit 失败")
         return {"ok": True, "output": out.decode("utf-8", "replace").strip()}
 
+    # ── 工作区内容搜索（只读） ─────────────────────────────────────
+    # 用系统 grep 子进程实现，不引入新依赖。只读端点，基准与 git 只读端点
+    # 一致（会话工作区优先，未设回退 workspace_root）。二进制文件经 -I 跳过，
+    # 常见噪声目录经 --exclude-dir 排除。匹配数与输出字节都有上限。
+    _SEARCH_EXCLUDE_DIRS = (
+        ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
+        "build", ".next", ".cache", ".mypy_cache", ".pytest_cache",
+    )
+    _SEARCH_MAX_MATCHES = 300
+    _SEARCH_MAX_OUTPUT = 512 * 1024
+
+    @api.get("/search")
+    async def _search_workspace(request: Request) -> dict:
+        q = str(request.query_params.get("q") or "")
+        if not q.strip():
+            raise HTTPException(status_code=400, detail="empty query")
+        if len(q) > 200:
+            raise HTTPException(status_code=400, detail="query too long")
+        base = _git_base(request)
+        regex = str(request.query_params.get("regex") or "").strip() in {"1", "true"}
+        case_insensitive = str(request.query_params.get("case") or "").strip().lower() == "i"
+        sub = str(request.query_params.get("path") or "").replace("\\", "/").strip()
+        root = base
+        if sub:
+            root = (base / sub).resolve() if not sub.startswith("/") else Path(sub).resolve()
+            try:
+                root.relative_to(base)
+            except ValueError:
+                raise HTTPException(status_code=403, detail="path outside session workspace")
+            if not root.is_dir():
+                raise HTTPException(status_code=404, detail="directory not found")
+
+        cmd = ["grep", "-rInI", "--color=never"]
+        cmd.extend(f"--exclude-dir={d}" for d in _SEARCH_EXCLUDE_DIRS)
+        if case_insensitive:
+            cmd.append("-i")
+        cmd.append("-E" if regex else "-F")
+        cmd.extend(["--", q, "."])
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise HTTPException(status_code=504, detail="搜索超时")
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="grep 未安装")
+        if proc.returncode not in (0, 1):
+            detail = err.decode("utf-8", "replace").strip() or "grep 执行失败"
+            raise HTTPException(status_code=400, detail=detail)
+
+        text = out.decode("utf-8", "replace")
+        truncated_bytes = len(text) > _SEARCH_MAX_OUTPUT
+        if truncated_bytes:
+            text = text[:_SEARCH_MAX_OUTPUT]
+        by_file: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        total = 0
+        truncated_matches = False
+        for line in text.splitlines():
+            # grep -n 输出 "path:lineno:content"；内容里可能含冒号，只切前两刀
+            first = line.find(":")
+            if first < 0:
+                continue
+            second = line.find(":", first + 1)
+            if second < 0:
+                continue
+            path = line[:first]
+            if path.startswith("./"):
+                path = path[2:]
+            try:
+                lineno = int(line[first + 1:second])
+            except ValueError:
+                continue
+            if path not in by_file:
+                by_file[path] = []
+                order.append(path)
+            if total < _SEARCH_MAX_MATCHES:
+                content = line[second + 1:]
+                if len(content) > 300:
+                    content = content[:300] + "…"
+                by_file[path].append({"line": lineno, "content": content})
+                total += 1
+            else:
+                truncated_matches = True
+        rel_base = base
+        files = []
+        for path in order:
+            full = (root / path).resolve()
+            try:
+                rel = full.relative_to(rel_base).as_posix()
+            except ValueError:
+                continue
+            files.append({"path": rel, "matches": by_file[path]})
+        return {
+            "query": q,
+            "total": total,
+            "truncated": truncated_matches or truncated_bytes,
+            "files": files,
+        }
+
     # register 必须在所有路由定义之后：已 attach 状态下 register 立即
     # include_router，只拷贝当时已存在的路由；之后定义的路由不会追加。
-    routes.register(api, description="ide 写文件与 git 端点（默认鉴权）")
+    routes.register(api, description="ide 写文件、搜索与 git 端点（默认鉴权）")
 
     # ── 面板静态资源 ─────────────────────────────────────────────────
     client = APIRouter()

@@ -3,7 +3,9 @@
 function renderStatusbar() {
   const tab = findTab(activePath);
   if (!tab || tab.path === TREE_TAB) {
-    statusbarEl.innerHTML = '<div class="seg grow">' + (gitViewActive ? '源代码管理' : '工作区文件') + '</div>';
+    statusbarEl.innerHTML = '<div class="seg grow">'
+      + (gitViewActive ? '源代码管理' : (searchViewActive ? '工作区搜索' : '工作区文件'))
+      + '</div>';
     barSaveBtn.classList.remove('show');
     return;
   }

@@ -30,8 +30,9 @@ function renderView() {
   stashScroll();
   viewPath = activePath;
   if (activePath === TREE_TAB) {
-    // Git 整页视图激活时替换文件树显示
+    // Git / 搜索整页视图激活时替换文件树显示（二者互斥，见各自模块）
     if (gitViewActive) { renderGitView(); renderStatusbar(); return; }
+    if (searchViewActive) { renderSearchView(); renderStatusbar(); return; }
     if (treeBooted) {
       viewEl.innerHTML = '';
       viewEl.appendChild(treeRootEl);
@@ -117,6 +118,7 @@ async function loadFileTab(tab) {
   if (activePath === tab.path && seq === loadSeq) {
     renderFileTab(tab);
     renderStatusbar();
+    doSearchJump();
   }
 }
 
