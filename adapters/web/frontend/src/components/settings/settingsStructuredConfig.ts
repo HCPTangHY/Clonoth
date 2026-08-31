@@ -96,6 +96,15 @@ function normalizeToolAccessMode(value: string, fallback: ToolAccessMode = 'all'
   return value === 'allow' || value === 'deny' || value === 'none' || value === 'all' ? value : fallback;
 }
 
+function parseToolAccessMode(ta: Record<string, any>): ToolAccessMode {
+  const mode = str(ta.mode, 'all').toLowerCase();
+  if (mode === 'allowlist' || mode === 'allow') return 'allow';
+  if (mode === 'none') return 'none';
+  if (mode === 'deny') return 'deny';
+  if (mode === 'all') return Array.isArray(ta.deny) && ta.deny.length > 0 ? 'deny' : 'all';
+  return 'all';
+}
+
 function normalizeNodeConfigType(value: string): NodeConfigType {
   return value === 'tool' || value === 'router' || value === 'ai' ? value : 'ai';
 }
@@ -144,7 +153,7 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
     persistent: doc.persistent === true,
     prompt: str(doc.prompt),
     delegate_targetsText: Array.isArray(doc.delegate_targets) ? doc.delegate_targets.map(String).join(', ') : '',
-    tool_access_mode: normalizeToolAccessMode(str(ta.mode, 'all')),
+    tool_access_mode: parseToolAccessMode(ta),
     tool_access_allowText: Array.isArray(ta.allow) ? ta.allow.map(String).join(', ') : '',
     tool_access_denyText: Array.isArray(ta.deny) ? ta.deny.map(String).join(', ') : '',
   };
@@ -162,10 +171,19 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
   doc.persistent = form.persistent;
   if (form.prompt.trim()) doc.prompt = form.prompt; else delete doc.prompt;
   doc.delegate_targets = commaTextToItems(form.delegate_targetsText);
+  // 表单态 allow/deny 是 UI 概念；后端 ToolAccess 合法集合为
+  // {none, all, allowlist}。allow → mode:allowlist；deny → mode:all + deny 列表。
   const mode = normalizeToolAccessMode(form.tool_access_mode);
-  const ta: Record<string, any> = { mode };
-  if (mode === 'allow') ta.allow = commaTextToItems(form.tool_access_allowText);
-  if (mode === 'deny') ta.deny = commaTextToItems(form.tool_access_denyText);
+  const ta: Record<string, any> = {};
+  if (mode === 'allow') {
+    ta.mode = 'allowlist';
+    ta.allow = commaTextToItems(form.tool_access_allowText);
+  } else if (mode === 'deny') {
+    ta.mode = 'all';
+    ta.deny = commaTextToItems(form.tool_access_denyText);
+  } else {
+    ta.mode = mode;
+  }
   doc.tool_access = ta;
   return safeDump(doc);
 }
