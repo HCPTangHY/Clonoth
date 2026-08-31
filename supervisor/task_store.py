@@ -1,6 +1,7 @@
 """Task 生命周期 mixin —— 创建、领取、完成、取消。"""
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -9,6 +10,8 @@ from clonoth_runtime import get_entry_node_id, get_str, load_runtime_config
 from engine.tool_step import cleanup_tool_result_artifacts
 
 from ._helpers import _now
+
+logger = logging.getLogger(__name__)
 from .types import Task, TaskKind, TaskStatus
 
 
