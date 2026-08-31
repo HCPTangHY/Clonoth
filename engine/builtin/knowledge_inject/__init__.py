@@ -1566,41 +1566,56 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     """List memory entries, optionally filtered by book."""
     # Why: list_memories is now plugin-owned like the memory catalog. How: keep
     # the old book scan and preview fields. Purpose: preserve the tool response.
-    # [2026-05-28] namespace 隔离：使用节点 memory_book 确定扫描目录。
+    # [AutoC 2026-08-31] 与 save_memory 的 scope 语义对齐：workspace 作用域的
+    # 记忆存放在 data/memory/{ns}/@{ws}/ 子目录，旧实现只扫节点级目录，节点
+    # 看不到自己刚保存的 workspace 记忆。How: 扫描节点级目录与全部 @ 子目录，
+    # 每条目标记 scope/workspace 来源；ns 目录不存在时保留 root 兜底。
     book_filter = str(args.get("book") or "").strip() or None
     _ns_extra = getattr(ctx, "_node_extra", None) or {}
     _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
     _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
-    mem_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
-    if not mem_dir.exists():
+
+    sources: list[tuple[Path, str, str]] = []  # (dir, scope, workspace)
+    base_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
+    if base_dir.is_dir():
+        sources.append((base_dir, "node", ""))
+        for sub in sorted(base_dir.iterdir()):
+            if sub.is_dir() and sub.name.startswith("@"):
+                sources.append((sub, "workspace", sub.name[1:]))
+    if not sources:
         # ponytail: fallback to root
-        mem_dir = memory_dir(ctx.workspace_root, "")
-    if not mem_dir.exists():
+        root_dir = memory_dir(ctx.workspace_root, "")
+        if root_dir.is_dir():
+            sources.append((root_dir, "node", ""))
+    if not sources:
         return _tool_ok("0 memories", entries=[])
 
     result: list[dict[str, Any]] = []
-    for yaml_path in sorted(mem_dir.glob("*.yaml")):
-        try:
-            data = _load_book(yaml_path)
-            bname = str(data.get("book") or yaml_path.stem).strip()
-            if book_filter and bname != book_filter:
-                continue
-            for e in data.get("entries", []):
-                if not isinstance(e, dict):
+    for mem_dir, scope, ws_name in sources:
+        for yaml_path in sorted(mem_dir.glob("*.yaml")):
+            try:
+                data = _load_book(yaml_path)
+                bname = str(data.get("book") or yaml_path.stem).strip()
+                if book_filter and bname != book_filter:
                     continue
-                result.append({
-                    "book": bname,
-                    "id": str(e.get("id") or ""),
-                    "content": str(e.get("content") or "")[:200],
-                    "keywords": e.get("keywords", []),
-                    "constant": bool(e.get("constant", False)),
-                    "enabled": bool(e.get("enabled", True)),
-                    "priority": int(e.get("priority") or 0),
-                    "scan_depth": int(e.get("scan_depth") or 0),
-                    "node_ids": e.get("node_ids", []),
-                })
-        except Exception:
-            continue
+                for e in data.get("entries", []):
+                    if not isinstance(e, dict):
+                        continue
+                    result.append({
+                        "book": bname,
+                        "id": str(e.get("id") or ""),
+                        "content": str(e.get("content") or "")[:200],
+                        "keywords": e.get("keywords", []),
+                        "constant": bool(e.get("constant", False)),
+                        "enabled": bool(e.get("enabled", True)),
+                        "priority": int(e.get("priority") or 0),
+                        "scan_depth": int(e.get("scan_depth") or 0),
+                        "node_ids": e.get("node_ids", []),
+                        "scope": scope,
+                        "workspace": ws_name or None,
+                    })
+            except Exception:
+                continue
 
     return _tool_ok(f"{len(result)} memories", entries=result)
 
@@ -1619,14 +1634,32 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
     _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
     book = str(args.get("book") or "default").strip()
-    book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
-    if not book_path.exists():
-        # ponytail: fallback to root for delete
-        _fallback_path = memory_dir(ctx.workspace_root, "") / f"{book}.yaml"
-        if _fallback_path.exists():
-            book_path = _fallback_path
-            _ns_memory_book = ""
-    if not book_path.exists():
+    # [AutoC 2026-08-31] 查找顺序与 save_memory 的默认落点（scope=workspace）
+    # 对齐：当前 workspace 子目录优先，其次节点级，最后 root 兜底。How: 第一个
+    # 包含目标 id 的书文件胜出；书文件存在但不含该 id 时继续向下找。Purpose:
+    # 节点能删掉自己刚保存的 workspace 作用域记忆，无需显式传 scope。
+    _ws_name = str(getattr(ctx, "workspace_name", "") or "").strip()
+    candidates: list[tuple[Path, str]] = []
+    if _ws_name:
+        _ws_ns = f"{_ns_memory_book}/@{_ws_name}"
+        candidates.append((memory_dir(ctx.workspace_root, _ws_ns) / f"{book}.yaml", _ws_ns))
+    candidates.append((memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml", _ns_memory_book))
+    candidates.append((memory_dir(ctx.workspace_root, "") / f"{book}.yaml", ""))
+
+    book_path: Path | None = None
+    for _cand_path, _cand_ns in candidates:
+        if not _cand_path.exists():
+            continue
+        if book_path is None:
+            book_path, _ns_memory_book = _cand_path, _cand_ns
+        _cand_data = _load_book(_cand_path)
+        if any(
+            isinstance(e, dict) and str(e.get("id") or "").strip() == mid
+            for e in _cand_data.get("entries", [])
+        ):
+            book_path, _ns_memory_book = _cand_path, _cand_ns
+            break
+    if book_path is None:
         return _tool_err(f"book not found: {book}")
 
     data = _load_book(book_path)
@@ -1737,7 +1770,7 @@ PLUGIN_META["tools"] = [
     },
     {
         "name": "list_memories",
-        "description": "List memory entries, optionally filtered by book name.",
+        "description": "List memory entries (node-level and workspace-scoped), optionally filtered by book name. Each entry carries scope/workspace fields indicating where it is stored.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1749,7 +1782,7 @@ PLUGIN_META["tools"] = [
     },
     {
         "name": "delete_memory",
-        "description": "Delete a memory entry from a book.",
+        "description": "Delete a memory entry from a book. Lookup order mirrors save_memory's default landing spot: current workspace first, then node level, then root.",
         "input_schema": {
             "type": "object",
             "properties": {
