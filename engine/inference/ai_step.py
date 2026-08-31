@@ -188,18 +188,12 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
             if tc.name not in ls.allowed_real_tools:
                 logger.warning("node %s attempted unauthorized tool call: %s (allowed: %s)",
                                ls.node.id, tc.name, ls.allowed_real_tools)
-                # [AutoC 2026-08-31] 拒绝信息按 output_mode 区分。Why: hybrid
-                # 模式下节点直接输出文本即结束，finish 可能不在工具列表里，
-                # 提示 "Use finish()" 会引导模型调用一个不存在的工具。How:
-                # tool_only 保留 finish 指引；hybrid 提示直接输出文本。
-                if getattr(ls.node, 'output_mode', 'hybrid') == 'tool_only':
-                    _err_hint = "Use finish() to provide your output directly."
-                else:
-                    _err_hint = "Provide your output as plain text instead."
+                # [AutoC 2026-08-31] 最简拒绝：只告知工具不存在，不给任何
+                # 替代指引。Why: 旧文案提示调用 finish()，但 finish 可能也不在
+                # 授权列表里，反而误导模型反复重试。
                 _err_msg = ls.formatter.format_tool_result(
                     tc,
-                    f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
-                    f"{_err_hint}",
+                    f"Error: Tool '{tc.name}' does not exist.",
                 )
                 # [2026-05-01] 工具结果必须带当前 tool_mode。
                 # 目的：真 native 的 role=tool 消息在下一轮仍由 NativeToolFormatter 透传。
