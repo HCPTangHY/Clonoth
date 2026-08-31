@@ -54,12 +54,9 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     if rtype == "child_result":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         result = resume_data.get("result") or {}
-        summary = str(result.get("summary") or "")
         text = str(result.get("text") or "")
         child_atts = _attachments_from_payload(result)
         lines = [f"下游节点 {from_node} 已完成。" if from_node else "下游节点已完成。"]
-        if summary:
-            lines.append(f"摘要：{summary}")
         if text:
             lines.append("结果：")
             lines.append(text)
@@ -162,13 +159,10 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                     _node = str(e.get("node_id") or "unknown")
                     _instr = str(e.get("instruction") or "")
                     _text = str(e.get("text") or "")
-                    _summary = str(e.get("summary") or "")
                     if _status == "fail":
                         msgs.append({"role": "user", "content": f"子节点 {_node} 执行失败：{e.get('error', '')}"})    
                     else:
                         lines = [f"子节点 {_node}（指令：{_instr[:100]}）已完成。"]
-                        if _summary:
-                            lines.append(f"摘要：{_summary}")
                         if _text:
                             lines.append(f"结果：\n{_text}")
                         msgs.append({"role": "user", "content": "\n".join(lines)})

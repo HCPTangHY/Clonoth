@@ -202,9 +202,6 @@ export function buildMessageSource(state: ChatState, event: SupervisorEvent): Me
     callerNodeId: getString(payload.caller_node_id)
       || (input ? getString(input.caller_node_id) || getString(input.inbound_caller_node_id) : '')
       || undefined,
-    summary: getString(payload.summary)
-      || (input ? getString(input.summary) || getString(input.inbound_summary) : '')
-      || undefined,
     nodeName: getString(payload.node_name) || nodeInfo?.nodeName,
     branchSessionId: getString(payload.branch_session_id) || (input ? getString(input.branch_session_id) : ''),
     parentSessionId: getString(payload.parent_session_id) || (input ? getString(input.parent_session_id) : ''),
@@ -240,7 +237,6 @@ export function mergeSource(current: MessageSource, patch: MessageSource): Messa
     nodeId: patch.nodeId || current.nodeId,
     childNodeId: patch.childNodeId || current.childNodeId,
     callerNodeId: patch.callerNodeId || current.callerNodeId,
-    summary: patch.summary || current.summary,
     nodeName: patch.nodeName || current.nodeName,
     branchSessionId: patch.branchSessionId || current.branchSessionId,
     parentSessionId: patch.parentSessionId || current.parentSessionId,
@@ -282,7 +278,7 @@ export function summarizeEvent(event: SupervisorEvent): string | undefined {
     return getString(payload.tool_name) || undefined;
   }
   if (event.type === 'tool_call_end') {
-    return getString(payload.summary) || getString(payload.tool_name) || undefined;
+    return getString(payload.tool_name) || undefined;
   }
   if (event.type === 'node_switch') {
     return getString(payload.target_node_id) || 'default';

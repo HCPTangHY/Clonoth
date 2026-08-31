@@ -115,7 +115,6 @@ export type HistoryToolResult = {
   rawInline?: string;
   format?: string;
   elapsedMs?: number;
-  summary?: string;
   attachments?: Attachment[];
   rejected?: boolean;
   rejectionCode?: string;

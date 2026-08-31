@@ -38,7 +38,6 @@ export type ToolPatch = {
   arguments?: Record<string, unknown>;
   argumentsText?: string;
   argumentsTextDelta?: string;
-  summary?: string;
   result?: unknown;
   rawInline?: string;
   format?: string;

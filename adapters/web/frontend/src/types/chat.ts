@@ -17,7 +17,6 @@ export interface Attachment {
 export interface ToolCall {
   id?: string;
   name: string;
-  summary: string;
   // [2026-05-17] Preserve raw arguments so the renderer can show details without
   // reconstructing them from a lossy text summary. This keeps Clonoth's flat API
   // compatible with Lim-Code's functionCall/functionResponse rendering model.

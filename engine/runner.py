@@ -38,7 +38,7 @@ from .node import Node, load_node
 from engine.faces import nodes as _plugin_nodes
 from .protocol import TaskAction
 # [2026-04-17] write_artifact 移除：截断机制已废弃
-from .tool_step import result_to_raw, summarize_result
+from .tool_step import result_to_raw
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
 # 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
 from .conversation_store import ConversationStore, Message, MessageType
@@ -841,16 +841,12 @@ def _task_action_from_dict(data: dict[str, Any], *, node_id: str) -> TaskAction:
     """Convert a script-produced TaskAction dictionary into the runtime object."""
     # [AutoC 2026-06-09] Why: script_step intentionally returns plain dicts so it
     # can stay independent from runner internals, while the rest of runner records
-    # TaskAction objects. How: filter unknown keys, supply node_id when omitted,
-    # and mirror result.summary into the top-level summary. Purpose: script nodes
-    # share the existing event, transcript, and completion logic without special
-    # casing every later use of action.action or action.to_dict().
+    # TaskAction objects. How: filter unknown keys and supply node_id when omitted.
+    # Purpose: script nodes share the existing event, transcript, and completion
+    # logic without special casing every later use of action.action or to_dict().
     raw = data if isinstance(data, dict) else {}
     kwargs = {key: value for key, value in raw.items() if key in _TASK_ACTION_FIELDS}
     kwargs.setdefault("node_id", node_id)
-    result = kwargs.get("result")
-    if not kwargs.get("summary") and isinstance(result, dict):
-        kwargs["summary"] = str(result.get("summary") or "")
     return TaskAction(**kwargs)
 
 
@@ -1162,7 +1158,6 @@ async def _run_node_task(
     # 此指令已在首次进入时写过 JSONL，这里不应再写一次。
     # 只在非 resume 场景追加 user_input 消息。
     _inbound_message_type = str(input_data.get("inbound_message_type") or "").strip()
-    _inbound_summary = str(input_data.get("inbound_summary") or "").strip()
     _inbound_child_session_id = str(input_data.get("inbound_child_session_id") or "").strip()
     _inbound_child_task_id = str(
         input_data.get("inbound_child_task_id")
@@ -1175,14 +1170,14 @@ async def _run_node_task(
         or ""
     ).strip()
     _inbound_caller_node_id = str(input_data.get("inbound_caller_node_id") or "").strip()
-    # [AutoC 2026-06-04] Why: dispatch_result.text can be empty when the child only
-    # returns a summary, but the callback still has semantic content. How: allow the
-    # shadow write when dispatch_result has inbound_summary. Purpose: ConversationStore
-    # keeps a structured callback row even without raw result text.
+    # [AutoC 2026-08-31] Why: the summary field has been removed from the kernel
+    # contract; a dispatch_result callback is written when it carries raw text or
+    # attachments. Purpose: ConversationStore keeps a structured callback row based
+    # on substantive content only.
     _should_write_user_input = bool(
         instruction
         or input_attachments
-        or (_inbound_message_type == "dispatch_result" and _inbound_summary)
+        or _inbound_message_type == "dispatch_result"
     )
     if _should_write_user_input and _conv_store and not is_resume:
         from datetime import datetime, timezone
@@ -1205,8 +1200,6 @@ async def _run_node_task(
         _inbound_meta: dict[str, Any] = {}
         if source_inbound_seq is not None:
             _inbound_meta["source_inbound_seq"] = int(source_inbound_seq)
-        if _inbound_summary:
-            _inbound_meta["summary"] = _inbound_summary
         if _inbound_child_session_id:
             _inbound_meta["child_session_id"] = _inbound_child_session_id
         if _inbound_child_task_id:
@@ -1241,8 +1234,6 @@ async def _run_node_task(
         # callback row has been stored. Purpose: storage remains pure while the caller
         # node receives an actionable instruction.
         _prefix_parts = [f"[Async task completed] Node {_inbound_node_id or 'unknown'} finished."]
-        if _inbound_summary:
-            _prefix_parts.append(f"Summary: {_inbound_summary}")
         _prefix_parts.append(f"Result:\n{instruction}")
         instruction = "\n".join(_prefix_parts)
 
@@ -1290,7 +1281,7 @@ async def _run_node_task(
 
     await rctx.emit_event("node_completed", {
         "task_id": task_id, "node_id": node.id, "node_name": node.name,
-        "action": action.action, "summary": action.summary,
+        "action": action.action,
         "source_inbound_seq": source_inbound_seq,
         "_output_chain": bool(input_data.get("_output_chain")),
         "node_type": node.type,
@@ -1314,7 +1305,6 @@ async def _run_node_task(
             step_count=rctx.completed_steps,
             tool_call_count=_tool_call_count,
             token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
-            summary=action.summary or "",
             error=action.error or "",
             child_session_id=child_session_id,
         )
@@ -1334,7 +1324,6 @@ async def _run_node_task(
                 step_count=rctx.completed_steps,
                 tool_call_count=_tool_call_count,
                 token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
-                summary=action.summary or "",
                 error=action.error or "",
                 child_session_id=child_session_id,
             )
@@ -1418,7 +1407,6 @@ async def _run_tool_task(
         return {
             "action": "cancelled",
             "node_id": tool_name,
-            "summary": "任务已取消",
         }
 
     # [AutoC 2026-05-31] Why: standalone tool tasks must collect files from both
@@ -1433,11 +1421,6 @@ async def _run_tool_task(
     else:
         tool_attachments = []
 
-    # [summary-args 2026-05-19] Why: standalone tool tasks emit the same compact
-    # handoff_progress row as AI-driven tools. How: pass the task arguments into
-    # summarize_result(). Purpose: make tool-node logs include the command, query,
-    # or other key parameters without changing the surrounding message format.
-    summary = summarize_result(tool_name, result, args=arguments)
     # [AutoC 2026-05-31] Why: standalone tool execution should preserve the same
     # result_format metadata path used by AI-driven tool calls. How: fetch the
     # registry spec for the executed tool and pass it to result_to_raw(). Purpose:
@@ -1449,16 +1432,14 @@ async def _run_tool_task(
     raw_inline = raw
 
     await kctx.emit_event("handoff_progress", {
-        "message": f"[tool] {tool_name}: {summary}",
+        "message": f"[tool] {tool_name} 完成",
         "task_id": task_id, "tool_name": tool_name,
     })
 
     return {
         "action": "finish",
         "node_id": tool_name,
-        "summary": summary,
         "result": {
-            "summary": summary,
             "text": raw_inline,
             "attachments": tool_attachments,
             "format": fmt,

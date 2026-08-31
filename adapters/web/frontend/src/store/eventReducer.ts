@@ -367,7 +367,7 @@ function applyInboundMessage(state: ChatState, event: SupervisorEvent): ChatStat
   const source: MessageSource = {
     inboundSeq,
     // [AutoC 2026-06-04] Why: dispatch-result inbound payloads now use explicit
-    // child_* metadata plus caller_node_id and summary. How: prefer the new fields and
+    // child_* metadata plus caller_node_id. How: prefer the new fields and
     // keep legacy task_id/node_id fallbacks for older event logs. Purpose: realtime
     // callback cards render from structured data without parsing localized text.
     taskId: childTaskId || undefined,
@@ -375,7 +375,6 @@ function applyInboundMessage(state: ChatState, event: SupervisorEvent): ChatStat
     nodeId: childNodeId || undefined,
     childNodeId: childNodeId || undefined,
     callerNodeId: getString(payload.caller_node_id) || undefined,
-    summary: getString(payload.summary) || undefined,
     nodeName: getString(payload.node_name) || undefined,
     branchSessionId: getString(payload.branch_session_id) || undefined,
     parentSessionId: getString(payload.parent_session_id) || undefined,
@@ -690,7 +689,6 @@ function applyToolCallEnd(state: ChatState, event: SupervisorEvent): ChatState {
     index: getNumber(payload.index),
     name: getString(payload.tool_name) || getString(payload.name),
     status: normalizeToolStatus(payload.status),
-    summary: getString(payload.summary),
     result,
     rawInline: getString(payload.raw_inline),
     format: getString(payload.format),

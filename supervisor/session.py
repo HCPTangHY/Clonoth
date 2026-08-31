@@ -1158,9 +1158,6 @@ class SessionMixin:
                 _caller_node_id = str(msg.meta.get("caller_node_id") or "").strip()
                 if _caller_node_id:
                     entry["caller_node_id"] = _caller_node_id
-                _dispatch_summary = str(msg.meta.get("summary") or "").strip()
-                if _dispatch_summary:
-                    entry["summary"] = _dispatch_summary
                 # [2026-06-06] Why: preempt messages are stored with meta.preempt=True
                 # by the engine preempt handler. How: forward the flag so the frontend
                 # can render them with the inline preempt card style during history
@@ -1198,10 +1195,6 @@ class SessionMixin:
                 if _result_format:
                     entry["format"] = _result_format
                     entry["tool_result_format"] = _result_format
-                _result_summary = str(msg.meta.get("tool_result_summary") or msg.meta.get("summary") or "").strip()
-                if _result_summary:
-                    entry["tool_summary"] = _result_summary
-                    entry["tool_result_summary"] = _result_summary
                 _result_elapsed = msg.meta.get("tool_result_elapsed_ms", msg.meta.get("elapsed_ms"))
                 if isinstance(_result_elapsed, (int, float)):
                     entry["elapsed_ms"] = _result_elapsed

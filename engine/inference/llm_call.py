@@ -276,7 +276,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     # [硬取消-场景2] 流式输出中取消：不将未完成的 assistant 消息存入 history。
                     # 调用方 ai_step.py 收到 TaskAction 后直接 return，
                     # 不执行 messages.append / _shadow_write，history 停留在上一轮完整状态。
-                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
+                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id)
                 if not ls.preempt_after_step and ls.preempt_inject_info is None:
                     _pi_s = await ls.rctx.check_preempted()
                     if _pi_s.get("preempted"):
@@ -366,7 +366,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
                     _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
                     # [硬取消-场景2] 非流式调用中取消：同上，不存盘未完成的 assistant 消息。
-                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
+                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id)
                 if not ls.preempt_after_step and ls.preempt_inject_info is None:
                     _pi_n = await ls.rctx.check_preempted()
                     if _pi_n.get("preempted"):
@@ -433,7 +433,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     # Phase 1: Signal — 重试等待期间取消，发射 end 信号
                     _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
                     _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
-                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
+                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id)
                 if not ls.preempt_after_step and ls.preempt_inject_info is None:
                     _pi_r = await ls.rctx.check_preempted()
                     if _pi_r.get("preempted"):
@@ -516,5 +516,4 @@ def _build_failure_action(ls: _LoopState, resp, step: int, retry_attempt: int = 
         action=ACTION_FAIL, node_id=ls.node.id,
         error=_fail_msg,
         context_ref=ctx_ref,
-        summary=_short(_fail_msg, 240),
     )

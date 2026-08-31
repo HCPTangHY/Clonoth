@@ -198,7 +198,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         })
 
         ctx_ref = _persist_ctx(ls, step + 1)
-        summary_text = str(args.get("summary") or "").strip()
         final_atts = []
         if terminal_name == "finish":
             _selected_paths = args.get("attachment_paths")
@@ -233,7 +232,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             "llm_request_id": getattr(ls.rctx, "current_llm_request_id", ""),
             "tool_result_raw_inline": "ok",
             "tool_result_format": "text",
-            "tool_result_summary": summary_text,
         }
         if final_atts:
             _tool_meta_patch["attachments"] = list(final_atts)
@@ -241,7 +239,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         _emit_pseudo_tool_result(ls, pseudo_call, "ok", meta_patch=_tool_meta_patch)
 
         result_payload = {
-            "summary": summary_text,
             "text": result_text,
         }
         if terminal_name == "finish":
@@ -251,7 +248,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             node_id=ls.node.id,
             result=result_payload,
             context_ref=ctx_ref,
-            summary=_short(summary_text, 240) if summary_text else "",
             llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
         )
 
@@ -264,7 +260,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             "tool_result_attachments": switch_atts,
             "tool_result_raw_inline": "ok",
             "tool_result_format": "text",
-            "tool_result_summary": "switch_node",
         })
         ctx_ref = _persist_ctx(ls, step + 1)
         switch_target = str(args.get("target") or "").strip()
@@ -293,7 +288,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 "attachments": switch_atts,
             },
             context_ref=ctx_ref,
-            summary=f"switch → {switch_target or 'default'}",
             llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
         )
 

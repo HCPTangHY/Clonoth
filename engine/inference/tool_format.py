@@ -937,7 +937,7 @@ def repair_tool_result_pairing_with_stats(
                     c.get('text', '') for c in existing
                     if isinstance(c, dict) and c.get('type') == 'text'
                 )
-            summary = ' '.join(text_parts)
+            merged_text = ' '.join(text_parts)
             ast_msg['content'] = (existing.strip() + '\n' + summary).strip() if existing.strip() else summary
         pending_assistant_result_idx = -1
 

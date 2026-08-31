@@ -39,7 +39,6 @@ from ..tool_step import (
     # 格式化与兑底截断所需的最小导入。
     get_tool_inline_limit,
     result_to_raw,
-    summarize_result,
     truncate_tool_result,
 )
 from clonoth_runtime import get_int, load_runtime_config
@@ -381,7 +380,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
             ctx_ref = _persist_ctx(ls, step + 1)
             return TaskAction(
                 action=ACTION_PREEMPTED, node_id=ls.node.id,
-                context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
+                context_ref=ctx_ref,
             )
 
     # finish/ask 最后执行（同轮真实工具已完成）
@@ -538,7 +537,6 @@ async def _execute_real_tools(
                 "raw_inline": _blocked_msg,
                 "truncated": False,
                 "ref": "",
-                "summary": _blocked_msg[:200],
             })
             continue
 
@@ -608,7 +606,6 @@ async def _execute_real_tools(
                 "raw_inline": _blocked_msg,
                 "truncated": False,
                 "ref": "",
-                "summary": _blocked_msg[:200],
                 "elapsed_ms": _t_elapsed_ms,
                 "attachments": [],
             })
@@ -618,7 +615,6 @@ async def _execute_real_tools(
                 "tool_call_id": _rtc.get("id", ""),
                 "tool_name": _t_name,
                 "status": "blocked",
-                "summary": _blocked_msg[:200],
                 "result": None,
                 "raw_inline": _blocked_msg,
                 "format": "text",
@@ -637,7 +633,6 @@ async def _execute_real_tools(
             # 执行策略选择后台运行：写占位 entry，发 async_started 结束事件，
             # 真实结果由策略插件通过 preempt 异步回传。
             _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1)
-            _async_summary = str(_t_result.get("summary") or "")
             _t_raw_inline = str(_t_result.get("raw_inline") or "")
             _tool_entries.append({
                 "id": _rtc.get("id", ""),
@@ -647,7 +642,6 @@ async def _execute_real_tools(
                 "raw_inline": _t_raw_inline,
                 "truncated": False,
                 "ref": "",
-                "summary": _async_summary,
                 "elapsed_ms": _t_elapsed_ms,
                 "attachments": [],
             })
@@ -662,14 +656,13 @@ async def _execute_real_tools(
                 "tool_call_id": _rtc.get("id", ""),
                 "tool_name": _t_name,
                 "status": "async_started",
-                "summary": _async_summary,
                 "result": None,
                 "raw_inline": _t_raw_inline,
                 "format": "text",
                 "elapsed_ms": _t_elapsed_ms,
             })
             await ls.rctx.emit_event("handoff_progress", {
-                "message": f"[{ls.node.id}] {_t_name}: {str(_t_result.get('handoff_message') or _async_summary)}",
+                "message": f"[{ls.node.id}] {_t_name}: {str(_t_result.get('handoff_message') or '异步执行已启动')}",
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
             })
@@ -679,12 +672,6 @@ async def _execute_real_tools(
         # 模型下次看到的是「我调了工具但被用户取消了」而非 tool_use 悬空无响应。
         _t_cancelled = isinstance(_t_result, dict) and _t_result.get("cancelled")
 
-        # [summary-args 2026-05-19] Why: handoff_progress keeps the legacy
-        # "[node] tool: summary" format, so argument detail must come from the
-        # summary itself. How: pass the parsed tool arguments alongside the result.
-        # Purpose: show commands, queries, and target paths without changing the
-        # event payload shape.
-        _t_summary = summarize_result(_t_name, _t_result, args=_t_args)
         # [AutoC 2026-05-31] Why: structural result routing also supports an
         # optional spec-level result_format override. How: read the spec from the
         # active registry immediately after execution and pass it to result_to_raw.
@@ -752,7 +739,6 @@ async def _execute_real_tools(
             "raw_inline": _t_raw_inline,
             "truncated": _t_truncated,
             "ref": _t_ref,
-            "summary": _t_summary,
             "elapsed_ms": _t_elapsed_ms,
             "attachments": list(_tool_atts[_tool_atts_start:]),
             # [AutoC 2026-06-15] Why: shadow write only persists raw_inline text,
@@ -775,9 +761,8 @@ async def _execute_real_tools(
             "tool_call_id": _rtc.get("id", ""),
             "tool_name": _t_name,
             "status": "cancelled" if _t_cancelled else ("error" if (isinstance(_t_result, dict) and _t_result.get("error")) else "success"),
-            "summary": _t_summary,
             # [WS tool result fields 2026-05-19] Why: SDKs and adapters need the
-            # complete returned object, not only a short summary. How: carry the
+            # complete returned object. How: carry the
             # original result plus the same formatted inline representation that is
             # appended to the model transcript. Purpose: leave truncation decisions
             # to consuming adapters while preserving the raw engine result here.
@@ -801,7 +786,7 @@ async def _execute_real_tools(
             break
 
         await ls.rctx.emit_event("handoff_progress", {
-            "message": f"[{ls.node.id}] {_t_name}: {_t_summary}",
+            "message": f"[{ls.node.id}] {_t_name}",
             "node_id": ls.node.id,
             "task_id": ls.rctx.task_id,
         })
@@ -844,7 +829,6 @@ def _persist_tool_results(
             _tool_meta["tool_result_structured"] = _structured
         _tool_meta["tool_result_raw_inline"] = str(_entry.get("raw_inline") or "")
         _tool_meta["tool_result_format"] = str(_entry.get("format") or "")
-        _tool_meta["tool_result_summary"] = str(_entry.get("summary") or "")
         if _entry.get("elapsed_ms") is not None:
             _tool_meta["tool_result_elapsed_ms"] = _entry.get("elapsed_ms")
         _entry_attachments = _entry.get("attachments")
@@ -1221,5 +1205,4 @@ async def run_ai_node(
         action=ACTION_FAIL, node_id=ls.node.id,
         error="达到最大步数限制。",
         context_ref=ctx_ref,
-        summary="max_steps reached",
     )

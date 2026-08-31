@@ -43,7 +43,7 @@ HOOK_POINTS: dict[str, str] = {
         "真实工具执行策略点：结构化 start 事件发出后、实际执行前触发。"
         "extra: loop_state/tool_name/tool_args/tool_ctx/spec/call_index/t0。"
         "handler 可返回 execution（awaitable 或已完成值）：解析为工具结果，或 "
-        "{'async_started': True, 'async_id', 'summary', 'raw_inline', 'handoff_message'} "
+        "{'async_started': True, 'async_id', 'raw_inline', 'handoff_message'} "
         "标记（循环写占位 entry、发 tool_call_end[async_started]、真实结果经 preempt 回传）。"
         "首个非空 execution 生效；是否允许执行由 before_tool_call 决定，此点不承担授权。"
     ),

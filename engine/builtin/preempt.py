@@ -58,7 +58,6 @@ class PreemptChecker:
                 action=TaskAction(
                     action=ACTION_CANCELLED,
                     node_id=ls.node.id,
-                    summary="任务已被用户取消。",
                 )
             )
 
@@ -175,7 +174,7 @@ class PreemptChecker:
             ctx_ref = _persist_ctx(ls, int(ctx.step) + 1)
             return hook_result(action=TaskAction(
                 action=ACTION_PREEMPTED, node_id=ls.node.id,
-                context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
+                context_ref=ctx_ref,
             ))
 
         return None

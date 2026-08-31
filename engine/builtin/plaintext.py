@@ -54,7 +54,6 @@ class PlaintextRetryHandler:
                 action=ACTION_PREEMPTED,
                 node_id=ls.node.id,
                 context_ref=ctx_ref,
-                summary="任务被软打断，上下文已保存。",
             ))
 
         if getattr(ls.node, "output_mode", "tool_only") == "hybrid":
@@ -77,7 +76,6 @@ class PlaintextRetryHandler:
             node_id=ls.node.id,
             error=f"模型未使用 finish 工具，裸文本不被内核认可为合法结束。原始文本: {_short(text, 200)}",
             context_ref=ctx_ref,
-            summary="plaintext_without_finish",
         ))
 
 
@@ -112,5 +110,4 @@ def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskActio
             "implicit_finish": True,
         },
         context_ref=ctx_ref,
-        summary=_short(text, 240),
     )

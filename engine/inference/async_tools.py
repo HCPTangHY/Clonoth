@@ -28,7 +28,6 @@ from ..tool_step import (
     artifact_enabled,
     get_tool_inline_limit,
     result_to_raw,
-    summarize_result,
     truncate_tool_result,
     write_artifact,
 )
@@ -188,7 +187,6 @@ async def _deliver_async_result(
         if error is not None:
             raise error
         _elapsed = time.monotonic() - started_at
-        _summary = summarize_result(tool_name, result, args=tool_args)
         _tool_spec = registry.get_spec(tool_name)
         _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
         if isinstance(raw, str):
@@ -209,7 +207,7 @@ async def _deliver_async_result(
 
         preempt_text = (
             f'✅ Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
-            f'\nSummary: {_summary}\nResult:\n{raw}'
+            f'\nResult:\n{raw}'
         )
 
         attachments: list[str] = []

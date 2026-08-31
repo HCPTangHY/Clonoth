@@ -203,7 +203,6 @@ def _finish_spec() -> dict:
                 "The caller or user will see it and respond.\n\n"
                 "Parameters:\n"
                 "- text: The actual deliverable content, or a question if you need more info.\n"
-                "- summary: Brief summary (optional) for the upstream node.\n"
                 "- attachment_paths: File paths to attach (optional).\n\n"
                 "Do not include internal protocol markers or debug info in text."
             ),
@@ -213,10 +212,6 @@ def _finish_spec() -> dict:
                     "text": {
                         "type": "string",
                         "description": "最终结果文本，或需要补充信息时的具体问题。",
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "简要摘要（可选），帮助上游快速了解结果。",
                     },
                     "attachment_paths": {
                         "type": "array",
@@ -254,8 +249,7 @@ def _ask_spec() -> dict:
                 "The upstream will see your question and can respond, which will create a new "
                 "task for you to continue working.\n\n"
                 "Parameters:\n"
-                "- text: Your specific question or request for information.\n"
-                "- summary: Brief summary (optional) for the upstream node."
+                "- text: Your specific question or request for information."
             ),
             "parameters": {
                 "type": "object",
@@ -263,10 +257,6 @@ def _ask_spec() -> dict:
                     "text": {
                         "type": "string",
                         "description": "Your question or request for additional information.",
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "Brief summary for the upstream node.",
                     },
                 },
                 "required": ["text"],

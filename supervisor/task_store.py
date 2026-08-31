@@ -245,15 +245,7 @@ class TaskStoreMixin:
         text = str(payload.get("text") or "").strip()
         has_attachments = isinstance(payload.get("attachments"), list) and bool(payload.get("attachments"))
         # [AutoC 2026-06-04] Why: dispatch_result.text is now the raw child result and
-        # can legitimately be empty when a child only returns summary. How: treat a
-        # dispatch_result summary as sufficient inbound content for task creation.
-        # Purpose: runner can still deliver the summary to the LLM through the new
-        # LLM-only English prefix while ConversationStore keeps text empty.
-        has_dispatch_summary = (
-            str(payload.get("message_type") or "").strip() == "dispatch_result"
-            and bool(str(payload.get("summary") or "").strip())
-        )
-        if not text and not has_attachments and not has_dispatch_summary:
+        if not text and not has_attachments:
             return None
         # 优先级: session 覆盖（AI switch） > 前端指定 > session 记录的 > 全局默认
         default_node = self._default_entry_node()
@@ -359,13 +351,6 @@ class TaskStoreMixin:
         _inbound_message_type = str(payload.get("message_type") or "").strip()
         if _inbound_message_type:
             inbound_metadata["inbound_message_type"] = _inbound_message_type
-        _inbound_summary = str(payload.get("summary") or "").strip()
-        if _inbound_summary:
-            # [AutoC 2026-06-04] Why: dispatch result summaries now live beside raw
-            # text instead of inside backend presentation prose. How: copy summary into
-            # runner input under an inbound_* key. Purpose: runner can build the LLM-only
-            # English prefix without changing the ConversationStore content field.
-            inbound_metadata["inbound_summary"] = _inbound_summary
         _inbound_child_session_id = str(payload.get("child_session_id") or "").strip()
         if _inbound_child_session_id:
             inbound_metadata["inbound_child_session_id"] = _inbound_child_session_id

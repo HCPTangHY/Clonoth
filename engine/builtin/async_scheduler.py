@@ -38,12 +38,11 @@ PLUGIN_META = {
 }
 
 
-def _async_marker(async_id: str, summary: str, raw_inline: str, handoff_message: str) -> dict[str, Any]:
+def _async_marker(async_id: str, raw_inline: str, handoff_message: str) -> dict[str, Any]:
     """Build the async_started resolution the loop renders as a placeholder."""
     return {
         "async_started": True,
         "async_id": async_id,
-        "summary": summary,
         "raw_inline": raw_inline,
         "handoff_message": handoff_message,
     }
@@ -120,14 +119,13 @@ class AsyncScheduler:
                 ),
                 name=f"async_tool_{tool_name}_{async_id}",
             )
-            summary = f"异步执行已启动 (id: {async_id})，结果将通过 preempt 自动回传"
             raw_inline = (
                 f'⏳ Async tool "{tool_name}" started (id: {async_id}). '
                 f'Result will be delivered via preempt when ready.'
             )
             return hook_result(
                 modified=True,
-                channels={"execution": _async_marker(async_id, summary, raw_inline, "异步执行已启动")},
+                channels={"execution": _async_marker(async_id, raw_inline, "异步执行已启动")},
             )
 
         # [AutoC 2026-06-27] Why: execute_command may run longer than the model
@@ -188,11 +186,10 @@ class AsyncScheduler:
                 ),
                 name=f"async_upgrade_{tool_name}_{async_id}",
             )
-            summary = f"执行超过 {threshold:.1f}s，已自动转为异步 (id: {async_id})，结果将通过 preempt 自动回传"
             raw_inline = (
                 f'⏳ Tool "{tool_name}" exceeded {threshold:.1f}s and was '
-                f'auto-upgraded to async (id: {async_id}). Result will be delivered via preempt when ready.'
+                f'auto-upgraded to async (id: {async_id}). Result will be delivered via preempt when ready. You can finish this task or continue working on other things.'
             )
-            return _async_marker(async_id, summary, raw_inline, "已自动转为异步执行")
+            return _async_marker(async_id, raw_inline, "已自动转为异步执行")
 
         return hook_result(modified=True, channels={"execution": _adaptive()})

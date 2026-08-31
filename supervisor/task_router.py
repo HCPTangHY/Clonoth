@@ -1027,7 +1027,6 @@ class TaskRouterMixin:
             entry: dict[str, Any] = {
                 "kind": t.kind.value,
                 "status": act,
-                "summary": str(t.result.get("summary") or tr.get("summary") or ""),
             }
 
             if t.kind == TaskKind.node:
@@ -1133,7 +1132,7 @@ class TaskRouterMixin:
             return
         if not isinstance(fallback_result, dict):
             fallback_result = {}
-        text = str(fallback_result.get("text") or fallback_result.get("summary") or "").strip()
+        text = str(fallback_result.get("text") or "").strip()
         atts = fallback_result.get("attachments") if isinstance(fallback_result.get("attachments"), list) else None
         # [Fix] finish(text="") 空文本时也产出 outbound_message 事件。
         # 原先 `if text or atts:` 导致空文本 finish 不发事件，
@@ -1170,7 +1169,6 @@ class TaskRouterMixin:
         # Purpose: the LLM and each client can render their own localized wrapper
         # without parsing or persisting backend-generated Chinese prose.
         result_text = str(fallback_result.get("text") or "").strip()
-        result_summary = str(fallback_result.get("summary") or "").strip()
         caller_node = str(task.input.get("_caller_node_id") or "").strip()
         # [AutoC 2026-06-03] Why: the web callback card needs a stable target for
         # child-session navigation. How: read the child session created for the
@@ -1209,8 +1207,6 @@ class TaskRouterMixin:
 
         # [AutoC 2026-07-05] 无 branch 模式下优先 preempt running task，避免并发写同一 ConversationStore
         _dispatch_preempt_text = result_text
-        if result_summary:
-            _dispatch_preempt_text = f"{result_summary}\n{result_text}" if result_text else result_summary
         branchless_task = self._is_branchless_running_task_locked(route_session_id)
         if branchless_task is not None:
             branchless_task.preempt_requested = True
@@ -1242,7 +1238,6 @@ class TaskRouterMixin:
             "conversation_key": conv_key,
             "message_id": msg_id,
             "text": result_text,
-            "summary": result_summary,
             "message_type": "dispatch_result",
             "caller_node_id": caller_node,
             "child_node_id": task.node_id,
@@ -1321,7 +1316,6 @@ class TaskRouterMixin:
         # and summary separate from caller/child ids. Purpose: this path cannot persist
         # backend-localized notification text while the legacy path has been cleaned.
         result_text = str(fallback_result.get("text") or "").strip()
-        result_summary = str(fallback_result.get("summary") or "").strip()
 
         result_atts = (
             fallback_result.get("attachments")
@@ -1331,8 +1325,6 @@ class TaskRouterMixin:
 
         # [AutoC 2026-07-05] 无 branch 模式下优先 preempt running task
         _origin_preempt_text = result_text
-        if result_summary:
-            _origin_preempt_text = f"{result_summary}\n{result_text}" if result_text else result_summary
         branchless_task = self._is_branchless_running_task_locked(target_session_id)
         if branchless_task is not None:
             branchless_task.preempt_requested = True
@@ -1364,7 +1356,6 @@ class TaskRouterMixin:
             "conversation_key": conv_key,
             "message_id": msg_id,
             "text": result_text,
-            "summary": result_summary,
             "message_type": "dispatch_result",
             "caller_node_id": caller_node,
             "child_node_id": task.node_id,

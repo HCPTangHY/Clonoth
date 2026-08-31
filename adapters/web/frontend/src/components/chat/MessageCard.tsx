@@ -71,7 +71,7 @@ function getDispatchCallbackTitle(message: WsMessage): string {
   const source = message.source || {};
   const nodeId = (source.childNodeId || source.nodeId || '').trim();
   const callerNodeId = (source.callerNodeId || '').trim();
-  const hasStructuredSource = Boolean(nodeId || callerNodeId || source.summary || source.childSessionId || source.childTaskId);
+  const hasStructuredSource = Boolean(nodeId || callerNodeId || source.childSessionId || source.childTaskId);
   if (!hasStructuredSource) return '子节点回调';
   const displayNodeId = nodeId || '未知';
   return callerNodeId ? `${callerNodeId} 委派的 ${displayNodeId} 已完成` : `子节点 ${displayNodeId} 已完成`;
@@ -118,11 +118,6 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
   // backend-provided source.childSessionId and leave normal messages without an
   // action. Purpose: navigation stays structured and does not parse the callback text.
   const childSessionId = message.role === 'dispatch_callback' ? message.source.childSessionId?.trim() || '' : '';
-  // Why: child result summaries moved out of backend text into structured source
-  // metadata. How: render source.summary directly below the dynamic dispatch title.
-  // Purpose: users see the summary without duplicating it in payload.text.
-  const dispatchSummary = message.role === 'dispatch_callback' ? message.source.summary?.trim() || '' : '';
-
   // Why: consecutive assistant cards look fragmented with repeated headers and
   // borders. How: hide the top border when the previous message is also assistant,
   // hide the bottom border when the next message is also assistant, and suppress the
@@ -192,12 +187,6 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
               </div>
             )}
           </header>
-        )}
-
-        {dispatchSummary && (
-          <div className="mb-2 text-xs text-purple-700">
-            {dispatchSummary}
-          </div>
         )}
 
         <div className={BLOCK_STACK_CLASS}>

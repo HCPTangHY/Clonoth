@@ -24,14 +24,6 @@ def _fail(node_id: str, error: str) -> dict[str, Any]:
     return {"action": "fail", "node_id": node_id, "error": str(error)}
 
 
-def _coerce_summary(summary: Any) -> str:
-    """Coerce optional helper summaries to the existing protocol string shape."""
-    # [AutoC 2026-06-09] Why: script authors may pass None or non-string summary
-    # values. How: keep None as an empty string and stringify other values.
-    # Purpose: finish and ask helpers always return stable serializable payloads.
-    return "" if summary is None else str(summary)
-
-
 def _allowed_builtins() -> dict[str, Any]:
     """Return the deliberately small builtin set exposed to inline scripts."""
     # [AutoC 2026-06-09] Why: Phase 1 script nodes should be deterministic logic
@@ -61,38 +53,32 @@ async def run_script_node(*, rctx, node, text, attachments, input_data) -> dict:
     if not isinstance(script_attachments, list):
         script_attachments = []
 
-    def _make_finish(text, summary=None, attachments=None):
-        summary_text = _coerce_summary(summary)
-        result = {"text": str(text), "summary": summary_text}
+    def _make_finish(text, attachments=None):
+        result = {"text": str(text)}
         if isinstance(attachments, list) and attachments:
             result["attachments"] = attachments
         return {
             "action": "finish",
             "node_id": node_id,
             "result": result,
-            "summary": summary_text,
         }
 
-    def _make_ask(text, summary=None):
-        summary_text = _coerce_summary(summary)
+    def _make_ask(text):
         return {
             "action": "ask",
             "node_id": node_id,
-            "result": {"text": str(text), "summary": summary_text},
-            "summary": summary_text,
+            "result": {"text": str(text)},
         }
 
-    def _make_reject(reason, summary=None):
+    def _make_reject(reason):
         # [AutoC 2026-06-10] Why: output chain quality scripts must reject bad
         # upstream output without using ask's clarification semantics. How: expose
         # a reject helper with the same result shape as finish/ask. Purpose: script
         # QA nodes can send a clear reject action back to the chain entry.
-        summary_text = _coerce_summary(summary)
         return {
             "action": "reject",
             "node_id": node_id,
-            "result": {"text": str(reason), "summary": summary_text},
-            "summary": summary_text,
+            "result": {"text": str(reason)},
         }
 
     script_globals: dict[str, Any] = {

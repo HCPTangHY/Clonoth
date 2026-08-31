@@ -58,7 +58,6 @@ class TaskAction:
     # Child Session 隔离（Phase B）：子节点使用的 child session ID。
     # 非空时表示此 task 的消息存储在 child session 的 JSONL 中，而非 snapshot。
     child_session_id: str = ""
-    summary: str = ""  # 简短摘要（用于事件日志、进度展示）
     # [AutoC 2026-06-04] Why: supervisor emits outbound_message after the engine
     # task returns, but the frontend must replace the card for the specific LLM
     # request that produced finish/ask. How: carry that request id through the task
@@ -70,7 +69,6 @@ class TaskAction:
             "action": self.action,
             "node_id": self.node_id,
             "context_ref": self.context_ref,
-            "summary": self.summary,
         }
         if self.llm_request_id:
             d["llm_request_id"] = self.llm_request_id
@@ -86,8 +84,8 @@ class TaskAction:
             # [AutoC 2026-05-31] Why: ask carries the same result payload shape as
             # finish in Phase 0. How: serialize both actions through the same
             # branch. Purpose: supervisors can receive action="ask" without losing
-            # text/summary fields.
-            # [AutoC 2026-06-10] Why: reject returns the same text/summary payload
+            # text fields.
+            # [AutoC 2026-06-10] Why: reject returns the same text payload
             # as finish and ask. How: include ACTION_REJECT in this serialization
             # branch. Purpose: supervisor receives the reject reason intact.
             d["result"] = dict(self.result)

@@ -1229,7 +1229,7 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
     ? getCompactPreview(tool.summary)
     : tool.status === 'args_streaming'
       ? getCompactPreview(argumentDisplay?.text || '')
-      : '';
+      : getCompactPreview(getToolInlineSummary(tool));
   const approvalDetails = getApprovalDetailsRecord(tool);
   const approvalOperation = getApprovalOperation(tool);
   const canExpand = Boolean(argumentDisplay || resultDisplay || tool.taskId || tool.nodeId || tool.nodeName || tool.approvalDetails);
