@@ -152,12 +152,17 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     raw_base_url = str(data.get("base_url") or "").strip()
     base_url = resolve_env_ref(raw_base_url) if raw_base_url else ""
 
+    # [AutoC 2026-08-31] "allow" 作为 "allowlist" 别名。Why: dict 形态给出
+    # allow 列表时 mode 写 "allow" 是直观写法（mini 节点配置实测踩坑：
+    # mode="allow" 被静默回退成 none，execute_command 未注入）。
+    # How: 归一化在进入集合判定前完成。Purpose: 错误配置不再静默吞掉工具。
     ta_raw = data.get("tool_access")
     if isinstance(ta_raw, str):
-        m = ta_raw.strip().lower()
+        m = {"allow": "allowlist"}.get(ta_raw.strip().lower(), ta_raw.strip().lower())
         ta = ToolAccess(mode=m if m in {"none", "all", "allowlist"} else "none")
     elif isinstance(ta_raw, dict):
-        m = str(ta_raw.get("mode") or "none").strip().lower()
+        _raw_m = str(ta_raw.get("mode") or "none").strip().lower()
+        m = {"allow": "allowlist"}.get(_raw_m, _raw_m)
         allow = [
             str(x).strip()
             for x in (ta_raw.get("allow") or [])
@@ -168,7 +173,13 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
             for x in (ta_raw.get("deny") or [])
             if isinstance(x, str) and x.strip()
         ]
-        ta = ToolAccess(mode=m if m in {"none", "all", "allowlist"} else "none", allow=allow, deny=deny)
+        if m not in {"none", "all", "allowlist"}:
+            # [AutoC 2026-08-31] 非法 mode 静默回退 none 会把 allow 列表一起
+            # 吞掉（实测：mode="allow" 的 mini 节点 execute_command 未注入，
+            # 排查链路很长）。告警让配置错误在日志中立即可见。
+            logger.warning("node %r: invalid tool_access.mode %r, falling back to 'none'", nid, _raw_m)
+            m = "none"
+        ta = ToolAccess(mode=m, allow=allow, deny=deny)
     else:
         ta = ToolAccess()
 
