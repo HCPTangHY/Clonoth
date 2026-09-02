@@ -123,6 +123,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const taskActivities = useChatStore(state => state.taskActivities);
   const [tab, setTab] = useState<'tasks' | 'async'>('tasks');
+  const [showAsyncHistory, setShowAsyncHistory] = useState(false);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [asyncTools, setAsyncTools] = useState<AsyncToolEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -233,13 +234,34 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
         )}
 
         {tab === 'async' ? (
-          asyncTools.length === 0 ? (
+          (() => {
+            // 默认只显示运行中的条目；已完成/失败/丢失的归入历史，按需展开。
+            const runningEntries = asyncTools.filter(t => t.status === 'running');
+            const historyEntries = asyncTools.filter(t => t.status !== 'running');
+            const visibleEntries = showAsyncHistory ? asyncTools : runningEntries;
+            return (
+              <>
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+                    运行中 {runningEntries.length} · 历史 {historyEntries.length}
+                  </span>
+                  {historyEntries.length > 0 && (
+                    <button
+                      className="font-mono text-[0.6rem] text-blue-600 hover:underline"
+                      onClick={() => setShowAsyncHistory(v => !v)}
+                      type="button"
+                    >
+                      {showAsyncHistory ? '收起历史' : `显示历史 (${historyEntries.length})`}
+                    </button>
+                  )}
+                </div>
+                {visibleEntries.length === 0 ? (
             <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-4 text-center text-[0.75rem] text-[var(--duties-secondary)]">
               {loading ? '正在加载异步工具…' : '没有异步工具记录'}
             </div>
           ) : (
             <ul className="space-y-2">
-              {asyncTools.map(entry => (
+              {visibleEntries.map(entry => (
                 <li
                   className="flex flex-col gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2.5 text-[0.7rem]"
                   key={entry.async_id}
@@ -290,7 +312,10 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
                 </li>
               ))}
             </ul>
-          )
+                )}
+              </>
+            );
+          })()
         ) : loading && tasks.length === 0 ? (
           <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-4 text-center text-[0.75rem] text-[var(--duties-secondary)]">
             正在加载活跃任务…
