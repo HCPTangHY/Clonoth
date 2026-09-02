@@ -384,6 +384,30 @@ export async function cancelTask(_adminToken: string, taskId: string): Promise<v
   if (!resp.ok) throw new Error(`Cancel failed: ${resp.status}`);
 }
 
+// ── Async tools (2026-09-02) ──
+// Supervisor 影子清单：engine 在启动/完成/失败时上报，重启后 running → lost。
+export interface AsyncToolEntry {
+  async_id: string;
+  tool_name: string;
+  session_id: string;
+  task_id: string;
+  node_id: string;
+  worker_id: string;
+  args_summary: string;
+  upgraded_from: string;
+  status: 'running' | 'done' | 'failed' | 'lost';
+  started_at: string;
+  finished_at: string;
+  elapsed_sec: number | null;
+  error: string;
+}
+
+export async function fetchAsyncTools(): Promise<AsyncToolEntry[]> {
+  const resp = await _fetch('/admin/async_tools');
+  if (!resp.ok) throw new Error(`Failed to fetch async tools: ${resp.status}`);
+  return resp.json();
+}
+
 // ── Admin auth ──
 
 export interface AuthStatus {

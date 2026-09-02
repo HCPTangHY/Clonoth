@@ -4,7 +4,7 @@
 // shared Modal shell. Purpose: DRY modal UX, reusable from any page.
 import { useEffect, useState } from 'react';
 
-import { cancelTask, fetchActiveTasks, type ActiveTask } from '../../api/supervisorClient';
+import { cancelTask, fetchActiveTasks, fetchAsyncTools, type ActiveTask, type AsyncToolEntry } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
@@ -94,10 +94,37 @@ function taskTitle(task: ActiveTask): string {
   return task.node_id || `task:${shortId(task.task_id)}`;
 }
 
+function asyncToolStatusClass(status: AsyncToolEntry['status']): string {
+  if (status === 'running') return 'animate-pulse border-green-500/40 bg-green-500/10 text-green-700';
+  if (status === 'done') return 'border-gray-400/40 bg-gray-400/10 text-gray-600';
+  if (status === 'failed') return 'border-red-500/40 bg-red-500/10 text-red-700';
+  return 'border-orange-500/40 bg-orange-500/10 text-orange-700'; // lost
+}
+
+function asyncToolStatusLabel(status: AsyncToolEntry['status']): string {
+  if (status === 'running') return '运行中';
+  if (status === 'done') return '已完成';
+  if (status === 'failed') return '失败';
+  return '已丢失';
+}
+
+function formatElapsed(entry: AsyncToolEntry): string {
+  const sec = entry.elapsed_sec;
+  if (sec == null || !Number.isFinite(sec)) return '';
+  if (sec < 60) return `${Math.floor(sec)}s`;
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const taskActivities = useChatStore(state => state.taskActivities);
+  const [tab, setTab] = useState<'tasks' | 'async'>('tasks');
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
+  const [asyncTools, setAsyncTools] = useState<AsyncToolEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [refreshTick, setRefreshTick] = useState(0);
@@ -119,9 +146,13 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
 
       try {
         setLoading(true);
-        const nextTasks = await fetchActiveTasks(adminToken);
+        // Why: both tabs share one polling cycle; fetching both lists on every tick
+        // keeps switching tabs free of a loading flash. Purpose: the async-tool
+        // shadow list and the task list age at the same rate.
+        const [nextTasks, nextAsyncTools] = await Promise.all([fetchActiveTasks(adminToken), fetchAsyncTools()]);
         if (!cancelled) {
           setTasks(nextTasks);
+          setAsyncTools(nextAsyncTools);
           setError('');
         }
       } catch (loadError) {
@@ -172,13 +203,95 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       title="活跃任务详情"
     >
       <div className="p-3">
+        {/* 标签页：活跃任务 / 异步工具 */}
+        <div aria-label="任务监控标签页" className="mb-3 flex border-b border-[var(--duties-border)]" role="tablist">
+          {([
+            { key: 'tasks', label: `活跃任务 ${tasks.length > 0 ? `(${tasks.length})` : ''}` },
+            { key: 'async', label: `异步工具 ${asyncTools.filter(t => t.status === 'running').length > 0 ? `(${asyncTools.filter(t => t.status === 'running').length})` : ''}` },
+          ] as const).map(item => (
+            <button
+              aria-selected={tab === item.key}
+              className={`-mb-px border-b-2 px-3 py-1.5 text-[0.7rem] transition-colors ${
+                tab === item.key
+                  ? 'border-blue-500 font-semibold text-[var(--duties-text)]'
+                  : 'border-transparent text-[var(--duties-secondary)] hover:text-[var(--duties-text)]'
+              }`}
+              key={item.key}
+              onClick={() => setTab(item.key)}
+              role="tab"
+              type="button"
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+
         {error && (
           <div className="mb-3 border border-orange-200 bg-orange-50 px-2.5 py-2 text-[0.65rem] text-orange-700">
             {error}
           </div>
         )}
 
-        {loading && tasks.length === 0 ? (
+        {tab === 'async' ? (
+          asyncTools.length === 0 ? (
+            <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-4 text-center text-[0.75rem] text-[var(--duties-secondary)]">
+              {loading ? '正在加载异步工具…' : '没有异步工具记录'}
+            </div>
+          ) : (
+            <ul className="space-y-2">
+              {asyncTools.map(entry => (
+                <li
+                  className="flex flex-col gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2.5 text-[0.7rem]"
+                  key={entry.async_id}
+                >
+                  {/* Row 1: tool + status */}
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-mono text-xs font-semibold text-[var(--duties-text)]">
+                        {entry.tool_name} <span className="text-[var(--duties-tertiary)]">#{entry.async_id}</span>
+                        {entry.upgraded_from === 'sync_timeout' && (
+                          <span className="ml-1 rounded-sm border border-blue-500/40 bg-blue-500/10 px-1 py-px text-[0.55rem] text-blue-700">超时转异步</span>
+                        )}
+                      </p>
+                      <p className="mt-0.5 truncate font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+                        {entry.node_id || '未知节点'} · task:{shortId(entry.task_id)}
+                      </p>
+                    </div>
+                    <span className={`flex-shrink-0 rounded-sm border px-1.5 py-0.5 font-mono text-[0.6rem] ${asyncToolStatusClass(entry.status)}`}>
+                      {asyncToolStatusLabel(entry.status)}
+                    </span>
+                  </div>
+                  {/* Row 2: args summary */}
+                  <p className="truncate text-[0.65rem] leading-4 text-[var(--duties-secondary)]" title={entry.args_summary || '无参数摘要'}>
+                    {entry.args_summary || '无参数摘要'}
+                  </p>
+                  {/* Row 3: metadata + actions */}
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+                    <span>{formatElapsed(entry) || '—'}</span>
+                    <span>{formatRelative(entry.started_at)}</span>
+                    {entry.error && <span className="truncate text-red-600" title={entry.error}>{entry.error}</span>}
+                    <div className="ml-auto flex gap-1">
+                      {entry.session_id && (
+                        <button
+                          aria-label={`查看异步工具 ${entry.async_id} 的 session`}
+                          className="rounded-sm border border-blue-500/40 bg-blue-500/10 px-2 py-1 font-mono text-[0.6rem] text-blue-700 transition-colors hover:bg-blue-500/20"
+                          onClick={() => {
+                            useViewStore.getState().closeSettings();
+                            useChatStore.getState().viewChildSession(entry.session_id, entry.task_id);
+                            onClose();
+                          }}
+                          type="button"
+                        >
+                          查看
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )
+        ) : loading && tasks.length === 0 ? (
           <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-4 text-center text-[0.75rem] text-[var(--duties-secondary)]">
             正在加载活跃任务…
           </div>
