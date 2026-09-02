@@ -22,6 +22,7 @@ from ..inference.async_tools import (
     _execute_registry_tool_with_span,
     _run_async_tool,
     _snapshot_tool_context,
+    report_async_tool_started,
 )
 
 
@@ -119,6 +120,10 @@ class AsyncScheduler:
                 ),
                 name=f"async_tool_{tool_name}_{async_id}",
             )
+            report_async_tool_started(
+                rctx=rctx, node_id=ls.node.id, async_id=async_id,
+                tool_name=tool_name, tool_args=tool_args,
+            )
             raw_inline = (
                 f'⏳ Async tool "{tool_name}" started (id: {async_id}). '
                 f'Result will be delivered via preempt when ready.'
@@ -185,6 +190,11 @@ class AsyncScheduler:
                     tool_call_id=tool_call_id or async_id,
                 ),
                 name=f"async_upgrade_{tool_name}_{async_id}",
+            )
+            report_async_tool_started(
+                rctx=rctx, node_id=ls.node.id, async_id=async_id,
+                tool_name=tool_name, tool_args=tool_args,
+                upgraded_from="sync_timeout",
             )
             raw_inline = (
                 f'⏳ Tool "{tool_name}" exceeded {threshold:.1f}s and was '

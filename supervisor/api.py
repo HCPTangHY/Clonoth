@@ -874,6 +874,29 @@ def create_app(
         result = st.register_engine(worker_id, generation_id)
         return result
 
+    # ------------------------------------------------------------------ #
+    #  异步工具登记（engine 生命周期上报 + admin 清单）
+    # ------------------------------------------------------------------ #
+
+    @app.post("/v1/async_tools")
+    async def async_tool_register(body: dict[str, Any]) -> dict[str, Any]:
+        """Engine 调用：登记一个异步工具启动。"""
+        st: SupervisorState = app.state.state
+        return st.register_async_tool(body)
+
+    @app.post("/v1/async_tools/{async_id}/finish")
+    async def async_tool_finish(async_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Engine 调用：标记异步工具完成或失败。"""
+        st: SupervisorState = app.state.state
+        return st.finish_async_tool(async_id, body)
+
+    @app.get("/v1/admin/async_tools")
+    async def admin_async_tools(request: Request) -> list[dict[str, Any]]:
+        """Admin 查询：当前全部异步工具条目（含 running/lost/done/failed）。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        return st.list_async_tools()
+
     @app.get("/v1/tools/reload-seq")
     async def tools_reload_seq() -> dict[str, Any]:
         st: SupervisorState = app.state.state

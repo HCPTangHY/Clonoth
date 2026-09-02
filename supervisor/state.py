@@ -82,6 +82,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._session_context_usage: dict[tuple[str, str], dict[str, Any]] = {}
         self._engine_generations: dict[str, str] = {}  # worker_id -> generation_id (Direction 2)
 
+        # [AutoC 2026-09-02] 异步工具登记处：engine 在启动/完成/失败时上报，
+        # supervisor 持有影子清单。engine 本地 _async_tool_tasks 仍是执行侧唯一
+        # 真实来源；此处供管理查询与重启 lost 标记。
+        self._async_tools: dict[str, dict[str, Any]] = {}
+
         self._init_hooks_and_sessions(workspace_root)
 
     def _purge_context_usage_for_session(self, session_id: str) -> None:
@@ -1495,6 +1500,24 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 # from a previous run where this worker_id was used
                 orphan_count = self._cancel_worker_orphans_locked(wid)
 
+            # [AutoC 2026-09-02] 引擎重启后，其名下 running 的异步工具实际已死亡：
+            # 标记 lost 并向对应会话注入通知，不再静默丢失。
+            for _lost in self._mark_worker_async_tools_lost_locked(wid):
+                _sid = str(_lost.get("session_id") or "")
+                if not _sid or _sid not in self.sessions:
+                    continue
+                try:
+                    self.inject_async_result(
+                        _sid,
+                        text=(
+                            f'⚠️ 异步工具 "{_lost.get("tool_name", "")}" '
+                            f'(id: {_lost.get("async_id", "")}) 因引擎重启中断，结果已丢失。'
+                        ),
+                        source_task_id=str(_lost.get("task_id") or ""),
+                    )
+                except Exception:
+                    pass
+
             self.eventlog.append(
                 session_id=SYSTEM_SESSION_ID,
                 component="engine",
@@ -1529,6 +1552,92 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     self.record_inbound_message_event(_restart_evt)
 
             return {"ok": True, "orphans_cancelled": orphan_count, "generation_id": gid}
+
+    # ------------------------------------------------------------------ #
+    #  异步工具登记处（engine 生命周期上报的影子视图）
+    # ------------------------------------------------------------------ #
+
+    _ASYNC_TOOLS_MAX = 200  # 已完成条目的保留上限
+
+    def register_async_tool(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """登记一个异步工具启动。engine 在创建后台任务时调用。
+
+        Why: 执行真实来源仍在 engine 进程，supervisor 这里只保留影子清单。
+        How: 以 async_id 为键覆盖写入；条目上限超限时淘汰最老的已完成条目。
+        """
+        aid = str(entry.get("async_id") or "").strip()
+        if not aid:
+            return {"ok": False, "error": "async_id required"}
+        with self._lock:
+            self._async_tools[aid] = {
+                "async_id": aid,
+                "tool_name": str(entry.get("tool_name") or ""),
+                "session_id": str(entry.get("session_id") or ""),
+                "task_id": str(entry.get("task_id") or ""),
+                "node_id": str(entry.get("node_id") or ""),
+                "worker_id": str(entry.get("worker_id") or ""),
+                "args_summary": str(entry.get("args_summary") or "")[:200],
+                "upgraded_from": str(entry.get("upgraded_from") or ""),
+                "status": "running",
+                "started_at": _now().isoformat(),
+                "finished_at": "",
+                "elapsed_sec": None,
+                "error": "",
+            }
+            finished = [
+                k for k, v in self._async_tools.items()
+                if v.get("status") not in ("running",)
+            ]
+            if len(finished) > self._ASYNC_TOOLS_MAX:
+                finished.sort(key=lambda k: self._async_tools[k].get("finished_at") or "")
+                for k in finished[: len(finished) - self._ASYNC_TOOLS_MAX]:
+                    del self._async_tools[k]
+        return {"ok": True}
+
+    def finish_async_tool(self, async_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """标记一个异步工具完成或失败。engine 在结果投递时调用。"""
+        aid = (async_id or "").strip()
+        with self._lock:
+            entry = self._async_tools.get(aid)
+            if entry is None:
+                return {"ok": False, "error": "unknown async_id"}
+            status = str(body.get("status") or "done").strip()
+            if status not in {"done", "failed"}:
+                status = "done"
+            entry["status"] = status
+            entry["finished_at"] = _now().isoformat()
+            try:
+                entry["elapsed_sec"] = round(float(body.get("elapsed_sec")), 1)
+            except (TypeError, ValueError):
+                entry["elapsed_sec"] = None
+            entry["error"] = str(body.get("error") or "")[:500]
+        return {"ok": True}
+
+    def list_async_tools(self) -> list[dict[str, Any]]:
+        """导出全部异步工具条目，running 条目补算已运行时长。"""
+        with self._lock:
+            rows = [dict(e) for e in self._async_tools.values()]
+        for row in rows:
+            if row.get("status") == "running" and row.get("started_at"):
+                try:
+                    started = datetime.fromisoformat(str(row["started_at"]))
+                    row["elapsed_sec"] = round((_now() - started).total_seconds(), 1)
+                except Exception:
+                    pass
+        rows.sort(key=lambda r: str(r.get("started_at") or ""), reverse=True)
+        return rows
+
+    def _mark_worker_async_tools_lost_locked(self, worker_id: str) -> list[dict[str, Any]]:
+        """将某 worker 名下 running 的异步工具标记为 lost（引擎重启语义）。"""
+        wid = (worker_id or "").strip()
+        lost: list[dict[str, Any]] = []
+        for entry in self._async_tools.values():
+            if entry.get("worker_id") == wid and entry.get("status") == "running":
+                entry["status"] = "lost"
+                entry["finished_at"] = _now().isoformat()
+                entry["error"] = "engine worker restarted"
+                lost.append(dict(entry))
+        return lost
 
     def _cancel_worker_orphans_locked(self, worker_id: str) -> int:
         """Cancel all non-terminal tasks assigned to a specific worker_id."""

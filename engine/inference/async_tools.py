@@ -81,6 +81,54 @@ def get_async_tool_tasks() -> list[dict]:
     return result
 
 
+# ---------------------------------------------------------------------------
+#  Supervisor 生命周期上报（2026-09-02）
+#  Why: 异步工具状态过去只存在 engine 进程内存，supervisor/前端完全不可见。
+#  How: 启动时登记、完成/失败时上报，两个 POST 端点；上报失败不影响投递。
+#  Purpose: supervisor 持有影子清单，可查询、可在引擎重启时标记 lost。
+# ---------------------------------------------------------------------------
+
+async def report_async_tool_lifecycle(
+    http: Any,
+    supervisor_url: str,
+    path: str,
+    payload: dict[str, Any],
+) -> None:
+    """向 supervisor 异步工具登记处上报一条生命周期事件（best-effort）。"""
+    try:
+        await http.post(f"{supervisor_url}/v1/async_tools{path}", json=payload, timeout=5.0)
+    except Exception as exc:
+        logger.debug("async tool lifecycle report failed: %s", exc)
+
+
+def report_async_tool_started(
+    *,
+    rctx: Any,
+    node_id: str,
+    async_id: str,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    upgraded_from: str = "",
+) -> None:
+    """登记异步工具启动（fire-and-forget）。调度插件在两个创建点调用。"""
+    payload = {
+        "async_id": async_id,
+        "tool_name": tool_name,
+        "session_id": rctx.parent_session_id or rctx.session_id,
+        "task_id": rctx.task_id,
+        "node_id": node_id,
+        "worker_id": rctx.worker_id,
+        "args_summary": _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200),
+        "upgraded_from": upgraded_from,
+    }
+    try:
+        asyncio.get_running_loop().create_task(
+            report_async_tool_lifecycle(rctx.http, rctx.supervisor_url, "", payload)
+        )
+    except RuntimeError:
+        pass
+
+
 def _snapshot_tool_context(tool_ctx: ToolContext) -> ToolContext:
     """Return an immutable-enough ToolContext snapshot for background tool work."""
     # [AutoC 2026-06-27] Why: _execute_real_tools reuses one ToolContext and rewrites
@@ -204,6 +252,10 @@ async def _deliver_async_result(
             "finished_at": time.monotonic(),
             "elapsed": round(_elapsed, 1),
         }
+        await report_async_tool_lifecycle(
+            http, supervisor_url, f"/{async_tool_id}/finish",
+            {"status": "done", "elapsed_sec": round(_elapsed, 1)},
+        )
 
         preempt_text = (
             f'✅ Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
@@ -239,6 +291,10 @@ async def _deliver_async_result(
             "elapsed": round(time.monotonic() - started_at, 1),
             "error": str(e),
         }
+        await report_async_tool_lifecycle(
+            http, supervisor_url, f"/{async_tool_id}/finish",
+            {"status": "failed", "elapsed_sec": round(time.monotonic() - started_at, 1), "error": str(e)[:500]},
+        )
         try:
             await http.post(
                 f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
