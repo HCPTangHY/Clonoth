@@ -73,7 +73,7 @@ def get_async_tool_tasks() -> list[dict]:
     result = []
     now = time.monotonic()
     for aid, info in _async_tool_tasks.items():
-        entry = {"async_id": aid, **info}
+        entry = {"async_id": aid, **{k: v for k, v in info.items() if not k.startswith("_")}}
         # 对 running 状态补算已经过的时间
         if info.get("status") == "running" and "started_at" in info:
             entry["elapsed"] = round(now - info["started_at"], 1)
@@ -114,10 +114,10 @@ def report_async_tool_started(
     payload = {
         "async_id": async_id,
         "tool_name": tool_name,
-        "session_id": rctx.parent_session_id or rctx.session_id,
-        "task_id": rctx.task_id,
+        "session_id": getattr(rctx, "parent_session_id", "") or getattr(rctx, "session_id", ""),
+        "task_id": getattr(rctx, "task_id", ""),
         "node_id": node_id,
-        "worker_id": rctx.worker_id,
+        "worker_id": getattr(rctx, "worker_id", ""),
         "args_summary": _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200),
         "upgraded_from": upgraded_from,
     }
@@ -128,6 +128,24 @@ def report_async_tool_started(
     except RuntimeError:
         pass
 
+_CANCELLED_ASYNC_IDS: set[str] = set()
+
+
+def mark_async_tool_cancelled(async_id: str) -> None:
+    """登记一个取消意图；engine 侧执行体与 runner 轮询都会消费。"""
+    aid = (async_id or "").strip()
+    if aid:
+        _CANCELLED_ASYNC_IDS.add(aid)
+
+
+def is_async_tool_cancelled(async_id: str) -> bool:
+    """查询某异步工具是否被请求取消。"""
+    return (async_id or "") in _CANCELLED_ASYNC_IDS
+
+
+def _clear_cancel_mark(async_id: str) -> None:
+    _CANCELLED_ASYNC_IDS.discard(async_id)
+
 
 def _snapshot_tool_context(tool_ctx: ToolContext) -> ToolContext:
     """Return an immutable-enough ToolContext snapshot for background tool work."""
@@ -137,7 +155,7 @@ def _snapshot_tool_context(tool_ctx: ToolContext) -> ToolContext:
     # async execute_command callbacks keep the approval and artifact identity of the
     # original tool call.
     snapshot = replace(tool_ctx)
-    for attr in ("_node_id", "_node_extra"):
+    for attr in ("_node_id", "_node_extra", "_async_id"):
         if hasattr(tool_ctx, attr):
             setattr(snapshot, attr, getattr(tool_ctx, attr))
     return snapshot
@@ -282,23 +300,32 @@ async def _deliver_async_result(
             json=payload,
         )
     except Exception as e:
+        _is_cancelled = is_async_tool_cancelled(async_tool_id) or isinstance(e, asyncio.CancelledError)
         _async_tool_tasks[async_tool_id] = {
             "tool_name": tool_name,
-            "status": "failed",
+            "status": "cancelled" if _is_cancelled else "failed",
             "task_id": task_id,
             "started_at": started_at,
             "finished_at": time.monotonic(),
             "elapsed": round(time.monotonic() - started_at, 1),
-            "error": str(e),
+            "error": "" if _is_cancelled else str(e),
         }
         await report_async_tool_lifecycle(
             http, supervisor_url, f"/{async_tool_id}/finish",
-            {"status": "failed", "elapsed_sec": round(time.monotonic() - started_at, 1), "error": str(e)[:500]},
+            {
+                "status": "cancelled" if _is_cancelled else "failed",
+                "elapsed_sec": round(time.monotonic() - started_at, 1),
+                "error": "" if _is_cancelled else str(e)[:500],
+            },
         )
         try:
             await http.post(
                 f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-                json={"message": f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}', "task_id": task_id},
+                json={"message": (
+                    f'⛔ Async tool "{tool_name}" (id: {async_tool_id}) was cancelled.'
+                    if _is_cancelled else
+                    f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'
+                ), "task_id": task_id},
             )
         except Exception:
             pass
@@ -314,6 +341,10 @@ async def _deliver_started_async_task(
     # instead of starting the command again, then delegate to _deliver_async_result.
     # Purpose: the subprocess remains single-instance and execute_command's internal
     # timeout still owns the eventual kill behavior.
+    async_tool_id = str(delivery_kwargs.get("async_tool_id") or "")
+    _CANCELLED_ASYNC_IDS.discard(async_tool_id)
+    if isinstance(_async_tool_tasks.get(async_tool_id), dict):
+        _async_tool_tasks[async_tool_id]["_task"] = asyncio.current_task()
     try:
         result = await exec_task
     except Exception as e:
@@ -344,6 +375,9 @@ async def _run_async_tool(
     # Purpose: branch-local ConversationStore writes remain isolated while async callbacks still
     # reach the SDK conversation_key mapping.
     _started = time.monotonic()
+    _CANCELLED_ASYNC_IDS.discard(async_tool_id)
+    if isinstance(_async_tool_tasks.get(async_tool_id), dict):
+        _async_tool_tasks[async_tool_id]["_task"] = asyncio.current_task()
     try:
         result = await _execute_registry_tool_with_span(
             registry,

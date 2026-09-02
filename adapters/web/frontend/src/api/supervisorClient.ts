@@ -396,6 +396,7 @@ export interface AsyncToolEntry {
   args_summary: string;
   upgraded_from: string;
   status: 'running' | 'done' | 'failed' | 'lost';
+  cancel_requested?: boolean;
   started_at: string;
   finished_at: string;
   elapsed_sec: number | null;
@@ -406,6 +407,13 @@ export async function fetchAsyncTools(): Promise<AsyncToolEntry[]> {
   const resp = await _fetch('/admin/async_tools');
   if (!resp.ok) throw new Error(`Failed to fetch async tools: ${resp.status}`);
   return resp.json();
+}
+
+export async function cancelAsyncTool(asyncId: string): Promise<void> {
+  const resp = await _fetch(`/admin/async_tools/${encodeURIComponent(asyncId)}/cancel`, {
+    method: 'POST',
+  });
+  if (!resp.ok) throw new Error(`Cancel failed: ${resp.status}`);
 }
 
 // ── Admin auth ──

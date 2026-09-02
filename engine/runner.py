@@ -717,6 +717,23 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                             )
                             _active.add(_t)
                             continue
+
+                # [AutoC 2026-09-02] 异步工具取消消费：supervisor 的待消费队列
+                # 每秒随轮询拉一次，命中的 async_id 在本地登记表里标取消意图；
+                # execute_command 的 0.2s 循环与投递路径都会感知。
+                try:
+                    from engine.inference.async_tools import mark_async_tool_cancelled
+                    cr = await http.get(
+                        f"{supervisor_url}/v1/async_tools/pending_cancels",
+                        params={"worker_id": wid},
+                        timeout=2.0,
+                    )
+                    if cr.status_code == 200:
+                        for _aid in (cr.json().get("async_ids") or []):
+                            mark_async_tool_cancelled(str(_aid))
+                            print(f"[engine] async tool {_aid} cancel requested", flush=True)
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[engine] error: {e}", flush=True)
             # Stop-aware sleep: wake immediately on stop signal

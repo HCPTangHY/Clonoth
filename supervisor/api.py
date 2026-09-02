@@ -892,10 +892,26 @@ def create_app(
 
     @app.get("/v1/admin/async_tools")
     async def admin_async_tools(request: Request) -> list[dict[str, Any]]:
-        """Admin 查询：当前全部异步工具条目（含 running/lost/done/failed）。"""
+        """Admin 查询：当前全部异步工具条目（含 running/lost/done/failed/cancelled）。"""
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         return st.list_async_tools()
+
+    @app.post("/v1/admin/async_tools/{async_id}/cancel")
+    async def admin_async_tool_cancel(async_id: str, request: Request) -> dict[str, Any]:
+        """Admin 请求取消一个 running 的异步工具；engine 轮询消费。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        result = st.cancel_async_tool(async_id)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error", "unknown"))
+        return result
+
+    @app.get("/v1/async_tools/pending_cancels")
+    async def async_tools_pending_cancels(worker_id: str) -> dict[str, Any]:
+        """Engine 轮询：拉取并清空该 worker 的待消费取消队列。内部端点，不鉴权。"""
+        st: SupervisorState = app.state.state
+        return {"ok": True, "async_ids": st.pull_pending_cancels(worker_id)}
 
     @app.get("/v1/tools/reload-seq")
     async def tools_reload_seq() -> dict[str, Any]:

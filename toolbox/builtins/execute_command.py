@@ -25,6 +25,24 @@ def _error_response(message: Any, **extra: Any) -> dict[str, Any]:
     return payload
 
 
+def _async_cancel_marked(ctx: ToolContext) -> bool:
+    """检查当前 execute_command 调用是否被异步工具取消标记命中。
+
+    [AutoC 2026-09-02] Why: 异步托管后 supervisor 的 task 级取消检查已不适用，
+    取消意图挂在 async_id 上。How: 通过 ToolContext 快照携带的 _async_id 属性
+    查询 engine 的取消登记表；engine 进程外（或标记缺失）一律返回 False。
+    Purpose: execute_command 的 0.2s 轮询循环同时感知 task 级取消与异步工具级取消。
+    """
+    async_id = getattr(ctx, "_async_id", "")
+    if not async_id:
+        return False
+    try:
+        from engine.inference.async_tools import is_async_tool_cancelled
+    except Exception:
+        return False
+    return is_async_tool_cancelled(async_id)
+
+
 async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     command = str(args.get("command", "")).strip()
 
@@ -76,7 +94,7 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
             if waiter in done:
                 stdout_bytes, stderr_bytes = waiter.result()
                 break
-            if await ctx.check_cancelled():
+            if await ctx.check_cancelled() or _async_cancel_marked(ctx):
                 # Fix: kill entire process group, not just the shell
                 kill_process_group(proc)
                 # Fix: 5s safety timeout on gather — if killpg didn't clean

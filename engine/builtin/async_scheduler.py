@@ -97,6 +97,12 @@ class AsyncScheduler:
             # background task. Purpose: callback artifacts and approvals keep
             # the current tool call identity.
             snapshot = _snapshot_tool_context(tool_ctx)
+            # [AutoC 2026-09-02] 异步工具级取消：快照携带 async_id，
+            # execute_command 的轮询循环凭它查询取消登记表。
+            try:
+                snapshot._async_id = async_id
+            except AttributeError:
+                pass
             # [AutoC 2026-08-28] 声明式异步同样授权前置：先审批，获批后再
             # 宣称"已启动"。拒绝时同步返回错误结果，不出现占位。
             denied = await ls.registry.authorize(name=tool_name, arguments=tool_args, ctx=snapshot)
@@ -121,7 +127,7 @@ class AsyncScheduler:
                 name=f"async_tool_{tool_name}_{async_id}",
             )
             report_async_tool_started(
-                rctx=rctx, node_id=ls.node.id, async_id=async_id,
+                rctx=rctx, node_id=str(getattr(getattr(ls, "node", None), "id", "") or ""), async_id=async_id,
                 tool_name=tool_name, tool_args=tool_args,
             )
             raw_inline = (
@@ -171,6 +177,10 @@ class AsyncScheduler:
                 "task_id": rctx.task_id,
                 "upgraded_from": "sync_timeout",
             }
+            try:
+                exec_ctx._async_id = async_id
+            except AttributeError:
+                pass
             asyncio.create_task(
                 _deliver_started_async_task(
                     exec_task,
@@ -192,7 +202,7 @@ class AsyncScheduler:
                 name=f"async_upgrade_{tool_name}_{async_id}",
             )
             report_async_tool_started(
-                rctx=rctx, node_id=ls.node.id, async_id=async_id,
+                rctx=rctx, node_id=str(getattr(getattr(ls, "node", None), "id", "") or ""), async_id=async_id,
                 tool_name=tool_name, tool_args=tool_args,
                 upgraded_from="sync_timeout",
             )

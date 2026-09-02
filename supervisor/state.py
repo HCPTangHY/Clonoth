@@ -86,6 +86,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # supervisor 持有影子清单。engine 本地 _async_tool_tasks 仍是执行侧唯一
         # 真实来源；此处供管理查询与重启 lost 标记。
         self._async_tools: dict[str, dict[str, Any]] = {}
+        # [AutoC 2026-09-02] 待消费的取消意图队列：admin 取消 → 入队 →
+        # engine 轮询拉走 → 标 cancel_requested。幂等：同一 async_id 重复
+        # 入队去重，lost 后拒绝再入队。
+        self._async_tool_pending_cancels: dict[str, list[str]] = {}  # worker_id -> [async_id]
 
         self._init_hooks_and_sessions(workspace_root)
 
@@ -1602,7 +1606,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if entry is None:
                 return {"ok": False, "error": "unknown async_id"}
             status = str(body.get("status") or "done").strip()
-            if status not in {"done", "failed"}:
+            if status not in {"done", "failed", "cancelled"}:
                 status = "done"
             entry["status"] = status
             entry["finished_at"] = _now().isoformat()
@@ -1627,6 +1631,37 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         rows.sort(key=lambda r: str(r.get("started_at") or ""), reverse=True)
         return rows
 
+    def cancel_async_tool(self, async_id: str) -> dict[str, Any]:
+        """请求取消一个 running 的异步工具。
+
+        Why: engine 是纯轮询 worker，没有 HTTP 服务接收反向调用。How: 把
+        async_id 挂到其 worker_id 的待消费队列；engine 每秒轮询时拉走。
+        Purpose: 取消语义与其他 admin 操作一致，幂等且立即可见。
+        """
+        aid = (async_id or "").strip()
+        with self._lock:
+            entry = self._async_tools.get(aid)
+            if entry is None:
+                return {"ok": False, "error": "unknown async_id"}
+            if entry.get("status") != "running":
+                return {"ok": False, "error": f"not running (status={entry.get('status')})"}
+            wid = str(entry.get("worker_id") or "")
+            if not wid:
+                return {"ok": False, "error": "no worker_id"}
+            queue = self._async_tool_pending_cancels.setdefault(wid, [])
+            if aid not in queue:
+                queue.append(aid)
+            entry["cancel_requested"] = True
+        return {"ok": True}
+
+    def pull_pending_cancels(self, worker_id: str) -> list[str]:
+        """engine 轮询拉取并清空该 worker 的待消费取消队列。"""
+        wid = (worker_id or "").strip()
+        if not wid:
+            return []
+        with self._lock:
+            return self._async_tool_pending_cancels.pop(wid, [])
+
     def _mark_worker_async_tools_lost_locked(self, worker_id: str) -> list[dict[str, Any]]:
         """将某 worker 名下 running 的异步工具标记为 lost（引擎重启语义）。"""
         wid = (worker_id or "").strip()
@@ -1636,7 +1671,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 entry["status"] = "lost"
                 entry["finished_at"] = _now().isoformat()
                 entry["error"] = "engine worker restarted"
+                entry.pop("cancel_requested", None)
                 lost.append(dict(entry))
+        self._async_tool_pending_cancels.pop(wid, None)
         return lost
 
     def _cancel_worker_orphans_locked(self, worker_id: str) -> int:
