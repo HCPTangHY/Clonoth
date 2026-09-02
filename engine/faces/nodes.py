@@ -49,6 +49,20 @@ def declared_node_owner(node_id: str) -> str:
     return str(entry["owner"]) if entry is not None else ""
 
 
+def declared_node_path(node_id: str) -> str:
+    """Return the declaration source file path for one id, or empty string.
+
+    [AutoC 2026-09-02] Why: the admin node editor reads node YAML through a
+    raw-file endpoint that only knew the two on-disk node directories; after
+    system nodes migrated to plugin declarations the editor got 404. How: the
+    loader records the resolved {"file": ...} target on the store entry, and
+    the admin API resolves plugin-declared ids to this path. Purpose: editing
+    a plugin-declared node opens its declaration file in the plugin package.
+    """
+    entry = _DECLS.get((node_id or "").strip())
+    return str(entry.get("path") or "") if entry is not None else ""
+
+
 def iter_declared_nodes() -> list[dict[str, Any]]:
     """Return all declarations as {"id", "owner", "data"} rows, sorted by id."""
     return [
@@ -77,13 +91,14 @@ class PluginNodesFace:
         """Attach the shared disposal ledger (see engine/registry_core.py)."""
         self._ledger = ledger
 
-    def register(self, decl: dict[str, Any]) -> Callable[[], None]:
+    def register(self, decl: dict[str, Any], source_path: str = "") -> Callable[[], None]:
         """Declare one node and return its disposer.
 
         decl uses the same schema as a node YAML file (id/type/name/prompt/
         tool_access/...). Validation beyond id presence happens at parse time
         in load_node; a declaration that fails to parse falls back to the
         file sources with a warning instead of silently breaking the id.
+        source_path optionally records the declaration file for raw editors.
         """
         owner = self._ledger.current_owner() if self._ledger is not None else None
         if not isinstance(decl, dict):
@@ -105,7 +120,7 @@ class PluginNodesFace:
         # works; this duplicate registration archives nothing.
         if existing is not None and existing["data"] == data:
             return lambda: None
-        _DECLS[nid] = {"owner": owner or "", "data": data}
+        _DECLS[nid] = {"owner": owner or "", "data": data, "path": source_path or ""}
         _bump()
 
         def _dispose() -> None:

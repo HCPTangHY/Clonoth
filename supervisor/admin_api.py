@@ -192,7 +192,20 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return res
 
     def _resolve_node_path(node_id: str) -> Path:
-        """Resolve the actual file path for a node, checking system_nodes first."""
+        """Resolve the file path for a node.
+
+        [AutoC 2026-09-02] Plugin-declared nodes resolve to their declaration
+        file inside the plugin package (e.g. engine/builtin/nodes/*.yaml);
+        then fall back to system_nodes and config/nodes. Why first: after the
+        system-node migration, plugin declarations are the authoritative
+        source and the only place whose edit takes effect (on plugin reload).
+        """
+        from engine.faces.nodes import declared_node_path
+        plugin_path = declared_node_path(node_id)
+        if plugin_path:
+            pp = Path(plugin_path)
+            if pp.is_file():
+                return pp
         sys_path = _safe_path(workspace_root / "engine" / "system_nodes", node_id, ".yaml")
         if sys_path.exists():
             return sys_path
@@ -217,6 +230,14 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.delete("/nodes/{node_id}")
     def delete_node(node_id: str) -> dict[str, Any]:
+        # 插件声明节点不受此端点管理：删 config/nodes 下的文件不会影响声明，
+        # 静默成功会误导。卸载或修改归属插件才是正确操作。
+        from engine.faces.nodes import declared_node
+        if declared_node(node_id) is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="node is declared by a plugin; manage it via the owning plugin",
+            )
         p = _safe_path(workspace_root / "config" / "nodes", node_id, ".yaml")
         if p.exists():
             p.unlink()

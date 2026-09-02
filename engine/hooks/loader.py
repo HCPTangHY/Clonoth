@@ -110,6 +110,7 @@ def register_declared_nodes(module_name: str, meta: dict[str, Any], context: Any
     if mod_file:
         base = Path(mod_file).resolve().parent
     for decl in raw_nodes:
+        source_path = ""
         if isinstance(decl, dict) and set(decl.keys()) == {"file"}:
             rel = str(decl.get("file") or "").strip()
             if base is None or not rel:
@@ -125,7 +126,8 @@ def register_declared_nodes(module_name: str, meta: dict[str, Any], context: Any
             # Purpose: file-ref declarations behave like files under config/nodes/.
             data.setdefault("id", target.stem)
             decl = data
-        face.register(decl)
+            source_path = str(target)
+        face.register(decl, source_path=source_path)
 
 
 def register_meta_handler(
