@@ -959,9 +959,9 @@ export interface SessionListItem {
   updated_at: string;
 }
 
-export async function listSessions(channel = 'web', limit = 50): Promise<SessionListItem[]> {
+export async function listSessions(channel = 'web', limit = 50, offset = 0): Promise<SessionListItem[]> {
   try {
-    const params = new URLSearchParams({ limit: String(limit) });
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     if (channel) params.set('channel', channel);
     const resp = await _fetch(`/sessions?${params.toString()}`);
     if (!resp.ok) return [];
@@ -969,6 +969,20 @@ export async function listSessions(channel = 'web', limit = 50): Promise<Session
   } catch {
     return [];
   }
+}
+
+// [2026-09-02] Why: /v1/sessions caps one page at 200 rows, so a single call can
+// silently drop older sessions once the registry grows past the cap. How: loop with
+// offset pagination until a short page signals the end. Purpose: the sidebar and the
+// system session browser always see the complete list instead of a truncated prefix.
+export async function listAllSessions(channel = '', pageSize = 200, maxPages = 50): Promise<SessionListItem[]> {
+  const all: SessionListItem[] = [];
+  for (let page = 0; page < maxPages; page += 1) {
+    const batch = await listSessions(channel, pageSize, page * pageSize);
+    all.push(...batch);
+    if (batch.length < pageSize) break;
+  }
+  return all;
 }
 
 export interface ContextWindowResponse {

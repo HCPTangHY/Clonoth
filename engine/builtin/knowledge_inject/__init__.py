@@ -19,6 +19,11 @@ class RawContent(BaseModel):
 class CreatePayload(BaseModel):
     id: str
     content: str
+
+
+class SkillPinsPayload(BaseModel):
+    session_id: str
+    pinned: list[str] = []
 import re
 import shutil
 import threading
@@ -71,6 +76,16 @@ PLUGIN_META = {
                 "icon": "psychology",
                 "entry": "/v1/plugins/knowledge_inject/web/memory.html",
             }
+        ],
+        "slots": [
+            {
+                # 输入框上方：当前工作区的 skill 挂载 chip，点击展开管理浮层。
+                "slot_id": "knowledge.skill_pins",
+                "slot": "input_above",
+                "priority": 30,
+                "mode": "append",
+                "script": {"file": "web/skill_pins.js"},
+            },
         ],
     },
     # Why: the six skill and memory CRUD tools now belong to the knowledge
@@ -287,6 +302,14 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
             if isinstance(meta.get("scan_depth"), (int, float)):
                 scan_depth = max(0, int(meta["scan_depth"]))
 
+            # [2026-09-04] Skill visibility: "private" skills are never injected
+            # automatically (constant/keyword/INDEX) and only enter the prompt
+            # when the user pins them to a workspace. Default "public" keeps the
+            # historical behavior.
+            visibility = str(meta.get("visibility") or "public").strip().lower()
+            if visibility not in ("public", "private"):
+                visibility = "public"
+
             raw_node_ids = meta.get("node_ids")
             node_ids: list[str] = []
             if isinstance(raw_node_ids, list):
@@ -305,6 +328,7 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
                 "order": order,
                 "priority": priority,
                 "scan_depth": scan_depth,
+                "visibility": visibility,
                 "body": body.strip(),
                 "node_ids": node_ids,
             })
@@ -312,6 +336,57 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
             continue
     _SkillCache.put(workspace_root, items)
     return items
+
+
+# ---------------------------------------------------------------------------
+#  Workspace skill pins
+# ---------------------------------------------------------------------------
+
+# [2026-09-04] Workspace-scoped manual skill mounting.
+# Why: constant skills inject for every session of a node and keyword skills
+# only fire on matches; users need a middle tier where a skill stays mounted
+# for one workspace regardless of keywords. How: pins live in
+# data/knowledge_inject/skill_pins.yaml ({workspace_name: [skill_id]}), private to this plugin
+# so no core session state is touched. Both engine (injection) and supervisor
+# (admin endpoints) read the same file, guarded by an mtime cache. Purpose:
+# mounting is a user decision stored beside other plugin data, and a deleted
+# session never destroys the mapping.
+_skill_pins_cache: dict[str, Any] = {"mtime": -1.0, "data": {}}
+
+
+def load_skill_pins(workspace_root: Path) -> dict[str, list[str]]:
+    """Read data/knowledge_inject/skill_pins.yaml → {workspace_name: [skill_id, ...]}."""
+    p = workspace_root / "data" / "knowledge_inject" / "skill_pins.yaml"
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        _skill_pins_cache["mtime"] = -1.0
+        _skill_pins_cache["data"] = {}
+        return {}
+    if mtime == _skill_pins_cache["mtime"]:
+        return _skill_pins_cache["data"]
+    try:
+        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    data: dict[str, list[str]] = {}
+    if isinstance(raw, dict):
+        for ws, ids in raw.items():
+            if isinstance(ids, list):
+                data[str(ws)] = [str(i).strip() for i in ids if str(i).strip()]
+    _skill_pins_cache["mtime"] = mtime
+    _skill_pins_cache["data"] = data
+    return data
+
+
+def save_skill_pins(workspace_root: Path, data: dict[str, list[str]]) -> None:
+    """Atomically write data/knowledge_inject/skill_pins.yaml and drop the read cache."""
+    p = workspace_root / "data" / "knowledge_inject" / "skill_pins.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".yaml.tmp")
+    tmp.write_text(yaml.safe_dump(data, sort_keys=True, allow_unicode=True), encoding="utf-8")
+    tmp.replace(p)
+    _skill_pins_cache["mtime"] = -1.0
 
 
 def build_skill_messages(
@@ -701,6 +776,7 @@ def normalize_skill_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any
             "node_ids": _as_string_list(raw.get("node_ids")),
             "description": str(raw.get("description") or ""),
             "path": str(raw.get("path") or ""),
+            "visibility": str(raw.get("visibility") or "public"),
             "book": "",
             "source": "",
             "created_at": "",
@@ -1172,6 +1248,23 @@ def build_knowledge_context(
         mem_entries = load_memory_catalog(workspace_root, memory_book="")
     entries.extend(normalize_memory_entries(mem_entries))
 
+    # [2026-09-04] Apply workspace pins and skill visibility. Why: private
+    # skills must not leak through constant/keyword/INDEX paths, and pinned
+    # skills must stay mounted for the whole workspace. How: pinned skill ids
+    # are promoted to constant; private skills are dropped unless pinned. Pin
+    # wins over visibility so a private skill becomes mountable on purpose.
+    _pins = set(load_skill_pins(workspace_root).get(_ws_name) or []) if _ws_name else set()
+    _next_entries: list[dict[str, Any]] = []
+    for e in entries:
+        if e.get("kind") == "skill":
+            if e.get("id") in _pins:
+                if e.get("strategy") != "constant":
+                    e = {**e, "strategy": "constant"}
+            elif e.get("visibility") == "private":
+                continue
+        _next_entries.append(e)
+    entries = _next_entries
+
     return build_knowledge_messages(
         workspace_root,
         entries,
@@ -1249,6 +1342,10 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         except (TypeError, ValueError):
             pass
 
+    visibility = str(args.get("visibility", "") or "").strip().lower() or None
+    if visibility is not None and visibility not in ("public", "private"):
+        return _tool_err("invalid visibility: 'public' or 'private'")
+
     if not name:
         return _tool_err("empty skill name")
     if not SKILL_NAME_RE.fullmatch(name):
@@ -1263,6 +1360,8 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         }
         if strategy:
             meta["strategy"] = strategy
+        if visibility:
+            meta["visibility"] = visibility
         if keywords is not None:
             meta["keywords"] = keywords
         if order is not None:
@@ -1285,6 +1384,8 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         meta["enabled"] = enabled
         if strategy:
             meta["strategy"] = strategy
+        if visibility:
+            meta["visibility"] = visibility
         if keywords is not None:
             meta["keywords"] = keywords
         if order is not None:
@@ -1718,6 +1819,7 @@ PLUGIN_META["tools"] = [
                 "order": {"type": "integer", "description": "injection order within the same block; higher values are placed later (closer to conversation)"},
                 "priority": {"type": "integer", "description": "budget priority; higher values are kept first when token budget is exceeded"},
                 "scan_depth": {"type": "integer", "description": "number of recent conversation rounds to scan for keyword matching; 0 = current message only"},
+                "visibility": {"type": "string", "description": "public (constant/keyword activation allowed) or private (injected only when pinned to a workspace); default public", "enum": ["public", "private"]},
             },
             "required": ["name"],
         },
@@ -1832,6 +1934,7 @@ def _list_skills_endpoint(request: Any) -> list[dict[str, Any]]:
             "description": str(item.get("description") or ""),
             "enabled": bool(item.get("enabled", True)),
             "strategy": str(item.get("strategy") or "normal"),
+            "visibility": str(item.get("visibility") or "public"),
             "keywords": [str(k) for k in (item.get("keywords") or []) if k],
             "body_preview": str(item.get("body") or "")[:200],
         })
@@ -1877,6 +1980,83 @@ def _delete_skill_endpoint(name: str, request: Any) -> dict[str, Any]:
         _shutil.rmtree(p.parent)
     _SkillCache.invalidate(ws)
     return {"ok": True}
+
+
+# [2026-09-04] Workspace skill pin endpoints.
+# Why: the input-bar chip needs to read and edit the current workspace's pin
+# list without knowing workspace internals. How: the caller passes only
+# session_id; the supervisor resolves the workspace name from session state
+# and maps it onto data/knowledge_inject/skill_pins.yaml. Purpose: the frontend stays
+# workspace-agnostic and the mapping cannot be spoofed by the client.
+def _session_workspace_name(request: Any, session_id: str) -> str:
+    """Resolve a session's workspace name from supervisor state."""
+    st = getattr(request.app.state, "state", None)
+    sessions = getattr(st, "sessions", None)
+    si = sessions.get(session_id) if isinstance(sessions, dict) else None
+    if si is None:
+        return ""
+    ws = getattr(si, "workspace", None)
+    if isinstance(ws, dict):
+        return str(ws.get("name") or "").strip()
+    return ""
+
+
+def _get_skill_pins_endpoint(session_id: str, request: Any) -> dict[str, Any]:
+    ws_root = _ws_root(request)
+    ws_name = _session_workspace_name(request, session_id)
+    pinned = list(load_skill_pins(ws_root).get(ws_name) or []) if ws_name else []
+    pinned_set = set(pinned)
+    skills: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for item in load_skill_catalog(ws_root, _use_cache=False):
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        names.add(name)
+        skills.append({
+            "name": name,
+            "description": str(item.get("description") or ""),
+            "visibility": str(item.get("visibility") or "public"),
+            "pinned": name in pinned_set,
+        })
+    # 过滤掉已不存在于 catalog 的 pin，保持响应与实际生效一致。
+    return {
+        "workspace": ws_name,
+        "pinned": [n for n in pinned if n in names],
+        "skills": skills,
+    }
+
+
+def _put_skill_pins_endpoint(request: Any, payload: Any) -> dict[str, Any]:
+    ws_root = _ws_root(request)
+    ws_name = _session_workspace_name(request, str(getattr(payload, "session_id", "") or ""))
+    if not ws_name:
+        raise _http_exc(400, "Session has no workspace")
+    catalog_names = {
+        str(item.get("name") or "")
+        for item in load_skill_catalog(ws_root, _use_cache=False)
+        if str(item.get("name") or "")
+    }
+    pinned: list[str] = []
+    for raw in (getattr(payload, "pinned", None) or []):
+        name = str(raw).strip()
+        if name and name in catalog_names and name not in pinned:
+            pinned.append(name)
+    data = {k: list(v) for k, v in load_skill_pins(ws_root).items()}
+    if pinned:
+        data[ws_name] = pinned
+    else:
+        data.pop(ws_name, None)
+    save_skill_pins(ws_root, data)
+    return {"ok": True, "workspace": ws_name, "pinned": pinned}
+
+
+def _skill_pins_get_route(request: Request, session_id: str = "") -> dict[str, Any]:
+    return _get_skill_pins_endpoint(session_id, request)
+
+
+def _skill_pins_put_route(request: Request, payload: SkillPinsPayload) -> dict[str, Any]:
+    return _put_skill_pins_endpoint(request, payload)
 
 
 def _memory_book_path(workspace_root: Path, ns: str, book: str) -> Path:
@@ -1928,6 +2108,91 @@ def _entry_summary(e: dict[str, Any]) -> dict[str, Any]:
 # 改变 mtime，无需显式失效。Purpose: 重复扫描毫秒级返回。
 _book_scan_cache: dict[Path, tuple[float, int, dict[str, Any]]] = {}
 
+# [2026-09-04] 搜索用的整本缓存：列表缓存只存摘要（120 字预览），内容搜索
+# 需要完整正文。同 (mtime, size) 失效策略。
+_book_data_cache: dict[Path, tuple[float, int, dict[str, Any]]] = {}
+
+
+def _book_full_data(yf: Path) -> dict[str, Any]:
+    """整本 book 数据（含完整正文），带 mtime+size 缓存，供全库搜索使用。"""
+    try:
+        st = yf.stat()
+    except OSError:
+        return {"book": yf.stem, "entries": []}
+    hit = _book_data_cache.get(yf)
+    if hit is not None and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        return hit[2]
+    data = _load_book(yf)
+    _book_data_cache[yf] = (st.st_mtime, st.st_size, data)
+    return data
+
+
+def _memory_search(base: Path, needle: str) -> dict[str, Any]:
+    """全库搜索：id / 内容子串 + 关键词命中。
+
+    返回与列表接口相同的树形结构，只含命中条目；每条附加
+    matches（命中类型列表）与 kw_hits（命中的关键词原文），
+    前端据此做关键词聚合分组。
+    """
+
+    def _scan_matches(ns_dir: Path) -> list[dict[str, Any]]:
+        books: list[dict[str, Any]] = []
+        for yf in sorted(ns_dir.glob("*.yaml")):
+            data = _book_full_data(yf)
+            hits: list[dict[str, Any]] = []
+            for e in data.get("entries", []):
+                if not isinstance(e, dict):
+                    continue
+                eid = str(e.get("id") or "")
+                content = str(e.get("content") or "")
+                kws = [str(k) for k in (e.get("keywords") or []) if isinstance(k, str)]
+                matched: list[str] = []
+                if needle in eid.lower():
+                    matched.append("id")
+                if needle in content.lower():
+                    matched.append("content")
+                kw_hits = [k for k in kws if needle in k.lower()]
+                if kw_hits:
+                    matched.append("keyword")
+                if not matched:
+                    continue
+                s = _entry_summary(e)
+                s["matches"] = matched
+                s["kw_hits"] = kw_hits
+                hits.append(s)
+            if hits:
+                books.append({
+                    "book": str(data.get("book") or yf.stem),
+                    "file": yf.name,
+                    "count": len(hits),
+                    "enabled_count": sum(1 for h in hits if h["enabled"]),
+                    "entries": hits,
+                })
+        return books
+
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+    root = _scan_matches(base)
+    if root:
+        groups.append(("", root))
+    for d in sorted(x for x in base.iterdir() if x.is_dir() and not x.name.startswith(".")):
+        nb = _scan_matches(d)
+        if nb:
+            groups.append((d.name, nb))
+        for sub in sorted(x for x in d.iterdir() if x.is_dir()):
+            sb = _scan_matches(sub)
+            if sb:
+                groups.append((f"{d.name}/{sub.name}", sb))
+    total = sum(b["count"] for _, books in groups for b in books)
+    return {
+        "total": total,
+        "query": needle,
+        "namespaces": [
+            {"ns": ns, "total": sum(b["count"] for b in books), "books": books}
+            for ns, books in groups
+        ],
+    }
+
+
 
 def _book_listing(yf: Path) -> dict[str, Any]:
     """单个 book 的列表数据（名称/计数/条目摘要），带 mtime+size 缓存。"""
@@ -1977,6 +2242,12 @@ def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
     base = ws / "data" / "memory"
     if not base.is_dir():
         return []
+
+    # [2026-09-04] 搜索分支：?q= 触发全库扫描（解析层有按文件缓存），
+    # 与 lazy/直达路径互斥，优先级最高。
+    needle = _q("q").strip().lower()
+    if needle:
+        return _memory_search(base, needle)
 
     base_resolved = base.resolve()
 
@@ -2134,6 +2405,8 @@ def _register_admin_routes(routes: Any) -> None:
     router.add_api_route("/skills/{name}/raw", _skills_update_route, methods=["PUT"])
     router.add_api_route("/skills", _skills_create_route, methods=["POST"])
     router.add_api_route("/skills/{name}", _skills_delete_route, methods=["DELETE"])
+    router.add_api_route("/skill_pins", _skill_pins_get_route, methods=["GET"])
+    router.add_api_route("/skill_pins", _skill_pins_put_route, methods=["PUT"])
     routes.register(router, mount="admin/config", description="skills 配置端点")
 
     mem_router = APIRouter()

@@ -112,6 +112,7 @@ function renderNode(node, depth, container) {
     } else {
       items.push({ label: '打开', action: () => openFileTab(node.path, false) });
       items.push({ label: '固定打开', action: () => openFileTab(node.path, true) });
+      items.push({ label: '下载', action: () => downloadFile(node.path, node.name) });
     }
     items.push({ label: '剪切（移动）', action: () => { cutPath = node.path; } });
     items.push({ label: '重命名', action: () => opRename(node) });

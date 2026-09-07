@@ -8,7 +8,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import {
   deleteSession,
-  listSessions,
+  listAllSessions,
   type AdminApproval,
   type SessionListItem,
 } from '../../api/supervisorClient';
@@ -84,7 +84,10 @@ export const SessionBrowserModal = ({ open, onClose, pendingApprovals = [] }: Se
     const load = async () => {
       try {
         setLoading(true);
-        const nextSessions = await listSessions('', 200);
+        // [2026-09-02] Why: a single 200-row page truncated the total once the
+        // registry exceeded the cap, undercounting older sessions. How: paginate
+        // through every page so the header count and channel filters use the full set.
+        const nextSessions = await listAllSessions('');
         if (!cancelled) {
           setSessions(nextSessions);
           setError('');

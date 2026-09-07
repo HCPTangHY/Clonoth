@@ -18,6 +18,7 @@ import {
 } from 'react';
 
 import { type ApprovalLevel, useChatStore, useClientPrefsStore } from '../../store';
+import { isConversationGenerating } from '../../store/eventRouting';
 import type { Attachment } from '../../types';
 import { Icon } from '../common';
 import { AttachmentList } from './AttachmentList';
@@ -105,17 +106,21 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
     const sessionId = state.viewingChildSessionId || activeConversation?.sessionId || '';
     return sessionId ? state.contextUsageBySession[sessionId] || null : state.contextUsage;
   });
-  // [AutoC 2026-06-15] Why: on the welcome page (activeConversationId=null),
-  // a background session may still be generating. The global isGenerating flag
-  // stays true from that session, making the input show stop/preempt instead of
-  // send. How: derive generating state from the active conversation's session.
-  // If no conversation is active (welcome page), always treat as idle.
-  const isGenerating = useChatStore((state) => {
-    if (!state.activeConversationId) return false;
-    const conv = state.conversations.find((c) => c.id === state.activeConversationId);
-    if (!conv?.sessionId) return state.isGenerating;
-    return Boolean(state.generatingBySession[conv.sessionId]);
-  });
+  // [2026-09-05] Why: this selector previously ignored viewingChildSessionId, so
+  // while viewing a running child task (entered from the active-tasks panel) the
+  // composer stayed in idle mode and submission went through the plain inbound
+  // path instead of preempting the running task. How: reuse the shared helper
+  // that already understands the visible child session. Purpose: generating with
+  // a draft = preempt, generating without draft = stop, in child views too.
+  const isGenerating = useChatStore((state) =>
+    isConversationGenerating(
+      state.conversations,
+      state.activeConversationId,
+      state.generatingBySession,
+      state.activeConversationId ? state.isGenerating : false,
+      state.viewingChildSessionId,
+    ),
+  );
   const composerDisabled = disabled && !isGenerating;
   const cancelCurrentTask = useChatStore((state) => state.cancelCurrentTask);
   const preemptCurrentTask = useChatStore((state) => state.preemptCurrentTask);

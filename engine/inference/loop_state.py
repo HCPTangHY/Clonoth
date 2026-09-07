@@ -130,6 +130,10 @@ class _LoopState:
     # ---- 已授权的真工具名集合（由 _filter_tool_specs 输出决定）----
     allowed_real_tools: set = field(default_factory=set)
 
+    # [fix 2026-09-03] 已授权的伪工具名集合（由 build_node_tool_specs 实际注入
+    # 的 spec 推导，含 finish 宽免）。None = 不校验（直接构造 _LoopState 的旧调用方）。
+    allowed_pseudo_tools: set | None = None
+
     # ---- Phase 3 (Session Conversation Store): 最近一次 shadow write 的 Message.id ----
     # 由 _shadow_write() 更新，_persist_ctx() 写入 snapshot 的 last_message_id 字段，
     # 为后续 snapshot 瘦身（不再存完整 messages 数组）做准备。
@@ -196,6 +200,7 @@ def _build_loop_state(
     tool_produced_attachments: list[dict[str, Any]],
     formatter: Any,
     allowed_real_tools: set,
+    allowed_pseudo_tools: set | None = None,
 ) -> _LoopState:
     """Construct the loop state, resolving retry/compact parameters from config.
 
@@ -224,6 +229,7 @@ def _build_loop_state(
         tool_produced_attachments=tool_produced_attachments,
         formatter=formatter,
         allowed_real_tools=allowed_real_tools,
+        allowed_pseudo_tools=allowed_pseudo_tools,
         compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
         compact_keep_recent=get_int(runtime_cfg, "engine.compact.keep_recent", 6, min_value=2, max_value=50),
         compacted=False,

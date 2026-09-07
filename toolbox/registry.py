@@ -618,6 +618,21 @@ class ToolRegistry:
             # validating and storing builtin specs.
             self.register_builtin_tool(name, desc, schema, func)
 
+        # [2026-09-06] Why: execute_command runs a second, internal guard
+        # (op="execute_command", command-level approval) inside its body. The
+        # adaptive async scheduler pre-flights only the registry-level guard,
+        # so the internal approval wait still sat inside the timed execution
+        # task and pending approvals were counted toward the 60s async-upgrade
+        # threshold. How: declare the internal guard on the spec; authorize()
+        # pre-flights it and request_guard hands off via ctx fingerprints.
+        # Purpose: the upgrade timer measures only post-approval execution.
+        # register_builtin_tool stores the same spec object in both the active
+        # map and the builtin snapshot, so in-place mutation covers reload().
+        _cmd_spec = self._tool_specs.get("execute_command")
+        if isinstance(_cmd_spec, dict):
+            _cmd_spec["guard_op"] = "execute_command"
+            _cmd_spec["guard_params"] = ["command"]
+
     def reload(self) -> int:
         """Reload external tools under tools/.
 
@@ -713,6 +728,30 @@ class ToolRegistry:
                 "cancelled": _err.get("cancelled", False),
                 "approval_id": _err.get("approval_id"),
             }
+        # [2026-09-06] Pre-flight the tool's own internal guard when declared.
+        # Why: execute_command's command-level approval used to wait inside the
+        # scheduler's timed execution task, so a pending approval tripped the
+        # 60s async-upgrade threshold before the command ever ran. How: run the
+        # declared guard here; request_guard records the approved fingerprint
+        # on ctx, making the in-tool repeat a no-op for this exact operation.
+        # Purpose: approval latency is excluded from execution timing on both
+        # the adaptive and the direct paths.
+        _spec = self._tool_specs.get(name) or {}
+        _guard_op = str(_spec.get("guard_op") or "").strip()
+        if _guard_op:
+            _guard_params = {
+                k: arguments[k]
+                for k in (_spec.get("guard_params") or [])
+                if isinstance(k, str) and k in (arguments or {})
+            }
+            _op2, _err2 = await request_guard(ctx, _guard_op, _guard_params)
+            if _err2 is not None:
+                return {
+                    "ok": False,
+                    "error": _err2.get("error", "denied"),
+                    "cancelled": _err2.get("cancelled", False),
+                    "approval_id": _err2.get("approval_id"),
+                }
         return None
 
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any, _authorized: bool = False) -> dict[str, Any]:

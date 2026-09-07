@@ -187,6 +187,9 @@ class DreamHandler:
         extractor_task_ids: list[str] = []
         extractor_node = "system.memory_extractor"
         generation_cb = ctx.get("current_session_generation")
+        # [fix 2026-09-04] Resolve each session's memory namespace/workspace once
+        # per run so a disobeying extractor writes to the source node's directory.
+        memory_targets = self._session_memory_targets(workspace_root)
 
         for sid in session_ids:
             transcript = self._session_transcript(workspace_root=workspace_root, ctx=ctx, session_id=sid)
@@ -198,6 +201,12 @@ class DreamHandler:
                 session_generation = 1
             child_sid = f"child_{uuid.uuid4().hex[:12]}"
             instruction = self._build_extractor_instruction(transcript, book_list=book_list)
+            _target = memory_targets.get(sid) or {}
+            _route_input: dict[str, Any] = {}
+            if _target.get("ns"):
+                _route_input["_memory_route_ns"] = _target["ns"]
+            if _target.get("ws"):
+                _route_input["_memory_route_ws"] = _target["ws"]
             try:
                 # [AutoC 2026-05-31] Why: Dream preprocessing must reuse the
                 # existing memory_extractor node without changing its system
@@ -213,6 +222,7 @@ class DreamHandler:
                         "instruction": instruction,
                         "child_session_id": child_sid,
                         "_system_task": True,
+                        **_route_input,
                     },
                     continuation={},
                     source_inbound_seq=None,
@@ -526,6 +536,41 @@ class DreamHandler:
                 continue
             active.add(str(entry.get("session_id") or sid))
         return active
+
+    def _session_memory_targets(self, workspace_root: Path) -> dict[str, dict[str, str]]:
+        """Read sessions.json and return sid -> {ns, ws} memory write targets.
+
+        [fix 2026-09-04] Why: dream preprocessing extractor tasks carried no
+        routing info, so when a model disobeys the 'no save_memory' instruction
+        its writes land in data/memory/system.memory_extractor/ — the extractor's
+        own namespace — instead of the session's source node (observed on
+        2026-09-03: 4 books written there). How: reuse the sessions.json registry
+        each session already flows through; entry_node_id is the namespace and
+        workspace.name (when set) scopes the write to the @ws directory. Purpose:
+        even instruction violations write to the correct location.
+        """
+        path = workspace_root / "data" / "sessions.json"
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        targets: dict[str, dict[str, str]] = {}
+        for sid, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            ns = str(entry.get("entry_node_id") or "").strip()
+            if not ns:
+                continue
+            ws = ""
+            ws_field = entry.get("workspace")
+            if isinstance(ws_field, dict):
+                ws = str(ws_field.get("name") or "").strip()
+            targets[str(entry.get("session_id") or sid)] = {"ns": ns, "ws": ws}
+        return targets
 
     def _active_session_updates_from_registry(self, workspace_root: Path) -> dict[str, float] | None:
         """Read explicit activity timestamps from sessions.json when available."""

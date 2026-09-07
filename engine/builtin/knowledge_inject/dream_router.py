@@ -90,6 +90,11 @@ class DreamMemoryRouter(Handler):
             _direct_ns = str(task_context.get("_memory_route_ns") or "").strip()
             if _direct_ns:
                 target_ns = _direct_ns
+                # [fix 2026-09-04] Dream preprocessing also carries the session's
+                # workspace name; scope the write to the @ws directory when set.
+                _direct_ws = str(task_context.get("_memory_route_ws") or "").strip()
+                if _direct_ws:
+                    target_ws = _direct_ws
 
         if not target_ns:
             return None

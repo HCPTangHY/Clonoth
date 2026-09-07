@@ -1610,6 +1610,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 status = "done"
             entry["status"] = status
             entry["finished_at"] = _now().isoformat()
+            # [fix 2026-09-03] a finish report settles the entry; a stale
+            # cancel_requested flag would linger in the admin list otherwise.
+            entry.pop("cancel_requested", None)
             try:
                 entry["elapsed_sec"] = round(float(body.get("elapsed_sec")), 1)
             except (TypeError, ValueError):

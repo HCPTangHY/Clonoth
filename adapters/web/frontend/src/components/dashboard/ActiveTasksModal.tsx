@@ -4,7 +4,7 @@
 // shared Modal shell. Purpose: DRY modal UX, reusable from any page.
 import { useEffect, useState } from 'react';
 
-import { cancelTask, fetchActiveTasks, fetchAsyncTools, type ActiveTask, type AsyncToolEntry } from '../../api/supervisorClient';
+import { cancelAsyncTool, cancelTask, fetchActiveTasks, fetchAsyncTools, type ActiveTask, type AsyncToolEntry } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
@@ -130,6 +130,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   const [error, setError] = useState('');
   const [refreshTick, setRefreshTick] = useState(0);
   const [cancellingTaskIds, setCancellingTaskIds] = useState<Record<string, boolean>>({});
+  const [cancellingAsyncIds, setCancellingAsyncIds] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     if (!open) return undefined;
@@ -172,6 +173,27 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       clearInterval(timer);
     };
   }, [adminToken, open, refreshTick]);
+
+  const handleCancelAsync = async (entry: AsyncToolEntry) => {
+    if (!adminToken || entry.status !== 'running' || entry.cancel_requested || cancellingAsyncIds[entry.async_id]) return;
+    // [2026-09-05] Why: mirrors handleCancel for tasks — per-row disabled state
+    // plus an immediate refresh after the POST. How: the endpoint only queues a
+    // cancel mark on the owning worker; only execute_command actually kills the
+    // process group, other async tools just see the flag and finish normally.
+    setCancellingAsyncIds(current => ({ ...current, [entry.async_id]: true }));
+    try {
+      await cancelAsyncTool(entry.async_id);
+      setRefreshTick(value => value + 1);
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : '异步工具取消失败。');
+    } finally {
+      setCancellingAsyncIds(current => {
+        const next = { ...current };
+        delete next[entry.async_id];
+        return next;
+      });
+    }
+  };
 
   const handleCancel = async (task: ActiveTask) => {
     if (!adminToken || task.cancel_requested || cancellingTaskIds[task.task_id]) return;
@@ -307,6 +329,24 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
                           查看
                         </button>
                       )}
+                      {entry.status === 'running' && (() => {
+                        const cancelling = Boolean(cancellingAsyncIds[entry.async_id]) || Boolean(entry.cancel_requested);
+                        return (
+                          <button
+                            aria-label={`取消异步工具 ${entry.async_id}`}
+                            className={`rounded-sm border px-2 py-1 font-mono text-[0.6rem] transition-colors ${
+                              cancelling
+                                ? 'cursor-not-allowed border-gray-300 bg-gray-100 text-gray-500'
+                                : 'border-red-500/40 bg-red-500/10 text-red-700 hover:bg-red-500/20'
+                            }`}
+                            disabled={cancelling}
+                            onClick={() => { void handleCancelAsync(entry); }}
+                            type="button"
+                          >
+                            {cancelling ? '取消中...' : '取消'}
+                          </button>
+                        );
+                      })()}
                     </div>
                   </div>
                 </li>

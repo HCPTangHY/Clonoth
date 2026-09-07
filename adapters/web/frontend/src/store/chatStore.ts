@@ -11,7 +11,7 @@ import {
   cancelActiveTasks,
   deleteSession,
   getSessionHistoryPage,
-  listSessions,
+  listAllSessions,
   postInbound,
   preemptTask,
   retryInbound,
@@ -120,7 +120,10 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   if (startupLoaded) return;
   startupLoaded = true;
 
-  const serverSessions = await listSessions('web', 50);
+  // [2026-09-02] Why: a fixed 50-row page could hide older web conversations once
+  // the registry grows. How: paginate channel=web until a short page ends the scan.
+  // Purpose: the sidebar always reflects every web session, not just the newest 50.
+  const serverSessions = await listAllSessions('web');
   const userSessions = (serverSessions || []).filter((session) =>
     !isEntryBranchSessionId(session.session_id)
     && !session.parent_session_id
@@ -269,6 +272,21 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     }));
     void loadChildSessionHistoryIntoStore(trimmed, set, trimmedTaskId || undefined);
     void loadContextUsageIntoStore(trimmed, set, get);
+    // [2026-09-05] Why: entering a running child task from the active-tasks panel
+    // showed an idle composer. The child session's generating flags are only set
+    // by events flowing through the pump while viewing it; entering after the
+    // task started receives nothing, so generatingBySession[child] stayed false
+    // and submission fell back to plain inbound instead of preempt. How: query
+    // the backend's running-tasks list on entry, same recovery used after a
+    // WebSocket reconnect. Purpose: the composer immediately reflects the
+    // child's real running state (stop / preempt) without waiting for events.
+    void restoreGeneratingStateFromBackend(
+      getChildConversationId(trimmed),
+      trimmed,
+      set,
+      get,
+      { reloadHistory: false },
+    );
   },
 
   exitChildSession: () => {

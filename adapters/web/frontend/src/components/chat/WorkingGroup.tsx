@@ -13,6 +13,7 @@ import { Icon } from '../common';
 import { MessageCard, MessageCopyButton, MessageMetaInfo } from './MessageCard';
 import { AttachmentList } from './AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
+import { mergeThinkingBlocksForDisplay } from './displayBlocks';
 import { BLOCK_STACK_CLASS } from './renderingConstants';
 
 interface WorkingGroupProps {
@@ -174,7 +175,7 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
             <article className="bg-[var(--duties-panel)] px-3 pt-0 pb-2 sm:px-4">
               <div className="mx-auto max-w-3xl">
                 <div className={BLOCK_STACK_CLASS}>
-                  {lastCard.blocks
+                  {mergeThinkingBlocksForDisplay(lastCard.blocks)
                     .filter((b) => b.kind !== 'text')
                     .map((block) => (
                       <RenderBlockView

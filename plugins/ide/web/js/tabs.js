@@ -193,6 +193,12 @@ function renderTabs() {
           label: '复制路径',
           action: () => copyText(String(tab.path).replace(/ \(diff\)$/, '')),
         });
+        if (!String(tab.path).endsWith(' (diff)')) {
+          items.push({
+            label: '下载',
+            action: () => downloadFile(tab.path, baseName(tab.path)),
+          });
+        }
         e.preventDefault();
         e.stopPropagation();
         showContextMenu(e.clientX, e.clientY, items);

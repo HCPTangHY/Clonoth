@@ -44,6 +44,35 @@ def _is_pseudo_tool_name(name: str) -> bool:
     )
 
 
+def allowed_pseudo_names(openai_tools: list[dict], node: Any = None) -> set[str]:
+    """Derive the authorized pseudo-tool set from the composed tool list.
+
+    [fix 2026-09-03] Why: pseudo calls were routed by static name only, so a model
+    could invoke a control tool that was never injected for this node — e.g. a
+    system node hallucinating switch_node from the task log it summarizes — and
+    the handler executed it, switching the session entry. How: the authorized set
+    is exactly what build_node_tool_specs injected. finish is the protocol
+    terminator: hybrid mode injects no finish spec, but node prompts (e.g.
+    system.compactor) still end tasks via a finish call, so finish stays allowed
+    unless the node explicitly excluded it via control_tools.
+    """
+    names: set[str] = set()
+    for spec in openai_tools or []:
+        if not isinstance(spec, dict):
+            continue
+        name = str((spec.get("function") or {}).get("name") or "").strip()
+        if name and _is_pseudo_tool_name(name):
+            names.add(name)
+    ct = getattr(node, "control_tools", "all") if node is not None else "all"
+    if isinstance(ct, str):
+        if ct.strip().lower() != "none":
+            names.add("finish")
+    elif isinstance(ct, list):
+        if "finish" in {str(x).strip() for x in ct}:
+            names.add("finish")
+    return names
+
+
 import re as _re
 
 _TOOL_NAME_SANITIZE_RE = _re.compile(r'[^a-zA-Z0-9_-]')

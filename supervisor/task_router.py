@@ -424,6 +424,50 @@ class TaskRouterMixin:
             ).strip()
             if compact_target_session_id:
                 task.input["_compact_target_session_id"] = compact_target_session_id
+                # [fix 2026-09-03] Why: concurrent entry-branch forks of one session
+                # all cross the compact threshold on the same inherited history, each
+                # dispatching its own compactor LLM call, then rewriting the same
+                # JSONL concurrently (observed 4 compact_start within 46s on one
+                # session). How: if another caller already waits on a compactor for
+                # the same target, or a standalone API compact for it is still
+                # active, skip creating a duplicate compactor and resume this caller
+                # immediately with a no-op deduped compact_done. The deduped flag
+                # tells the engine to not re-dispatch on resume. Purpose: at most
+                # one in-flight compaction per target session — no duplicate LLM
+                # cost, no file race. Runs under the state lock, so check+mark is
+                # atomic across engine workers.
+                _dup = any(
+                    _o.task_id != task.task_id
+                    and _o.status == TaskStatus.suspended
+                    and _o.input.get("_compact_dispatch_pending")
+                    and str(_o.input.get("_compact_target_session_id") or "") == compact_target_session_id
+                    for _o in self.tasks.values()
+                ) or any(
+                    str(_o.input.get("_compact_apply_to_session_id") or "") == compact_target_session_id
+                    and str(_o.node_id or "") == "system.compactor"
+                    and _o.status in (TaskStatus.pending, TaskStatus.running)
+                    for _o in self.tasks.values()
+                )
+                if _dup:
+                    log.info(
+                        "compact dedupe: target=%s already compacting, skip duplicate dispatch from task=%s",
+                        compact_target_session_id, str(task.task_id or "")[:12],
+                    )
+                    task.status = TaskStatus.pending
+                    task.waiting_for_task_id = None
+                    task.worker_id = None
+                    task.lease_expires_at = None
+                    task.updated_at = _now()
+                    task.input["resume_data"] = {
+                        "type": "compact_done",
+                        "success": True,
+                        "before": 0,
+                        "after": 0,
+                        "deduped": True,
+                    }
+                    task.input.pop("_compact_dispatch_pending", None)
+                    self._event_task_snapshot("task_resumed", task)
+                    return
 
         created_child_ids: list[str] = []
         # [Fork/Merge 2026-05-17] Why: descendants of an entry branch should keep

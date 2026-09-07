@@ -89,28 +89,36 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         )
         waiter = asyncio.create_task(proc.communicate())
         started = time.monotonic()
-        while True:
-            done, _pending = await asyncio.wait({waiter}, timeout=0.2)
-            if waiter in done:
-                stdout_bytes, stderr_bytes = waiter.result()
-                break
-            if await ctx.check_cancelled() or _async_cancel_marked(ctx):
-                # Fix: kill entire process group, not just the shell
-                kill_process_group(proc)
-                # Fix: 5s safety timeout on gather — if killpg didn't clean
-                # all grandchildren, don't hang forever waiting for pipe EOF
-                try:
-                    await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-                return _error_response("task cancelled", cancelled=True)
-            if time.monotonic() - started >= timeout_sec:
-                kill_process_group(proc)
-                try:
-                    await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-                return _error_response(f"timeout after {timeout_sec}s")
+        try:
+            while True:
+                done, _pending = await asyncio.wait({waiter}, timeout=0.2)
+                if waiter in done:
+                    stdout_bytes, stderr_bytes = waiter.result()
+                    break
+                if await ctx.check_cancelled() or _async_cancel_marked(ctx):
+                    # Fix: kill entire process group, not just the shell
+                    kill_process_group(proc)
+                    # Fix: 5s safety timeout on gather — if killpg didn't clean
+                    # all grandchildren, don't hang forever waiting for pipe EOF
+                    try:
+                        await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    return _error_response("task cancelled", cancelled=True)
+                if time.monotonic() - started >= timeout_sec:
+                    kill_process_group(proc)
+                    try:
+                        await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    return _error_response(f"timeout after {timeout_sec}s")
+        except asyncio.CancelledError:
+            # [fix 2026-09-03] Why: hard task.cancel() from the async-tool cancel
+            # path can land between two 0.2s polls, before the cooperative mark is
+            # sensed — without cleanup the subprocess keeps running orphaned.
+            # How: kill the process group, then let the cancellation propagate.
+            kill_process_group(proc)
+            raise
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")

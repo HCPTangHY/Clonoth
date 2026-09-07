@@ -8,6 +8,7 @@ import type { MessageRole, MessageStatus, TextBlock, ToolExecution, WsMessage } 
 import { useChatStore } from '../../store/chatStore';
 import { AttachmentList } from './AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
+import { mergeThinkingBlocksForDisplay } from './displayBlocks';
 import { BLOCK_STACK_CLASS, type MessageRenderContext } from './renderingConstants';
 import { PluginSlotHost } from '../plugins/PluginSlotHost';
 import { Icon } from '../common';
@@ -190,7 +191,7 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
         )}
 
         <div className={BLOCK_STACK_CLASS}>
-          {message.blocks
+          {mergeThinkingBlocksForDisplay(message.blocks)
             .filter((block) => {
               // [2026-06-03] Why: free prose (stream/final text) duplicates reply text
               // and clutters the card. How: when a card contains any intermediate text

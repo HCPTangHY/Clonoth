@@ -887,6 +887,11 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     _mrns = input_data.get("_memory_route_ns")
     if isinstance(_mrns, str) and _mrns:
         ctx["_memory_route_ns"] = _mrns
+    # [fix 2026-09-04] Forward _memory_route_ws alongside: dream preprocessing
+    # carries the session's workspace name so writes land in the @ws directory.
+    _mrws = input_data.get("_memory_route_ws")
+    if isinstance(_mrws, str) and _mrws:
+        ctx["_memory_route_ws"] = _mrws
     return ctx
 
 

@@ -1392,10 +1392,19 @@ def create_app(
     @app.get("/v1/sessions")
     async def list_sessions(
         channel: str = Query("", description="Filter by channel (e.g. 'web')"),
+        type: str = Query("", description="Session type filter; 'web' is shorthand for channel='web'"),
         limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, description="Pagination offset applied after filtering and sorting"),
     ) -> list[dict[str, Any]]:
-        """List sessions, optionally filtered by channel."""
+        """List sessions, optionally filtered by channel/type and paginated."""
         st: SupervisorState = app.state.state
+        # [2026-09-02] Why: the frontend sidebar only wants web sessions and the
+        # system panel needs the true total count. How: 'type' maps the semantic
+        # session kind to a channel filter, and 'offset' lets clients page past
+        # the limit cap without losing older rows. Purpose: callers no longer
+        # silently truncate when total sessions exceed the page limit.
+        if not channel and str(type or "").strip().lower() == "web":
+            channel = "web"
         results = []
         # [2026-06-06] Why: the frontend needs parent_session_id to distinguish
         # dispatch child sessions from top-level conversations without relying
@@ -1422,7 +1431,7 @@ def create_app(
             })
         # Sort by updated_at desc, most recent first
         results.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-        return results[:limit]
+        return results[offset:offset + limit]
 
     @app.post("/v1/sessions/get_or_create")
     async def get_or_create_session(

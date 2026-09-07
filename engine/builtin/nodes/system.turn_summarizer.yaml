@@ -5,6 +5,10 @@ type: ai
 name: "轮摘要节点"
 description: "生成任务执行摘要。系统内部节点，对用户不可见。"
 model: ""  # 空 = 使用全局默认模型
+# [fix 2026-09-03] 系统内部节点只需要 finish 终止协议，不注入 ask/reply/
+# compact/preempt 等控制类伪工具，缩小提示词噪声与幻觉面。
+control_tools:
+  - finish
 tool_access:
   mode: none
 skills:

@@ -266,6 +266,7 @@ async function select(name) {
       description: esc(meta.description),
       enabled: meta.enabled !== false,
       strategy: meta.strategy === 'constant' ? 'constant' : 'normal',
+      visibility: meta.visibility === 'private' ? 'private' : 'public',
       keywords: Array.isArray(meta.keywords) ? meta.keywords.join(', ') : '',
       order: esc(meta.order ?? '0'),
       priority: esc(meta.priority ?? '0'),
@@ -292,6 +293,7 @@ async function save() {
     next = replaceFmValue(next, 'description', JSON.stringify(f.description));
     next = replaceFmValue(next, 'enabled', f.enabled ? 'true' : 'false');
     next = replaceFmValue(next, 'strategy', f.strategy || 'normal');
+    next = replaceFmValue(next, 'visibility', f.visibility || 'public');
     const kwItems = f.keywords.split(',').map((s) => s.trim()).filter(Boolean)
       .map((s) => '"' + s.replace(/"/g, '\\"') + '"');
     next = replaceFmValue(next, 'keywords', '[' + kwItems.join(', ') + ']');
@@ -338,7 +340,7 @@ async function createSkill() {
   if (!name) { alert('请输入技能目录名'); return; }
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) { alert('名称需匹配 ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$'); return; }
   if (S.skills.some((s) => s.name === name)) { alert('该技能已存在'); return; }
-  const content = `---\nname: ${name}\ndescription: 通过设置页面创建的技能。\nenabled: true\nstrategy: normal\nkeywords: []\norder: 0\npriority: 0\nscan_depth: 0\n---\n\n# ${name}\n\n请在这里编写技能内容。\n`;
+  const content = `---\nname: ${name}\ndescription: 通过设置页面创建的技能。\nenabled: true\nstrategy: normal\nvisibility: public\nkeywords: []\norder: 0\npriority: 0\nscan_depth: 0\n---\n\n# ${name}\n\n请在这里编写技能内容。\n`;
   try {
     await api('/admin/config/skills', { method: 'POST', body: JSON.stringify({ id: name, content }) });
     input.value = '';
@@ -378,6 +380,12 @@ function renderList() {
     trBadge.className = 'badge tr';
     trBadge.textContent = s.strategy || 'normal';
     row1.append(nameSpan, onBadge, trBadge);
+    if (s.visibility === 'private') {
+      const visBadge = document.createElement('span');
+      visBadge.className = 'badge tr';
+      visBadge.textContent = '私密';
+      row1.appendChild(visBadge);
+    }
     btn.appendChild(row1);
     if (s.description || s.body_preview) {
       const desc = document.createElement('div');
@@ -458,9 +466,21 @@ function renderEditor() {
     opt.value = t;
     opt.textContent = t;
     if (t === f.strategy) opt.selected = true;
+    strategySel.appendChild(opt);
   }
   strategySel.addEventListener('change', () => { f.strategy = strategySel.value; markDirty(); });
   form.appendChild(field('strategy（normal=关键词触发，constant=常驻注入）', strategySel));
+
+  const visibilitySel = document.createElement('select');
+  for (const t of ['public', 'private']) {
+    const opt = document.createElement('option');
+    opt.value = t;
+    opt.textContent = t;
+    if (t === f.visibility) opt.selected = true;
+    visibilitySel.appendChild(opt);
+  }
+  visibilitySel.addEventListener('change', () => { f.visibility = visibilitySel.value; markDirty(); });
+  form.appendChild(field('visibility（public=可自动注入，private=仅手动挂载后注入）', visibilitySel));
 
   form.appendChild(field('keywords（逗号分隔，支持 /regex/flags）', textInput(f.keywords, (v) => { f.keywords = v; markDirty(); })));
 

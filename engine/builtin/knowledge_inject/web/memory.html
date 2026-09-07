@@ -21,6 +21,15 @@
   .bar { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 14px 20px 10px; border-bottom: 1px solid var(--muted); display: flex; align-items: baseline; gap: 12px; }
   .bar h1 { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: -0.02em; }
   .bar .count { flex: 1; color: var(--tertiary); font: 10.5px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* [2026-09-04] 搜索框：id/内容/关键词三维度，结果在主区分组渲染 */
+  #search { font: 11px var(--mono); color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 9px; outline: none; width: 200px; }
+  #search:focus { border-color: var(--secondary); }
+  #search::placeholder { color: var(--tertiary); }
+  .sg { margin-bottom: 16px; }
+  .sg-head { display: flex; align-items: baseline; gap: 8px; padding: 3px 2px 5px; margin-bottom: 7px; color: var(--tertiary); font: 600 10px var(--mono); border-bottom: 1px solid var(--muted); }
+  .sg-head .sg-count { margin-left: auto; font-weight: 400; }
+  .sg-list { display: flex; flex-direction: column; gap: 8px; }
+  .entry .loc { font: 9.5px var(--mono); color: var(--tertiary); }
   button.op { font: 10.5px var(--mono); cursor: pointer; white-space: nowrap; color: var(--secondary); background: transparent; border: 1px solid var(--border); border-radius: 4px; padding: 3px 10px; transition: color .15s, border-color .15s; }
   button.op:hover:not(:disabled) { color: var(--text); border-color: var(--secondary); }
   button.op:disabled { opacity: .4; cursor: not-allowed; }
@@ -90,7 +99,7 @@
 
   /* [AutoC 2026-08-28] mode=editor：宿主右栏中的编辑器形态，只保留编辑区。
      列表形态是纯列表（无内联编辑器、无分栏），条目编辑由宿主右栏承担。 */
-  body.editor-only .bar .count, body.editor-only .bar #refresh, body.editor-only .bar #new-entry { display: none; }
+  body.editor-only .bar .count, body.editor-only .bar #refresh, body.editor-only .bar #new-entry, body.editor-only .bar #search { display: none; }
   body.editor-only .cols { display: block; min-height: 0; }
   body.editor-only .tree-pane, body.editor-only .entries, body.editor-only .book-bar { display: none; }
   body.editor-only .editor { display: block; border-top: none; max-height: none; height: calc(100vh - 44px); }
@@ -131,6 +140,7 @@
 <header class="bar">
   <h1>记忆</h1>
   <span class="count" id="count">—</span>
+  <input id="search" type="text" placeholder="搜索 id / 内容 / 关键词" spellcheck="false" autocomplete="off">
   <button class="op" id="rail-close" hidden>关闭</button>
   <button class="op" id="refresh">刷新</button>
   <button class="op primary" id="new-entry" disabled title="先在左侧选择一个 book，新条目写入该书">新建条目</button>
@@ -218,6 +228,9 @@ const S = {
   raw: null,             // 当前 book 原文（懒加载）
   editingId: null,       // 正在编辑的条目 id；'__new__' 表示新建
   form: null,
+  query: '',             // [2026-09-04] 搜索词；非空时主区显示搜索结果而非 book 条目
+  searchData: null,      // GET /admin/config/memory?q= 的响应
+  searchError: null,     // 最近一次搜索错误
 };
 
 const $ = (id) => document.getElementById(id);
@@ -403,6 +416,11 @@ function renderEntries() {
   const el = $('entries');
   const bar = $('book-bar');
   el.innerHTML = '';
+  // [2026-09-04] 搜索模式：主区改为渲染搜索结果，分组见 renderSearchResults
+  if (S.query) {
+    renderSearchResults(el);
+    return;
+  }
   if (!S.book) {
     bar.hidden = true;
     $('new-entry').disabled = true;
@@ -489,6 +507,152 @@ function renderEntries() {
     card.addEventListener('click', () => startEdit(e.id));
     el.appendChild(card);
   }
+}
+
+// ── search ─────────────────────────────────────────────────
+// [2026-09-04] 全库搜索：后端 ?q= 返回命中树（条目带 matches / kw_hits），
+// 前端分三组渲染——关键词聚合（按命中关键词分组）、ID 匹配、内容匹配。
+// 同一条目可能出现在多个组（语义不同：聚合回答“哪些条目挂了这关键词”，
+// ID/内容组回答“id/正文里写了什么”）。
+let _searchTimer = null;
+function onSearchInput() {
+  const v = $('search').value.trim();
+  if (_searchTimer) clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(() => { runSearch(v).catch((e) => {
+    S.searchData = null;
+    S.searchError = e.message;
+    if (S.query === v) renderEntries();
+  }); }, 250);
+}
+
+async function runSearch(query) {
+  S.query = query;
+  S.searchError = null;
+  if (!query) {
+    S.searchData = null;
+    renderTree();
+    renderEntries();
+    return;
+  }
+  S.searchData = null;
+  renderEntries();
+  // 移动端：搜索时切到条目视图（桌面端该 class 无视觉效果，规则在媒体查询内）
+  document.body.classList.add('show-entries');
+  const resp = await api('/admin/config/memory?' + q({ q: query }));
+  if (S.query !== query) return;  // 已过期响应丢弃
+  S.searchData = resp;
+  renderEntries();
+}
+
+function mkResultCard(ns, book, e) {
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'entry';
+  const row1 = document.createElement('div');
+  row1.className = 'row1';
+  const idSpan = document.createElement('span');
+  idSpan.className = 'id';
+  idSpan.textContent = e.id;
+  row1.appendChild(idSpan);
+  const onB = document.createElement('span');
+  onB.className = 'badge ' + (e.enabled === false ? 'off' : 'on');
+  onB.textContent = e.enabled === false ? '禁用' : '启用';
+  row1.appendChild(onB);
+  if (e.constant) {
+    const cb = document.createElement('span');
+    cb.className = 'badge const';
+    cb.textContent = '常驻';
+    row1.appendChild(cb);
+  }
+  const loc = document.createElement('span');
+  loc.className = 'loc';
+  loc.textContent = (ns === '' ? '(全局)' : ns) + ' / ' + book;
+  row1.appendChild(loc);
+  card.appendChild(row1);
+  if (e.content_preview) {
+    const pv = document.createElement('div');
+    pv.className = 'preview';
+    pv.textContent = e.content_preview;
+    card.appendChild(pv);
+  }
+  if ((e.keywords || []).length) {
+    const kw = document.createElement('div');
+    kw.className = 'kws';
+    kw.textContent = e.keywords.join(', ');
+    card.appendChild(kw);
+  }
+  card.addEventListener('click', () => railOpen({ ns: ns || '', book, id: e.id }));
+  return card;
+}
+
+function mkSearchGroup(title, items) {
+  const g = document.createElement('div');
+  g.className = 'sg';
+  const head = document.createElement('div');
+  head.className = 'sg-head';
+  const t = document.createElement('span');
+  t.textContent = title;
+  const c = document.createElement('span');
+  c.className = 'sg-count';
+  c.textContent = items.length + ' 条';
+  head.append(t, c);
+  g.appendChild(head);
+  const list = document.createElement('div');
+  list.className = 'sg-list';
+  for (const it of items) list.appendChild(mkResultCard(it.ns, it.book, it.e));
+  g.appendChild(list);
+  return g;
+}
+
+function renderSearchResults(el) {
+  $('count').textContent = S.searchData
+    ? '搜索「' + S.query + '」：' + S.searchData.total + ' 条命中'
+    : '搜索「' + S.query + '」…';
+  if (S.searchError) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '搜索失败：' + S.searchError;
+    el.appendChild(p);
+    return;
+  }
+  if (!S.searchData) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '搜索中…';
+    el.appendChild(p);
+    return;
+  }
+  if (!S.searchData.total) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '没有命中「' + S.query + '」的条目。';
+    el.appendChild(p);
+    return;
+  }
+  const kwGroups = new Map();  // 关键词原文 -> [{ns, book, e}]
+  const idHits = [];
+  const contentHits = [];
+  for (const g of S.searchData.namespaces || []) {
+    for (const b of g.books || []) {
+      for (const e of b.entries || []) {
+        const it = { ns: g.ns, book: b.book, e };
+        if ((e.matches || []).includes('id')) idHits.push(it);
+        if ((e.matches || []).includes('content')) contentHits.push(it);
+        for (const kw of e.kw_hits || []) {
+          if (!kwGroups.has(kw)) kwGroups.set(kw, []);
+          kwGroups.get(kw).push(it);
+        }
+      }
+    }
+  }
+  if (kwGroups.size) {
+    const sorted = [...kwGroups.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+    for (const [kw, items] of sorted) {
+      el.appendChild(mkSearchGroup('关键词「' + kw + '」', items));
+    }
+  }
+  if (idHits.length) el.appendChild(mkSearchGroup('ID 匹配', idHits));
+  if (contentHits.length) el.appendChild(mkSearchGroup('内容匹配', contentHits));
 }
 
 // ── editor pane ────────────────────────────────────────────
@@ -783,8 +947,14 @@ if (MODE === 'editor') {
           .then(() => { if (MODE === 'list') renderEntries(); })
           .catch((e) => { S.entriesError = e.message; if (MODE === 'list') renderEntries(); });
       }
+      // 搜索处于激活状态时重跑一次，让结果反映保存/删除后的内容
+      if (S.query) runSearch(S.query).catch(() => undefined);
     };
   }
+  $('search').addEventListener('input', onSearchInput);
+  $('search').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') { $('search').value = ''; onSearchInput(); }
+  });
   $('refresh').addEventListener('click', () => { loadAll().catch((e) => alert('加载失败：' + e.message)); });
   $('new-entry').addEventListener('click', startNew);
   $('back-to-tree').addEventListener('click', () => {

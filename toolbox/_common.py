@@ -1,6 +1,7 @@
 """Shared utilities and constants for built-in tools."""
 from __future__ import annotations
 
+import json
 import os
 import signal
 from pathlib import Path
@@ -143,6 +144,17 @@ async def request_guard(
     Returns (op_response, error_result).
     error_result is None when the operation may proceed.
     """
+    # [2026-09-06] Why: registry.authorize() pre-flights a tool's internal
+    # guard (e.g. execute_command's command-level approval) before the adaptive
+    # scheduler starts its async-upgrade timer; without a hand-off the tool
+    # would request the same approval a second time. How: every approved guard
+    # records an (op, canonical params) fingerprint on the ctx, and a matching
+    # later request returns immediately. ctx objects are per tool call (the
+    # scheduler snapshots before pre-flight), so fingerprints cannot leak
+    # across calls. Purpose: one approval per exact guarded operation, with the
+    # wait happening outside any execution timer.
+    if _guard_fingerprint(op, parameters) in (getattr(ctx, "_approved_guard_fps", None) or ()):
+        return {}, None
     op_res = await ctx.request_op(op, parameters)
     safety_level = str(op_res.get("safety_level") or "")
 
@@ -163,7 +175,25 @@ async def request_guard(
     if await ctx.check_cancelled():
         return op_res, {"ok": False, "error": "task cancelled", "cancelled": True}
 
+    try:
+        approved = getattr(ctx, "_approved_guard_fps", None)
+        if not isinstance(approved, set):
+            approved = set()
+            setattr(ctx, "_approved_guard_fps", approved)
+        approved.add(_guard_fingerprint(op, parameters))
+    except Exception:
+        pass
+
     return op_res, None
+
+
+def _guard_fingerprint(op: str, parameters: dict[str, Any]) -> str:
+    """Stable identity of one guarded operation for pre-approval hand-off."""
+    try:
+        canonical = json.dumps(parameters, sort_keys=True, default=str)
+    except Exception:
+        canonical = repr(sorted((parameters or {}).items()))
+    return f"{op}:{canonical}"
 
 
 async def guard_external_read(

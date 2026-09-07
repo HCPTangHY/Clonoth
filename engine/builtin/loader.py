@@ -14,6 +14,7 @@ from ..hooks.loader import (
     register_declared_nodes,
     clear_load_error,
     record_load_error,
+    _resolve_client_assets,
 )
 
 if TYPE_CHECKING:
@@ -76,6 +77,13 @@ def auto_discover_and_register(
             meta = getattr(module, "PLUGIN_META", None)
             if not isinstance(meta, dict):
                 continue
+            # [2026-09-04] Inline {"file": ...} client asset references for
+            # built-ins too. Why: only the external hooks loader resolved slot
+            # scripts and styles, so a built-in declaring slots (e.g.
+            # knowledge_inject skill pins chip) served the raw {"file": ...}
+            # dict to the web manifest and the browser import failed. How:
+            # reuse the same resolver with the plugin directory as base.
+            _resolve_client_assets(entry if entry.is_dir() else entry.parent, meta)
             # Peek at handler_class to derive handler_name for dependency keys
             class_name = str(meta.get("handler_class") or "").strip()
             if not class_name:
@@ -293,6 +301,9 @@ def load_single_builtin(
         meta = getattr(module, "PLUGIN_META", None)
         if not isinstance(meta, dict):
             raise ValueError(f"{module_name} declares no PLUGIN_META")
+        # See auto_discover_and_register: built-ins need client asset inlining
+        # on the runtime reload path as well.
+        _resolve_client_assets(entry if entry.is_dir() else entry.parent, meta)
         class_name = str(meta.get("handler_class") or "").strip()
         if not class_name:
             # Meta-only plugin (declarative surfaces only, e.g. turn_summary).

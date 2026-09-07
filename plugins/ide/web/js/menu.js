@@ -81,3 +81,23 @@ function fallbackCopy(text) {
   try { document.execCommand('copy'); } catch (e) { /* 忽略 */ }
   ta.remove();
 }
+
+// [2026-09-05] 文件下载：经会话文件端点取回字节，以对象 URL 触发浏览器保存。
+// 文件端点需要鉴权头，不能直接以 <a href> 指向 URL，必须先 fetch 拿 blob。
+async function downloadFile(path, name) {
+  try {
+    const resp = await api('/sessions/' + encodeURIComponent(SESSION_ID)
+      + '/file?path=' + encodeURIComponent(path));
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name || baseName(path);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) {
+    alert('下载失败：' + e.message);
+  }
+}

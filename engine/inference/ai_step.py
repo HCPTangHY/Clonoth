@@ -8,7 +8,7 @@ from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
 
-from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs
+from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names
 from .resume_builder import apply_resume_messages, collect_resume_attachments
 from .loop_state import _LoopState, _build_loop_state, _persist_ctx, _short
 from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
@@ -174,6 +174,30 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     pseudo_calls: list = []
     real_tool_calls: list[dict[str, Any]] = []
     _unauthorized_errors: list[dict[str, Any]] = []  # [fix 2026-06-24] collect, don't append yet
+
+    def _reject_unauthorized(tc) -> None:
+        # [AutoC 2026-08-31] 最简拒绝：只告知工具不存在，不给任何
+        # 替代指引。Why: 旧文案提示调用 finish()，但 finish 可能也不在
+        # 授权列表里，反而误导模型反复重试。
+        logger.warning("node %s attempted unauthorized tool call: %s", ls.node.id, tc.name)
+        _err_msg = ls.formatter.format_tool_result(
+            tc,
+            f"Error: Tool '{tc.name}' does not exist.",
+        )
+        # [2026-05-01] 工具结果必须带当前 tool_mode。
+        # 目的：真 native 的 role=tool 消息在下一轮仍由 NativeToolFormatter 透传。
+        set_message_meta(_err_msg, MessageMeta(
+            tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+            message_type="tool_result",
+        ))
+        # [fix 2026-06-24] 不在此处立即追加到 ls.messages。
+        # 原因：assistant 消息在 for 循环之后才追加（行 541），如果在此处先
+        # 追加 tool_result，消息列表会变成 [..., tool_result, assistant]，
+        # 导致 _prepare_messages prefill guard 检测到末尾是 assistant 并注入
+        # "请继续。"，引发模型反复重试同一个 unauthorized tool 的无限循环。
+        # 做法：暂存到 _unauthorized_errors，在 assistant 消息之后统一追加。
+        _unauthorized_errors.append(_err_msg)
+
     for tc in resp.tool_calls:
         # [2026-05-04] Dynamic per-target dispatch tools are pseudo tools too.
         # Why: names like dispatch:child_coder are generated from delegate_targets
@@ -181,32 +205,18 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         # instead of a fixed name-only set. Purpose: route fixed-target dispatches
         # to pseudo_handlers without accepting removed aggregate dispatch tools.
         if _is_pseudo_tool_name(tc.name):
+            # [fix 2026-09-03] 伪工具同样要做授权校验：只放行本轮实际注入的伪工具。
+            # Why: switch_node 此前仅按静态名称放行，未注入该工具的系统节点
+            # （如 system.turn_summarizer 摘要的日志里含有 switch_node 调用）可能
+            # 幻觉出同名调用并被直接执行，导致 session 入口节点被乱切换。
+            if ls.allowed_pseudo_tools is not None and tc.name not in ls.allowed_pseudo_tools:
+                _reject_unauthorized(tc)
+                continue
             pseudo_calls.append(tc)
         else:
             # 【Fix】真工具权限校验：工具必须在节点的授权列表内才能执行
             if tc.name not in ls.allowed_real_tools:
-                logger.warning("node %s attempted unauthorized tool call: %s (allowed: %s)",
-                               ls.node.id, tc.name, ls.allowed_real_tools)
-                # [AutoC 2026-08-31] 最简拒绝：只告知工具不存在，不给任何
-                # 替代指引。Why: 旧文案提示调用 finish()，但 finish 可能也不在
-                # 授权列表里，反而误导模型反复重试。
-                _err_msg = ls.formatter.format_tool_result(
-                    tc,
-                    f"Error: Tool '{tc.name}' does not exist.",
-                )
-                # [2026-05-01] 工具结果必须带当前 tool_mode。
-                # 目的：真 native 的 role=tool 消息在下一轮仍由 NativeToolFormatter 透传。
-                set_message_meta(_err_msg, MessageMeta(
-                    tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-                    message_type="tool_result",
-                ))
-                # [fix 2026-06-24] 不在此处立即追加到 ls.messages。
-                # 原因：assistant 消息在 for 循环之后才追加（行 541），如果在此处先
-                # 追加 tool_result，消息列表会变成 [..., tool_result, assistant]，
-                # 导致 _prepare_messages prefill guard 检测到末尾是 assistant 并注入
-                # "请继续。"，引发模型反复重试同一个 unauthorized tool 的无限循环。
-                # 做法：暂存到 _unauthorized_errors，在 assistant 消息之后统一追加。
-                _unauthorized_errors.append(_err_msg)
+                _reject_unauthorized(tc)
                 continue
 
             real_tool_calls.append({
@@ -1031,6 +1041,12 @@ async def run_ai_node(
         downstream_info=downstream_info, switch_info=switch_info,
         task_context=rctx.task_context,
     )
+    # [fix 2026-09-03] Why: pseudo calls were accepted by static name only, so a
+    # hallucinated control call (e.g. switch_node imitated from a summarized log)
+    # was executed even for nodes that never had it injected. How: derive the
+    # authorized pseudo set from the injected specs before the formatter rewrites
+    # the list, and enforce it in _handle_tool_calls like real-tool authz.
+    _allowed_pseudo_tools = allowed_pseudo_names(openai_tools, node)
 
     # ---- 工具定义注入（formatter 统一处理 native/json 差异）----
     if openai_tools:
@@ -1055,7 +1071,19 @@ async def run_ai_node(
         collected_attachments=collected_attachments,
         tool_produced_attachments=_tool_produced_attachments,
         formatter=formatter, allowed_real_tools=_allowed_real_tools,
+        allowed_pseudo_tools=_allowed_pseudo_tools,
     )
+
+    # [fix 2026-09-03] Why: supervisor dedupes concurrent compact dispatches for
+    # the same target session — late callers get a no-op compact_done resume while
+    # the shared compactor is still in flight. Without a marker the fresh loop
+    # state would immediately re-detect the over-threshold history and dispatch
+    # yet another compactor, spinning cheap resume loops until the first one
+    # lands. How: a deduped resume marks this task's loop state compacted, so the
+    # before_step check passes and the task proceeds with its current context.
+    # Purpose: dedupe actually saves the duplicate LLM call instead of looping.
+    if str((resume_data or {}).get("type") or "") == "compact_done" and (resume_data or {}).get("deduped"):
+        ls.compacted = True
 
     # ---- 推理循环 ----
     for step in range(step_count, max_steps):

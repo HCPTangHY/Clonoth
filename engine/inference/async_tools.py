@@ -136,6 +136,17 @@ def mark_async_tool_cancelled(async_id: str) -> None:
     aid = (async_id or "").strip()
     if aid:
         _CANCELLED_ASYNC_IDS.add(aid)
+        # [fix 2026-09-03] Why: the mark alone only stopped execute_command (its
+        # 0.2s loop polls the registry); MCP tools and other async_mode tools ran
+        # to completion, so cancel was label-only and saved nothing. How: the
+        # runners already register their asyncio task handle under _task — cancel
+        # it so the underlying coroutine is actually interrupted; the runners'
+        # CancelledError handlers report a proper cancelled finish. Purpose:
+        # cancel really stops the work, not just the label.
+        entry = _async_tool_tasks.get(aid)
+        task = entry.get("_task") if isinstance(entry, dict) else None
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
 
 
 def is_async_tool_cancelled(async_id: str) -> bool:
@@ -252,6 +263,14 @@ async def _deliver_async_result(
     try:
         if error is not None:
             raise error
+        # [fix 2026-09-03] Why: a cancel that lands after the work finished but
+        # before delivery used to ship as done and overwrite the supervisor's
+        # cancel_requested marker — label and reality diverged. How: honor the
+        # cancel mark at delivery time; the cancel API contract is that the
+        # result will not be delivered. Purpose: consistent cancelled state on
+        # both engine tracker and supervisor shadow list.
+        if is_async_tool_cancelled(async_tool_id):
+            raise asyncio.CancelledError()
         _elapsed = time.monotonic() - started_at
         _tool_spec = registry.get_spec(tool_name)
         _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
@@ -299,7 +318,14 @@ async def _deliver_async_result(
             f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
             json=payload,
         )
-    except Exception as e:
+    except (Exception, asyncio.CancelledError) as e:
+        # [fix 2026-09-03] Why: since Python 3.8 asyncio.CancelledError is a
+        # BaseException, so `except Exception` never caught it — the isinstance
+        # check below was dead code and a hard-cancelled task died without any
+        # cancelled report, leaving the supervisor shadow entry stuck at running
+        # until an engine restart marked it lost. How: catch CancelledError
+        # explicitly alongside Exception. Purpose: real cancellations now flow
+        # through the cancelled-report path they were designed for.
         _is_cancelled = is_async_tool_cancelled(async_tool_id) or isinstance(e, asyncio.CancelledError)
         _async_tool_tasks[async_tool_id] = {
             "tool_name": tool_name,
@@ -347,6 +373,10 @@ async def _deliver_started_async_task(
         _async_tool_tasks[async_tool_id]["_task"] = asyncio.current_task()
     try:
         result = await exec_task
+    except asyncio.CancelledError as e:
+        # [fix 2026-09-03] hard cancel from mark_async_tool_cancelled lands here;
+        # route it through the normal cancelled-report delivery instead of dying.
+        await _deliver_async_result(error=e, **delivery_kwargs)
     except Exception as e:
         await _deliver_async_result(error=e, **delivery_kwargs)
     else:
@@ -385,6 +415,26 @@ async def _run_async_tool(
             tool_args,
             tool_ctx,
             async_call=True,
+        )
+    except asyncio.CancelledError as e:
+        # [fix 2026-09-03] hard cancel from mark_async_tool_cancelled lands here;
+        # route it through the normal cancelled-report delivery instead of dying.
+        await _deliver_async_result(
+            registry=registry,
+            http=http,
+            supervisor_url=supervisor_url,
+            task_id=task_id,
+            session_id=session_id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_ctx=tool_ctx,
+            async_tool_id=async_tool_id,
+            started_at=_started,
+            runtime_cfg=runtime_cfg,
+            step=step,
+            index=index,
+            tool_call_id=tool_call_id,
+            error=e,
         )
     except Exception as e:
         await _deliver_async_result(
