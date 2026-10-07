@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import os
 import signal
 import uuid
@@ -765,12 +766,20 @@ async def _heartbeat(
         while True:
             await asyncio.sleep(interval)
             try:
-                await http.post(
+                response = await http.post(
                     f"{sup_url}/v1/tasks/{task_id}/renew_lease",
                     json={"worker_id": worker_id, "lease_sec": lease_sec},
                 )
-            except Exception:
-                pass
+                response.raise_for_status()
+                if response.json().get("ok") is False:
+                    logging.getLogger(__name__).warning(
+                        "Task lease renewal rejected: task=%s worker=%s", task_id, worker_id,
+                    )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Task lease renewal failed: task=%s worker=%s error=%s",
+                    task_id, worker_id, type(exc).__name__,
+                )
     except asyncio.CancelledError:
         pass
 

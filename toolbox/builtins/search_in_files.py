@@ -7,6 +7,8 @@ Supports:
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 from fnmatch import fnmatch
 from pathlib import Path
@@ -139,29 +141,28 @@ def _collect_files(root: Path, pattern: str, max_file_size: int, workspace: Path
             pass
         return
 
-    for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
-        if any(part in _SKIP_DIRS for part in p.parts):
-            continue
-        if p.suffix in _SKIP_SUFFIXES:
-            continue
-        try:
-            if p.stat().st_size > max_file_size:
+    # Prune before descending; rglob + sorting traverses even excluded caches.
+    for directory, dirs, filenames in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
+        for filename in sorted(filenames):
+            p = Path(directory) / filename
+            if p.suffix in _SKIP_SUFFIXES:
                 continue
-        except Exception:
-            continue
-        rel = _rel(p)
-        if not _match_pattern(rel, pattern):
-            continue
-        yield p, rel
+            try:
+                if not p.is_file() or p.stat().st_size > max_file_size:
+                    continue
+            except OSError:
+                continue
+            rel = _rel(p)
+            if _match_pattern(rel, pattern):
+                yield p, rel
 
 
 # ---------------------------------------------------------------------------
 #  Search mode
 # ---------------------------------------------------------------------------
 
-async def _do_search(
+def _search_sync(
     root: Path, regex: re.Pattern, pattern: str,
     max_results: int, max_file_size: int, ctx: ToolContext,
 ) -> dict[str, Any]:
@@ -234,6 +235,15 @@ async def _do_replace(
     if err is not None:
         return _error_response(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
+    return await asyncio.to_thread(
+        _replace_sync, root, regex, replace_str, pattern, max_files, max_file_size, ctx,
+    )
+
+
+def _replace_sync(
+    root: Path, regex: re.Pattern, replace_str: str,
+    pattern: str, max_files: int, max_file_size: int, ctx: ToolContext,
+) -> dict[str, Any]:
     all_matches: list[dict[str, Any]] = []
     files_modified: list[str] = []
     files_processed = 0
@@ -352,6 +362,6 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
             root, regex, query, replace_str, pattern, max_files, max_file_size_bytes, ctx,
         )
     else:
-        return await _do_search(
-            root, regex, pattern, max_results, max_file_size_bytes, ctx,
+        return await asyncio.to_thread(
+            _search_sync, root, regex, pattern, max_results, max_file_size_bytes, ctx,
         )
