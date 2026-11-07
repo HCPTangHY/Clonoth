@@ -9,7 +9,7 @@ from typing import Any
 
 from clonoth_runtime import classify_path, load_policy_config, parse_extra_roots
 
-from .context import ToolContext
+from .context import APPROVAL_FAILURE_STATUSES, ToolContext
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +167,29 @@ async def request_guard(
     if safety_level == "approval_required":
         approval_id = op_res.get("approval_id")
         approval = await ctx.wait_for_approval(approval_id)
-        if approval.get("status") == "cancelled":
+        approval_status = str(approval.get("status") or "") if isinstance(approval, dict) else ""
+        if approval_status == "cancelled":
             return op_res, {"ok": False, "error": "task cancelled", "approval_id": approval_id, "cancelled": True}
-        if approval.get("status") != "allowed":
-            return op_res, {"ok": False, "error": "user denied approval", "approval_id": approval_id}
+        if approval_status in APPROVAL_FAILURE_STATUSES:
+            # [Audit A 2026-10] Why: every non-``allowed`` status used to be
+            # reported as "user denied approval", so a Supervisor outage or a lost
+            # approval was blamed on the human. How: pass the structured failure
+            # through with denied=False. Purpose: the caller states what actually
+            # failed and the guarded operation is still not executed.
+            return op_res, {
+                "ok": False,
+                "error": str(approval.get("error") or f"approval {approval_status}"),
+                "approval_id": approval_id,
+                "approval_status": approval_status,
+                "denied": False,
+            }
+        if approval_status != "allowed":
+            return op_res, {
+                "ok": False,
+                "error": "user denied approval",
+                "approval_id": approval_id,
+                "denied": True,
+            }
 
     if await ctx.check_cancelled():
         return op_res, {"ok": False, "error": "task cancelled", "cancelled": True}

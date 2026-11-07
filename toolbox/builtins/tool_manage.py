@@ -1,8 +1,8 @@
-"""Tool management: create_or_update_tool, reload_tools."""
+"""External script management through manage_tool."""
 from __future__ import annotations
 
+import math
 import pprint
-import re
 from typing import Any
 
 from ..context import ToolContext
@@ -75,7 +75,7 @@ def _render_tool_py(*, spec: dict[str, Any], script_body: str, timeout_sec: floa
 #  Tool functions
 # ---------------------------------------------------------------------------
 
-async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+async def _upsert_tool(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update an external tool under tools/."""
     name = str(args.get("name", "")).strip()
     description = str(args.get("description", "")).strip()
@@ -95,15 +95,26 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
         input_schema = {"type": "object", "properties": {}, "required": []}
 
     spec = {"name": name, "description": description, "input_schema": input_schema}
+    for flag in ("pure", "async_mode"):
+        if flag in args:
+            spec[flag] = bool(args[flag])
+    try:
+        timeout_value = float(timeout_sec) if timeout_sec is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return _err("timeout_sec must be a positive finite number")
+    if timeout_value is not None and (not math.isfinite(timeout_value) or timeout_value <= 0):
+        return _err("timeout_sec must be a positive finite number")
     code = _render_tool_py(
         spec=spec,
         script_body=script.strip(),
-        timeout_sec=float(timeout_sec) if timeout_sec is not None else None,
+        timeout_sec=timeout_value,
     )
 
     from .write_file import write_file
     path = f"tools/{name}.py"
-    res = await write_file({"path": path, "content": code}, ctx)
+    # Tools belong to the installation registry, not the active project workspace.
+    target = ctx.registry.tools_dir / f"{name}.py"
+    res = await write_file({"path": str(target.resolve()), "content": code}, ctx)
     if not res.get("ok"):
         return res
 
@@ -115,7 +126,7 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
     return _ok(f"Tool written: {path}", path=path, reloaded=count)
 
 
-async def reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+async def _reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Reload tools/ directory.
 
     [AutoC 2026-08-27] MCP discovery no longer runs here: the mcp builtin plugin
@@ -127,3 +138,15 @@ async def reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         return _ok(f"Tools reloaded: {count} local", tools=count)
     except Exception as e:
         return _err(e)
+
+
+async def manage_tool(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Create/update a script or reload the external-tool registry."""
+    action = str(args.get("action") or "").strip().lower()
+    if not action:
+        action = "upsert" if (args.get("name") or args.get("script")) else "reload"
+    if action == "reload":
+        return await _reload_tools(args, ctx)
+    if action == "upsert":
+        return await _upsert_tool(args, ctx)
+    return _err(f"invalid action: {action!r}, must be 'upsert' or 'reload'")

@@ -27,21 +27,39 @@ RESERVED_TOOL_NAMES = {
     "apply_diff",
     "write_file",
     "execute_command",
-    "search_in_files",
+    "grep",
     "create_or_update_skill",
     "list_skills",
     "delete_skill",
-    "create_or_update_tool",
-    "reload_tools",
+    "manage_tool",
     "request_restart",
-    "create_schedule",
-    "list_schedules",
-    "delete_schedule",
+    "manage_schedule",
     "save_memory",
     "list_memories",
     "delete_memory",
     "get_context_window",
     "set_workspace",
+    "manage_workers",
+    "create_agent",
+    "manage_memory",
+    "manage_skill",
+    "manage_mcp_client",
+    "finish",
+    "ask",
+    "intermediate_reply",
+    "compact_context",
+    "switch_node",
+    # Retired public names stay unavailable to script tools; no aliases are installed.
+    "create_or_update_tool",
+    "reload_tools",
+    "create_schedule",
+    "list_schedules",
+    "delete_schedule",
+    "cancel_active_tasks",
+    "preempt_task",
+    "create_or_update_mcp_client",
+    "list_mcp_clients",
+    "delete_mcp_client",
 }
 
 # Convenience alias used by supervisor/admin_api.py
@@ -59,10 +77,10 @@ from .search_in_files import search_in_files  # noqa: E402,F401
 # Why: skill CRUD tools moved into engine.builtin.knowledge_inject. How: keep the
 # names reserved above but stop importing the removed skill-tool module.
 # Purpose: registry startup no longer depends on deleted knowledge files.
-from .tool_manage import create_or_update_tool, reload_tools  # noqa: E402,F401
+from .tool_manage import manage_tool  # noqa: E402,F401
 from .system import request_restart  # noqa: E402,F401
-from .schedules import create_schedule, list_schedules, delete_schedule  # noqa: E402,F401
-from .tasks import cancel_active_tasks, list_active_tasks, get_context_window  # noqa: E402,F401
+from .schedules import manage_schedule  # noqa: E402,F401
+from .tasks import get_context_window  # noqa: E402,F401
 # Why: memory CRUD tools moved into engine.builtin.knowledge_inject. How: keep the
 # names reserved above but stop importing the removed memory-tool module.
 # Purpose: plugin metadata becomes the single registration source.

@@ -1,15 +1,28 @@
 """apply_diff — apply sequential search/replace diffs to a file (policy + approval guarded).
 
-Each diff in the array is applied in order. The search string must match exactly
-(including whitespace and indentation). If start_line is omitted and the search
-string appears more than once, the diff is rejected.
+Each diff in the array is applied in order, each one operating on the content
+produced by the previous one. The search string must match exactly (including
+whitespace and indentation).
 
-After diffs[0] is applied, diffs[1] operates on the *resulting* content, and so on.
+``start_line`` is always a line number of the *original* file, i.e. the file as it
+was before the first diff of this batch ran. That is the only coordinate system a
+caller can reason about: once an edit adds or removes lines, a post-edit line number
+means something different from what was written. Each applied edit is recorded in
+the coordinate frame it ran in and replayed in order, so a later start_line keeps
+pointing at the same text across any number of insertions, deletions, replacements,
+re-edits of previously inserted text, or bottom-to-top edit order.
+
+If the search text is unique it is located by content alone, unless that only
+occurrence ends before the mapped position — then the requested region was already
+replaced or deleted by an earlier diff of this batch and must not fall back to a
+different copy. When the text occurs more than once, start_line picks the first
+occurrence at or after the mapped position; without start_line the diff is rejected
+with the candidate original line numbers.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..context import ToolContext
 from .._common import request_guard, resolve_under_allowed_roots
@@ -20,6 +33,7 @@ from .._common import request_guard, resolve_under_allowed_roots
 # ---------------------------------------------------------------------------
 
 _MAX_FILE_SIZE = 1024 * 1024 * 64  # 64 MiB — generous but bounded
+_MAX_CANDIDATES = 200  # 只限制错误信息里回显的候选行号数量，不限制实际定位
 
 
 # ---------------------------------------------------------------------------
@@ -27,22 +41,67 @@ _MAX_FILE_SIZE = 1024 * 1024 * 64  # 64 MiB — generous but bounded
 # ---------------------------------------------------------------------------
 
 
-def _find_match_lines(content: str, search: str, limit: int = 20) -> list[int]:
-    """找出 search 在 content 中所有匹配位置的起始行号(1-based)。
-
-    改进2辅助函数：在多匹配场景下，提供每个匹配的行号候选列表，
-    帮助 AI 快速定位正确的 start_line，而不是只返回匹配数量。
-    """
-    lines: list[int] = []
-    start = 0
-    while len(lines) < limit:
-        idx = content.find(search, start)
+def _match_offsets(content: str, search: str, limit: int) -> list[int]:
+    """search 在 content 中前 *limit* 个（不重叠）匹配的字符偏移。"""
+    offsets: list[int] = []
+    pos = 0
+    while len(offsets) < limit:
+        idx = content.find(search, pos)
         if idx == -1:
             break
-        line_no = content[:idx].count('\n') + 1
-        lines.append(line_no)
-        start = idx + max(1, len(search))
-    return lines
+        offsets.append(idx)
+        pos = idx + max(1, len(search))
+    return offsets
+
+
+def _line_of(content: str, offset: int) -> int:
+    """字符偏移所在的 1-based 行号。"""
+    return content.count("\n", 0, offset) + 1
+
+
+def _line_start_offsets(text: str) -> list[int]:
+    """每一行起始字符偏移；index 0 即第 1 行。"""
+    starts = [0]
+    for idx, char in enumerate(text):
+        if char == "\n":
+            starts.append(idx + 1)
+    return starts
+
+
+# 已应用的一次编辑记录为 (cur_start, cur_end, new_len)：命中区间是**该次编辑执行时**
+# 那份文本里的坐标，new_len 是替换文本长度。行号重放时从原始坐标出发，按应用顺序
+# 逐个变换 —— 每次编辑都用自己的坐标系，所以「对上一编辑插入的文本再替换/删除」
+# 不会把已计入的位移重复累加（那正是用原始坐标记录再反推起点时的经典错误）。
+Edit = tuple[int, int, int]
+
+
+def _current_offset(edits: list[Edit], offset: int) -> int:
+    """原始文件字符偏移 → 当前（本批修改后）文本字符偏移。"""
+    for start, end, new_len in edits:
+        if offset >= end:
+            offset += new_len - (end - start)
+        elif offset >= start:
+            # 目标文本已被这次编辑替换或删除：退到该编辑起点，不猜其内部对应关系
+            # （也保证映射单调不减，可反查用于候选行号回显）。
+            offset = start
+    return offset
+
+
+def _original_offset(edits: list[Edit], offset: int, original_len: int) -> int:
+    """_current_offset 的反函数（映射单调不减）；仅用于候选行号的原始坐标回显。"""
+    lo, hi = 0, original_len
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _current_offset(edits, mid) < offset:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _candidate_lines(content: str, search: str, orig_line_of: Callable[[int], int]) -> list[int]:
+    """候选匹配的原始行号（仅回显，截断到 _MAX_CANDIDATES，不影响实际定位）。"""
+    return [orig_line_of(offset) for offset in _match_offsets(content, search, _MAX_CANDIDATES)]
 
 
 def _find_and_replace(
@@ -50,74 +109,68 @@ def _find_and_replace(
     search: str,
     replace: str,
     start_line: int | None,
-) -> tuple[str, str | None, list[int] | None]:
+    search_from: int | None,
+    orig_line_of: Callable[[int], int],
+) -> tuple[str, str | None, int | None, list[int] | None]:
     """Apply a single search/replace on *content*.
 
-    Returns (new_content, error_message | None, candidate_lines | None).
-    error_message is None on success.
-    candidate_lines is populated when multiple matches exist without a valid start_line.
+    Returns (new_content, error_message | None, match_offset | None, candidate_lines | None).
+    error_message is None on success. match_offset is the character offset of the
+    occurrence that was replaced, so the caller can record where the edit happened.
+    candidate_lines holds original-file line numbers and is populated when the search
+    text is ambiguous.
+
+    *search_from* is the earliest character offset (in the current content) that the
+    caller's original-file start_line maps to; None means "no usable line hint".
     """
     if not search:
-        return content, "Empty search string is not allowed.", None
+        return content, "Empty search string is not allowed.", None, None
 
-    # 改进1 & 2: 先做全局计数，用于唯一匹配优先判断和候选行号收集
-    count = content.count(search)
-
-    if start_line is not None:
-        # 改进1: 唯一匹配时忽略 start_line —— 即使 AI 给了过期的行号，
-        # 只要 search 内容在文件中唯一，就直接替换，不因行号偏移而失败。
-        if count == 1:
-            new_content = content.replace(search, replace, 1)
-            return new_content, None, None
-
-        if count == 0:
-            return content, (
-                "No exact match found. "
-                "Please verify the content matches exactly."
-            ), None
-
-        # count > 1: 多匹配场景，使用 start_line 定位（原有逻辑）
-        lines = content.split("\n")
-        if start_line < 1 or start_line > len(lines):
-            return content, (
-                f"start_line {start_line} is out of range "
-                f"(file has {len(lines)} lines)."
-            ), None
-
-        # Build the prefix (lines before start_line) and the search region.
-        prefix = "\n".join(lines[: start_line - 1])
-        region = "\n".join(lines[start_line - 1:])
-
-        idx = region.find(search)
-        if idx == -1:
-            return content, (
-                "No exact match found starting from line "
-                f"{start_line}. Please verify the content matches exactly."
-            ), None
-
-        # Replace the *first* occurrence in region.
-        new_region = region[:idx] + replace + region[idx + len(search):]
-        separator = "\n" if prefix else ""
-        new_content = prefix + separator + new_region
-        return new_content, None, None
-
-    # Global search: require unique match.
-    if count == 0:
+    # 改进1 & 2: 先做唯一性判断，并保留首处匹配位置
+    first = content.find(search)
+    if first == -1:
         return content, (
             "No exact match found. "
             "Please verify the content matches exactly."
-        ), None
-    if count > 1:
+        ), None, None
+
+    if content.find(search, first + max(1, len(search))) == -1:
+        # 改进1: 唯一匹配时忽略 start_line —— 即使调用方给了过期/越界的行号，
+        # 只要 search 内容在文件中唯一，就直接替换，不因行号漂移而失败。
+        if search_from is not None and first + len(search) <= search_from:
+            # 例外：这唯一一处整体位于映射位置之前 —— 原始目标段落已被本批前序
+            # diff 删除/替换，剩下的是「另一段」，不能拿它顶替。
+            candidate_lines = _candidate_lines(content, search, orig_line_of)
+            return content, (
+                f"No exact match found at or after line {start_line} "
+                "(start_line is resolved against the original file); the only "
+                "remaining occurrence ends before it. "
+                f"Candidate match lines: {', '.join(str(l) for l in candidate_lines)}."
+            ), None, candidate_lines
+        idx = first
+    elif search_from is None:
         # 改进2: 多匹配时返回候选行号，帮助 AI 快速定位正确位置
-        candidate_lines = _find_match_lines(content, search)
+        candidate_lines = _candidate_lines(content, search, orig_line_of)
         return content, (
-            f"Multiple matches found ({count}). "
+            f"Multiple matches found ({content.count(search)}). "
             "Please provide 'start_line' parameter to specify which match to use. "
             f"Candidate match lines: {', '.join(str(l) for l in candidate_lines)}."
-        ), candidate_lines
+        ), None, candidate_lines
+    else:
+        # 只接受映射位置及其之后的匹配：更早出现的同文本属于另一个位置，
+        # 这正是生产版「先命中 start_line 当前坐标」误改的根源。定位本身不设
+        # 匹配数上限——第 201 处也可能是真实目标。
+        idx = content.find(search, search_from)
+        if idx == -1:
+            candidate_lines = _candidate_lines(content, search, orig_line_of)
+            return content, (
+                f"No exact match found at or after line {start_line} "
+                "(start_line is resolved against the original file). "
+                f"Candidate match lines: {', '.join(str(l) for l in candidate_lines)}."
+            ), None, candidate_lines
 
-    new_content = content.replace(search, replace, 1)
-    return new_content, None, None
+    new_content = content[:idx] + replace + content[idx + len(search):]
+    return new_content, None, idx, None
 
 
 # ---------------------------------------------------------------------------
@@ -223,9 +276,18 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     failed_count = 0
     failed_diffs: list[dict[str, Any]] = []
 
-    # 改进3: lineDelta 行号偏移维护 —— 前面的 diff 增删行后，后续 diff
-    # 的 start_line 需要相应调整，避免因行号漂移导致定位失败。
-    line_delta = 0
+    # 改进3: start_line 一律解析为「本批修改开始前的原始文件行号」。每次编辑按
+    # 「它执行时」的字符区间记录，行号经 _current_offset 逐条重放后映射到当前文本；
+    # 插入/删除/替换/再编辑插入文本/先改下方再改上方都能正确累加，不存在坐标混用。
+    edits: list[Edit] = []
+    original_text = content
+    original_line_starts = _line_start_offsets(original_text)
+
+    def _orig_line_of(offset: int) -> int:
+        return _line_of(
+            original_text,
+            _original_offset(edits, offset, len(original_text)),
+        )
 
     for i, diff_entry in enumerate(diffs):
         if not isinstance(diff_entry, dict):
@@ -261,13 +323,25 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                 })
                 continue
 
-        # 改进3: 用累积的 line_delta 调整 start_line，补偿前序 diff 的行数增减
-        adjusted_start_line = start_line
+        # 改进3: 原始行号 → 当前文本的字符偏移。唯一 search 不依赖行号，
+        # 因此行号越界只在「多匹配又必须靠行号定位」时才是硬错误。
+        search_from: int | None = None
         if start_line is not None:
-            adjusted_start_line = start_line + line_delta
+            if 1 <= start_line <= len(original_line_starts):
+                search_from = _current_offset(edits, original_line_starts[start_line - 1])
+            elif content.count(search) > 1:
+                failed_count += 1
+                failed_diffs.append({
+                    "index": i,
+                    "error": (
+                        f"start_line {start_line} is out of range "
+                        f"(original file has {len(original_line_starts)} lines)."
+                    ),
+                })
+                continue
 
-        new_content, error, candidate_lines = _find_and_replace(
-            content, search, replace, adjusted_start_line,
+        new_content, error, match_offset, candidate_lines = _find_and_replace(
+            content, search, replace, start_line, search_from, _orig_line_of,
         )
         if error is not None:
             failed_count += 1
@@ -279,10 +353,10 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             # Don't update content — skip this diff and continue with next.
             continue
 
-        # 改进3: 计算本次 diff 的行数变化并累加到 line_delta
-        old_line_count = search.count('\n') + 1
-        new_line_count = replace.count('\n') + 1
-        line_delta += new_line_count - old_line_count
+        # 改进3: 记录本次命中的当前文本字符区间（即这次编辑自己的坐标系），
+        # 后续行号重放即可正确累加，包括对上一编辑插入文本的再修改。
+        if match_offset is not None:
+            edits.append((match_offset, match_offset + len(search), len(replace)))
 
         content = new_content
         applied_count += 1

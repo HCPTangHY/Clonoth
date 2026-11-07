@@ -94,11 +94,19 @@ def _git_snapshot(ctx: ToolContext) -> dict[str, Any]:
 
     head_rc, head = _run_capture(args=["git", "rev-parse", "HEAD"], cwd=root)
     status_rc, status = _run_capture(args=["git", "status", "--porcelain"], cwd=root)
-    stat_rc, diff_stat = _run_capture(args=["git", "diff", "--stat"], cwd=root, timeout_sec=20)
+    # [migration] Why: 快照必需同时覆盖已暂存与未暂存的跟踪修改，否则 checkpoint 里的
+    # diff 与实际提交内容不一致。How: 有 HEAD 时对比 HEAD（含 index），没有 HEAD（刚
+    # init 的仓）退回工作区 diff。Purpose: 暂存/未暂存改动的处理保持一致。
+    diff_base = ["HEAD"] if head_rc == 0 else []
+    stat_rc, diff_stat = _run_capture(
+        args=["git", "diff", *diff_base, "--stat"], cwd=root, timeout_sec=20,
+    )
 
     diff_ref = ""
     if stat_rc == 0 and diff_stat.strip():
-        diff_rc, diff_text = _run_capture(args=["git", "diff"], cwd=root, timeout_sec=30)
+        diff_rc, diff_text = _run_capture(
+            args=["git", "diff", *diff_base], cwd=root, timeout_sec=30,
+        )
         if diff_rc == 0:
             if len(diff_text) > diff_max_chars:
                 diff_text = diff_text[:diff_max_chars] + "\n...<truncated>"
@@ -136,14 +144,39 @@ def _git_commit_all(*, ctx: ToolContext, message: str) -> dict[str, Any]:
 
     before_head = str(snap_before.get("git_head") or "")
 
-    if not snap_before.get("git_dirty"):
-        return {"ok": True, "committed": False, "before_head": before_head, "after_head": before_head}
+    # [migration] Why: 只有未跟踪文件时 git status 也是 dirty，但 checkpoint 只应提交
+    # 已被 git 跟踪的内容；直接 commit 会撞上 "nothing to commit" 而没内容也报错。
+    # How: 用 --untracked-files=no 判断 tracked 是否有改动，git add -u 后再用
+    # git diff --cached --quiet 确认索引里真的有东西可提交。Purpose: 既不把未跟踪
+    # 文件偷偷加进 checkpoint，也不让空提交失败阻断重启。
+    rc_tracked, tracked_status = _run_capture(
+        args=["git", "status", "--porcelain", "--untracked-files=no"], cwd=root,
+    )
+    if rc_tracked == 0 and not tracked_status.strip():
+        return {
+            "ok": True,
+            "committed": False,
+            "reason": "no tracked changes",
+            "before_head": before_head,
+            "after_head": before_head,
+        }
 
     _git_ensure_identity(root=root)
 
-    rc_add, out_add = _run_capture(args=["git", "add", "-A"], cwd=root, timeout_sec=30)
+    # 只暂存已跟踪文件的修改/删除，绝不把未跟踪文件加进 checkpoint。
+    rc_add, out_add = _run_capture(args=["git", "add", "-u"], cwd=root, timeout_sec=30)
     if rc_add != 0:
         return {"ok": False, "error": "git add failed", "output": out_add, "before_head": before_head}
+
+    rc_cached, _out_cached = _run_capture(args=["git", "diff", "--cached", "--quiet"], cwd=root)
+    if rc_cached == 0:  # 索引与 HEAD 无差异 → 没有可提交的内容，正常跳过
+        return {
+            "ok": True,
+            "committed": False,
+            "reason": "nothing staged",
+            "before_head": before_head,
+            "after_head": before_head,
+        }
 
     rc_commit, out_commit = _run_capture(
         args=["git", "commit", "-m", message],

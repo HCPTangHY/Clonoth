@@ -31,7 +31,12 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not path.strip():
         return {"ok": False, "error": "empty path", "data": {"result": "ERROR: empty path"}}
 
-    p = resolve_under_allowed_roots(ctx.workspace_root, path, workspace=ctx.workspace)
+    try:
+        p = resolve_under_allowed_roots(ctx.workspace_root, path, workspace=ctx.workspace)
+    except ValueError as exc:
+        # [migration] 路径越界/非法由 _common 以 ValueError 抛出，必须变成可读的
+        # 工具失败结果，而不是冒泡成异常把整个 tool call 打挂。
+        return {"ok": False, "error": str(exc), "data": {"result": f"ERROR: {exc}"}}
     if p.is_dir():
         return {"ok": False, "error": f"path is a directory: {path}", "data": {"result": f"ERROR: path is a directory: {path}"}}
     p.parent.mkdir(parents=True, exist_ok=True)

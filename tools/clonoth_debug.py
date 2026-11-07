@@ -8,6 +8,11 @@ At invocation this file runs as a subprocess:
   - Input: tool arguments as JSON on stdin
   - Output: result as JSON on stdout
   - Sensitive env vars are stripped
+
+Env contract (injected by toolbox registry from ToolContext):
+  CLONOTH_SUPERVISOR_URL  supervisor base url (empty -> local default)
+  CLONOTH_ADMIN_TOKEN     admin bearer token (fallback: <root>/data/.admin_token)
+  CLONOTH_WORKSPACE       install root; local event log lives at <root>/data/events.jsonl
 """
 
 SPEC = {
@@ -69,83 +74,242 @@ SPEC = {
 }
 
 TIMEOUT_SEC = 15.0
+DEFAULT_SUPERVISOR_URL = "http://127.0.0.1:8765"
+ALLOWED_METHODS = ("GET", "POST", "PUT", "DELETE")
+MAX_LIMIT = 1000
+TAIL_BYTES = 262144  # bounded seek fallback when `tail` is unavailable
+
+
+def _workspace_root():
+    """Install root: CLONOTH_WORKSPACE, else the repo containing this tool.
+
+    Why: the event log path used to be the relative literal "data/events.jsonl",
+    which only worked when the subprocess cwd happened to be the install root.
+    How: derive it from the injected workspace root with a repo-relative
+    fallback. Purpose: the tool stays portable across deployments (no
+    production directory is hardcoded).
+    """
+    import os
+    from pathlib import Path
+
+    raw = (os.environ.get("CLONOTH_WORKSPACE") or "").strip()
+    if raw:
+        return Path(raw)
+    return Path(__file__).resolve().parent.parent
+
+
+def _events_file():
+    return _workspace_root() / "data" / "events.jsonl"
+
+
+def _supervisor_url():
+    import os
+
+    return (os.environ.get("CLONOTH_SUPERVISOR_URL") or "").strip().rstrip("/") or DEFAULT_SUPERVISOR_URL
+
+
+def _admin_token(root):
+    """Bearer token following the existing production convention only.
+
+    [2026-10-31] Why: engine/runner.py resolves CLONOTH_ADMIN_TOKEN ->
+    <install>/data/.admin_token. How: same order here, value never printed.
+    Purpose: one credential path for engine, bot and tools.
+    """
+    import os
+
+    token = (os.environ.get("CLONOTH_ADMIN_TOKEN") or "").strip()
+    if token:
+        return token
+    try:
+        path = root / "data" / ".admin_token"
+        if path.is_file():
+            return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _validated_path(path):
+    """Accept only a rooted, whitespace-free supervisor path.
+
+    Why: `path` is caller-controlled and concatenated onto the supervisor base
+    url. How: require a single leading '/', no scheme/authority override, no
+    control chars or whitespace. Purpose: keep the request on the configured
+    supervisor origin.
+    """
+    raw = str(path if path is not None else "").strip()
+    if not raw:
+        raise ValueError("api action 需要 path 参数")
+    if not raw.startswith("/") or raw.startswith("//"):
+        raise ValueError("path must start with a single '/'")
+    if "://" in raw or "\\" in raw:
+        raise ValueError("path must be a supervisor path, not a URL")
+    if any(ch.isspace() for ch in raw) or any(ord(ch) < 0x20 for ch in raw):
+        raise ValueError("path must not contain whitespace or control characters")
+    return raw
+
+
+def _validated_method(method):
+    raw = str(method if method is not None else "GET").strip().upper() or "GET"
+    if raw not in ALLOWED_METHODS:
+        raise ValueError(f"method must be one of {', '.join(ALLOWED_METHODS)}")
+    return raw
+
+
+def _validated_limit(limit):
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return 20
+    return max(1, min(MAX_LIMIT, value))
+
+
+def _parse_event_lines(text):
+    import json
+
+    events = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
+def _tail_by_seek(path, n):
+    """Bounded-memory fallback: read only the last TAIL_BYTES of the log."""
+    import os
+
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - TAIL_BYTES)
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    if start > 0:
+        # first line is very likely cut in half
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    lines = text.splitlines()[-int(n):]
+    return _parse_event_lines("\n".join(lines))
+
+
+def read_events_tail(n=500):
+    """Tail the local event log without ever loading it whole.
+
+    Why: events.jsonl reaches GB size; reading all lines and slicing the tail
+    would allocate the entire log per query. How: keep the production
+    `tail -n N <file>` argv call (10s timeout, no shell interpolation) and fall
+    back to a bounded seek when the binary is unavailable. Purpose: constant
+    memory per debug query on production-sized logs.
+    """
+    import subprocess
+
+    path = str(_events_file())
+    try:
+        proc = subprocess.run(
+            ["tail", f"-{int(n)}", path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return _parse_event_lines(proc.stdout)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return _tail_by_seek(path, n)
 
 
 if __name__ == "__main__":
-    import json, sys
-    _input = json.loads(sys.stdin.read())
+    import json, os, sys
+    import httpx
+
+    try:
+        _input = json.loads(sys.stdin.read() or "{}")
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": f"invalid JSON input: {e}",
+                          "data": {"result": f"ERROR: invalid JSON input: {e}"}}, ensure_ascii=False))
+        sys.exit(1)
+
     def _readable_result(result):
-        # [AutoC 2026-05-31] Why: clonoth_debug has many action-specific payloads,
-        # but the engine now reads data.result uniformly. How: derive a concise
-        # action-aware summary while storing the original payload under data.payload.
-        # Purpose: keep debug details structured without losing readable history.
-        if isinstance(result, dict):
-            if action == "api":
-                return f"API result for {args.get('path', '')}"
-            if action == "task_events":
-                return f"{result.get('count', 0)} task events"
-            if action == "active_tasks":
-                return f"{result.get('active_count', 0)} active tasks"
-            if action == "pending_approvals":
-                return f"{result.get('pending_count', 0)} pending approvals"
-            if action == "recent_events":
-                return f"{result.get('total', 0)} recent events"
-            if action == "node_status":
-                return f"Node status: {result.get('node_id', '')}"
-            if action == "health":
-                return "Health checked"
-        return json.dumps(result, ensure_ascii=False, default=str)
-    def output(result):
-        print(json.dumps({"ok": True, "data": {"result": _readable_result(result), "payload": result}}, ensure_ascii=False)); sys.exit(0)
-    def fail(error): print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
-    args = _input
-    import os, subprocess
-    from urllib.request import Request, urlopen
-    from urllib.parse import urlencode
-    from urllib.error import HTTPError, URLError
-    action = args.get("action", "")
-    task_id = args.get("task_id", "")
-    node_id = args.get("node_id", "")
-    limit = args.get("limit", 20)
-    EVENTS_FILE = "data/events.jsonl"
-    CLONOTH_URL = "http://127.0.0.1:8765"
+        # [2026-10-31] Why: engine's result_to_raw only forwards data.result, so a
+        # concise "N events" summary would hide every debug detail from the model.
+        # How: migrate the production representation — the full JSON payload,
+        # indented and stringified for non-JSON values. Purpose: data.result is
+        # losslessly json.loads()-able back into data.payload.
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+    def output(result, ok=True, error=""):
+        text = _readable_result(result) if isinstance(result, (dict, list)) else str(result)
+        payload = {"ok": ok, "data": {"result": text, "payload": result}}
+        if not ok:
+            payload["error"] = error or text
+        print(json.dumps(payload, ensure_ascii=False)); sys.exit(0 if ok else 1)
+
+    def fail(error): output(f"ERROR: {error}", ok=False, error=str(error))
+
+    args = _input if isinstance(_input, dict) else {}
+    action = str(args.get("action", "") or "").strip()
+    task_id = str(args.get("task_id", "") or "").strip()
+    node_id = str(args.get("node_id", "") or "").strip()
+    limit = _validated_limit(args.get("limit", 20))
+
+    root = _workspace_root()
+    supervisor_url = _supervisor_url()
+    admin_token = _admin_token(root)
+    headers = {"User-Agent": "Clonoth"}
+    if admin_token:
+        headers["Authorization"] = f"Bearer {admin_token}"
+
     def api_call(path, method="GET", body=None, params=None):
-        url = f"{CLONOTH_URL}{path}"
-        if params:
-            url += "?" + urlencode(params)
-        data = json.dumps(body).encode() if body else None
-        headers = {"Content-Type": "application/json"} if data else {}
-        req = Request(url, data=data, headers=headers, method=method)
+        """Call the supervisor; return (transport_error, payload).
+
+        Why: supervisor payloads legitimately contain an "error" key (e.g.
+        /v1/admin/state snapshots), so a failed request cannot be detected by
+        sniffing the body. How: connection failures and HTTP >= 400 are reported
+        out-of-band as transport_error, every other response is a real payload.
+        Purpose: a dead supervisor is never rendered as a successful debug result.
+        """
+        url = f"{supervisor_url}{path}"
         try:
-            with urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode())
-        except HTTPError as e:
-            try:
-                err_body = json.loads(e.read().decode())
-            except Exception:
-                err_body = e.reason
-            return {"error": f"HTTP {e.code}", "detail": err_body}
-        except URLError as e:
-            return {"error": f"Connection failed: {e.reason}"}
-        except Exception as e:
-            return {"error": str(e)}
-    def read_events_tail(n=500):
+            resp = httpx.request(
+                method,
+                url,
+                params=params or None,
+                json=body if body is not None else None,
+                headers=headers,
+                timeout=10.0,
+            )
+        except httpx.HTTPError as e:
+            return f"Connection failed: {e}", None
         try:
-            result = subprocess.run(["tail", f"-{n}", EVENTS_FILE],
-                                    capture_output=True, text=True, timeout=10)
-            lines = result.stdout.strip().split("\n")
-            return [json.loads(l) for l in lines if l.strip()]
-        except Exception:
-            return []
-    # ── api: 通用 API 调用 ──
+            payload = resp.json()
+        except ValueError:
+            payload = {"text": resp.text[:2000]}
+        if resp.status_code >= 400:
+            return f"HTTP {resp.status_code}", payload
+        return None, payload
+
+    # ── api: 通用 API 调用（method/body/params 原样透传） ──
     if action == "api":
-        path = args.get("path", "")
-        if not path:
-            fail("api action 需要 path 参数")
-        method = args.get("method", "GET")
+        try:
+            path = _validated_path(args.get("path", ""))
+            method = _validated_method(args.get("method", "GET"))
+        except ValueError as e:
+            fail(str(e))
         body = args.get("body")
         params = args.get("params")
-        output(api_call(path, method=method, body=body, params=params))
+        err, payload = api_call(path, method=method, body=body, params=params)
+        if err:
+            detail = payload if isinstance(payload, dict) else {"detail": payload}
+            output({**detail, "error": err}, ok=False, error=err)
+        output(payload)
     # ── task_events: 查事件流（events.jsonl） ──
     elif action == "task_events":
         if not task_id:
@@ -157,8 +321,8 @@ if __name__ == "__main__":
             tid = p.get("task_id", "")
             if task_id in tid:
                 matched.append({
-                    "type": ev["type"],
-                    "ts": ev.get("ts", "")[:19],
+                    "type": ev.get("type", ""),
+                    "ts": str(ev.get("ts", ""))[:19],
                     "node_id": p.get("node_id", ""),
                     "status": p.get("status", ""),
                     "message": (p.get("message", "") or "")[:100],
@@ -173,8 +337,8 @@ if __name__ == "__main__":
             tid = p.get("task_id", "")
             if not tid:
                 continue
-            etype = ev["type"]
-            ts = ev.get("ts", "")[:19]
+            etype = ev.get("type", "")
+            ts = str(ev.get("ts", ""))[:19]
             nid = p.get("node_id", "")
             if etype == "task_created":
                 tasks[tid] = {"node_id": nid, "status": "pending", "created": ts, "last_ts": ts}
@@ -205,32 +369,41 @@ if __name__ == "__main__":
                     "created": info.get("created", ""),
                     "last_ts": info.get("last_ts", ""),
                 })
-        api_state = api_call("/v1/admin/state")
+        api_err, api_state = api_call("/v1/admin/state")
         api_counts = api_state.get("tasks", {}) if isinstance(api_state, dict) else {}
-        output({"active_count": len(active), "tasks": active, "api_task_counts": api_counts})
+        result = {"active_count": len(active), "tasks": active, "api_task_counts": api_counts}
+        if api_err:
+            # 本地事件推算结果仍然有用，但 supervisor 交叉校验失败必须如实标注。
+            result["api_error"] = api_err
+            output(result, ok=False, error=api_err)
+        output(result)
     # ── pending_approvals: 从 API 查 ──
     elif action == "pending_approvals":
-        data = api_call("/v1/admin/state")
-        if isinstance(data, dict) and "pending_approvals" in data:
+        api_err, data = api_call("/v1/admin/state")
+        if api_err is None and isinstance(data, dict) and "pending_approvals" in data:
             pa = data["pending_approvals"]
             output({"pending_count": len(pa), "approvals": pa})
         else:
-            # fallback to events
+            # fallback to events（降级结果，若 API 传输失败则如实标记 ok=false）
             events = read_events_tail(200)
             requested = {}
             decided = set()
             for ev in events:
                 p = ev.get("payload", {})
-                if ev["type"] == "approval_requested":
+                if ev.get("type") == "approval_requested":
                     aid = p.get("approval_id", "")
-                    det = p.get("details", {})
-                    desc = det.get("tool_name", "") or det.get("command", "")[:80] or det.get("path", "") or str(det)[:80]
-                    requested[aid] = {"ts": ev.get("ts", "")[:19], "desc": desc}
-                elif ev["type"] == "approval_decided":
+                    det = p.get("details", {}) or {}
+                    desc = det.get("tool_name", "") or (det.get("command", "") or "")[:80] or det.get("path", "") or str(det)[:80]
+                    requested[aid] = {"ts": str(ev.get("ts", ""))[:19], "desc": desc}
+                elif ev.get("type") == "approval_decided":
                     decided.add(p.get("approval_id", ""))
             pending = {k: v for k, v in requested.items() if k not in decided}
             result = [{"approval_id": k[:16], **v} for k, v in pending.items()]
-            output({"pending_count": len(result), "approvals": result})
+            payload = {"pending_count": len(result), "approvals": result}
+            if api_err:
+                payload["api_error"] = api_err
+                output(payload, ok=False, error=api_err)
+            output(payload)
     # ── recent_events: 最近事件 ──
     elif action == "recent_events":
         events = read_events_tail(200)
@@ -241,10 +414,10 @@ if __name__ == "__main__":
             if node_id and node_id not in nid:
                 continue
             filtered.append({
-                "type": ev["type"],
-                "ts": ev.get("ts", "")[:19],
+                "type": ev.get("type", ""),
+                "ts": str(ev.get("ts", ""))[:19],
                 "node_id": nid,
-                "task_id": p.get("task_id", "")[:12],
+                "task_id": str(p.get("task_id", ""))[:12],
                 "message": (p.get("message", "") or "")[:80],
                 "status": p.get("status", ""),
             })
@@ -262,16 +435,16 @@ if __name__ == "__main__":
             tid = p.get("task_id", "")
             if node_id in nid:
                 node_events.append({
-                    "type": ev["type"],
-                    "ts": ev.get("ts", "")[:19],
-                    "task_id": tid[:12],
+                    "type": ev.get("type", ""),
+                    "ts": str(ev.get("ts", ""))[:19],
+                    "task_id": str(tid)[:12],
                     "message": (p.get("message", "") or "")[:100],
                     "status": p.get("status", ""),
                 })
                 if tid:
-                    etype = ev["type"]
+                    etype = ev.get("type", "")
                     if etype in ("task_created", "task_started"):
-                        node_tasks[tid] = {"status": p.get("status", "running"), "ts": ev.get("ts", "")[:19]}
+                        node_tasks[tid] = {"status": p.get("status", "running"), "ts": str(ev.get("ts", ""))[:19]}
                     elif etype in ("task_completed", "task_cancelled"):
                         node_tasks.pop(tid, None)
                     elif etype == "task_suspended":
@@ -292,6 +465,10 @@ if __name__ == "__main__":
         })
     # ── health ──
     elif action == "health":
-        output(api_call("/v1/health"))
+        err, payload = api_call("/v1/health")
+        if err:
+            detail = payload if isinstance(payload, dict) else {"detail": payload}
+            output({**detail, "error": err}, ok=False, error=err)
+        output(payload)
     else:
         fail(f"未知 action: {action}")

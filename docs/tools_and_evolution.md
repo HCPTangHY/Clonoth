@@ -22,7 +22,7 @@
 
 节点配置中的 `output_mode` 决定回复方式：
 
-- `hybrid`（默认）：纯文本即为隐式 finish，无需调用 finish 工具。同时保留 finish 工具用于需要附件的场景。
+- `hybrid`（默认）：纯文本作为隐式 finish，不要求调用 finish 工具。
 - `tool_only`：必须通过 finish 工具提交回复，纯文本被拒绝并重试。
 
 ## 工具来源
@@ -34,21 +34,18 @@
 | 工具 | 说明 |
 |------|------|
 | `list_dir` | 列出目录内容 |
-| `read_file` | 读取文件（支持行号范围） |
+| `read_file` | 读取文件；文本每次最多 500 行、64 KB，超过 10 MB 默认预览前 50 行，也可指定范围读取 |
 | `write_file` | 写入文件 |
-| `apply_diff` | 搜索替换式修改文件 |
-| `execute_command` | 执行 shell 命令 |
-| `search_in_files` | 搜索（和替换）文件内容 |
+| `apply_diff` | 精确搜索替换；`start_line` 使用本批修改前的原文件行号，自动补偿前序修改 |
+| `execute_command` | 执行 shell 命令，默认超时 90 秒，可通过配置或参数覆盖 |
+| `grep` | 搜索或替换文件内容；支持正则、glob 和 content/files_only/count 输出模式 |
 | `set_workspace` | 切换活跃工作区 |
-| `create_or_update_skill` | 创建或更新 Skill |
-| `list_skills` / `delete_skill` | 列出 / 删除 Skill |
-| `save_memory` / `list_memories` / `delete_memory` | 记忆管理 |
-| `create_or_update_mcp_client` | 创建或更新 MCP 客户端 |
-| `list_mcp_clients` / `delete_mcp_client` | 列出 / 删除 MCP 客户端 |
-| `create_or_update_tool` / `reload_tools` | 创建工具 / 热重载 |
+| `manage_skill` | `list` 查看、`upsert` 创建或更新、`delete` 删除 Skill |
+| `manage_memory` | `list` 查看、`upsert` 保存、`delete` 删除记忆；指定 ID 可读取完整条目 |
+| `manage_mcp_client` | `list` 查看、`upsert` 创建或更新、`delete` 删除 MCP 客户端 |
+| `manage_tool` | `upsert` 创建或更新外部脚本，`reload` 热重载；可声明 pure 和 async_mode |
 | `request_restart` | 请求重启 Engine 或全系统 |
-| `create_schedule` / `list_schedules` / `delete_schedule` | 定时调度管理 |
-| `cancel_active_tasks` | 取消当前会话活跃任务 |
+| `manage_schedule` | `list` 查看、`upsert` 创建或局部更新、`delete` 删除定时任务 |
 | `get_context_window` | 查看当前上下文窗口使用情况 |
 
 ### 伪工具（Pseudo Tools）
@@ -62,11 +59,21 @@
 | `intermediate_reply` | 发送中间进度消息 |
 | `switch_node` | 切换到其他节点 |
 | `compact_context` | 触发上下文压缩 |
-| `preempt_task` | 抢占下游任务 |
+| `manage_workers` | `list` 查看、`message` 追加指令、`preempt` 软中断、`cancel` 硬取消当前会话的下游任务 |
+
+`preempt` 不带消息时请求任务停止，带 `message` 时按追加指令继续处理，与生产接口一致。`cancel` 可以指定任务或节点；省略目标时取消当前会话的活跃下游任务，但不取消调用任务本身。指定了不存在或不明确的目标时返回错误，不扩大取消范围。
 
 ### 自定义工具
 
-位于 `tools/*.py`，以独立子进程运行。协议：stdin 读 JSON 参数，stdout 写 JSON 结果。通过 AST 解析 `SPEC` 字典注册，不 import 脚本代码。
+位于 `tools/*.py`，以独立子进程运行。协议：stdin 读 JSON 参数，stdout 写 JSON 结果。通过 AST 解析 `SPEC` 字典注册，不 import 脚本代码。结构化 JSON 在文本截断前解析，避免较大的结果被截成无效 JSON。
+
+脚本环境提供 `CLONOTH_WORKSPACE`（安装根目录）、`CLONOTH_SESSION_ID`、`CLONOTH_TASK_ID` 和 `CLONOTH_SUPERVISOR_URL`。管理脚本通过 `CLONOTH_ADMIN_TOKEN` 或本机 `data/.admin_token` 认证，不得将生产凭据写入脚本。
+
+本次仅迁移 `clear_context.py` 和 `clonoth_debug.py` 两个管理脚本，其余本地脚本保持原状。清理上下文只应在用户明确要求时执行；脚本会排除当前调用任务，仍会终止其他相关任务。
+
+统一管理工具不提供旧名称别名。节点工具名单应使用 `manage_tool`、`manage_schedule`、`manage_workers`、`manage_skill`、`manage_memory`、`manage_mcp_client`。已有部署还需检查自定义节点和策略文件中的旧工具名，不能只替换源码。
+
+真实工具与控制工具按模型声明顺序处理。连续的显式异步工具可以分组启动，普通工具仍按顺序执行。中断时为未执行的原生工具调用补充结果，避免恢复后的请求出现配对错误。
 
 ### MCP 工具
 
@@ -95,7 +102,7 @@ MCP 客户端配置在 `data/mcp_clients.yaml`，支持 `stdio`、`sse`、`strea
 
 ### 统一工具级审批
 
-所有通过 `ToolRegistry.execute()` 执行的工具（内置、自定义、MCP）都会经过 Supervisor policy 的 `evaluate_tool` 检查。默认策略对所有工具返回 `auto`，可通过 `data/policy.yaml` 的 `tools` 配置覆盖。
+所有通过 `ToolRegistry.execute()` 执行的工具（内置、自定义、MCP）都会经过 Supervisor policy 的 `evaluate_tool` 检查。默认策略为 `approval_required`；已有内部文件或命令审批的工具可通过具体规则免除重复的工具级审批。可通过 `data/policy.yaml` 的 `tools` 配置覆盖。
 
 ### 文件保护规则
 
@@ -130,12 +137,12 @@ AI 可以在人类审批下修改系统自身：
 
 | 操作 | 途径 | 审批 |
 |------|------|------|
-| 创建工具 | `create_or_update_tool` | 需要 |
+| 创建工具 | `manage_tool(action="upsert")` | 需要 |
 | 修改节点定义 | `write_file` → `config/nodes/*.yaml` | 需要 |
 | 修改引擎源码 | `write_file` → `engine/**` | 需要 |
-| 接入 MCP 服务 | `create_or_update_mcp_client` | 不需要 |
+| 接入 MCP 服务 | `manage_mcp_client(action="upsert")` | 按配置文件写权限审批 |
 | 调整运行参数 | `write_file` → `config/runtime.yaml` | 不需要 |
-| 创建定时任务 | `create_schedule` | 需要 |
+| 创建定时任务 | `manage_schedule(action="upsert")` | 需要 |
 | 重启 | `request_restart` | 需要 |
 
-安全策略（`data/policy.yaml`）和事件日志（`data/events.jsonl`）始终硬拒绝写入。
+安全策略（`data/policy.yaml`）和事件日志（`data/events.jsonl`）始终硬拒绝写入。`request_restart` 的 Git 检查点只提交已跟踪文件，不自动纳入未跟踪文件。

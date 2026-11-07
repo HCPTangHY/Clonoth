@@ -98,6 +98,29 @@ def _ensure_tool_response_shape(result: Any) -> dict[str, Any]:
     return response
 
 
+def _approval_failure_response(err: dict[str, Any]) -> dict[str, Any]:
+    """Shape a ``request_guard`` failure for the scheduler and engine.
+
+    [Audit A 2026-10] Why: authorize() forwarded only ok/error/cancelled, so an
+    approval_unavailable / approval_lost / approval_error (Supervisor outage or a
+    vanished approval) was indistinguishable downstream from a human denial.
+    How: mirror the structured approval fields and keep ``denied`` False unless
+    request_guard actually saw a denial. Purpose: the tool channel reports what
+    happened and never blames the user for an infrastructure failure.
+    """
+    status = err.get("approval_status")
+    result: dict[str, Any] = {
+        "ok": False,
+        "error": err.get("error", "denied"),
+        "cancelled": err.get("cancelled", False),
+        "approval_id": err.get("approval_id"),
+        "denied": bool(err.get("denied", False)),
+    }
+    if isinstance(status, str) and status:
+        result["approval_status"] = status
+    return result
+
+
 def _extract_tool_spec(py: Path) -> tuple[dict[str, Any] | None, float | None]:
     """Extract tool spec from a python file via AST.
 
@@ -182,13 +205,26 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
         input_json = json.dumps(args or {}, ensure_ascii=False)
 
         try:
+            sub_env = _safe_subprocess_env()
+            # Runtime identity overrides inherited values from a parent tool process.
+            context_env = {
+                "CLONOTH_WORKSPACE": str(root) if isinstance(root, Path) else "",
+                "CLONOTH_SESSION_ID": str(getattr(ctx, "session_id", "") or ""),
+                "CLONOTH_TASK_ID": str(getattr(ctx, "task_id", "") or ""),
+                "CLONOTH_SUPERVISOR_URL": str(getattr(ctx, "supervisor_url", "") or ""),
+            }
+            for key, value in context_env.items():
+                if value:
+                    sub_env[key] = value
+                else:
+                    sub_env.pop(key, None)
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, str(script_path),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
-                env=_safe_subprocess_env(),
+                env=sub_env,
                 # Fix: run in new session so os.killpg can kill the entire
                 # process tree, preventing orphaned grandchildren from holding
                 # pipe fds and causing communicate() to hang forever.
@@ -257,9 +293,7 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                 stdout=stdout_text[:2000] if stdout_text else "",
             )
 
-        if len(stdout_text) > max_output:
-            stdout_text = stdout_text[:max_output]
-
+        # Decode JSON before truncating: structured results are bounded downstream.
         try:
             result = json.loads(stdout_text)
             if isinstance(result, dict):
@@ -268,11 +302,12 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
             # engine now expects ok/data/error. How: keep the scalar under value and
             # expose its string form as data.result. Purpose: make every successful
             # external script output readable through the same contract.
-            return {"ok": True, "data": {"result": str(result), "value": result}}
+            return {"ok": True, "data": {"result": str(result)[:max_output], "value": result}}
         except json.JSONDecodeError:
             # [AutoC 2026-05-31] Why: legacy scripts may still print plain text.
             # How: wrap stdout as both data.result and data.output. Purpose: keep
             # plain-text scripts usable while conforming to the unified schema.
+            stdout_text = stdout_text[:max_output]
             return {"ok": True, "data": {"result": stdout_text, "output": stdout_text}}
 
     return _run
@@ -292,7 +327,7 @@ class ToolRegistry:
 
         self.reload()
 
-    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc) -> Callable[[], None]:
+    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc, *, pure: bool = False) -> Callable[[], None]:
         """Register one builtin tool declared by a built-in plugin.
 
         Why: some built-in tools now live with their owning plugin instead of
@@ -318,6 +353,7 @@ class ToolRegistry:
             "name": clean_name,
             "description": str(description or ""),
             "input_schema": input_schema,
+            "pure": bool(pure),
         }
         self._tool_specs[clean_name] = spec
         self._tool_funcs[clean_name] = func
@@ -340,7 +376,7 @@ class ToolRegistry:
         # bridging of tool disposers.
         ledger = getattr(self, "_disposal_ledger", None)
         if ledger is not None:
-            ledger.record(_dispose)
+            ledger.record(_dispose, key=("tool", self, clean_name))
         return _dispose
 
     def set_disposal_ledger(self, ledger: Any) -> None:
@@ -384,26 +420,26 @@ class ToolRegistry:
             ),
             (
                 "read_file",
-                "Read one or more files under workspace root. Supports text files (with optional line range), images (returned as multimodal), and binary files. Policy+approval guarded.",
+                "Read one or more files under workspace root. Supports text files (up to 500 lines / 64 KB per read; >10 MB files default to a 50-line head preview, with bounded streaming for explicit ranges), images (multimodal), and binary files. Policy+approval guarded.",
                 {
                     "type": "object",
                     "properties": {
                         "files": {
                             "type": "array",
-                            "description": "Array of file objects. Each has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive). MUST be an array even for single file.",
+                            "description": "Preferred: array of file objects. Each has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive).",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "path": {"type": "string", "description": "File path relative to workspace root."},
-                                    "startLine": {"type": "integer", "description": "Start line (1-based, inclusive). Only for text files."},
+                                    "startLine": {"type": "integer", "description": "Start line (1-based, inclusive). Text only; supports bounded streaming on files larger than 10 MB."},
                                     "endLine": {"type": "integer", "description": "End line (1-based, inclusive). Only for text files."},
                                 },
                                 "required": ["path"],
                             },
                         },
-                        "path": {"type": "string", "description": "(Legacy single-file mode) File path relative to workspace root."},
-                        "start_line": {"type": "integer", "description": "(Legacy) Start line number."},
-                        "end_line": {"type": "integer", "description": "(Legacy) End line number."},
+                        "path": {"type": "string", "description": "Single-file shorthand; prefer the files array."},
+                        "start_line": {"type": "integer", "description": "Start line for single-file shorthand."},
+                        "end_line": {"type": "integer", "description": "End line for single-file shorthand."},
                     },
                     "required": [],
                 },
@@ -450,7 +486,7 @@ class ToolRegistry:
                                     },
                                     "start_line": {
                                         "type": "integer",
-                                        "description": "(Recommended) 1-based line number to start searching from. Required when search matches multiple locations. Note: line numbers refer to content AFTER previous diffs in the array have been applied.",
+                                        "description": "(Recommended) 1-based line number from the original file to start searching from. Required when search matches multiple locations. Line shifts from earlier diffs are compensated automatically.",
                                     },
                                 },
                                 "required": ["search", "replace"],
@@ -463,12 +499,12 @@ class ToolRegistry:
             ),
             (
                 "execute_command",
-                "Execute a shell command in workspace root (policy+approval guarded; secrets are stripped from env).",
+                "Execute a shell command in workspace root (policy+approval guarded; secrets are stripped from env; default timeout 90s; long-running commands may upgrade to background execution).",
                 {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string"},
-                        "timeout_sec": {"type": "number"},
+                        "timeout_sec": {"type": "number", "description": "Timeout in seconds (default 90s)."},
                     },
                     "required": ["command"],
                 },
@@ -489,17 +525,17 @@ class ToolRegistry:
             ),
             (
                 "grep",
-                "Search file contents using pattern matching (like grep). Supports regex, glob filter, replace mode, and output_mode (content/files_only/count).",
+                "Search file contents using pattern matching (like grep). Supports regex, glob filter, replace mode, and output_mode (content/files_only/count). Search is case-insensitive; replace is case-sensitive.",
                 {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
                         "path": {"type": "string", "description": "Directory or file path to search in (relative or absolute). Supports single file. Default '.'"},
-                        "mode": {"type": "string", "description": "search (default) or replace", "enum": ["search", "replace"]},
+                        "mode": {"type": "string", "description": "search (default, case-insensitive) or replace (case-sensitive)", "enum": ["search", "replace"]},
                         "pattern": {"type": "string", "description": "file glob pattern, e.g. '*.py', '**/*.js'. Default '**/*'"},
                         "isRegex": {"type": "boolean", "description": "treat query as regex. Default false"},
                         "maxResults": {"type": "integer", "description": "max matches for search mode. Default 100"},
-                        "replace": {"type": "string", "description": "replacement string for replace mode. Supports $1 $2 capture groups"},
+                        "replace": {"type": "string", "description": "Replacement string for replace mode. Supports $1/$2 and backslash-number capture groups when isRegex=true; otherwise literal."},
                         "maxFiles": {"type": "integer", "description": "max files to modify in replace mode. Default 50"},
                         "output_mode": {"type": "string", "description": "Output format: content (default, full match text), files_only (file paths only), count (match count per file)", "enum": ["content", "files_only", "count"]},
                     },
@@ -508,32 +544,28 @@ class ToolRegistry:
                 _builtins.search_in_files,
             ),
             (
-                "create_or_update_tool",
-                "Create/update an external tool under tools/. "
-                "Provide 'script' (Python code body). "
-                "The tool runs as a subprocess: JSON in via stdin, JSON out via stdout.",
+                "manage_tool",
+                "Manage external tools under tools/: action='upsert' creates or updates a Python script "
+                "(JSON in via stdin, JSON out via stdout) and reloads the registry; action='reload' reloads tools/.",
                 {
                     "type": "object",
                     "properties": {
+                        "action": {"type": "string", "enum": ["upsert", "reload"], "description": "Operation. Defaults to upsert when name/script is given, otherwise reload."},
                         "name": {"type": "string"},
                         "description": {"type": "string"},
                         "input_schema": {"type": "object"},
                         "script": {"type": "string", "description": "Python script body. Has access to: args (dict from stdin), output(result), fail(error)."},
                         "timeout_sec": {"type": "number"},
+                        "pure": {"type": "boolean", "description": "[upsert] Pure/side-effect-free tool; safe for parallel execution. Default false."},
+                        "async_mode": {"type": "boolean", "description": "[upsert] Execute in background and deliver results via preempt. Default false."},
                     },
-                    "required": ["name", "script"],
+                    "required": ["action"],
                 },
-                _builtins.create_or_update_tool,
-            ),
-            (
-                "reload_tools",
-                "Reload tools/ directory (MCP tools live in reload snapshots).",
-                {"type": "object", "properties": {}, "required": []},
-                _builtins.reload_tools,
+                _builtins.manage_tool,
             ),
             (
                 "request_restart",
-                "Request supervisor to restart engine/all (policy+approval guarded; includes git diff summary).",
+                "Request supervisor to restart engine/all (policy+approval guarded; creates a git checkpoint of tracked files and includes git diff summary).",
                 {
                     "type": "object",
                     "properties": {
@@ -545,60 +577,29 @@ class ToolRegistry:
                 _builtins.request_restart,
             ),
             (
-                "create_schedule",
-                "Create or update a scheduled task in data/schedules.yaml. "
-                "Supports type='message' (default, injects text as inbound) and type='script' "
-                "(runs a shell command, parses stdout JSON for inbound injection). "
-                "Requires approval.",
+                "manage_schedule",
+                "Manage data/schedules.yaml: action='list' lists schedules; action='upsert' creates or patches "
+                "a message/script schedule; action='delete' removes one. Changes require approval.",
                 {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string", "description": "unique schedule id"},
+                        "action": {"type": "string", "enum": ["list", "upsert", "delete"], "description": "Operation: list (default), upsert, or delete."},
+                        "id": {"type": "string", "description": "[upsert/delete] Unique schedule id."},
                         "cron": {"type": "string", "description": "5-field cron: minute hour day month weekday (UTC)"},
                         "text": {"type": "string", "description": "message text injected as inbound (for message type); prefix text (for script type)"},
                         "type": {"type": "string", "enum": ["message", "script"], "description": "schedule type: message (default) or script"},
                         "command": {"type": "string", "description": "shell command to run (required for script type). stdout must be a single-line JSON object with a 'text' field: {\"text\": \"message to inject\"}. Optional 'attachments' field for file paths. Empty stdout = silent skip (if silent=true) or prefix-only injection."},
                         "timeout": {"type": "integer", "description": "script timeout in seconds (default 30, script type only)"},
                         "silent": {"type": "boolean", "description": "if true, skip inbound when script stdout is empty (default true, script type only)"},
-                        "conversation_key": {"type": "string", "description": "conversation key (default: scheduler:{id})"},
+                        "conversation_key": {"type": "string", "description": "Conversation key (defaults to current session's conversation_key, then scheduler:{id})."},
                         "entry_node_id": {"type": "string", "description": "optional entry node override for the injected inbound"},
                         "workflow_id": {"type": "string", "description": "optional workflow override"},
                         "enabled": {"type": "boolean"},
                         "once": {"type": "boolean", "description": "if true, auto-delete after first trigger"},
                     },
-                    "required": ["id", "cron"],
+                    "required": ["action"],
                 },
-                _builtins.create_schedule,
-            ),
-            (
-                "list_schedules",
-                "List all scheduled tasks from data/schedules.yaml.",
-                {"type": "object", "properties": {}, "required": []},
-                _builtins.list_schedules,
-            ),
-            (
-                "delete_schedule",
-                "Delete a scheduled task by id. Requires approval.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "schedule id to delete"},
-                    },
-                    "required": ["id"],
-                },
-                _builtins.delete_schedule,
-            ),
-            (
-                "cancel_active_tasks",
-                "Cancel all active downstream tasks in the current session. "
-                "Use when the user's new message makes the previous task unnecessary.",
-                {"type": "object", "properties": {
-                    "node_id": {
-                        "type": "string",
-                        "description": "可选。只取消指定节点的活跃任务（如 scout、smith），不填则取消 session 内全部下游任务。",
-                    },
-                }, "required": []},
-                _builtins.cancel_active_tasks,
+                _builtins.manage_schedule,
             ),
             (
                 "get_context_window",
@@ -611,12 +612,13 @@ class ToolRegistry:
             ),
         ]
 
+        pure_builtins = {"list_dir", "read_file", "get_context_window"}
         for name, desc, schema, func in builtins:
             # Why: built-in tools now have a public registration path shared by
             # registry-owned and plugin-owned tools. How: seed the central table
             # through register_builtin_tool(). Purpose: keep one code path for
             # validating and storing builtin specs.
-            self.register_builtin_tool(name, desc, schema, func)
+            self.register_builtin_tool(name, desc, schema, func, pure=(name in pure_builtins))
 
         # [2026-09-06] Why: execute_command runs a second, internal guard
         # (op="execute_command", command-level approval) inside its body. The
@@ -650,7 +652,7 @@ class ToolRegistry:
 
         builtin_names = set(self._tool_specs.keys())
 
-        for py in self.tools_dir.glob("*.py"):
+        for py in sorted(self.tools_dir.glob("*.py")):
             if py.name == "__init__.py":
                 continue
 
@@ -663,7 +665,7 @@ class ToolRegistry:
                 continue
             name = name.strip()
 
-            if name in builtin_names:
+            if name in builtin_names or name in _builtins.RESERVED_TOOL_NAMES:
                 continue
 
             description = str(spec.get("description", ""))
@@ -681,6 +683,7 @@ class ToolRegistry:
                 "description": description,
                 "input_schema": input_schema,
                 "async_mode": bool(spec.get("async_mode", False)),
+                "pure": bool(spec.get("pure", False)),
             }
             result_format = spec.get("result_format")
             if isinstance(result_format, str) and result_format.strip():
@@ -693,7 +696,7 @@ class ToolRegistry:
         return len(self._tool_specs)
 
     def list_specs(self) -> list[dict[str, Any]]:
-        return list(self._tool_specs.values())
+        return sorted(self._tool_specs.values(), key=lambda spec: spec["name"])
 
     def get_spec(self, name: str) -> dict[str, Any] | None:
         """按名称获取单个工具的 spec，不存在返回 None。"""
@@ -722,12 +725,7 @@ class ToolRegistry:
             {"tool_name": name, "arguments": arguments},
         )
         if _err is not None:
-            return {
-                "ok": False,
-                "error": _err.get("error", "denied"),
-                "cancelled": _err.get("cancelled", False),
-                "approval_id": _err.get("approval_id"),
-            }
+            return _approval_failure_response(_err)
         # [2026-09-06] Pre-flight the tool's own internal guard when declared.
         # Why: execute_command's command-level approval used to wait inside the
         # scheduler's timed execution task, so a pending approval tripped the
@@ -746,12 +744,7 @@ class ToolRegistry:
             }
             _op2, _err2 = await request_guard(ctx, _guard_op, _guard_params)
             if _err2 is not None:
-                return {
-                    "ok": False,
-                    "error": _err2.get("error", "denied"),
-                    "cancelled": _err2.get("cancelled", False),
-                    "approval_id": _err2.get("approval_id"),
-                }
+                return _approval_failure_response(_err2)
         return None
 
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any, _authorized: bool = False) -> dict[str, Any]:

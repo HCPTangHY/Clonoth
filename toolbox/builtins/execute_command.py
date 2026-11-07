@@ -50,7 +50,7 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     default_timeout_sec = get_float(
         runtime_cfg,
         "meta.execute_command.default_timeout_sec",
-        60.0,
+        90.0,   # 配置优先；未配置时默认 90s（原 60s 对 pytest/npm 等偏短）
         min_value=1.0,
         max_value=3600.0,
     )
