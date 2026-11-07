@@ -1,12 +1,120 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import resolve_env_ref
 
 from .node import Node
+
+
+_current_sticky_sid_var: ContextVar[str] = ContextVar("_current_sticky_sid_var", default="")
+_PROVIDER_OPTION_KEYS = (
+    "reasoning_field", "reasoning_effort", "max_tokens", "max_completion_tokens", "thought_summary",
+)
+
+
+def parse_sticky_session_config(raw: Any) -> dict[str, Any] | None:
+    """Normalize the production boolean/dict configuration without truthy strings."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return {"enabled": raw, "header": "X-Forwarded-For", "ip_prefix": "10"}
+    if not isinstance(raw, dict):
+        raise ValueError("sticky_session must be a boolean, a dict or None")
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("sticky_session.enabled must be a boolean")
+    return {
+        "enabled": enabled,
+        "header": str(raw.get("header") or "X-Forwarded-For").strip() or "X-Forwarded-For",
+        "ip_prefix": str(raw.get("ip_prefix") or "10").strip().strip(".") or "10",
+    }
+
+
+def compute_sticky_ip(session_key: str, ip_prefix: str = "10") -> str:
+    """Map a session key to the same deterministic IPv4 value used in production."""
+    parts = [part.strip() for part in str(ip_prefix or "10").strip().strip(".").split(".") if part.strip()]
+    octets: list[int] = []
+    for part in parts[:4]:
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if 0 <= value <= 255:
+            octets.append(value)
+    if not octets:
+        octets = [10]
+    if len(octets) >= 4:
+        return ".".join(str(value) for value in octets[:4])
+
+    digest = hashlib.md5(str(session_key or "default").encode("utf-8")).digest()
+    needed = 4 - len(octets)
+    for index in range(needed):
+        byte = digest[index]
+        # Avoid .0 and .255 in the final host octet, matching production routing.
+        octets.append(1 + byte % 254 if index == needed - 1 else byte)
+    return ".".join(str(value) for value in octets)
+
+
+class StickyHttpProxy:
+    """Inject a session header while borrowing the caller's existing HTTP client."""
+
+    def __init__(self, client: Any, header_name: str, header_value: str):
+        self._client = client
+        self._header_name = header_name
+        self._header_value = header_value
+
+    def _merge_headers(self, headers: Any) -> dict[str, Any]:
+        merged = dict(headers) if headers else {}
+        if self._header_name.lower() not in {str(key).lower() for key in merged}:
+            merged[self._header_name] = self._header_value
+        return merged
+
+    async def post(self, url: Any, **kwargs: Any) -> Any:
+        kwargs["headers"] = self._merge_headers(kwargs.get("headers"))
+        return await self._client.post(url, **kwargs)
+
+    async def get(self, url: Any, **kwargs: Any) -> Any:
+        kwargs["headers"] = self._merge_headers(kwargs.get("headers"))
+        return await self._client.get(url, **kwargs)
+
+    async def request(self, method: str, url: Any, **kwargs: Any) -> Any:
+        kwargs["headers"] = self._merge_headers(kwargs.get("headers"))
+        return await self._client.request(method, url, **kwargs)
+
+    def stream(self, method: str, url: Any, **kwargs: Any) -> Any:
+        kwargs["headers"] = self._merge_headers(kwargs.get("headers"))
+        return self._client.stream(method, url, **kwargs)
+
+    def build_request(self, method: str, url: Any, **kwargs: Any) -> Any:
+        kwargs["headers"] = self._merge_headers(kwargs.get("headers"))
+        return self._client.build_request(method, url, **kwargs)
+
+    async def send(self, request: Any, **kwargs: Any) -> Any:
+        if hasattr(request, "headers") and self._header_name.lower() not in {
+            str(key).lower() for key in request.headers
+        }:
+            request.headers[self._header_name] = self._header_value
+        return await self._client.send(request, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_client"), name)
+
+
+def wrap_http_with_sticky_session(http: Any, sticky_cfg_raw: Any, session_key: str) -> Any:
+    """Apply the configured header without stacking proxies or replacing the pool."""
+    if http is None or not session_key:
+        return http
+    config = parse_sticky_session_config(sticky_cfg_raw)
+    if config is None or not config["enabled"]:
+        return http
+    base_client = http._client if isinstance(http, StickyHttpProxy) else http
+    return StickyHttpProxy(base_client, config["header"], compute_sticky_ip(session_key, config["ip_prefix"]))
 
 
 @dataclass
@@ -17,6 +125,9 @@ class ResolvedProvider:
     provider_type: str = "openai"
     api_key: str | None = None   # None 表示使用全局默认
     base_url: str | None = None  # None 表示使用全局默认
+    # Keep session overrides separate so provider defaults cannot override node options.
+    provider_options: dict[str, Any] = field(default_factory=dict)
+    provider_defaults: dict[str, Any] = field(default_factory=dict)
 
 
 def resolve_provider(
@@ -64,6 +175,19 @@ def resolve_provider(
     if override_base_url:
         base_url = override_base_url
 
+    raw_options = override.get("provider_options")
+    override_options = deepcopy(raw_options) if isinstance(raw_options, dict) else {}
+    for key in _PROVIDER_OPTION_KEYS:
+        if key in override and override[key] is not None:
+            override_options[key] = deepcopy(override[key])
+    thinking = override.get("thinking_config")
+    if isinstance(thinking, dict):
+        existing = override_options.get("thinking_config")
+        override_options["thinking_config"] = {
+            **(existing if isinstance(existing, dict) else {}), **deepcopy(thinking),
+        }
+    provider_defaults: dict[str, Any] = {}
+
     # [2026-06-07] Why: when a node sets provider but leaves model/base_url/api_key
     # empty, the old code fell back to the global active provider's values, not the
     # target provider's own config section. How: if fields are still empty after
@@ -78,6 +202,13 @@ def resolve_provider(
             base_url = resolve_env_ref(str(pcfg["base_url"]).strip())
         if not api_key and pcfg.get("api_key"):
             api_key = resolve_env_ref(str(pcfg["api_key"]).strip())
+        for key in _PROVIDER_OPTION_KEYS:
+            if key in pcfg and pcfg[key] is not None:
+                provider_defaults[key] = deepcopy(pcfg[key])
+        if isinstance(pcfg.get("thinking_config"), dict):
+            provider_defaults["thinking_config"] = deepcopy(pcfg["thinking_config"])
+        if "sticky_session" in pcfg:
+            provider_defaults["sticky_session"] = deepcopy(pcfg["sticky_session"])
     if not model:
         model = provider_default or "gpt-4o-mini"
 
@@ -86,4 +217,6 @@ def resolve_provider(
         provider_type=provider_type,
         api_key=api_key or None,
         base_url=base_url or None,
+        provider_options=override_options,
+        provider_defaults=provider_defaults,
     )

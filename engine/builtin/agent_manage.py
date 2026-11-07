@@ -26,7 +26,52 @@ PLUGIN_META = {
     "hook_points": [],
     "priority": 10,
     "tools": [],  # 在文件末尾由工具函数定义后填充
+    # [2026-09-13] _worker 不再通过 nodes 声明提供：声明会压过 config/nodes/
+    # 物理文件，导致设置页编辑写入文件后不生效。改为 ensure_worker_node_yaml
+    # 落盘的 config/nodes/_worker.yaml 作为唯一来源，插件声明仅作为文件缺失时
+    # 的默认内容模板。
 }
+
+# [2026-09-13] _worker 默认节点内容。字段与原插件声明一致；provider/model 留空
+# 表示跟随全局默认，用户可在设置页节点编辑器中修改这两个字段。
+WORKER_NODE_YAML = """id: _worker
+type: ai
+name: Temporary worker node
+description: Anonymous ephemeral child node invoked automatically by spawn_worker. Adjust provider and model in the settings node editor to change its default model.
+persistent: false
+control_tools:
+  - finish
+  - intermediate_reply
+  - compact_context
+  - manage_workers
+tool_access:
+  mode: all
+  deny:
+  - manage_memory:!list
+prompt: |
+  You are a capable assistant running inside a multi-agent system. Complete the task below, then submit your result.
+
+  {{instruction}}
+model: ""
+provider: ""
+delegate_targets: []
+"""
+
+
+def ensure_worker_node_yaml(workspace_root: Path) -> Path:
+    """在指定工作区落盘默认 _worker 节点文件（存在即跳过，返回文件路径）。
+
+    [2026-09-13] Why: _worker 原为插件声明节点，admin 节点编辑器会解析到插件
+    Python 源文件，无法在设置页修改 provider/model。How: 改为 config/nodes/
+    _worker.yaml 物理文件作为唯一来源，移除插件声明；首次使用前由本函数生成
+    默认内容。Purpose: 前端节点设置页可直接编辑临时子节点的渠道与模型。
+    """
+    nodes_dir = Path(workspace_root) / "config" / "nodes"
+    nodes_dir.mkdir(parents=True, exist_ok=True)
+    target = nodes_dir / "_worker.yaml"
+    if not target.exists():
+        target.write_text(WORKER_NODE_YAML, encoding="utf-8")
+    return target
 
 
 class AgentManageHandler:
@@ -56,12 +101,49 @@ def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
     return {"ok": True, "data": {"result": result_text, **fields}}
 
 
-def _err(message: Any) -> dict[str, Any]:
+def _err(message: Any, **fields: Any) -> dict[str, Any]:
     # [AutoC 2026-05-31] Why: create_agent validation failures should be readable
     # through data.result. How: wrap the error once. Purpose: avoid legacy plugin
     # error payloads during migration.
     text = str(message)
-    return {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
+    data = {"result": f"ERROR: {text}", **fields}
+    response: dict[str, Any] = {"ok": False, "error": text, "data": data}
+    response.update(fields)
+    return response
+
+
+def _append_delegate_target_preserving_format(raw_yaml: str, target_name: str) -> str | None:
+    """Insert ``- {target_name}`` under ``delegate_targets:`` without re-dumping the whole YAML."""
+    lines = raw_yaml.splitlines()
+    for idx, line in enumerate(lines):
+        m = re.match(r"^(\s*)delegate_targets\s*:\s*(\[\s*\])?\s*(#.*)?$", line)
+        if not m:
+            continue
+        indent = m.group(1)
+        is_empty_inline = bool(m.group(2))
+        comment = f" {m.group(3)}" if m.group(3) else ""
+        item_indent = indent + "  "
+        if is_empty_inline:
+            lines[idx] = f"{indent}delegate_targets:{comment}"
+            lines.insert(idx + 1, f"{item_indent}- {target_name}")
+            return "\n".join(lines) + ("\n" if raw_yaml.endswith("\n") else "")
+        # Find existing list items under delegate_targets:
+        insert_at = idx + 1
+        while insert_at < len(lines):
+            cur = lines[insert_at]
+            stripped = cur.strip()
+            if not stripped or stripped.startswith("#"):
+                insert_at += 1
+                continue
+            item_m = re.match(r"^(\s*)-\s+(\S+)", cur)
+            if item_m and len(item_m.group(1)) >= len(indent):
+                item_indent = item_m.group(1)
+                insert_at += 1
+                continue
+            break
+        lines.insert(insert_at, f"{item_indent}- {target_name}")
+        return "\n".join(lines) + ("\n" if raw_yaml.endswith("\n") else "")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +154,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     """Create a new persistent sub-node from an existing node yaml template.
 
     [2026-05-28] 工作流程：
-    1. 读取模板节点 yaml（先 config/nodes/，再 engine/system_nodes/）
+    1. 读取模板节点（先 config/nodes/ 文件，再插件声明）
     2. 替换 id / name / description / persistent / memory_book / provider 字段
     3. 写入 config/nodes/{name}.yaml
     4. 可选：追加到 caller_node_id 的 delegate_targets
@@ -103,22 +185,19 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if target_path.exists():
         return _err(f"node config already exists: config/nodes/{name}.yaml")
 
-    # Step 2: 查找模板 yaml（先 config/nodes/，再 engine/system_nodes/）
-    # 与 engine/node.py load_node 的搜索顺序一致
+    # Step 2: 查找模板（先 config/nodes/ 文件，再插件声明）
     tmpl_path = workspace_root / "config" / "nodes" / f"{template}.yaml"
-    if not tmpl_path.exists():
-        tmpl_path = workspace_root / "engine" / "system_nodes" / f"{template}.yaml"
-    if not tmpl_path.exists():
-        return _err(f"template not found: {template} (checked config/nodes/ and engine/system_nodes/)")
-
-    # Step 3: 解析模板 yaml
-    try:
-        tmpl_text = tmpl_path.read_text(encoding="utf-8")
-        tmpl_data = yaml.safe_load(tmpl_text)
-    except Exception as e:
-        return _err(f"failed to parse template: {e}")
+    tmpl_data: dict | None = None
+    if tmpl_path.exists():
+        try:
+            tmpl_data = yaml.safe_load(tmpl_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return _err(f"failed to parse template: {e}")
+    else:
+        from engine.faces.nodes import declared_node
+        tmpl_data = declared_node(template)
     if not isinstance(tmpl_data, dict):
-        return _err("template is not a valid YAML dict")
+        return _err(f"template not found: {template} (checked config/nodes/ and plugin declarations)")
 
     # Step 4: 替换核心字段
     tmpl_data["id"] = name
@@ -132,7 +211,17 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if provider:
         tmpl_data["provider"] = provider
 
-    # Step 5: 写入新节点 yaml
+    # Step 5: 审批守卫 + 写入新节点 yaml
+    from toolbox._common import request_guard
+
+    _op, err = await request_guard(
+        ctx,
+        "write_file",
+        {"path": f"config/nodes/{name}.yaml", "tool_name": "create_agent", "template": template},
+    )
+    if err is not None:
+        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
+
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(
         yaml.safe_dump(tmpl_data, default_flow_style=False, allow_unicode=True),
@@ -144,22 +233,25 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     caller_updated = False
     if caller_node_id:
         caller_path = workspace_root / "config" / "nodes" / f"{caller_node_id}.yaml"
-        if not caller_path.exists():
-            caller_path = workspace_root / "engine" / "system_nodes" / f"{caller_node_id}.yaml"
         if caller_path.exists():
             try:
-                caller_data = yaml.safe_load(caller_path.read_text(encoding="utf-8"))
+                raw_caller_text = caller_path.read_text(encoding="utf-8")
+                caller_data = yaml.safe_load(raw_caller_text)
                 if isinstance(caller_data, dict):
                     targets = caller_data.get("delegate_targets", [])
                     if not isinstance(targets, list):
                         targets = []
                     if name not in targets:
-                        targets.append(name)
-                        caller_data["delegate_targets"] = targets
-                        caller_path.write_text(
-                            yaml.safe_dump(caller_data, default_flow_style=False, allow_unicode=True),
-                            encoding="utf-8",
-                        )
+                        patched_text = _append_delegate_target_preserving_format(raw_caller_text, name)
+                        if patched_text is not None:
+                            caller_path.write_text(patched_text, encoding="utf-8")
+                        else:
+                            targets.append(name)
+                            caller_data["delegate_targets"] = targets
+                            caller_path.write_text(
+                                yaml.safe_dump(caller_data, default_flow_style=False, allow_unicode=True),
+                                encoding="utf-8",
+                            )
                         caller_updated = True
             except Exception:
                 pass  # 非致命：节点已创建但调用者更新失败
@@ -190,44 +282,45 @@ PLUGIN_META["tools"] = [
     {
         "name": "create_agent",
         "description": (
-            "从现有节点 yaml 模板创建新的持久化子节点。"
-            "读取模板节点配置，替换 id/name/description 等字段后写入 config/nodes/ 目录，"
-            "并可选地将新节点追加到调用者的 delegate_targets 中。"
+            "Create a new persistent child node from an existing node yaml template. "
+            "Reads the template node config, replaces fields such as id/name/description, "
+            "writes it into config/nodes/, and optionally appends the new node to the "
+            "caller's delegate_targets."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "新节点 ID，如 bob",
+                    "description": "New node ID, e.g. bob",
                 },
                 "display_name": {
                     "type": "string",
-                    "description": "显示名，不填则用 name",
+                    "description": "Display name; defaults to name",
                 },
                 "template": {
                     "type": "string",
-                    "description": "模板节点 ID，如 child_coder。先查 config/nodes/，再查 engine/system_nodes/",
+                    "description": "Template node ID, e.g. child_coder. Searches config/nodes/ first, then plugin declarations",
                 },
                 "description": {
                     "type": "string",
-                    "description": "节点描述",
+                    "description": "Node description",
                 },
                 "memory_book": {
                     "type": "string",
-                    "description": "记忆 namespace，不填则默认等于 name",
+                    "description": "Memory namespace; defaults to name",
                 },
                 "persistent": {
                     "type": "boolean",
-                    "description": "是否持久化，默认 true",
+                    "description": "Whether to persist; default true",
                 },
                 "provider": {
                     "type": "string",
-                    "description": "覆盖 provider",
+                    "description": "Override provider",
                 },
                 "caller_node_id": {
                     "type": "string",
-                    "description": "调用者节点 ID，用于自动追加 delegate_targets",
+                    "description": "Caller node ID, used to auto-append delegate_targets",
                 },
             },
             "required": ["name", "template"],

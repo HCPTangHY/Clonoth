@@ -14,6 +14,7 @@ knowledge_inject's skill/memory injection onto this surface is a later step.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,17 @@ SCOPES = ("static", "dynamic")
 # (role/content/...) and pass through so a section can control message
 # boundaries (e.g. knowledge static emits separate system messages).
 SectionRender = Callable[["PromptSectionContext"], "None | str | list"]
+
+
+def content_sha1(text: str) -> str:
+    """Return the sha1 hex digest used to deduplicate persisted dynamic context.
+
+    [Persistent Dynamic Context] Why: dynamic blocks now stay in history, so each
+    turn must know which entries are already present. How: every injectable unit
+    (prompt dynamic part, skill, memory, section) is keyed and hashed with this one
+    helper. Purpose: assembler and knowledge plugin compute identical digests.
+    """
+    return hashlib.sha1(str(text).encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -106,7 +118,7 @@ class PromptSectionRegistry:
         # collecting block is active. Purpose: one unload undoes all surfaces.
         ledger = getattr(self, "_disposal_ledger", None)
         if ledger is not None:
-            ledger.record(_dispose)
+            ledger.record(_dispose, key=("prompt_section", self, clean_name))
         return _dispose
 
     def set_disposal_ledger(self, ledger: Any) -> None:
@@ -159,9 +171,44 @@ class PromptSectionRegistry:
                 messages.append({"role": "user", "content": item.strip(), "_section": True})
         return messages
 
-    def _render_items(self, scope: str, ctx: PromptSectionContext) -> list[Any]:
-        """Call each section render of one scope and flatten list returns."""
-        items: list[Any] = []
+    def render_dynamic_entries(self, ctx: PromptSectionContext) -> list[tuple[str, dict[str, str]]]:
+        """Render dynamic sections as ``(text, injected_hashes)`` pairs.
+
+        [Persistent Dynamic Context] Why: the assembler only appends dynamic parts
+        whose content is not already present in the uncompacted history. How: a
+        dict item may carry its own ``_injected_hashes`` (knowledge plugin: one key
+        per skill/memory); any other item is keyed ``section:<name>`` (``#i`` for
+        additional items of the same section) and hashed by its text. Purpose:
+        every dynamic unit has a stable key for history-based deduplication.
+        """
+        entries: list[tuple[str, dict[str, str]]] = []
+        counts: dict[str, int] = {}
+        for name, item in self._render_named_items("dynamic", ctx):
+            if isinstance(item, dict):
+                text = str(item.get("content") or "").strip()
+                hashes = item.get("_injected_hashes")
+            elif isinstance(item, str):
+                text, hashes = item.strip(), None
+            else:
+                continue
+            if not text:
+                continue
+            if not isinstance(hashes, dict) or not hashes:
+                idx = counts.get(name, 0)
+                counts[name] = idx + 1
+                key = f"section:{name}" if idx == 0 else f"section:{name}#{idx}"
+                hashes = {key: content_sha1(text)}
+            entries.append((text, {str(k): str(v) for k, v in hashes.items()}))
+        return entries
+
+    def _render_named_items(self, scope: str, ctx: PromptSectionContext) -> list[tuple[str, Any]]:
+        """Same as _render_items but keeps the owning section name per item.
+
+        [Persistent Dynamic Context] Why: section-level dedup keys need the
+        section name. How: carry it beside each flattened item. Purpose: one
+        render loop serves both the plain and the keyed views.
+        """
+        items: list[tuple[str, Any]] = []
         for section in sorted(self._sections.values(), key=lambda s: (s.order, s.name)):
             if section.scope != scope:
                 continue
@@ -173,10 +220,14 @@ class PromptSectionRegistry:
             if result is None:
                 continue
             if isinstance(result, list):
-                items.extend(result)
+                items.extend((section.name, item) for item in result)
             else:
-                items.append(result)
+                items.append((section.name, result))
         return items
+
+    def _render_items(self, scope: str, ctx: PromptSectionContext) -> list[Any]:
+        """Call each section render of one scope and flatten list returns."""
+        return [item for _name, item in self._render_named_items(scope, ctx)]
 
 
 # Why: prompt assembly runs in the engine process and needs one shared registry.

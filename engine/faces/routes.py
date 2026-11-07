@@ -46,7 +46,17 @@ def _is_websocket(route: Any) -> bool:
 
 
 def _iter_http_routes(router: Any) -> list[Any]:
-    return [r for r in (getattr(router, "routes", None) or []) if not _is_websocket(r)]
+    """Include effective paths from FastAPI's lazy router wrappers (0.141+).
+
+    Older FastAPI exposes the already-expanded APIRoute objects directly.
+    Keep this compatibility detail shared by auth, listing and conflict checks.
+    """
+    routes: list[Any] = []
+    for route in getattr(router, "routes", None) or []:
+        expand = getattr(route, "effective_route_contexts", None)
+        candidates = expand() if callable(expand) else [route]
+        routes.extend(r for r in candidates if getattr(r, "methods", None))
+    return routes
 
 
 class _Declaration:
@@ -54,15 +64,27 @@ class _Declaration:
 
     __slots__ = (
         "owner", "router", "prefix", "public", "description",
-        "mounted_routes", "public_paths",
+        "key", "disposer", "mounted_routes", "public_paths",
     )
 
-    def __init__(self, owner: str, router: Any, prefix: str, public: bool, description: str) -> None:
+    def __init__(
+        self,
+        owner: str,
+        router: Any,
+        prefix: str,
+        public: bool,
+        description: str,
+        key: str = "",
+    ) -> None:
         self.owner = owner
         self.router = router
         self.prefix = prefix
         self.public = public
         self.description = description
+        # Resource key: a re-registration with the same key replaces this
+        # declaration instead of adding a second, conflicting one.
+        self.key = key
+        self.disposer: Callable[[], None] | None = None
         # Route objects include_router created; None while unmounted.
         self.mounted_routes: list[Any] | None = None
         # Full paths this declaration added to the auth exempt set.
@@ -80,6 +102,8 @@ class PluginRoutesFace:
 
     def __init__(self) -> None:
         self._declarations: list[_Declaration] = []
+        # key -> declaration, for re-registrations of the same resource.
+        self._by_key: dict[str, _Declaration] = {}
         self._app: Any = None
         self._disposal_ledger: Any = None
 
@@ -98,6 +122,7 @@ class PluginRoutesFace:
         mount: str | None = None,
         public: bool = False,
         description: str = "",
+        key: str = "",
     ) -> Callable[[], None]:
         """Declare one APIRouter and return its disposer.
 
@@ -105,6 +130,13 @@ class PluginRoutesFace:
         plugin load are rejected); mount overrides the default
         ``/v1/plugins/{owner}`` prefix with ``/v1/{mount}``; public exempts
         the served paths from the global /v1/ auth middleware.
+
+        ``key`` names the resource this router serves. Registering the same key
+        again (plugin reload, or a handler re-entered on the same load) replaces
+        the previous declaration, so a reload cannot accumulate a second copy
+        that then fails the route-conflict check. Declarations without a key are
+        always independent — the same owner may mount several routers under one
+        prefix (e.g. two ``admin/config`` routers).
         """
         ledger = self._disposal_ledger
         owner = ledger.current_owner() if ledger is not None else None
@@ -119,19 +151,39 @@ class PluginRoutesFace:
             raise ValueError(f"invalid mount path: {mount!r}")
         prefix = f"/v1/{clean_mount}" if clean_mount else f"/v1/plugins/{owner}"
 
-        decl = _Declaration(owner, router, prefix, bool(public), str(description or ""))
+        clean_key = str(key or "").strip()
+        if clean_key:
+            previous = self._by_key.pop(clean_key, None)
+            if previous is not None:
+                # Replace in place: unmount the old router before the new one is
+                # mounted, otherwise the conflict check would reject it.
+                if previous in self._declarations:
+                    self._declarations.remove(previous)
+                self._unmount(previous)
+                if ledger is not None and previous.disposer is not None:
+                    # Its own dispose closure is now stale; it must not remove
+                    # the declaration that replaces it.
+                    ledger.forget(previous.disposer)
+
+        decl = _Declaration(owner, router, prefix, bool(public), str(description or ""), clean_key)
 
         def _dispose() -> None:
             if decl in self._declarations:
                 self._declarations.remove(decl)
+            if decl.key and self._by_key.get(decl.key) is decl:
+                self._by_key.pop(decl.key, None)
             self._unmount(decl)
+
+        decl.disposer = _dispose
 
         # Why: like every registration surface, the disposer joins the shared
         # per-plugin ledger. How: record while the loader's collecting block
         # is active. Purpose: unload_plugin(owner) also removes the routes.
         if ledger is not None:
-            ledger.record(_dispose)
+            ledger.record(_dispose, key=("route", self, clean_key) if clean_key else None)
         self._declarations.append(decl)
+        if clean_key:
+            self._by_key[clean_key] = decl
         if self._app is not None:
             self._mount(decl)
         return _dispose
@@ -268,9 +320,9 @@ def static_router(directory: "str | PathLike[str]") -> Any:
     the requested relative path inside ``directory`` with a resolve()
     containment check (path traversal refused), maps directory requests to
     index.html, and returns a FileResponse (Starlette guesses the media type);
-    no directory listing. Declare with ``public=True`` on the routes face so
-    iframes can load the entry without an Authorization header. Purpose:
-    plugins get a web UI surface with zero frontend involvement.
+    no directory listing. Keep the declaration authenticated; the web host
+    exchanges its Bearer credential for a short-lived panel cookie before
+    loading the iframe. Purpose: standalone plugin pages without public files.
     """
     from pathlib import Path
 
@@ -283,7 +335,7 @@ def static_router(directory: "str | PathLike[str]") -> Any:
 
     router = APIRouter()
 
-    @router.get("/{file_path:path}", include_in_schema=False)
+    @router.api_route("/{file_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     async def _serve_static(file_path: str) -> FileResponse:
         cleaned = (file_path or "").strip("/")
         if not cleaned:
@@ -293,6 +345,9 @@ def static_router(directory: "str | PathLike[str]") -> Any:
             raise HTTPException(status_code=404, detail="Not Found")
         if not target.is_file():
             raise HTTPException(status_code=404, detail="Not Found")
-        return FileResponse(target)
+        return FileResponse(target, headers={"Cache-Control": "private, no-store", "Vary": "Authorization, Cookie"})
 
+    # Only this read-only handler may be reached with a panel cookie. Merely
+    # registering an API below /web/ does not give it the same permission.
+    _serve_static._clonoth_panel_static = True
     return router

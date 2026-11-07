@@ -11,11 +11,11 @@ from typing import Any
 from uuid import uuid4
 
 from ..attachments import build_multimodal_content
-from ..compact import record_compact_success
+from ..compact import record_compact_failure, record_compact_success
 from ..conversation_store import Message
 from ..signals import Signal, get_bus
 from .message_model import MessageMeta, set_message_meta
-from .tool_format import ParsedToolCall
+from providers.tool_format import ParsedToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +56,9 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         result = resume_data.get("result") or {}
         text = str(result.get("text") or "")
         child_atts = _attachments_from_payload(result)
-        lines = [f"下游节点 {from_node} 已完成。" if from_node else "下游节点已完成。"]
+        lines = [f"Downstream node {from_node} has finished." if from_node else "Downstream node has finished."]
         if text:
-            lines.append("结果：")
+            lines.append("Result:")
             lines.append(text)
         content_text = "\n".join(lines).strip()
         if isinstance(child_atts, list) and child_atts:
@@ -71,13 +71,13 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         result = resume_data.get("result") or {}
         text = str(result.get("text") or "").strip()
         if from_node and text:
-            content = f"下游节点 {from_node} 需要补充信息：{text}"
+            content = f"Downstream node {from_node} needs more information: {text}"
         elif text:
-            content = f"下游节点需要补充信息：{text}"
+            content = f"Downstream node needs more information: {text}"
         elif from_node:
-            content = f"下游节点 {from_node} 需要补充信息。"
+            content = f"Downstream node {from_node} needs more information."
         else:
-            content = "下游节点需要补充信息。"
+            content = "Downstream node needs more information."
         return [{"role": "user", "content": content}]
 
     # v2: output_rejected (output chain downstream rejected upstream finish)
@@ -92,23 +92,23 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     # v2: child_failed
     if rtype == "child_failed":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
-        error = str(resume_data.get("error") or "未知错误")
-        prefix = f"下游节点 {from_node} 执行失败：" if from_node else "下游节点执行失败："
+        error = str(resume_data.get("error") or "unknown error")
+        prefix = f"Downstream node {from_node} failed: " if from_node else "Downstream node failed: "
         return [{"role": "user", "content": f"{prefix}{error}"}]
 
     # v2: child_cancelled
     if rtype == "child_cancelled":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
-        text = f"下游节点 {from_node} 已被取消。" if from_node else "下游节点已被取消。"
+        text = f"Downstream node {from_node} was cancelled." if from_node else "Downstream node was cancelled."
         return [{"role": "user", "content": text}]
 
     # v2: child_preempted
     if rtype == "child_preempted":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         ctx_ref = str(resume_data.get("context_ref") or "")
-        prefix = f"下游节点 {from_node} 被打断，上下文已保存。" if from_node else "下游节点被打断，上下文已保存。"
+        prefix = f"Downstream node {from_node} was interrupted; its context has been saved." if from_node else "Downstream node was interrupted; its context has been saved."
         if ctx_ref:
-            prefix += f"（context_ref: {ctx_ref}）"
+            prefix += f" (context_ref: {ctx_ref})"
         return [{"role": "user", "content": prefix}]
 
     # v2: compact_done (compactor 子 task 完成后恢复)
@@ -134,7 +134,7 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                 if atts:
                     all_atts.extend(atts)
             if all_atts:
-                msgs.append({"role": "user", "content": build_multimodal_content("以上工具执行产生了以下图片结果：", all_atts)})
+                msgs.append({"role": "user", "content": build_multimodal_content("The tool executions above produced the following image results:", all_atts)})
             return msgs
         return []
 
@@ -206,7 +206,7 @@ def _select_attachments(
 
     def _attachment_from_path(path: str) -> dict[str, Any]:
         suffix = Path(path).suffix.lower()
-        image_exts = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
+        image_exts = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
         return {
             "path": path,
             "name": Path(path).name or "附件",
@@ -232,6 +232,8 @@ def _select_attachments(
             if not p.is_file():
                 continue
             try:
+                if p.stat().st_size > 25 * 1024 * 1024:
+                    continue
                 data_bytes = p.read_bytes()
             except Exception:
                 continue
@@ -334,20 +336,53 @@ def _apply_output_rejected(
     logger.info("output_rejected: from=%s reason=%s fcid=%r implicit=%s msg_count=%d",
              _rej_from, _rej_reason[:80], _finish_call_id, _is_implicit_finish, len(messages))
 
+    _rej_src = _rej_from or "output_gate"
+    _store = getattr(rctx, 'conversation_store', None)
+    _target_sid = getattr(rctx, 'child_session_id', '') or getattr(rctx, 'session_id', '')
+    _cur_tid = str(getattr(rctx, "task_id", "") or "")
+
+    # Mark the preceding rejected assistant draft in messages and ConversationStore
+    for _d_idx in range(len(messages) - 1, -1, -1):
+        _dm = messages[_d_idx]
+        if not isinstance(_dm, dict) or _dm.get("role") != "assistant":
+            continue
+        _dmeta = _dm.setdefault("_meta", {})
+        _dmeta["rejected_draft"] = True
+        _dmeta["rejection_source"] = _rej_src
+        _dmeta["rejection_code"] = "output_rejected"
+        _dm_id = str(_dm.get("id") or "").strip()
+        if _store and _target_sid and _dm_id:
+            try:
+                _store.update_message(_target_sid, _dm_id, _dm)
+            except Exception:
+                pass
+        break
+
     if _is_implicit_finish:
         # Hybrid 模式隐式 finish 或无 finish call_id：
         # 以 user 角色注入 reject，追加到 messages 末尾。
         # reject 作为当前指令应该在动态上下文（背景信息）之后。
-        _rej_user_msg = {"role": "user", "content": _rej_line}
+        _rej_meta_dict = {
+            "message_type": "output_rejected",
+            "is_rejection": True,
+            "rejection_source": _rej_src,
+            "rejection_code": "output_rejected",
+        }
+        if _cur_tid:
+            _rej_meta_dict["source_task_id"] = _cur_tid
+        _rej_user_msg = {
+            "role": "user",
+            "content": _rej_line,
+            "message_type": "output_rejected",
+        }
         set_message_meta(_rej_user_msg, MessageMeta(
             message_type="output_rejected",
         ))
+        _rej_user_msg.setdefault("_meta", {}).update(_rej_meta_dict)
         messages.append(_rej_user_msg)
         logger.info("output_rejected(implicit): appended user reject msg at idx=%d",
                     len(messages) - 1)
-        _store = getattr(rctx, 'conversation_store', None)
-        _target_sid = getattr(rctx, 'child_session_id', '') or rctx.session_id
-        if _store:
+        if _store and _target_sid:
             try:
                 _store.append(_target_sid, Message(
                     id=str(uuid4()),
@@ -355,6 +390,9 @@ def _apply_output_rejected(
                     content=_rej_line,
                     message_type="output_rejected",
                     created_at=datetime.now(timezone.utc).isoformat(),
+                    meta=dict(_rej_meta_dict),
+                    source_node_id=_rej_src,
+                    source_task_id=_cur_tid,
                 ))
             except Exception as _wr_exc:
                 logger.warning("output_rejected(implicit): append failed sid=%s: %s",
@@ -381,7 +419,14 @@ def _apply_output_rejected(
         set_message_meta(_rej_msg, MessageMeta(
             tool_mode=getattr(node, 'tool_mode', 'fake-native'),
             message_type="tool_result",
+            tool_rejected=True,
+            tool_rejection_code="output_rejected",
         ))
+        _rej_msg.setdefault("_meta", {}).update({
+            "is_rejection": True,
+            "rejection_source": _rej_src,
+            "rejection_code": "output_rejected",
+        })
         if _finish_result_idx >= 0:
             _old_msg_id = str(messages[_finish_result_idx].get("id") or "").strip()
             messages[_finish_result_idx] = _rej_msg
@@ -409,14 +454,29 @@ async def _emit_compact_done(
     node: Any,
     rctx: Any,
 ) -> None:
-    """Reset the compaction breaker and emit compact_done signal/event."""
-    # [2026-04-24] P1.5 熔断器：压缩成功时重置失败计数
-    # [AutoC 2026-05-13] Why: compaction may have targeted the parent session
-    # while the task resumed on a branch. How: reset the breaker on
-    # parent_session_id when present. Purpose: success accounting stays
-    # consistent with parent-first compact targeting.
-    record_compact_success(rctx.parent_session_id or rctx.session_id)
-    # Phase 2 Signal: compact.done 信号，通过 SignalBus 发射供监控使用
+    """Record the compaction result and emit the compact_done signal/event."""
+    # [fix 2026-09-11] Why: a failed compactor task is resumed with compact_done
+    # success=False. Resetting the breaker for that resume made every failed
+    # attempt look successful, so the next before_step dispatched another
+    # compactor indefinitely. How: only clear consecutive failures after the
+    # supervisor actually reports a successful compaction. Purpose: a failed
+    # compaction remains bounded by the session circuit breaker.
+    # [fix 2026-10-02] Why: both outcomes must move the same counter the engine
+    # reads in before_step (engine.compact). Recording only the supervisor side
+    # left the local breaker permanently closed after failures. How: reuse the
+    # engine.compact trackers — increment on failure, reset only on real success.
+    # Purpose: one breaker per session, fed by every finished compaction attempt.
+    # The session that owns the context is the child session when this resume comes
+    # from a compacting child, else the caller's parent session, else this session.
+    _compact_sid = (
+        getattr(rctx, "child_session_id", "")
+        or getattr(rctx, "parent_session_id", "")
+        or getattr(rctx, "session_id", "")
+    )
+    if resume_data.get("success", True):
+        record_compact_success(_compact_sid)
+    else:
+        record_compact_failure(_compact_sid)
     _cd_payload = {
         "node_id": node.id,
         "success": resume_data.get("success", True),

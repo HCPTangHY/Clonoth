@@ -28,7 +28,7 @@ class SkillAccess:
 
 @dataclass
 class MemoryAccess:
-    mode: str = "all"  # "all" | "allowlist" | "none"
+    mode: str = "all"  # "all" | "allowlist" | "constant" | "none"
     allow: list[str] = field(default_factory=list)
 
 
@@ -73,7 +73,7 @@ class Node:
     # 同时 dispatch 该节点时默认使用 accumulate context_mode。
     persistent: bool = False
     # [AutoC 2026-08-30] control_tools: 控制类伪工具（finish/ask/intermediate_reply/
-    # compact_context/preempt_task/switch_node）的注入开关。Why: 此前这些工具无条件
+    # compact_context/manage_workers/switch_node）的注入开关。Why: 此前这些工具无条件
     # 注入，无法声明一个只有 execute_command 的最小节点。How: "all"（默认，旧行为）/
     # "none"（全部不注入）/ 名称列表（只注入列出的）。Purpose: 插件声明的极简节点
     # 不再被框架强行塞入控制面工具。
@@ -84,6 +84,16 @@ class Node:
     # 怎么改：load_node 把 yaml 中不属于 core 已知字段的 key-value 全部收进 extra。
     # 目的：插件通过 ToolContext._node_extra 零 IO 拿到自己的配置。
     extra: dict = field(default_factory=dict)
+
+
+def node_file_candidates(workspace_root: Path, node_id: str) -> tuple[Path, ...]:
+    """Return node files in local override, user, then builtin priority order."""
+    user_dir = workspace_root / "config" / "nodes"
+    return (
+        user_dir / f"{node_id}.local.yaml",
+        user_dir / f"{node_id}.yaml",
+        workspace_root / "engine" / "builtin" / "nodes" / f"{node_id}.yaml",
+    )
 
 
 def load_node(workspace_root: Path, node_id: str) -> Node | None:
@@ -101,11 +111,8 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         logger.warning(
             "plugin-declared node %r failed to parse; falling back to file sources", nid
         )
-    # 系统节点目录分离：优先从 engine/system_nodes/ 加载内建系统节点，
-    # 找不到时回退到 config/nodes/ 用户配置目录。确保系统节点跟随代码仓库同步。
-    _sys_path = workspace_root / "engine" / "system_nodes" / f"{nid}.yaml"
-    _usr_path = workspace_root / "config" / "nodes" / f"{nid}.yaml"
-    _node_path = _sys_path if _sys_path.is_file() else _usr_path
+    candidates = node_file_candidates(workspace_root, nid)
+    _node_path = next((path for path in candidates if path.is_file()), candidates[1])
     data = load_yaml_dict(_node_path)
     if not isinstance(data, dict):
         return None
@@ -163,16 +170,27 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     elif isinstance(ta_raw, dict):
         _raw_m = str(ta_raw.get("mode") or "none").strip().lower()
         m = {"allow": "allowlist"}.get(_raw_m, _raw_m)
-        allow = [
-            str(x).strip()
-            for x in (ta_raw.get("allow") or [])
-            if isinstance(x, str) and x.strip()
-        ]
-        deny = [
-            str(x).strip()
-            for x in (ta_raw.get("deny") or [])
-            if isinstance(x, str) and x.strip()
-        ]
+        def access_rules(raw: Any) -> list[str]:
+            if raw is None:
+                return []
+            if not isinstance(raw, list):
+                raise ValueError(f"node {nid!r}: tool_access allow/deny must be lists")
+            rules: list[str] = []
+            for entry in raw:
+                if isinstance(entry, str) and entry.strip():
+                    rules.append(entry.strip())
+                elif isinstance(entry, dict):
+                    for name, actions in entry.items():
+                        if not isinstance(name, str) or not name.strip():
+                            continue
+                        if isinstance(actions, list):
+                            actions = ",".join(a.strip() for a in actions if isinstance(a, str) and a.strip())
+                        if isinstance(actions, str) and actions.strip():
+                            rules.append(f"{name.strip()}:{actions.strip()}")
+            return rules
+
+        allow = access_rules(ta_raw.get("allow"))
+        deny = access_rules(ta_raw.get("deny"))
         if m not in {"none", "all", "allowlist"}:
             # [AutoC 2026-08-31] 非法 mode 静默回退 none 会把 allow 列表一起
             # 吞掉（实测：mode="allow" 的 mini 节点 execute_command 未注入，
@@ -197,11 +215,11 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     ma_raw = data.get("memories")
     if isinstance(ma_raw, str):
         mm = ma_raw.strip().lower()
-        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "none"} else "all")
+        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "constant", "none"} else "all")
     elif isinstance(ma_raw, dict):
         mm = str(ma_raw.get("mode") or "all").strip().lower()
         ma_allow = [str(x).strip() for x in (ma_raw.get("allow") or []) if isinstance(x, str) and x.strip()]
-        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "none"} else "all", allow=ma_allow)
+        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "constant", "none"} else "all", allow=ma_allow)
     else:
         ma = MemoryAccess()
 
@@ -234,10 +252,11 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
 
     # provider — 节点 yaml 可指定 provider 类型
     raw_provider = str(data.get("provider") or "").strip().lower()
-    # [provider-registry 2026-05-03] 从 registry 动态校验 provider 名称。
-    # 原因：固定白名单会阻止新 provider 插件；做法：读取 ProviderRegistry.list()；
-    # 目的：注册成功的 provider 可以直接被节点配置使用，未知值仍回退为空字符串。
-    provider = raw_provider if raw_provider in {"", *provider_registry.list()} else ""
+    # Reject invalid explicit choices instead of silently selecting the global
+    # default. An empty provider still means inheritance from the global config.
+    if raw_provider and provider_registry.get(raw_provider) is None:
+        raise ValueError(f"Unknown provider '{raw_provider}'. Available: {provider_registry.list()}")
+    provider = raw_provider
 
     # provider_options — 透传给 provider 的参数（如 Anthropic thinking、OpenAI reasoning 等）
     raw_po = data.get("provider_options")
@@ -256,14 +275,20 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
 
     # control_tools：字符串 "all"/"none"，或工具名列表。非法值回退 "all"。
     _ct_raw = data.get("control_tools")
+    # [2026-08-30] retired names (preempt_task / cancel_active_tasks) are dropped here on
+    # purpose: manage_workers replaced them and they are not pseudo tools anymore, so
+    # keeping the name would advertise a control tool the engine can never execute.
+    # The single source of truth for that retirement is engine.inference.pseudo_tools;
+    # no alias path exists (a retired name never re-authorizes manage_workers).
+    from engine.inference.pseudo_tools import _RETIRED_PSEUDO_TOOL_NAMES
     _CONTROL_NAMES = {"finish", "ask", "intermediate_reply", "compact_context",
-                      "preempt_task", "switch_node"}
+                      "dispatch_to", "spawn_worker", "manage_workers", "switch_node"}
     if isinstance(_ct_raw, str):
         control_tools: Any = _ct_raw.strip().lower() if _ct_raw.strip().lower() in {"all", "none"} else "all"
     elif isinstance(_ct_raw, list):
         control_tools = [
-            str(x).strip() for x in _ct_raw
-            if isinstance(x, str) and x.strip() in _CONTROL_NAMES
+            name for name in (str(x).strip() for x in _ct_raw if isinstance(x, str))
+            if name in _CONTROL_NAMES and name not in _RETIRED_PSEUDO_TOOL_NAMES
         ]
     else:
         control_tools = "all"

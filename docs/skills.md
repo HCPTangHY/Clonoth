@@ -59,27 +59,26 @@ Skill 正文以 Markdown 格式编写，会被原样注入到模型的 system pr
 
 ```yaml
 skills:
-  mode: all      # all | none | allowlist | deny
-  list:          # allowlist / deny 模式下的 Skill 名称列表
+  mode: all      # all | none | allowlist
+  allow:         # allowlist 模式下的 Skill 名称列表
     - skill-name
 ```
 
 - `all`：允许使用所有启用的 Skill。
 - `none`：不注入 Skill。
-- `allowlist`：只注入 `list` 中指定的 Skill。
-- `deny`：注入除 `list` 以外的所有 Skill。
+- `allowlist`：只注入 `allow` 中指定的 Skill。
 
 ## 创建与管理
 
 ### 通过 AI 工具
 
 ```
-create_or_update_skill(name="my-skill", description="...", content="...")
-list_skills()
-delete_skill(name="my-skill")
+manage_skill(action="upsert", name="my-skill", description="...", content="...")
+manage_skill(action="list")
+manage_skill(action="delete", name="my-skill")
 ```
 
-`create_or_update_skill` 会自动规范化 frontmatter。`delete_skill` 受审批保护。
+`manage_skill(action="upsert")` 会规范化 frontmatter。写入和删除均按实际文件路径进行权限检查。
 
 ### 手动创建
 

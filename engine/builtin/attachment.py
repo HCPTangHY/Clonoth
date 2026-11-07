@@ -86,7 +86,8 @@ class AttachmentCollector:
         mime = str(raw.get("mime_type") or mimetypes.guess_type(path_for_name)[0] or "")
         if mime:
             raw["mime_type"] = mime
-        raw.setdefault("type", "image" if mime.startswith("image/") else "file")
+        is_svg = path_for_name.lower().endswith(".svg") or mime.lower() == "image/svg+xml"
+        raw.setdefault("type", "image" if (mime.startswith("image/") and not is_svg and not raw.get("invalid_image")) else "file")
         return raw
 
     async def handle(self, ctx: Any) -> Any | None:

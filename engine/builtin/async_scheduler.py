@@ -132,11 +132,13 @@ class AsyncScheduler:
             )
             raw_inline = (
                 f'⏳ Async tool "{tool_name}" started (id: {async_id}). '
-                f'Result will be delivered via preempt when ready.'
+                f'The result will be delivered via preempt while this task is running, '
+                f'or as a follow-up message after it ends. '
+                f'You can finish this task or continue working on other things.'
             )
             return hook_result(
                 modified=True,
-                channels={"execution": _async_marker(async_id, raw_inline, "异步执行已启动")},
+                channels={"execution": _async_marker(async_id, raw_inline, "Async execution started")},
             )
 
         # [AutoC 2026-06-27] Why: execute_command may run longer than the model
@@ -208,8 +210,11 @@ class AsyncScheduler:
             )
             raw_inline = (
                 f'⏳ Tool "{tool_name}" exceeded {threshold:.1f}s and was '
-                f'auto-upgraded to async (id: {async_id}). Result will be delivered via preempt when ready. You can finish this task or continue working on other things.'
+                f'auto-upgraded to async (id: {async_id}). '
+                f'The result will be delivered via preempt while this task is running, '
+                f'or as a follow-up message after it ends. '
+                f'You can finish this task or continue working on other things.'
             )
-            return _async_marker(async_id, raw_inline, "已自动转为异步执行")
+            return _async_marker(async_id, raw_inline, "Automatically switched to async execution")
 
         return hook_result(modified=True, channels={"execution": _adaptive()})

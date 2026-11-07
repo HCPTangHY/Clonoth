@@ -8,6 +8,7 @@ core llm_call.py or ai_step.py.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from pathlib import Path
@@ -16,38 +17,8 @@ from typing import Any
 import yaml
 
 from .result import hook_result
-# [fix 2026-05-28] Import message formatting utilities so fallback calls go
-# through the same conversion pipeline as the primary call (llm_call.py L171-172).
-# Without this, internal fields like _meta/_ephemeral leak into provider requests.
-from engine.inference.llm_call import _build_messages_for_provider
-from engine.attachments import prepare_messages_for_llm
+from engine.protocol import TaskAction
 
-
-def _strip_image_blocks(messages: list[dict]) -> list[dict]:
-    """Remove image_url content blocks from all messages.
-
-    Why: fallback providers like DeepSeek don't support vision/multimodal.
-    How: for each message with list-type content, filter out image_url blocks.
-    If a message becomes empty after stripping, replace with placeholder text.
-    """
-    result = []
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            result.append(msg)
-            continue
-        filtered = [p for p in content if not (isinstance(p, dict) and p.get("type") == "image_url")]
-        if not filtered:
-            new_msg = {**msg, "content": "[image content removed]"}
-        elif len(filtered) == 1 and isinstance(filtered[0], dict) and filtered[0].get("type") == "text":
-            new_msg = {**msg, "content": filtered[0].get("text", "")}
-        elif len(filtered) == len(content):
-            result.append(msg)
-            continue
-        else:
-            new_msg = {**msg, "content": filtered}
-        result.append(new_msg)
-    return result
 
 logger = logging.getLogger(__name__)
 
@@ -96,14 +67,23 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     """
     provider_name = (fb_cfg.get("provider") or "openai").strip().lower()
     provider_block = full_cfg.get(provider_name, {})
+    if (not isinstance(provider_block, dict) or not provider_block) and provider_name in ("gemini", "gemini-vertex", "gemini-aistudio"):
+        provider_block = full_cfg.get("gemini-vertex") or full_cfg.get("gemini") or {}
     if not isinstance(provider_block, dict):
         provider_block = {}
 
+    po: dict[str, Any] = {}
+    for _opt_key in ("reasoning_field", "reasoning_effort", "max_tokens", "max_completion_tokens", "thought_summary"):
+        _val = fb_cfg.get(_opt_key) if _opt_key in fb_cfg else provider_block.get(_opt_key)
+        if _val is not None:
+            po[_opt_key] = _val
     return {
         "provider": provider_name,
         "base_url": (fb_cfg.get("base_url") or "").strip() or (provider_block.get("base_url") or "").strip(),
         "api_key": (fb_cfg.get("api_key") or "").strip() or (provider_block.get("api_key") or "").strip(),
         "model": (fb_cfg.get("model") or "").strip() or (provider_block.get("model") or "").strip(),
+        "sticky_session": fb_cfg["sticky_session"] if "sticky_session" in fb_cfg else provider_block.get("sticky_session"),
+        "provider_options": po,
     }
 
 
@@ -148,7 +128,8 @@ def _create_fallback_provider(
     base_url: str,
     api_key: str,
     model: str,
-    timeout: float = 600.0,
+    http: Any,
+    provider_options: dict[str, Any] | None = None,
 ) -> Any | None:
     """Instantiate a provider by type string using ProviderRegistry.
 
@@ -162,11 +143,18 @@ def _create_fallback_provider(
                            provider_type, registry.list())
             return None
         # Build kwargs — different providers accept different params
-        kwargs: dict[str, Any] = {"model": model, "api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        if timeout:
-            kwargs["timeout"] = timeout
+        # Share the engine-managed HTTP client; do not allocate an unclosed
+        # client for every replacement. Provider constructors differ slightly.
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url,
+            "http": http,
+            "provider_options": provider_options or {},
+        }
+        params = inspect.signature(provider_cls).parameters
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            kwargs = {k: v for k, v in kwargs.items() if k in params}
         return provider_cls(**kwargs)
     except Exception as exc:
         logger.warning("fallback_provider: failed to create %s provider: %s", provider_type, exc)
@@ -206,16 +194,17 @@ class FallbackProviderHandler:
 
         original_error = getattr(resp, "error", "unknown")
         messages = ctx.messages
-        tools = ctx.tools
         original_provider = ctx.provider
         original_model = getattr(original_provider, "model", "unknown")
 
-        # [fix 2026-05-28] Retrieve formatter from loop_state so we can run the
-        # same message format conversion that llm_call.py does before provider.chat().
-        # Why: without this, messages with _meta/_ephemeral fields are sent raw to
-        # the fallback provider, causing "missing field type" errors on DS etc.
-        _ls = ctx.extra.get("loop_state")
-        _formatter = getattr(_ls, 'formatter', None) if _ls else None
+        call_provider = ctx.extra.get("call_provider")
+        if not callable(call_provider):
+            logger.error("fallback_provider: call_provider capability unavailable")
+            return None
+        # Safe audit data only. Raw errors and endpoint addresses stay out of
+        # delivery metadata; the plugin owns the meaning, the host only transports it.
+        requested = {"provider": getattr(original_provider, "name", "unknown"), "model": original_model}
+        attempts = []
 
         logger.warning(
             "fallback_provider: primary failed (status=%s error=%s model=%s), "
@@ -238,6 +227,22 @@ class FallbackProviderHandler:
             fb_api_key = fb_cfg["api_key"]
             fb_model = fb_cfg["model"] or original_model
 
+            _orig_name = getattr(original_provider, "name", "")
+            _same_provider = (
+                fb_provider_type == _orig_name
+                or ({fb_provider_type, _orig_name} <= {"gemini", "gemini-vertex"})
+            )
+            if (
+                len(fallbacks_raw) > 1
+                and _same_provider
+                and fb_model == original_model
+            ):
+                logger.info(
+                    "fallback_provider: skipping fallback[%d] (%s/%s) — identical to failed primary",
+                    i, fb_provider_type, fb_model,
+                )
+                continue
+
             if not fb_base_url or not fb_api_key:
                 logger.warning(
                     "fallback_provider: skipping fallback[%d] (%s) — no base_url/api_key after resolve",
@@ -246,12 +251,24 @@ class FallbackProviderHandler:
                 continue
 
             try:
+                from engine.model import wrap_http_with_sticky_session
+                _fb_sticky_sid = (
+                    getattr(rctx, "sticky_session_id", "")
+                    or getattr(rctx, "parent_session_id", "")
+                    or getattr(rctx, "session_id", "")
+                )
+                _fb_http = wrap_http_with_sticky_session(
+                    rctx.llm_http,
+                    fb_cfg.get("sticky_session"),
+                    _fb_sticky_sid,
+                )
                 fb_provider = _create_fallback_provider(
                     provider_type=fb_provider_type,
                     base_url=fb_base_url,
                     api_key=fb_api_key,
                     model=fb_model,
-                    timeout=getattr(original_provider, "timeout", 600.0),
+                    http=_fb_http,
+                    provider_options=fb_cfg.get("provider_options"),
                 )
                 if fb_provider is None:
                     logger.warning(
@@ -265,67 +282,41 @@ class FallbackProviderHandler:
                     i, fb_base_url[:40], fb_model,
                 )
 
-                # [fix 2026-05-28] Format messages for this specific fallback
-                # provider before calling chat(). Mirrors llm_call.py L171-172:
-                #   1. _build_messages_for_provider: L2 formatter / bypass based
-                #      on provider type (e.g. Responses/Gemini skip L2)
-                #   2. prepare_messages_for_llm: resolve file:// image refs → base64
-                # The third arg MUST be fb_provider (not original_provider) because
-                # different providers need different format conversion paths.
-                _fb_formatted = _build_messages_for_provider(
-                    messages, _formatter, fb_provider,
-                )
-                _fb_messages = prepare_messages_for_llm(
-                    _fb_formatted, workspace_root,
-                ) if workspace_root else _fb_formatted
-
-                # [fix 2026-05-28] Strip image_url blocks for non-vision
-                # fallback providers (e.g. DeepSeek). Without this, messages
-                # containing multimodal content cause deserialization errors
-                # like: unknown variant `image_url`, expected `text`.
-                _fb_messages = _strip_image_blocks(_fb_messages)
-
+                # Preserve multimodal content for fallback providers. The public
+                # call capability owns formatting, request hooks, IDs and cancellation.
+                attempt = {"provider": fb_provider_type, "model": fb_model, "index": i}
                 t0 = time.monotonic()
-                new_resp = await fb_provider.chat(
-                    messages=_fb_messages,
-                    tools=tools,
-                )
+                new_resp = await call_provider(fb_provider, messages=messages)
+                if isinstance(new_resp, TaskAction):
+                    return hook_result(action=new_resp)
+                if new_resp is None:
+                    return hook_result(skip_step=True)
                 elapsed = round((time.monotonic() - t0) * 1000, 1)
+                attempt.update(success=bool(new_resp.ok), status=getattr(new_resp, "status_code", None))
+                attempts.append(attempt)
+                await rctx.emit_event("llm_fallback", {
+                    "node_id": ctx.node.id, "task_id": rctx.task_id,
+                    "requested": requested, "original_status": status_code,
+                    "attempt": attempt, "elapsed_ms": elapsed,
+                })
 
                 if new_resp.ok:
-                    import sys; print(f"[FB-DIAG] fallback[{i}] SUCCEEDED in {elapsed:.0f}ms model={fb_model}", file=sys.stderr, flush=True)
                     logger.warning(
                         "fallback_provider: fallback[%d] succeeded in %.0fms "
                         "(base_url=%s model=%s)",
                         i, elapsed, fb_base_url[:40], fb_model,
                     )
-                    # Overwrite ctx.response so ai_step uses the new response
                     ctx.response = new_resp
-
-                    # Emit signal if bus is available
-                    try:
-                        from engine.signals import get_bus, Signal
-                        bus = get_bus()
-                        bus.emit(Signal(
-                            name="llm.fallback",
-                            payload={
-                                "original_error": original_error,
-                                "original_status": status_code,
-                                "fallback_index": i,
-                                "fallback_url": fb_base_url[:60],
-                                "fallback_model": fb_model,
-                                "success": True,
-                                "elapsed_ms": elapsed,
-                            },
-                        ))
-                    except Exception:
-                        pass  # signal emission is best-effort
-
-                    return None  # ai_step continues with updated ctx.response
+                    ctx.provider = fb_provider  # This hook response only, not the configured provider.
+                    text = f"原渠道 {original_model} 请求失败，本次改用 {fb_model}（{fb_provider_type}）。"
+                    return hook_result(modified=True, channels={"response_notices": [{
+                        "code": "fallback_provider.used", "label": "备用模型", "text": text,
+                        "requested": requested, "original_status": status_code,
+                        "attempts": attempts,
+                    }]})
                 else:
                     _fb_err = getattr(new_resp, 'error', 'unknown')
                     _fb_st = getattr(new_resp, 'status_code', '?')
-                    import sys; print(f"[FB-DIAG] fallback[{i}] ALSO FAILED status={_fb_st} error={str(_fb_err)[:200]}", file=sys.stderr, flush=True)
                     logger.warning(
                         "fallback_provider: fallback[%d] also failed "
                         "(status=%s error=%s)",
@@ -338,7 +329,13 @@ class FallbackProviderHandler:
                     )
 
             except Exception as exc:
-                import sys, traceback; print(f"[FB-DIAG] fallback[{i}] EXCEPTION: {exc}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
+                await rctx.emit_event("llm_fallback", {
+                    "node_id": ctx.node.id, "task_id": rctx.task_id, "requested": requested,
+                    "original_status": status_code, "attempt": {
+                        "provider": fb_provider_type, "model": fb_model, "index": i,
+                        "success": False, "error_type": type(exc).__name__,
+                    },
+                })
                 logger.error(
                     "fallback_provider: fallback[%d] exception: %s",
                     i, exc, exc_info=True,
@@ -362,19 +359,10 @@ class FallbackProviderHandler:
             "original error stands (status=%s)",
             len(fallbacks_raw), status_code,
         )
-        try:
-            from engine.signals import get_bus, Signal
-            bus = get_bus()
-            bus.emit(Signal(
-                name="llm.fallback",
-                payload={
-                    "original_error": original_error,
-                    "original_status": status_code,
-                    "fallback_count": len(fallbacks_raw),
-                    "success": False,
-                },
-            ))
-        except Exception:
-            pass
+        await rctx.emit_event("llm_fallback", {
+            "node_id": ctx.node.id, "task_id": rctx.task_id, "requested": requested,
+            "original_status": status_code, "success": False, "exhausted": True,
+            "attempts": attempts,
+        })
 
         return None

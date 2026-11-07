@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 HOOK_POINTS: dict[str, str] = {
     # ---- engine inference (async afire) ----
     "before_llm_call": (
-        "每次 provider 调用前、L2 格式化与图片解析之后触发。"
-        "extra: workspace_root。ctx.messages 是本次请求的 L2 产物（每次新建），"
+        "主请求、备用请求及压缩后重建请求在附件解析后、Provider 格式转换前触发；普通重试复用已处理的请求副本。"
+        "extra: workspace_root。ctx.messages 是本次请求的内部历史深复制，保留工具调用及 Provider 元数据，"
         "handler 可原地改写或替换 ctx.messages，仅影响本次出站请求，"
         "不影响 ls.messages 与 JSONL 落库。返回 action 终止任务。"
         "典型用途：@文件引用展开、请求级脱敏。"
@@ -32,7 +32,11 @@ HOOK_POINTS: dict[str, str] = {
         "注意：向 prompt 贡献内容应优先用 prompt_sections 声明型注册面。"
     ),
     "before_step": "每轮推理开始前触发。extra: step 序号等。返回 action 可终止。",
-    "after_llm_call": "LLM 返回后触发。extra: response/usage。可读取用量做统计。",
+    "after_llm_call": (
+        "LLM 返回后触发。ctx.response/ctx.provider 可替换本次响应与来源，不改变下轮默认渠道。"
+        "channels.response_notices 为用户可见说明列表（首个非 None 值生效），"
+        "只进入 response_info 展示与审计，不进入模型消息正文。"
+    ),
     "before_tool_call": "工具执行前触发。extra: tool_name/arguments。返回 block 可拒绝执行。",
     "terminal_tool": (
         "终止型伪工具（finish/ask）实际执行前触发。extra: loop_state/terminal_call。"
@@ -116,9 +120,35 @@ class HookRegistry:
         """Attribute register() disposers created inside the block to one plugin."""
         return self._ledger.collecting(plugin_name)
 
-    def add_plugin_disposer(self, plugin_name: str, disposer: Callable[[], None]) -> None:
-        """Archive an externally created disposer under a plugin name."""
-        self._ledger.add(plugin_name, disposer)
+    def add_plugin_disposer(
+        self,
+        plugin_name: str,
+        disposer: Callable[[], None],
+        *,
+        key: object | None = None,
+    ) -> None:
+        """Archive an externally created disposer under a plugin name.
+
+        ``key`` identifies the resource the disposer releases, so a surface that
+        re-registers the same resource (e.g. the MCP bridge re-registering one
+        tool per tool name on every refresh) replaces its predecessor instead of
+        accumulating dead undo closures.
+        """
+        self._ledger.add(plugin_name, disposer, key=key)
+
+    def owned(self, plugin_name: str) -> int:
+        """Return how many live disposers one plugin still owns (diagnostics)."""
+        return self._ledger.owned(plugin_name)
+
+    def remove_plugin_disposer(self, disposer: Callable[[], None]) -> None:
+        """Drop an archived disposer whose resource was already released.
+
+        Why: a surface may dispose a resource itself (MCP tool refresh) and then
+        archive a fresh disposer under the same key. How: delegate to the
+        ledger's identity-based forget. Purpose: the ledger tracks live
+        resources, not refresh history.
+        """
+        self._ledger.forget(disposer)
 
     def unload_plugin(self, plugin_name: str) -> dict[str, Any]:
         """Undo every registration owned by one plugin, in reverse order.
@@ -174,7 +204,7 @@ class HookRegistry:
             if not current:
                 self._hooks.pop(point, None)
 
-        self._ledger.record(_dispose)
+        self._ledger.record(_dispose, key=("hook", self, point, name))
         return _dispose
 
     def unregister(self, hook_point: str, handler_name: str) -> bool:

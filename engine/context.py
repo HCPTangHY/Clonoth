@@ -42,6 +42,8 @@ class RunContext:
     default_model: str = "gpt-4o-mini"
     user_text: str = ""
     task_id: str = ""
+    inbound_message_id: str = ""  # Stable identity of the current persisted input.
+    inbound_message: dict = field(default_factory=dict)  # Replayable current input, including its type.
     session_generation: int = 0
     source_inbound_seq: int | None = None
     task_context: dict = field(default_factory=dict)
@@ -55,8 +57,18 @@ class RunContext:
     llm_request_index: int = 0
     workspace: Path | None = None
     workspace_name: str = ""
+    sticky_session_id: str = ""
+    # Presentation metadata is separate from model-visible messages.
+    response_info: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.sticky_session_id:
+            self.sticky_session_id = self.parent_session_id or self.child_session_id or self.session_id
+        from .model import _current_sticky_sid_var
+        _current_sticky_sid_var.set(self.sticky_session_id)
 
     def begin_llm_request(self) -> str:
+        self.response_info = {}
         self.llm_request_index += 1
         base = self.task_id or self.session_id or "llm"
         self.current_llm_request_id = f"{base}:llm:{self.llm_request_index}:{uuid.uuid4().hex[:8]}"
@@ -73,6 +85,10 @@ class RunContext:
             payload.setdefault("is_system_task", True)
         if self.current_llm_request_id:
             payload.setdefault("llm_request_id", self.current_llm_request_id)
+        if self.response_info and event_type in {
+            "assistant_text", "intermediate_reply", "stream_text_final", "tool_call_start", "tool_call_end",
+        }:
+            payload.setdefault("response_info", dict(self.response_info))
         route_session_id = self.parent_session_id or self.session_id
         if self.parent_session_id and self.parent_session_id != self.session_id:
             payload.setdefault("parent_session_id", self.parent_session_id)
@@ -118,14 +134,89 @@ class RunContext:
             pass
         return {"preempted": False, "message": "", "attachments": []}
 
-    async def consume_preempt(self) -> None:
+    async def consume_preempt(self, message: str = "", attachment_count: int = 0) -> None:
+        """Acknowledge only the prefix already injected into the current history."""
         try:
             if self.task_id:
                 await self.http.post(
-                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed"
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed",
+                    json={
+                        "consumed_message": str(message or ""),
+                        "consumed_attachment_count": int(attachment_count or 0),
+                    },
                 )
         except Exception:
             pass
+
+    async def list_active_child_tasks(self) -> list[dict[str, Any]]:
+        """Return active child-agent tasks routed under this conversation.
+
+        Why: manage_workers must only ever see the sub-agents of its own
+        conversation; a global by-node lookup could reach another session.
+        How: query the Supervisor child-task representations that are scoped to
+        the route session (running_tasks covers dispatched children in the same
+        session, /children covers durable child sessions) and merge them.
+        Purpose: one conversation-scoped discovery surface for worker control,
+        excluding this task itself and user-entry tasks of the conversation.
+        """
+        import asyncio as _asyncio
+        route_session_id = str(self.parent_session_id or self.session_id or "").strip()
+        if not route_session_id:
+            return []
+
+        active_statuses = {"pending", "running", "suspended", "awaiting_approval"}
+        tasks_by_id: dict[str, dict[str, Any]] = {}
+
+        def _add(raw: Any, *, child_session: bool = False) -> None:
+            if not isinstance(raw, dict):
+                return
+            task_id = str(raw.get("task_id") or "").strip()
+            status = str(raw.get("status") or "").strip()
+            if not task_id or task_id == self.task_id or status not in active_statuses:
+                return
+            if not child_session and bool(raw.get("is_user_entry")):
+                return
+            tasks_by_id[task_id] = {
+                "task_id": task_id,
+                "node_id": str(raw.get("node_id") or ""),
+                "status": status,
+                "created_at": str(raw.get("created_at") or raw.get("started_at") or ""),
+                "session_id": str(raw.get("session_id") or raw.get("branch_session_id") or ""),
+                "caller_task_id": str(raw.get("caller_task_id") or ""),
+            }
+
+        async def _fetch_running() -> None:
+            try:
+                response = await self.http.get(
+                    f"{self.supervisor_url}/v1/sessions/{route_session_id}/running_tasks",
+                    timeout=3.0,
+                )
+                if response.status_code == 200:
+                    payload = response.json()
+                    rows = payload.get("tasks") if isinstance(payload, dict) else payload
+                    if isinstance(rows, list):
+                        for row in rows:
+                            _add(row)
+            except Exception:
+                pass
+
+        async def _fetch_children() -> None:
+            try:
+                response = await self.http.get(
+                    f"{self.supervisor_url}/v1/sessions/{route_session_id}/children",
+                    timeout=3.0,
+                )
+                if response.status_code == 200:
+                    rows = response.json()
+                    if isinstance(rows, list):
+                        for row in rows:
+                            _add(row, child_session=True)
+            except Exception:
+                pass
+
+        await _asyncio.gather(_fetch_running(), _fetch_children())
+
+        return sorted(tasks_by_id.values(), key=lambda item: (item.get("created_at", ""), item["task_id"]))
 
 
 class Contributions:
@@ -182,7 +273,7 @@ class Contributions:
                     setter(None)
 
         if self._ledger is not None:
-            self._ledger.record(_dispose)
+            self._ledger.record(_dispose, key=("face", self, clean))
         return _dispose
 
     def get(self, name: str) -> Any | None:

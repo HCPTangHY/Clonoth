@@ -10,7 +10,7 @@ discovery, the supervisor node list) can query them. Purpose: a plugin
 declares a capability, the framework consumes it — unloading the plugin
 reverts the override through the shared disposal ledger.
 
-Precedence: plugin declaration > engine/system_nodes/ > config/nodes/.
+Precedence: plugin declaration > config/nodes/.
 Conflict rule matches the routes face: the same node id declared by two
 different plugins is rejected; re-registration by the same plugin (reload)
 replaces.
@@ -23,14 +23,13 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-# Module-level store: node_id -> {"owner": str, "data": dict}.
+# Module-level store: node_id -> {"owner": str, "data": dict, "path": str}.
 # Why module-level: load_node() and the runner caches are plain functions
 # without EngineContext access; the store must be reachable from them. Each
 # process (engine / supervisor) has its own interpreter and therefore its own
 # store, populated by the plugins loaded in that process.
-_DECLS: dict[str, dict[str, Any]] = {}
+_DECLS: dict[str, dict[str, Any]] = globals().get("_DECLS") or {}
 _VERSION = 0
-
 
 def _bump() -> None:
     global _VERSION
@@ -38,9 +37,29 @@ def _bump() -> None:
 
 
 def declared_node(node_id: str) -> dict[str, Any] | None:
-    """Return the plugin-declared node dict for one id, or None."""
+    """Return the plugin-declared node dict for one id, or None (auto-reloads on disk mtime change)."""
     entry = _DECLS.get((node_id or "").strip())
-    return entry["data"] if entry is not None else None
+    if entry is None:
+        return None
+    src_path = entry.get("path")
+    if src_path:
+        try:
+            from pathlib import Path
+            import yaml
+            p = Path(src_path)
+            if p.is_file():
+                mtime = p.stat().st_mtime
+                if entry.get("_mtime") != mtime:
+                    fresh = yaml.safe_load(p.read_text(encoding="utf-8"))
+                    if isinstance(fresh, dict):
+                        fresh["id"] = (node_id or "").strip()
+                        # Keep the registration entry stable for its disposer.
+                        entry["data"] = fresh
+                        entry["_mtime"] = mtime
+                        _bump()
+        except Exception:
+            pass
+    return entry["data"]
 
 
 def declared_node_owner(node_id: str) -> str:
@@ -76,6 +95,10 @@ def registry_version() -> int:
     return _VERSION
 
 
+def _noop() -> None:
+    """Disposer for idempotent re-registration: the original one stays live."""
+
+
 class PluginNodesFace:
     """Contribution face for plugin-declared nodes (both processes).
 
@@ -106,8 +129,10 @@ class PluginNodesFace:
         nid = str(decl.get("id") or "").strip()
         if not nid:
             raise ValueError("node declaration missing id")
+        owner_name = owner or ""
+        clean_path = source_path or ""
         existing = _DECLS.get(nid)
-        if existing is not None and existing["owner"] != (owner or ""):
+        if existing is not None and existing["owner"] != owner_name:
             raise ValueError(
                 f"node {nid!r} already declared by plugin {existing['owner']!r}"
             )
@@ -118,17 +143,21 @@ class PluginNodesFace:
         # must not bump the version (that would invalidate runner caches for
         # no reason). The original disposer stays recorded, so unload still
         # works; this duplicate registration archives nothing.
-        if existing is not None and existing["data"] == data:
-            return lambda: None
-        _DECLS[nid] = {"owner": owner or "", "data": data, "path": source_path or ""}
+        if existing is not None and existing["data"] == data \
+                and str(existing.get("path") or "") == clean_path:
+            return _noop
+        entry = {"owner": owner_name, "data": data, "path": clean_path}
+        _DECLS[nid] = entry
         _bump()
 
         def _dispose() -> None:
-            current = _DECLS.get(nid)
-            if current is not None and current["data"] is data:
+            # File reload replaces data, not the entry. A later registration
+            # gets its own entry, so an older disposer cannot remove it.
+            if _DECLS.get(nid) is entry:
                 del _DECLS[nid]
                 _bump()
 
         if self._ledger is not None:
-            self._ledger.record(_dispose)
+            # Node declarations are process-global, independent of the thin face.
+            self._ledger.record(_dispose, key=("node", nid))
         return _dispose

@@ -48,6 +48,53 @@ class PlaintextRetryHandler:
         if not text:
             return None
 
+        from .preempt import is_preempt_deferred_for_output_reject, is_user_entry_task
+
+        if getattr(ls.node, "output_mode", "tool_only") == "hybrid" and (
+            is_user_entry_task(ls) or is_preempt_deferred_for_output_reject(ls)
+        ):
+            return hook_result(action=_build_implicit_finish(ctx, ls, resp, text))
+
+        if not ls.preempt_after_step and ls.preempt_inject_info is None:
+            try:
+                _pi = await ls.rctx.check_preempted()
+            except Exception:
+                _pi = {}
+            if isinstance(_pi, dict) and _pi.get("preempted"):
+                if _pi.get("message") or _pi.get("attachments"):
+                    ls.preempt_inject_info = _pi
+                else:
+                    ls.preempt_after_step = True
+
+        if ls.preempt_inject_info is not None and getattr(ls.node, "output_mode", "tool_only") == "hybrid":
+            from engine.inference.ai_step import _shadow_write
+
+            _assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
+            provider_name = (getattr(ls.rctx, "response_info", {}) or {}).get("provider") or getattr(ls.provider, "name", "") or "unknown"
+            provider_meta = getattr(resp, "provider_meta", None)
+            reasoning_text = getattr(resp, "reasoning", None) or ""
+            draft_meta = MessageMeta(
+                provider=provider_name,
+                tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
+                message_type="assistant",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
+                metadata={provider_name: provider_meta} if provider_meta else {},
+                tool_call_ids=[],
+                reasoning=reasoning_text,
+                usage=dict(ls.last_usage) if ls.last_usage else {},
+            )
+            set_message_meta(_assistant_msg, draft_meta)
+            ls.messages.append(_assistant_msg)
+            _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
+            await ls.rctx.emit_event("preempt_finish_intercepted", {
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+                "step": ctx.step,
+            })
+            ls.use_stream = ls.streaming
+            return hook_result(modified=True)
+
         if ls.preempt_after_step:
             ctx_ref = _persist_ctx(ls, ctx.step + 1)
             return hook_result(action=TaskAction(
@@ -61,12 +108,49 @@ class PlaintextRetryHandler:
 
         ls.plaintext_retry_count += 1
         if ls.plaintext_retry_count <= ls.plaintext_retry_max:
+            from engine.inference.ai_step import _shadow_write
+
+            _assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
+            provider_name = (getattr(ls.rctx, "response_info", {}) or {}).get("provider") or getattr(ls.provider, "name", "") or "unknown"
+            provider_meta = getattr(resp, "provider_meta", None)
+            reasoning_text = getattr(resp, "reasoning", None) or ""
+            draft_meta = MessageMeta(
+                provider=provider_name,
+                tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
+                message_type="assistant",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
+                metadata={provider_name: provider_meta} if provider_meta else {},
+                tool_call_ids=[],
+                reasoning=reasoning_text,
+                usage=dict(ls.last_usage) if ls.last_usage else {},
+            )
+            set_message_meta(_assistant_msg, draft_meta)
+            _assistant_msg.setdefault("_meta", {}).update({
+                "rejected_draft": True,
+                "rejection_source": "plaintext_retry",
+                "rejection_code": "plaintext_not_allowed",
+                "source_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+            })
+            ls.messages.append(_assistant_msg)
+            _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
+
             retry_hint = ls.formatter.build_retry_hint()
-            ls.messages.append({
+            _retry_msg = {
                 "role": "user",
                 "content": retry_hint,
                 "_retry_hint": True,
-            })
+                "message_type": "retry_hint",
+                "_meta": {
+                    "message_type": "retry_hint",
+                    "is_rejection": True,
+                    "rejection_source": "plaintext_retry",
+                    "rejection_code": "plaintext_not_allowed",
+                    "source_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+                },
+            }
+            ls.messages.append(_retry_msg)
+            _shadow_write(ls, _retry_msg, "retry_hint")
             ls.use_stream = ls.streaming
             return hook_result(modified=True)
 
@@ -74,7 +158,7 @@ class PlaintextRetryHandler:
         return hook_result(action=TaskAction(
             action=ACTION_FAIL,
             node_id=ls.node.id,
-            error=f"模型未使用 finish 工具，裸文本不被内核认可为合法结束。原始文本: {_short(text, 200)}",
+            error=f"The model did not use the finish tool; bare text is not accepted by the kernel as a valid ending. Raw text: {_short(text, 200)}",
             context_ref=ctx_ref,
         ))
 
@@ -84,16 +168,18 @@ def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskActio
     from engine.inference.ai_step import _shadow_write
 
     assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
-    provider_name = getattr(ls.provider, "name", "") or "unknown"
+    provider_name = (getattr(ls.rctx, "response_info", {}) or {}).get("provider") or getattr(ls.provider, "name", "") or "unknown"
+    provider_meta = getattr(resp, "provider_meta", None)
+    reasoning_text = getattr(resp, "reasoning", None) or ""
     implicit_meta = MessageMeta(
         provider=provider_name,
         tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
-        metadata={},
+        llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
+        metadata={provider_name: provider_meta} if provider_meta else {},
         tool_call_ids=[],
-        reasoning="",
-        has_reasoning=False,
+        reasoning=reasoning_text,
         usage=dict(ls.last_usage) if ls.last_usage else {},
     )
     set_message_meta(assistant_msg, implicit_meta)

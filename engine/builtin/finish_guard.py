@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _REJECT_MESSAGE_TEMPLATE = (
     "\u274c REJECTED: {tool}() cannot be called alongside other tools "
-    "(except reply). Execute your other tools first, wait for their "
+    "(except intermediate_reply). Execute your other tools first, wait for their "
     "results, then call {tool}() alone in a separate turn."
 )
 
@@ -29,45 +29,90 @@ PLUGIN_META = {
 }
 
 
+_EXCLUSIVE_REJECT_TEMPLATE = (
+    "\u274c REJECTED: {tool}() must be called alone in its own turn. "
+    "Execute your other tools first, wait for their results, then call {tool}() separately."
+)
+
+
 class FinishGuardHandler:
-    """Reject terminal finish()/ask() when colocated with non-reply tool calls."""
+    """Reject terminal finish()/ask() and exclusive control tools when colocated."""
 
     name = "finish_guard"
     priority = 100
 
     async def handle(self, ctx: Any) -> Any | None:
-        """Apply the terminal finish/ask colocation guard.
+        """Apply the terminal finish/ask and exclusive compact_context/switch_node colocation guard.
 
         Why: finish and ask terminate the task, so other same-turn tool results
-        would never be read by the model. How: prefer ai_step's already-filtered
-        legacy pseudo/real call lists when present, and otherwise fall back to raw
-        ctx.tool_calls for isolated tests. Purpose: move the guard out of
-        ai_step.py while applying the same protection to the Phase 0 ask tool.
+        would never be read by the model; compact_context and switch_node exit
+        the step immediately in _handle_pseudo_tool, which would skip other
+        same-turn tools and leave unpaired tool_calls. How: prefer ai_step's
+        already-filtered legacy pseudo/real call lists when present, and
+        otherwise fall back to raw ctx.tool_calls for isolated tests.
         """
         terminal_tools = {"finish", "ask"}
+        exclusive_tools = {"compact_context", "switch_node"}
+        reply_tools = {"intermediate_reply", "reply"}
         pseudo_calls = ctx.extra.get("pseudo_calls")
         real_tool_calls = ctx.extra.get("real_tool_calls")
 
         if pseudo_calls is not None or real_tool_calls is not None:
             pseudo_list = list(pseudo_calls or [])
             real_list = list(real_tool_calls or [])
+            unauth_count = int(ctx.extra.get("unauthorized_count") or 0)
+            total_calls = len(pseudo_list) + len(real_list) + unauth_count
+            exclusive_name = next(
+                (_tool_name(call) for call in pseudo_list if _tool_name(call) in exclusive_tools),
+                "",
+            )
+            if exclusive_name and total_calls > 1:
+                logger.warning(
+                    "Rejected %s + other tools in same turn (node=%s, step=%d, tools=%s)",
+                    exclusive_name,
+                    getattr(ctx.node, "id", ""),
+                    ctx.step,
+                    [_tool_name(call) for call in (ctx.tool_calls or [])],
+                )
+                return hook_result(
+                    block=True,
+                    reason=f"{exclusive_name}_colocated",
+                    error_message=_EXCLUSIVE_REJECT_TEMPLATE.format(tool=exclusive_name),
+                )
             terminal_name = next(
                 (_tool_name(call) for call in pseudo_list if _tool_name(call) in terminal_tools),
                 "",
             )
             has_terminal = bool(terminal_name)
-            has_non_reply_others = bool(real_list) or any(
-                _tool_name(call) not in (*terminal_tools, "intermediate_reply") for call in pseudo_list
+            has_non_reply_others = bool(real_list) or (unauth_count > 0) or any(
+                _tool_name(call) not in (*terminal_tools, *reply_tools) for call in pseudo_list
             )
         else:
             calls = list(ctx.tool_calls or [])
+            exclusive_name = next(
+                (_tool_name(call) for call in calls if _tool_name(call) in exclusive_tools),
+                "",
+            )
+            if exclusive_name and len(calls) > 1:
+                logger.warning(
+                    "Rejected %s + other tools in same turn (node=%s, step=%d, tools=%s)",
+                    exclusive_name,
+                    getattr(ctx.node, "id", ""),
+                    ctx.step,
+                    [_tool_name(call) for call in calls],
+                )
+                return hook_result(
+                    block=True,
+                    reason=f"{exclusive_name}_colocated",
+                    error_message=_EXCLUSIVE_REJECT_TEMPLATE.format(tool=exclusive_name),
+                )
             terminal_name = next(
                 (_tool_name(call) for call in calls if _tool_name(call) in terminal_tools),
                 "",
             )
             has_terminal = bool(terminal_name)
             has_non_reply_others = any(
-                _tool_name(call) not in (*terminal_tools, "intermediate_reply") for call in calls
+                _tool_name(call) not in (*terminal_tools, *reply_tools) for call in calls
             )
 
         if not (has_terminal and has_non_reply_others):

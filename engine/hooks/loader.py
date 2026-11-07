@@ -70,7 +70,11 @@ def register_declared_tools(module_name: str, meta: dict[str, Any], tool_registr
             raise ValueError(f"{module_name}.{name} input_schema must be a dict")
         if not callable(func):
             raise ValueError(f"{module_name}.{name} func must be callable")
-        dispose = register_builtin_tool(name, description, input_schema, func)
+        _is_pure = bool(tool.get("pure", False))
+        try:
+            dispose = register_builtin_tool(name, description, input_schema, func, pure=_is_pure)
+        except TypeError:
+            dispose = register_builtin_tool(name, description, input_schema, func)
         if callable(dispose):
             disposers.append(dispose)
     return disposers
@@ -391,6 +395,10 @@ def _load_one_plugin(
     decide between best-effort (scan) and strict (admin operation) handling.
     """
     is_package = _is_plugin_package(entry)
+    # Both Engine scans and explicit reloads must refresh the entire package.
+    # Replacing only __init__ left cached submodules (and tool schemas) stale.
+    # Drop, rather than reload in place, so existing callbacks keep their globals.
+    drop_plugin_module(entry.name)
     module = _load_package_from_dir(entry) if is_package else _load_module_from_path(entry)
     meta = _normalize_plugin_meta(entry, getattr(module, "PLUGIN_META", {}))
 
@@ -496,7 +504,6 @@ def load_single_plugin(
     if not _is_plugin_package(entry) and not _is_enabled_python_plugin(entry):
         raise ValueError(f"no enabled plugin entry named {clean!r} under {plugins_dir}")
 
-    drop_plugin_module(clean)
     try:
         meta = _load_one_plugin(hook_registry, entry, context, process=process)
     except PluginProcessSkip:

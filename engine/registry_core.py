@@ -22,7 +22,7 @@ class DisposalLedger:
     """Per-process archive of plugin-owned disposers."""
 
     def __init__(self) -> None:
-        self._plugin_disposers: dict[str, list[Callable[[], None]]] = {}
+        self._plugin_disposers: dict[str, dict[object, Callable[[], None]]] = {}
         self._collecting_stack: list[str] = []
 
     @contextmanager
@@ -38,7 +38,7 @@ class DisposalLedger:
         finally:
             self._collecting_stack.pop()
 
-    def record(self, disposer: Callable[[], None]) -> None:
+    def record(self, disposer: Callable[[], None], *, key: object | None = None) -> None:
         """Archive a disposer under the plugin currently being loaded, if any.
 
         Why: startup wiring (core faces, built-in registries) also produces
@@ -46,15 +46,42 @@ class DisposalLedger:
         while a collecting block is active. Purpose: keep plugin unload scoped
         to plugin-owned effects.
         """
+        # Keyed registrations replace the live entry on their surface. Forget
+        # the old undo closure without calling it: it may belong to a callback
+        # currently executing in another task. Unkeyed resources still stack.
         if self._collecting_stack and callable(disposer):
-            self._plugin_disposers.setdefault(self._collecting_stack[-1], []).append(disposer)
+            self.add(self._collecting_stack[-1], disposer, key=key)
+        elif key is not None:
+            self._forget_key(key)
 
-    def add(self, plugin_name: str, disposer: Callable[[], None]) -> None:
-        """Archive an externally created disposer under a plugin name."""
+    def add(self, plugin_name: str, disposer: Callable[[], None], *, key: object | None = None) -> None:
+        """Archive an undo callback; an optional surface key replaces its predecessor."""
         name = (plugin_name or "").strip()
         if not name or not callable(disposer):
             return
-        self._plugin_disposers.setdefault(name, []).append(disposer)
+        if key is not None:
+            self._forget_key(key)
+        # dict insertion order preserves reverse-order unloading after replacement.
+        self._plugin_disposers.setdefault(name, {})[key if key is not None else object()] = disposer
+
+    def _forget_key(self, key: object) -> None:
+        for owner, entries in list(self._plugin_disposers.items()):
+            entries.pop(key, None)
+            if not entries:
+                self._plugin_disposers.pop(owner, None)
+
+    def forget(self, disposer: Callable[[], None]) -> None:
+        """Drop a callback whose resource has already been disposed explicitly."""
+        for owner, entries in list(self._plugin_disposers.items()):
+            for key, callback in list(entries.items()):
+                if callback is disposer:
+                    del entries[key]
+            if not entries:
+                self._plugin_disposers.pop(owner, None)
+
+    def counts(self) -> dict[str, int]:
+        """Metadata-only diagnostics; never expose callbacks or captured data."""
+        return {owner: len(entries) for owner, entries in self._plugin_disposers.items()}
 
     def current_owner(self) -> str | None:
         """Return the plugin currently being loaded, if any.
@@ -79,7 +106,7 @@ class DisposalLedger:
         per-disposer error isolation.
         """
         name = (plugin_name or "").strip()
-        disposers = self._plugin_disposers.pop(name, [])
+        disposers = list(self._plugin_disposers.pop(name, {}).values())
         errors: list[str] = []
         for dispose in reversed(disposers):
             try:

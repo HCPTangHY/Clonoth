@@ -18,23 +18,26 @@ from typing import Any
 _logger = logging.getLogger(__name__)
 
 _FILE_SCHEME = "file://"
-# [2026-04-22] 放宽为 data/ 前缀，使 data/ 下的非 attachments 文件（如 data/news_raw_*.md、
-# data/chat_messages_*.json）也能作为附件传递。安全风险可控——仍限制在 workspace 的 data/ 内，
-# 不会暴露源码或配置文件。
-_ALLOWED_PREFIX = "data/"
-
-_MIME_MAP = {
+# Attachment reads are restricted to the resolved workspace data/ directory.
+_RASTER_MIME_MAP = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".gif": "image/gif",
     ".webp": "image/webp",
     ".bmp": "image/bmp",
-    ".svg": "image/svg+xml",
 }
+_MIME_TO_EXT = {mime: ext for ext, mime in _RASTER_MIME_MAP.items()}
+_MIME_TO_EXT["image/jpeg"] = ".jpg"
+_MIME_MAP = {**_RASTER_MIME_MAP, ".svg": "image/svg+xml"}
 
-# 单图最大 10 MB
+# Restrict Pillow inspection to the raster formats used by the image channel.
+_ALLOWED_PIL_DECODERS = ("PNG", "JPEG", "GIF", "WEBP", "BMP")
+
+# Bound source reads as well as the compressed image sent to the provider.
+_MAX_SOURCE_IMAGE_BYTES = 25 * 1024 * 1024
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_TEXT_FILE_MAX_BYTES = 100 * 1024
 
 # LLM 图片压缩参数
 _MAX_LONG_EDGE = 1024
@@ -67,19 +70,101 @@ def _guess_mime(ext: str) -> str:
     return guessed or "application/octet-stream"
 
 
-def _guess_mime_from_path(path: str) -> str:
-    """根据路径扩展名猜测 MIME。
+def _detect_magic_raster_mime(data: bytes) -> str | None:
+    """仅根据文件头 Magic Bytes 识别五大主流栅格位图 MIME，不匹配一律返回 None。"""
+    if len(data) < 4:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 14 and data[:2] == b"BM":
+        return "image/bmp"
+    return None
 
-    仅用于 LLM 图片 base64 编码场景，未知扩展名仍兜底为 image/png。
+
+def inspect_raster_image_bytes(data: bytes) -> tuple[str | None, str]:
+    """校验字节流是否为合法且可被 Pillow 解码的栅格位图。
+
+    返回 (real_mime_type, error_reason)：
+    - 校验通过：返回 (real_mime_type, "")
+    - 校验失败：返回 (None, 具体错误原因)
     """
-    ext = Path(path).suffix.lower()
-    return _MIME_MAP.get(ext, "image/png")
+    if not data:
+        return None, "empty file (0 bytes)"
+    magic_mime = _detect_magic_raster_mime(data)
+    if not magic_mime:
+        head = data[:64].lstrip()
+        if head.startswith((b"<svg", b"<?xml")) or b"<svg" in data[:512].lower():
+            return None, "SVG/XML vector text is not a raster bitmap image"
+        if head.startswith((b"<!doctype html", b"<html", b"<!DOCTYPE html", b"<HTML")):
+            return None, "file content is an HTML page, not a valid image"
+        if head.startswith((b"{", b"[")):
+            return None, "file content is JSON text, not a valid image"
+        return None, "magic bytes do not match any supported raster image (PNG/JPEG/GIF/WEBP/BMP)"
+
+    try:
+        from PIL import Image as _PILImage
+
+        with _PILImage.open(io.BytesIO(data), formats=list(_ALLOWED_PIL_DECODERS)) as img:
+            w, h = img.size
+            if w <= 0 or h <= 0:
+                return None, f"invalid image dimensions ({w}x{h})"
+            img.verify()
+        return magic_mime, ""
+    except Exception as exc:
+        return None, f"corrupted or undecodable image ({exc})"
+
+
+def _is_claimed_raster_image(ext: str, declared_mime: str, declared_type: str) -> bool:
+    """Return whether attachment metadata claims a raster image, excluding SVG."""
+    ext = ext.lower()
+    mime = declared_mime.lower().strip()
+    if ext == ".svg" or mime == "image/svg+xml":
+        return False
+    return (
+        ext in _RASTER_MIME_MAP
+        or ext in {".apng", ".avif", ".heic", ".heif"}
+        or mime.startswith("image/")
+        or declared_type.lower().strip() == "image"
+    )
 
 
 def _is_allowed_attachment_path(rel_path: str) -> bool:
-    """Only allow paths under data/attachments/."""
-    normalized = rel_path.replace("\\", "/").lstrip("/")
-    return normalized.startswith(_ALLOWED_PREFIX)
+    """Accept relative data/ paths; resolved containment is checked before I/O."""
+    path = Path(rel_path)
+    return (
+        not path.is_absolute()
+        and path.parts[:1] == ("data",)
+        and ".." not in path.parts
+        and "\\" not in rel_path
+    )
+
+
+def _resolve_attachment_path(rel_path: str, workspace_root: Path) -> Path:
+    """Reject traversal and symlinks that leave the workspace data/ directory."""
+    if not _is_allowed_attachment_path(rel_path):
+        raise ValueError("path is outside allowed data/ directory")
+    root = workspace_root.resolve()
+    path = (root / rel_path).resolve()
+    if not path.is_relative_to(root / "data"):
+        raise ValueError("path escapes workspace data/ directory")
+    return path
+
+
+def _read_image_bytes(path: Path) -> bytes:
+    """Bound both the initial size and the read if a source grows concurrently."""
+    if path.stat().st_size > _MAX_SOURCE_IMAGE_BYTES:
+        raise ValueError("file size exceeds 25MiB limit")
+    with path.open("rb") as source:
+        data = source.read(_MAX_SOURCE_IMAGE_BYTES + 1)
+    if len(data) > _MAX_SOURCE_IMAGE_BYTES:
+        raise ValueError("file size exceeds 25MiB limit")
+    return data
 
 
 def save_attachment(
@@ -90,117 +175,131 @@ def save_attachment(
     filename: str = "",
     mime_type: str = "",
 ) -> dict[str, Any]:
-    """Save attachment bytes to data/attachments/{session_id}/. Returns attachment dict."""
-    # 清洗无意义的 MIME（如 Discord CDN 返回的 application/octet-stream）
+    """Save bytes under data/attachments/ and classify images by their real bytes."""
     mime_type = _sanitize_mime(mime_type)
+    ext = Path(filename).suffix.lower() if filename else ""
+    if len(data_bytes) > _MAX_SOURCE_IMAGE_BYTES:
+        real_mime, image_error = None, "file size exceeds 25MiB limit"
+    else:
+        real_mime, image_error = inspect_raster_image_bytes(data_bytes)
+    if real_mime and (not ext or ext == ".bin"):
+        ext = _MIME_TO_EXT[real_mime]
+    if not ext:
+        ext = mimetypes.guess_extension(mime_type) if mime_type else ""
+    ext = ext or ".bin"
 
     sid = (session_id or "unknown").strip() or "unknown"
-    d = workspace_root / "data" / "attachments" / sid
-    d.mkdir(parents=True, exist_ok=True)
-
-    ext = ""
-    if filename:
-        ext = Path(filename).suffix.lower()
-    if not ext and mime_type:
-        ext = mimetypes.guess_extension(mime_type) or ""
-    if not ext:
-        ext = ".bin"
-
     name = f"{uuid.uuid4().hex}{ext}"
-    p = d / name
-    p.write_bytes(data_bytes)
+    rel = f"data/attachments/{sid}/{name}"
+    path = _resolve_attachment_path(rel, workspace_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data_bytes)
 
-    rel = p.relative_to(workspace_root).as_posix()
-    detected_mime = mime_type or _guess_mime(ext)
-    return {
-        "type": "image" if detected_mime.startswith("image/") else "file",
+    detected_mime = real_mime or mime_type or _guess_mime(ext)
+    is_svg = ext == ".svg" or detected_mime.lower() == "image/svg+xml"
+    attachment: dict[str, Any] = {
+        "type": "image" if real_mime else "file",
         "path": rel,
-        "mime_type": detected_mime,
+        "mime_type": detected_mime if real_mime or is_svg or not detected_mime.startswith("image/") else "application/octet-stream",
         "name": filename or name,
     }
+    if not real_mime and _is_claimed_raster_image(ext, detected_mime, ""):
+        attachment["invalid_image"] = True
+        attachment["invalid_image_reason"] = image_error
+    return attachment
 
 
 def attachments_to_content_parts(
     attachments: list[dict[str, Any]],
-    workspace_root: Path | None = None,  # [2026-04-22] 用于解析文本文件的完整路径并读取内容
+    workspace_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Convert attachment dicts to OpenAI multimodal content parts.
+    """Build image references or inline text from attachments under data/.
 
-    Images use file:// references (resolved to base64 later by prepare_messages_for_llm).
-    Text files (<=100KB) are read and injected inline; larger files get metadata-only reference.
-    Only paths under data/ are accepted.
+    Raster images are checked before use; SVG is text. Without an explicit
+    workspace, files stay metadata-only and image validation is deferred to
+    prepare_messages_for_llm rather than reading the process working directory.
     """
     parts: list[dict[str, Any]] = []
     for att in attachments:
         if not isinstance(att, dict):
             continue
         path = str(att.get("path") or "").strip()
-        if not path:
-            continue
-        if not _is_allowed_attachment_path(path):
+        if not path or not _is_allowed_attachment_path(path):
             continue
 
-        att_type = str(att.get("type") or "").strip()
+        name = att.get("name") or Path(path).name
+        ext = Path(path).suffix.lower()
+        declared_type = str(att.get("type") or "").strip()
+        declared_mime = str(att.get("mime_type") or "").strip()
+        invalid_flag = bool(att.get("invalid_image"))
+        invalid_reason = str(att.get("invalid_image_reason") or "").strip()
+        full_path = None
+        if workspace_root is not None:
+            try:
+                full_path = _resolve_attachment_path(path, workspace_root)
+            except (OSError, ValueError, RuntimeError) as exc:
+                parts.append({"type": "text", "text": f"[Attachment unavailable | path: {path} | reason: {exc}]"})
+                continue
 
-        # [2026-04-22] Text files: read content inline if <=100KB, otherwise metadata-only.
-        # 之前只注入一行元数据引用，LLM 无法直接看到文件内容，需要额外调用 read_file。
-        # 改为：小文件直接注入完整内容到上下文，减少不必要的工具调用轮次。
-        # 大文件（>100KB）保持 metadata-only，避免撑爆上下文窗口。
-        _TEXT_FILE_MAX_BYTES = 102400  # 100KB
+        is_svg = ext == ".svg" or declared_mime.lower() == "image/svg+xml"
+        claimed_image = _is_claimed_raster_image(ext, declared_mime, declared_type)
+        att_type = "file" if is_svg or invalid_flag or (declared_type == "file" and not claimed_image) else "image"
+        if is_svg:
+            declared_mime = "image/svg+xml"
+        elif att_type == "image" and full_path is not None:
+            try:
+                if not full_path.is_file():
+                    raise FileNotFoundError("file does not exist on disk")
+                real_mime, reason = inspect_raster_image_bytes(_read_image_bytes(full_path))
+                if real_mime:
+                    declared_mime = real_mime
+                else:
+                    att_type = "file"
+                    invalid_flag = claimed_image
+                    invalid_reason = reason
+            except (OSError, ValueError) as exc:
+                att_type = "file"
+                invalid_flag = True
+                invalid_reason = str(exc)
+
+        if invalid_flag:
+            reason = invalid_reason or "magic bytes or Pillow decode check failed"
+            _logger.warning("invalid image attachment rejected: path=%s reason=%s", path, reason)
+            parts.append({
+                "type": "text",
+                "text": (
+                    f"[Invalid image attachment: {name} | path: {path} | reason: {reason}. "
+                    f"This file was not sent to vision input; you can inspect or fix it at '{path}' using tools.]"
+                ),
+            })
+            continue
+
         if att_type == "file":
-            name = att.get("name") or Path(path).name
-            mime = att.get("mime_type") or "text/plain"
+            mime = declared_mime or _guess_mime(ext)
             metadata = f"[Attached file: {name} | type: {mime} | path: {path}]"
-
-            # 尝试读取文件内容（需要 workspace_root 来解析相对路径）
-            if workspace_root is not None:
-                full_path = workspace_root / path
+            if full_path is not None:
                 try:
                     file_size = full_path.stat().st_size
-                    if file_size <= _TEXT_FILE_MAX_BYTES:
-                        # 小文件：注入元数据 + 完整内容
-                        file_content = full_path.read_text(
-                            encoding="utf-8", errors="replace"
+                    if not full_path.is_file():
+                        raise FileNotFoundError("file does not exist on disk")
+                    if file_size > _TEXT_FILE_MAX_BYTES:
+                        metadata += (
+                            f"\n(File too large to inject: {file_size / 1024:.1f}KB > 100KB limit. "
+                            "Use read_file to inspect content.)"
                         )
-                        parts.append({
-                            "type": "text",
-                            "text": f"{metadata}\n---\n{file_content}\n---",
-                        })
                     else:
-                        # 大文件：metadata-only + 大小提示
-                        size_kb = file_size / 1024
-                        parts.append({
-                            "type": "text",
-                            "text": (
-                                f"{metadata}\n"
-                                f"(File too large to inject: {size_kb:.1f}KB > 100KB limit. "
-                                f"Use read_file to inspect content.)"
-                            ),
-                        })
-                except Exception as exc:
-                    # 读取失败（文件不存在、权限等）：metadata-only + 错误提示
+                        with full_path.open("rb") as source:
+                            data = source.read(_TEXT_FILE_MAX_BYTES + 1)
+                        if len(data) > _TEXT_FILE_MAX_BYTES:
+                            raise ValueError("file grew beyond the 100KB inline limit")
+                        metadata += f"\n---\n{data.decode('utf-8', errors='replace')}\n---"
+                except (OSError, ValueError) as exc:
                     _logger.warning("failed to read attached file %s: %s", path, exc)
-                    parts.append({
-                        "type": "text",
-                        "text": (
-                            f"{metadata}\n"
-                            f"(Failed to read file content: {exc})"
-                        ),
-                    })
-            else:
-                # 没有 workspace_root，退回 metadata-only 行为
-                parts.append({
-                    "type": "text",
-                    "text": metadata,
-                })
+                    metadata += f"\n(Failed to read file content: {exc})"
+            parts.append({"type": "text", "text": metadata})
             continue
 
-        # Images: create file:// reference for later resolution
-        url = f"{_FILE_SCHEME}{path}"
-        parts.append({
-            "type": "image_url",
-            "image_url": {"url": url},
-        })
+        parts.append({"type": "image_url", "image_url": {"url": f"{_FILE_SCHEME}{path}"}})
     return parts
 
 
@@ -213,11 +312,12 @@ def build_multimodal_content(
     att_parts = attachments_to_content_parts(attachments, workspace_root=workspace_root)
     if not att_parts:
         return text
-    # Collect image paths from attachments for inline annotation
+    # Annotate only paths that actually produced image references.
     _img_paths = [
-        str(a.get("path", ""))
-        for a in attachments
-        if str(a.get("type", "")).strip() != "file" and a.get("path")
+        str(part["image_url"]["url"])[len(_FILE_SCHEME):]
+        for part in att_parts
+        if part.get("type") == "image_url"
+        and str(part["image_url"]["url"]).startswith(_FILE_SCHEME)
     ]
     _annotated = text
     if _img_paths:
@@ -227,34 +327,18 @@ def build_multimodal_content(
     return parts
 
 
-def _strip_image_parts_for_assistant(content: list[dict[str, Any]]) -> list[dict[str, Any]] | str:
-    """从 assistant 消息的 content 中剥掉所有 image_url 部分。
-
-    Claude API 不允许 assistant turn 包含 image block，会报：
-    'image' blocks are not permitted within assistant turns.
-    """
-    text_parts = [p for p in content if isinstance(p, dict) and p.get("type") != "image_url"]
-    if not text_parts:
-        # 全是图片，返回占位文本
-        return "[image attachment]"
-    if len(text_parts) == 1 and text_parts[0].get("type") == "text":
-        # 只剩一个 text part，展平为纯字符串
-        return text_parts[0].get("text", "")
-    return text_parts
-
-
 def prepare_messages_for_llm(
     messages: list[dict[str, Any]],
     workspace_root: Path,
 ) -> list[dict[str, Any]]:
     """Return a copy of messages with file:// image refs resolved to base64 data URLs.
 
-    Also strips image blocks from assistant messages (Claude API restriction).
+    Media restrictions belong to each provider; retain images in every role.
 
     Uses a per-call cache keyed by relative path to avoid re-encoding the same
     image file multiple times within a single invocation.
     """
-    cache: dict[str, str | None] = {}
+    cache: dict[str, tuple[str | None, str]] = {}
     result: list[dict[str, Any]] = []
     for msg in messages:
         # [2026-05-01] Keep _meta until the provider layer runs. Native
@@ -266,29 +350,12 @@ def prepare_messages_for_llm(
             msg = {k: v for k, v in msg.items() if not k.startswith("_") or k == "_meta"}
 
         content = msg.get("content")
-        role = msg.get("role", "")
 
         if not isinstance(content, list):
             result.append(msg)
             continue
 
-        # --- assistant 消息：剥掉所有 image_url 部分 ---
-        if role == "assistant":
-            has_image = any(
-                isinstance(p, dict) and p.get("type") == "image_url"
-                for p in content
-            )
-            if has_image:
-                new_msg = dict(msg)
-                new_msg["content"] = _strip_image_parts_for_assistant(content)
-                result.append(new_msg)
-                _logger.debug("stripped image blocks from assistant message")
-                continue
-            # assistant 消息没有 image_url，正常处理
-            result.append(msg)
-            continue
-
-        # --- user / system 等消息：正常解析 file:// 引用 ---
+        # Resolve local image references without changing the message role.
         needs_resolve = any(
             isinstance(part, dict)
             and part.get("type") == "image_url"
@@ -312,26 +379,24 @@ def prepare_messages_for_llm(
                 url = str(part["image_url"].get("url", ""))
                 if url.startswith(_FILE_SCHEME):
                     rel_path = url[len(_FILE_SCHEME):]
-                    if rel_path in cache:
-                        resolved = cache[rel_path]
-                    else:
-                        resolved = _resolve_file_url(url, workspace_root)
-                        cache[rel_path] = resolved
+                    if rel_path not in cache:
+                        cache[rel_path] = _resolve_file_url(url, workspace_root)
+                    resolved, reason = cache[rel_path]
                     if resolved:
                         new_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": resolved},
+                            **part,
+                            "image_url": {**part["image_url"], "url": resolved},
                         })
                     else:
-                        # [缺陷修复] 解析失败时注入占位文本，让 LLM 知道用户发过图片。
-                        # 之前是完全静默跳过，LLM 完全不知道用户发了图片，导致回复不连贯。
-                        # 原样传递 file:// URL 会导致 API 报 octet-stream 错误，所以不能保留原 URL。
-                        _logger.warning("attachment resolve failed, injecting placeholder: %s", rel_path)
+                        _logger.warning("attachment resolve failed: path=%s reason=%s", rel_path, reason)
                         new_content.append({
                             "type": "text",
-                            "text": "[Image unavailable]",
+                            "text": (
+                                f"[Invalid or unavailable image attachment | path: {rel_path} | "
+                                f"reason: {reason}. You can inspect or fix this file at '{rel_path}' using tools.]"
+                            ),
                         })
-                    continue  # 无论成功失败都 continue，不 fallback 到 append(part)
+                    continue
             new_content.append(part)  # 非 file:// 的 part 原样保留
         new_msg["content"] = new_content
         result.append(new_msg)
@@ -350,7 +415,7 @@ def _compress_image_for_llm(data: bytes, mime: str) -> tuple[bytes, str]:
     try:
         from PIL import Image as _PILImage
 
-        img = _PILImage.open(io.BytesIO(data))
+        img = _PILImage.open(io.BytesIO(data), formats=list(_ALLOWED_PIL_DECODERS))
 
         # GIF / animated: take first frame only
         if getattr(img, "is_animated", False) or img.format == "GIF":
@@ -371,7 +436,7 @@ def _compress_image_for_llm(data: bytes, mime: str) -> tuple[bytes, str]:
         long_edge = max(w, h)
         if long_edge > _MAX_LONG_EDGE:
             scale = _MAX_LONG_EDGE / long_edge
-            img = img.resize((int(w * scale), int(h * scale)), _PILImage.LANCZOS)
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), _PILImage.LANCZOS)
 
         # Encode as JPEG
         buf = io.BytesIO()
@@ -397,49 +462,27 @@ def _compress_image_for_llm(data: bytes, mime: str) -> tuple[bytes, str]:
         return b"", mime
 
 
-def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
-    """Resolve a file:// URL to a data: base64 URL.
-
-    Images are automatically compressed / resized for LLM consumption.
-    """
+def _resolve_file_url(url: str, workspace_root: Path) -> tuple[str | None, str]:
+    """Resolve a local raster image to (data URL, failure reason)."""
+    if not url.startswith(_FILE_SCHEME):
+        return None, "expected a file:// image reference"
     rel_path = url[len(_FILE_SCHEME):]
-
-    # Only allow paths under data/attachments/
-    if not _is_allowed_attachment_path(rel_path):
-        return None
-
-    p = (workspace_root / rel_path).resolve()
-
-    # Security: must be under workspace_root
     try:
-        p.relative_to(workspace_root.resolve())
-    except ValueError:
-        return None
+        path = _resolve_attachment_path(rel_path, workspace_root)
+        if not path.is_file():
+            return None, "file does not exist on disk"
+        data = _read_image_bytes(path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return None, str(exc)
 
-    if not p.exists() or not p.is_file():
-        return None
-
-    try:
-        data = p.read_bytes()
-    except Exception:
-        return None
-
-    mime = _guess_mime_from_path(rel_path)
-
-    # Compress / resize images (skip SVG)
-    if mime.startswith("image/") and mime != "image/svg+xml":
-        data, mime = _compress_image_for_llm(data, mime)
-
+    real_mime, reason = inspect_raster_image_bytes(data)
+    if not real_mime:
+        return None, reason
+    data, mime = _compress_image_for_llm(data, real_mime)
     if not data:
-        _logger.warning("image compression returned empty data, skipping: %s", rel_path)
-        return None
-
+        return None, "Pillow image compression/re-encoding failed"
     if len(data) > _MAX_IMAGE_BYTES:
-        _logger.warning(
-            "image too large after compression (%d bytes), skipping: %s",
-            len(data), rel_path,
-        )
-        return None
+        return None, "compressed image size exceeds 10MiB limit"
 
     b64 = base64.b64encode(data).decode("ascii")
-    return f"data:{mime};base64,{b64}"
+    return f"data:{mime};base64,{b64}", ""

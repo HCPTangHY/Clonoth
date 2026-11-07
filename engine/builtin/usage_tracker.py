@@ -15,7 +15,7 @@ PLUGIN_META = {
     "hook_points": [
         ("after_llm_call", "handle"),
     ],
-    "priority": 0,
+    "priority": -100,  # Account after response-replacement handlers.
 }
 
 
@@ -23,7 +23,7 @@ class UsageTracker:
     """Accumulate provider token usage after each LLM call."""
 
     name = "usage_tracker"
-    priority = 0
+    priority = -100
 
     async def handle(self, ctx: Any) -> Any | None:
         """Move response.usage into RunContext.total_usage.

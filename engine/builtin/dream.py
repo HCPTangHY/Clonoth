@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # pipeline under the scheduler lock. How: keep all limits near the handler so
 # session scanning, transcript formatting, and pending polling remain predictable.
 # Purpose: avoid reintroducing full memory scans or large conversation tails.
-_MAX_DREAM_SESSIONS = 5
+_MAX_DREAM_SESSIONS = 20
 _DREAM_TRANSCRIPT_MAX_CHARS = 12000
 _DREAM_PENDING_TIMEOUT_MINUTES = 15
 _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "missing"}
@@ -30,6 +30,11 @@ _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "missing"}
 # beside the polling constants. Purpose: keep the generated .dream-lock
 # format stable and avoid scattering literal strings across the handler.
 _DREAM_LOCK_NOTE = "Dream cycle completed via automated pipeline"
+_STANDARD_BOOKS = frozenset({
+    "changelog", "channels", "default", "jokes", "models", "people",
+    "projects", "prompts", "research", "resources", "rules", "slang",
+    "technical_notes", "tools", "user_preferences", "worldbook",
+})
 
 
 # Why: the built-in loader discovers handlers from per-file metadata.
@@ -306,6 +311,10 @@ class DreamHandler:
             text = str(snapshot.get("result_text") or "").strip()
             if not text:
                 continue
+            if text.startswith("```"):
+                _lines = text.splitlines()
+                if len(_lines) >= 2 and _lines[-1].strip() == "```":
+                    text = "\n".join(_lines[1:-1]).strip()
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError as exc:
@@ -319,19 +328,30 @@ class DreamHandler:
                     signals.append(item)
 
         runtime_cfg = load_runtime_config(workspace_root)
-        # [AutoC 2026-05-31] Load hit_cache and skill list for Prune/Promote phases
-        hit_cache_json = self._load_hit_cache_json(workspace_root)
+        # Use the same physical book identity for topology and hit timestamps.
+        topology_entries = self._load_memory_topology_entries(workspace_root)
+        hit_cache_json = self._load_hit_cache_json(workspace_root, entries=topology_entries)
         skill_list = self._load_skill_list(workspace_root)
         # [AutoC 2026-05-31] Why: the final organizer also needs to know the
         # current book landscape. How: rebuild the list at final task creation
         # time so files created during preprocessing are visible. Purpose: guide
         # save/delete decisions with live book names.
         book_list = self._build_book_list(workspace_root)
-        # [AutoC 2026-08-28] Build memory route table from topology entries.
-        # Maps book name to (source_ns, source_ws) so the dream_router hook
-        # can redirect save_memory/delete_memory writes to the correct target.
-        topology_entries = self._load_memory_topology_entries(workspace_root)
         memory_route = self._build_memory_route(topology_entries)
+        fragment_entries = [
+            {
+                "book": e["book"],
+                "id": e["id"],
+                "hit_key": e["_hit_key"],
+                "namespace": e.get("_source_ns", ""),
+                "scope": e.get("_source_ws") or "node",
+                "keywords": e["keywords"],
+                "content": e.get("_full_content", e["content_preview"]),
+            }
+            for e in topology_entries
+            if not e.get("constant") and (e["book"] not in _STANDARD_BOOKS or bool(e.get("_source_ws")))
+        ][:20]
+        fragment_json = json.dumps(fragment_entries, ensure_ascii=False, indent=2)
         instruction = self._build_dream_instruction(
             run_id=str(uuid.uuid4()),
             now=now,
@@ -340,6 +360,7 @@ class DreamHandler:
             hit_cache_json=hit_cache_json,
             skill_list=skill_list,
             book_list=book_list,
+            fragment_json=fragment_json,
         )
         dream_task_id = self._create_final_dream_task(
             ctx=ctx,
@@ -437,7 +458,8 @@ class DreamHandler:
             return
 
         if status == "completed":
-            if not self._write_dream_lock(workspace_root=workspace_root, completed_at=now):
+            result_note = str(snapshot.get("result_text") or "").strip()
+            if not self._write_dream_lock(workspace_root=workspace_root, completed_at=now, note=result_note):
                 return
             log.info(
                 "[scheduler] dream task completed; lock updated task=%s created_at=%s",
@@ -452,21 +474,41 @@ class DreamHandler:
             log.warning("[scheduler] dream task ended without lock update task=%s status=%s", dream_task_id[:8], status)
         self._dream_pending = None
 
-    def _write_dream_lock(self, *, workspace_root: Path, completed_at: datetime) -> bool:
-        """Write data/memory/.dream-lock for a successful Dream cycle."""
+    def _write_dream_lock(self, *, workspace_root: Path, completed_at: datetime, note: str = "") -> bool:
+        """Clean empty books/@-dirs and write data/memory/.dream-lock for a successful Dream cycle."""
         try:
-            # [AutoC 2026-06-01] Why: the final Dream prompt cannot use
-            # execute_command, but existing scheduling state expects this lock file.
-            # How: write a small JSON document from the supervisor hook after the
-            # final task reaches completed. Purpose: keep Dream completion durable
-            # without giving the Dream node shell access.
             if completed_at.tzinfo is None:
                 completed_at = completed_at.replace(tzinfo=timezone.utc)
             mem_dir = workspace_root / "data" / "memory"
             mem_dir.mkdir(parents=True, exist_ok=True)
+            for node_dir in sorted(mem_dir.iterdir()):
+                if not node_dir.is_dir() or node_dir.name.startswith("."):
+                    continue
+                for yp in list(node_dir.glob("*.yaml")):
+                    if yp.stem not in _STANDARD_BOOKS:
+                        try:
+                            bdata = yaml.safe_load(yp.read_text(encoding="utf-8")) or {}
+                            if isinstance(bdata, dict) and not (bdata.get("entries") or []):
+                                yp.unlink()
+                        except Exception:
+                            pass
+                for ws_dir in list(node_dir.iterdir()):
+                    if ws_dir.is_dir() and ws_dir.name.startswith("@"):
+                        for yp in list(ws_dir.glob("*.yaml")):
+                            try:
+                                bdata = yaml.safe_load(yp.read_text(encoding="utf-8")) or {}
+                                if isinstance(bdata, dict) and not (bdata.get("entries") or []):
+                                    yp.unlink()
+                            except Exception:
+                                pass
+                        if not any(ws_dir.iterdir()):
+                            try:
+                                ws_dir.rmdir()
+                            except Exception:
+                                pass
             payload = {
                 "last_run": completed_at.astimezone().isoformat(timespec="seconds"),
-                "note": _DREAM_LOCK_NOTE,
+                "note": (note.strip() or _DREAM_LOCK_NOTE)[:2000],
             }
             (mem_dir / ".dream-lock").write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -506,7 +548,11 @@ class DreamHandler:
             ranked.append((rank_time, sid))
 
         ranked.sort(key=lambda item: item[0], reverse=True)
-        return [sid for _mtime, sid in ranked[:_MAX_DREAM_SESSIONS]]
+        cutoff_24h = datetime.now(timezone.utc).timestamp() - 86400
+        recent_24h = [sid for mtime, sid in ranked if mtime >= cutoff_24h]
+        if recent_24h:
+            return recent_24h[:_MAX_DREAM_SESSIONS]
+        return [sid for _mtime, sid in ranked[:5]]
 
     def _active_session_ids_from_registry(self, workspace_root: Path) -> set[str] | None:
         """Read sessions.json and return active non-child session ids when available."""
@@ -684,11 +730,11 @@ class DreamHandler:
 </book_list>
 保存时优先使用已有 book，也可以创建新 book。
 
-禁止调用 save_memory、delete_memory、list_memories。
-只分析下方 transcript。
-最终必须调用 finish，finish 的 text 必须是纯 JSON 数组：
+禁止调用 manage_memory 或 finish 等任何工具。
+只分析下方 transcript，直接输出纯 JSON 数组文本（不要加 ```json 代码块围栏，也不要输出任何解释文字）：
 [{{"id": "...", "book": "...", "content": "...", "keywords": ["..."]}}]
-无可保存信息时返回 []。
+注意：提取的 content 文字必须简明扼要、高信息密度，直奔结论与核心参数/规则，不啰嗦不水字数；book 优先选用标准书目（technical_notes, models, channels, rules, people, tools, projects, prompts, research, resources, user_preferences, default）。
+无可保存信息时直接输出 []。
 
 --- 以下是对话记录 ---
 {transcript}"""
@@ -730,9 +776,19 @@ class DreamHandler:
         route: dict[str, dict[str, str]] = {}
         for e in entries:
             book = str(e.get("book") or "").strip()
+            eid = str(e.get("id") or "").strip()
             ns = str(e.get("_source_ns") or "").strip()
             ws = str(e.get("_source_ws") or "").strip()
-            if book and book not in route:
+            if book and eid:
+                key = f"{book}/{eid}"
+                target = {"ns": ns, "ws": ws}
+                # An ID can exist in several scopes. Never silently choose one
+                # for a read/update/delete; the router rejects ambiguous entries.
+                if key in route and route[key] != target:
+                    route[key] = None
+                else:
+                    route[key] = target
+            if book and (book not in route or (route[book].get("ws") and not ws)):
                 route[book] = {"ns": ns, "ws": ws}
         return route
 
@@ -782,7 +838,7 @@ class DreamHandler:
         for members in grouped.values():
             if len(members) < 2:
                 continue
-            member_keys = sorted(f"{m['book']}:{m['id']}" for m in members)
+            member_keys = sorted(m["_hit_key"] for m in members)
             cluster_id = f"cluster_{uuid.uuid5(uuid.NAMESPACE_URL, '|'.join(member_keys)).hex[:12]}"
             clusters.append(
                 {
@@ -791,6 +847,9 @@ class DreamHandler:
                         {
                             "book": m["book"],
                             "id": m["id"],
+                            "hit_key": m["_hit_key"],
+                            "namespace": m["_source_ns"],
+                            "workspace": m["_source_ws"],
                             "content_preview": m["content_preview"],
                             "keywords": m["keywords"],
                             "constant": m["constant"],
@@ -818,6 +877,8 @@ class DreamHandler:
         so the dream memory router can write results back to the correct target.
         Skips system.dream/ and system.memory_extractor/ (dream's own scratch).
         """
+        from engine.builtin.memory_hits import hit_key
+
         mem_dir = workspace_root / "data" / "memory"
         if not mem_dir.exists() or not mem_dir.is_dir():
             return []
@@ -856,7 +917,9 @@ class DreamHandler:
                         {
                             "book": book,
                             "id": eid,
-                            "content_preview": content[:50],
+                            "_hit_key": hit_key(workspace_root, yaml_path, eid),
+                            "content_preview": content[:300],
+                            "_full_content": content,
                             "keywords": keywords,
                             "keyword_set": set(keywords),
                             "constant": bool(entry.get("constant", False)),
@@ -893,34 +956,39 @@ class DreamHandler:
             return False
         return now - started > timedelta(minutes=_DREAM_PENDING_TIMEOUT_MINUTES)
 
-    def _load_hit_cache_json(self, workspace_root: Path) -> str:
-        """Load hit_cache.json and return as compact JSON string.
+    def _load_hit_cache_json(
+        self, workspace_root: Path, valid_ids: set[str] | None = None,
+        *, entries: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Return a scoped prompt view, never rewrite a filtered sidecar.
 
-        [AutoC 2026-05-31] Why: Dream Prune phase needs hit timestamps to
-        determine which auto-source entries are expired (30d no hit).
-        How: read the JSON file, truncate to entries with hits in last 60d
-        to keep instruction bounded. Purpose: enable lifecycle management.
+        Legacy ID-only timestamps cannot be assigned to a particular book.
+        Keep them on disk, but do not use them as evidence for Prune/Promote.
         """
-        hit_path = workspace_root / "data" / "memory" / ".hit_cache.json"
-        if not hit_path.exists():
-            return "{}"
+        from engine.builtin.memory_hits import flush_hits, read_hits
+
         try:
-            data = json.loads(hit_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return "{}"
-            # Only include entries with hits in last 60 days to bound size
-            from datetime import timedelta as _td
-            cutoff = datetime.now(timezone.utc) - _td(days=60)
+            if entries is None:
+                entries = self._load_memory_topology_entries(workspace_root)
+            valid_keys = {
+                e["_hit_key"] for e in entries
+                if e.get("_hit_key") and (valid_ids is None or e["id"] in valid_ids)
+            }
+            flush_hits(workspace_root)
+            data = read_hits(workspace_root)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=60)
             filtered: dict[str, str] = {}
-            for eid, ts_str in data.items():
+            for key, ts_str in data.items():
+                if key not in valid_keys:
+                    continue
                 try:
-                    ts = datetime.fromisoformat(str(ts_str))
+                    ts = datetime.fromisoformat(ts_str)
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=timezone.utc)
                     if ts >= cutoff:
-                        filtered[eid] = str(ts_str)
-                except Exception:
-                    pass
+                        filtered[key] = ts_str
+                except ValueError:
+                    continue
             return json.dumps(filtered, ensure_ascii=False)
         except Exception as exc:
             log.warning("[scheduler] dream: failed to load hit_cache: %s", exc)
@@ -965,6 +1033,7 @@ class DreamHandler:
         hit_cache_json: str = "{}",
         skill_list: str = "",
         book_list: str = "",
+        fragment_json: str = "[]",
     ) -> str:
         """Assemble the final Dream task instruction from preprocessed data."""
         signals_json = json.dumps(signals, ensure_ascii=False, indent=2)
@@ -988,7 +1057,9 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 {topology_json}
 </keyword_topology>
 
-以下是记忆关键词命中时间记录（entry_id → 最后命中时间 ISO）：
+以下是记忆关键词命中时间记录（hit_key → 最后命中时间 ISO）：
+请按 topology 或 fragment_books 的 hit_key 精确关联；同名 id 不代表同一条记忆。
+缺少命中记录表示证据不足，不能仅凭缺失判定过期。旧版无作用域的命中记录不参与归属推断。
 <hit_cache>
 {hit_cache_json}
 </hit_cache>
@@ -1003,18 +1074,26 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 {book_list}
 </book_list>
 
+以下是非标准散装 book 或 @* 临时子目录中待归并迁移的完整记忆条目：
+<fragment_books>
+{fragment_json}
+</fragment_books>
+
 约束：
-1. 不要调用 list_memories 全量扫描。
+1. 严禁不带 id 调用 manage_memory(action="list") 全量扫描；但当需要合并重复簇或更新已有记忆、而 preview 被截断时，必须调用 manage_memory(action="list", book="...", id="...") 按精确 book 和 id 读取完整原文后再合并保存。
 2. 不要读取对话文件（tail/cat/read_file）。
 3. 只基于上面的 signals、topology、hit_cache 和 skill_list 做操作。
-4. 对 signals 中的新信息：判断是否值得保存，调用 save_memory。
-5. 对 topology 中的重复簇：判断是否需要合并/删除/更新，调用 save_memory/delete_memory。
-6. 过期清理（Prune）：对 topology 中 source=auto 的条目，若 hit_cache 中超过 30 天未命中且 created_at 超过 30 天，审查后可用 delete_memory 清理。
-7. 提升（Promote）：对 source=auto、created_at 超过 7 天、hit_cache 中最近 7 天内仍被命中、content 长度 > 200 字的条目，检查 skill_list 是否已有同主题 skill，如有则合并，如无则用 create_or_update_skill 提升为 skill，之后 delete_memory 删除原条目。单次最多提升 3 条。
-8. 单轮最多操作 20 条（含 save/delete/create_or_update_skill）。
-9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删。
-10. 完成后用 finish 报告操作摘要。
-11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 save_memory 迁移到语义最近的大 book，然后 delete_memory 删除原条目。
-12. 结构抽象（Pattern Extraction）：合并重复簇（约束5）时，不要只保留最完整的一条——如果簇内多条记忆描述的是同一类事件的不同实例（如 5 条都是「在生产环境直接改代码出事」的记录），应从中归纳出一条更抽象的规则（如「所有代码修改必须先在 original 做」），而非简单保留其中一条。
-13. 关联链强化（Association Discovery）：处理 topology 簇时，交叉比对 <hit_cache>。如果簇内多条记忆在 48h 内被同一类 session 命中（共现），说明它们在实际使用中经常一起被需要。用 save_memory 给它们互相补充 keywords，使它们更容易一起被激活。
-14. 重激活（Reactivation）：对 priority > 0 且 <hit_cache> 中超过 20 天未命中（快过期但还没到 30 天删除线）的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 save_memory 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。"""
+4. 对 signals 中的新信息：判断是否值得保存，调用 manage_memory(action="upsert")。
+5. 对 topology 中的重复簇：判断是否需要合并/删除/更新，调用 manage_memory(action="upsert"|"delete")。
+6. 过期清理（Prune）：对 topology 中 source=auto 的条目，若 hit_cache 中超过 30 天未命中且 created_at 超过 30 天，审查后可用 manage_memory(action="delete") 清理。
+7. 提升（Promote）：对 source=auto、created_at 超过 7 天、hit_cache 中最近 7 天内仍被命中、content 长度 > 200 字的条目，检查 skill_list 是否已有同主题 skill，如有则合并，如无则用 manage_skill(action="upsert") 提升为 skill，之后用 manage_memory(action="delete") 删除原条目。单次最多提升 3 条。
+8. 单轮最多操作 35 条（含 manage_memory/manage_skill）。
+8b. 文字简明扼要：所有新建或合并更新的记忆文字必须简明扼要、高信息密度，直奔核心结论、参数与规则，不啰嗦不水字数。
+8c. 散装书与临时子目录归并：对 <fragment_books> 中的条目，若有长期价值则用 manage_memory(action="upsert") 归并到标准 16 本书（technical_notes, models, channels, rules, people, tools, projects, prompts, research, resources, user_preferences, default, changelog, jokes, slang, worldbook），再用 manage_memory(action="delete") 删除原 book/id；若属无价值临时琐事则直接用 manage_memory(action="delete") 删除。
+9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删、不改。
+10. 所有工具调用执行完毕并收到结果后，在最后一轮直接输出纯文本操作摘要（严禁调用 finish 等控制工具）。
+11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 manage_memory(action="upsert") 迁移到语义最近的大 book，然后用 manage_memory(action="delete") 删除原条目。
+12. 结构抽象（Pattern Extraction）：合并重复簇（约束5）时，不要只保留最完整的一条——如果簇内多条记忆描述的是同一类事件的不同实例（如 5 条都是「在生产环境直接改代码出事」的记录），应从中归纳出一条更抽象的规则（如「所有代码修改必须先在 original 做」），而非简单保留其中一条。严禁将 AI 拒绝或未能满足用户请求的实例抽象、归纳为任何行为限制规则。
+13. 关联链强化（Association Discovery）：处理 topology 簇时，交叉比对 <hit_cache>。如果簇内多条记忆在 48h 内被同一类 session 命中（共现），说明它们在实际使用中经常一起被需要。用 manage_memory(action="upsert") 给它们互相补充 keywords，使它们更容易一起被激活。
+14. 重激活（Reactivation）：对 priority > 0 且 <hit_cache> 中超过 20 天未命中（快过期但还没到 30 天删除线）的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 manage_memory(action="upsert") 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。
+15. 严禁保存、保留或从实例中归纳任何“AI 拒绝用户请求”相关的记忆或限制规则；若在 source=auto 的非 constant 候选中发现拒绝类污染条目，用 manage_memory(action="delete") 清理。"""

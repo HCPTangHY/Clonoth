@@ -1,6 +1,8 @@
 """Built-in supervisor hook handler for automatic memory extraction."""
 from __future__ import annotations
 
+from engine.conversation_store import is_dynamic_context
+
 import logging
 import threading
 import uuid
@@ -107,6 +109,10 @@ class MemoryExtractHandler:
         if task_input.get("_system_task"):
             log.debug("memory_extract gate: blocked by _system_task")
             return
+        inbound_mtype = str(task_input.get("inbound_message_type") or "").strip()
+        if inbound_mtype in ("dispatch_result", "async_tool_result"):
+            log.debug("memory_extract gate: blocked by inbound_message_type=%s", inbound_mtype)
+            return
         # [2026-06-04] Why: fresh child tasks are short-lived and disposable (session
         # cleaned within 24h), so extracting memory from them wastes CPU. However,
         # accumulate/persistent child nodes (like Smith) maintain long-lived sessions
@@ -151,40 +157,45 @@ class MemoryExtractHandler:
             ctx.get("session_id"),
         )
 
-        # Why: a task that explicitly saved memory has already handled the turn.
-        # How: preserve the old save_memory tool-name mutual exclusion. Purpose:
-        # avoid duplicate memory entries from automatic extraction.
-        tool_names = (getattr(task, "result", None) or {}).get("_tool_names") or []
-        if "save_memory" in tool_names:
-            log.debug("memory_extract TRACE: BLOCKED by save_memory in tool_names")
-            return
-
-        # [Fork/Merge 2026-05-17] Why: completed entry tasks run on temporary
-        # branch sessions, while on_entry_task_complete passes the merged parent
-        # session in ctx["session_id"]. How: prefer the hook route session and
-        # fall back to the task runtime session for legacy/non-branch tasks.
-        # Purpose: pending task ids and transcript extraction read durable parent
-        # history rather than the temporary branch name after merge.
         session_id = str(ctx.get("session_id") or getattr(task, "session_id", "") or "").strip()
         if not session_id:
             log.debug("memory_extract: skip, empty session_id")
             return
         log.debug("memory_extract TRACE: session_id=%s (ctx=%s task=%s)", session_id, ctx.get('session_id'), getattr(task, 'session_id', '?'))
-        # [2026-05-23] Why: entry-task completions remain monotonic within this
-        # handler and are still useful for diagnostics. How: keep the historical
-        # total task counter unchanged. Purpose: preserve observability while the
-        # trigger threshold below uses the unextracted pending-task-id list.
+
+        # Explicit memory writes/deletes suppress extraction; read-only calls do not.
+        if _memory_mutation_happened(getattr(task, "result", None)):
+            log.debug("memory_extract TRACE: BLOCKED by manage_memory upsert/delete in _tool_actions")
+            # If earlier unextracted turns are still pending in this session, re-arm the tail timer
+            # because on_inbound_message cancelled the previous timer when this turn started.
+            existing_pending = self._memory_extract_pending_task_ids.get(session_id) or []
+            if existing_pending:
+                fallback_delay = get_int(runtime_cfg, "memory.auto_extract.idle_fallback_delay_sec", 1800, min_value=5, max_value=7200)
+                pending_extract = self._prepare_memory_extract_pending_locked(
+                    ctx=ctx,
+                    task=task,
+                    workspace_root=workspace_root,
+                    runtime_cfg=runtime_cfg,
+                    session_id=session_id,
+                    task_count=self._memory_extract_task_counts.get(session_id, 0),
+                )
+                if pending_extract is not None:
+                    self._schedule_memory_extract_idle_locked(
+                        ctx=ctx,
+                        session_id=session_id,
+                        pending_extract=pending_extract,
+                        delay_sec=fallback_delay,
+                        timer_label="tail idle (re-armed)",
+                    )
+            return
+
         task_count = self._memory_extract_task_counts.get(session_id, 0) + 1
         self._memory_extract_task_counts[session_id] = task_count
-        # [AutoC 2026-05-24] Why: message indexes are polluted by compact summary
-        # records and no longer identify new dialogue. How: append the exact entry
-        # task id that passed every gate. Purpose: later build the transcript by
-        # ConversationStore.source_task_id membership.
         pending_task_ids = self._memory_extract_pending_task_ids.setdefault(session_id, [])
         pending_task_ids.append(task_id_str)
         pending_task_count = len(pending_task_ids)
 
-        min_increment = get_int(runtime_cfg, "memory.auto_extract.min_increment", 3, min_value=1, max_value=100)
+        min_increment = get_int(runtime_cfg, "memory.auto_extract.min_increment", 6, min_value=1, max_value=100)
         last_extracted_task_count = self._memory_extract_last_extracted_task_counts.get(session_id, 0)
         log.debug(
             "memory_extract TRACE: task_count=%d last_extracted_task_count=%d pending_task_count=%d min_incr=%d",
@@ -193,50 +204,6 @@ class MemoryExtractHandler:
             pending_task_count,
             min_increment,
         )
-        if pending_task_count < min_increment:
-            log.debug(
-                "memory_extract: pending_task_count=%d < min_increment=%d (task_count=%d, last_extracted_task_count=%d)",
-                pending_task_count,
-                min_increment,
-                task_count,
-                last_extracted_task_count,
-            )
-            # [2026-05-23 / AutoC 2026-05-24] Why: low-volume sessions may not
-            # reach the task threshold quickly. How: keep the fallback idle path,
-            # but prepare its transcript from pending source_task_id values instead
-            # of a message cursor. Purpose: preserve low-volume extraction without
-            # reintroducing msg-index slicing.
-            fallback_delay = get_int(
-                runtime_cfg,
-                "memory.auto_extract.idle_fallback_delay_sec",
-                120,
-                min_value=5,
-                max_value=3600,
-            )
-            log.debug(
-                "memory_extract TRACE: scheduling FALLBACK timer (%ds) for session %s task_count=%d pending_task_count=%d",
-                fallback_delay,
-                session_id,
-                task_count,
-                pending_task_count,
-            )
-            pending_extract = self._prepare_memory_extract_pending_locked(
-                ctx=ctx,
-                task=task,
-                workspace_root=workspace_root,
-                runtime_cfg=runtime_cfg,
-                session_id=session_id,
-                task_count=task_count,
-            )
-            if pending_extract is not None:
-                self._schedule_memory_extract_idle_locked(
-                    ctx=ctx,
-                    session_id=session_id,
-                    pending_extract=pending_extract,
-                    delay_sec=fallback_delay,
-                    timer_label="fallback idle",
-                )
-            return
         pending_extract = self._prepare_memory_extract_pending_locked(
             ctx=ctx,
             task=task,
@@ -248,13 +215,38 @@ class MemoryExtractHandler:
         if pending_extract is None:
             return
 
-        # [2026-04-26] P4b pre-injection stays removed: large memory lists polluted
-        # the main session history and could exceed context budgets. The extractor
-        # node prompt already contains duplicate-prevention instructions.
-        idle_delay = get_int(runtime_cfg, "memory.auto_extract.idle_delay_sec", 30, min_value=5, max_value=120)
+        if pending_task_count >= min_increment:
+            # Batch full (>= min_increment): cancel any tail timer and dispatch immediately in background!
+            self._cancel_memory_extract_idle_locked(session_id)
+            log.debug(
+                "memory_extract TRACE: immediate background dispatch for session %s (pending_task_count=%d >= min_increment=%d)",
+                session_id,
+                pending_task_count,
+                min_increment,
+            )
+            self._dispatch_memory_extract_locked(ctx=ctx, session_id=session_id, pending_extract=pending_extract)
+            return
+
+        # Tail tasks (1 <= pending_task_count < min_increment): schedule tail idle timer (default 1800s / 30min)
+        min_fallback_tasks = get_int(
+            runtime_cfg,
+            "memory.auto_extract.min_fallback_tasks",
+            1,
+            min_value=1,
+            max_value=100,
+        )
+        if pending_task_count < min_fallback_tasks:
+            return
+        fallback_delay = get_int(
+            runtime_cfg,
+            "memory.auto_extract.idle_fallback_delay_sec",
+            1800,
+            min_value=5,
+            max_value=7200,
+        )
         log.debug(
-            "memory_extract TRACE: scheduling NORMAL timer (%ds) for session %s task_count=%d pending_task_count=%d",
-            idle_delay,
+            "memory_extract TRACE: scheduling TAIL IDLE timer (%ds) for session %s task_count=%d pending_task_count=%d",
+            fallback_delay,
             session_id,
             task_count,
             pending_task_count,
@@ -263,8 +255,8 @@ class MemoryExtractHandler:
             ctx=ctx,
             session_id=session_id,
             pending_extract=pending_extract,
-            delay_sec=idle_delay,
-            timer_label="idle",
+            delay_sec=fallback_delay,
+            timer_label="tail idle",
         )
 
     def _prepare_memory_extract_pending_locked(
@@ -301,6 +293,27 @@ class MemoryExtractHandler:
         # readable and includes every message from each pending task.
         pending_task_id_set = set(pending_task_ids)
         task_msgs = [m for m in all_msgs if m.source_task_id in pending_task_id_set]
+        min_messages = get_int(runtime_cfg, "memory.auto_extract.min_messages", 4, min_value=1, max_value=200)
+        dialogue_msgs = [
+            m for m in task_msgs
+            if not is_dynamic_context(m) and getattr(m, "role", "") in ("user", "assistant")
+            and getattr(m, "message_type", "") not in ("tool_result", "retry_hint", "output_rejected")
+            and not (getattr(m, "meta", None) or {}).get("rejected_draft")
+            and not (getattr(m, "meta", None) or {}).get("is_rejection")
+            and (
+                bool(getattr(m, "content", "").strip())
+                if isinstance(getattr(m, "content", None), str)
+                else bool(getattr(m, "content", None))
+                if isinstance(getattr(m, "content", None), list)
+                else False
+            )
+        ]
+        if len(dialogue_msgs) < min_messages:
+            log.debug(
+                "memory_extract: dialogue_msgs=%d < min_messages=%d for session %s",
+                len(dialogue_msgs), min_messages, session_id,
+            )
+            return None
         transcript = _format_transcript_for_extract(task_msgs)
         if not transcript.strip():
             return None
@@ -310,6 +323,21 @@ class MemoryExtractHandler:
         # hook can redirect save_memory writes to the correct namespace.
         _entry_nid = get_entry_node_id(runtime_cfg)
         source_node_id = str(getattr(task, "node_id", "") or "").strip() or _entry_nid
+        source_ws = ""
+        # Storage scope follows the durable session, independent of transport or
+        # workspace naming. A malformed registry must not leak scoped writes
+        # into the node-level book through a silent fallback.
+        import json
+        try:
+            sessions = json.loads((workspace_root / "data" / "sessions.json").read_text(encoding="utf-8"))
+            session = sessions.get(session_id, {})
+            workspace = session.get("workspace") or {}
+            source_ws = str(workspace.get("name") or "").strip()
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, AttributeError):
+            log.warning("memory_extract: cannot resolve session memory scope; skipping extraction", exc_info=True)
+            return None
         return {
             "session_id": session_id,
             "session_generation": int(getattr(task, "session_generation", 0) or 0),
@@ -319,6 +347,7 @@ class MemoryExtractHandler:
             "extractor_node": extractor_node,
             "kind": getattr(task, "kind", "node"),
             "_source_node_id": source_node_id,
+            "_source_ws": source_ws,
         }
 
     def _schedule_memory_extract_idle_locked(
@@ -358,8 +387,75 @@ class MemoryExtractHandler:
         if timer is not None or pending is not None:
             log.debug("memory_extract TRACE: INBOUND CANCEL timer for session %s (had_timer=%s had_pending=%s)", sid, timer is not None, pending is not None)
 
+    def _dispatch_memory_extract_locked(
+        self,
+        *,
+        ctx: dict[str, Any],
+        session_id: str,
+        pending_extract: dict[str, Any],
+    ) -> None:
+        """Commit pending task cursor and create the background system.memory_extractor task."""
+        sid = str(session_id or "").strip()
+        if not sid or not isinstance(pending_extract, dict):
+            return
+        transcript = str(pending_extract.get("transcript") or "")
+        if not transcript.strip():
+            return
+        task_count = _safe_int(pending_extract.get("task_count"), self._memory_extract_task_counts.get(sid, 0))
+        session_generation = _safe_int(pending_extract.get("session_generation"), 0)
+        if session_generation <= 0:
+            current_generation = ctx.get("current_session_generation")
+            session_generation = int(current_generation(sid) or 1) if callable(current_generation) else 1
+        extractor_node = str(pending_extract.get("extractor_node") or "system.memory_extractor").strip()
+        extractor_node = extractor_node or "system.memory_extractor"
+
+        self._memory_extract_task_counts[sid] = task_count
+        self._memory_extract_last_extracted_task_counts[sid] = task_count
+        self._memory_extract_pending_task_ids[sid] = []
+
+        create_task = ctx.get("create_task")
+        if not callable(create_task):
+            return
+        _source_nid = str(pending_extract.get("_source_node_id") or "").strip()
+        workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
+        workspace_root = Path(workspace_value) if workspace_value is not None else None
+        mem_root = workspace_root / "data" / "memory" if workspace_root is not None else None
+        book_stems: set[str] = set()
+        if mem_root is not None and mem_root.exists():
+            ns_dir = (mem_root / _source_nid) if _source_nid else mem_root
+            for scan_dir in (ns_dir, mem_root):
+                if scan_dir.is_dir():
+                    book_stems.update(p.stem for p in scan_dir.glob("*.yaml"))
+        book_names = sorted(book_stems)
+        book_list_header = ""
+        if book_names:
+            book_list_header = f"当前已有的 memory book 列表：{', '.join(book_names)}\n保存时优先使用已有 book，也可以创建新 book。\n\n"
+
+        child_sid = f"child_{uuid.uuid4().hex[:12]}"
+        _extra_input: dict[str, Any] = {}
+        if _source_nid:
+            _extra_input["_memory_route_ns"] = _source_nid
+        source_ws = str(pending_extract.get("_source_ws") or "").strip()
+        if source_ws:
+            _extra_input["_memory_route_ws"] = source_ws
+        create_task(
+            session_id=sid,
+            session_generation=session_generation,
+            kind=pending_extract.get("kind") or "node",
+            node_id=extractor_node,
+            input_data={
+                "instruction": book_list_header + transcript,
+                "child_session_id": child_sid,
+                "_system_task": True,
+                **_extra_input,
+            },
+            continuation={},
+            source_inbound_seq=None,
+            caller_task_id=None,
+        )
+
     def _fire_memory_extract_idle(self, ctx: dict[str, Any], session_id: str) -> None:
-        """Fire a pending automatic memory extraction after the idle window."""
+        """Fire a pending tail automatic memory extraction after the idle window."""
         sid = str(session_id or "").strip()
         if not sid:
             return
@@ -367,79 +463,31 @@ class MemoryExtractHandler:
         lock = ctx.get("acquire_lock")
         if lock is None:
             return
-        # Why: threading.Timer runs outside the supervisor request/event thread.
-        # How: take the injected lock before touching pending state or creating
-        # tasks. Purpose: serialize timer callbacks with inbound handling and task
-        # routing while keeping handler-owned dictionaries consistent.
         with lock:
             pending_extract = self._memory_extract_pending.pop(sid, None)
             self._memory_extract_timers.pop(sid, None)
             if not isinstance(pending_extract, dict):
                 return
-
-            transcript = str(pending_extract.get("transcript") or "")
-            if not transcript.strip():
-                return
-            task_count = _safe_int(pending_extract.get("task_count"), self._memory_extract_task_counts.get(sid, 0))
-            session_generation = _safe_int(pending_extract.get("session_generation"), 0)
-            if session_generation <= 0:
-                current_generation = ctx.get("current_session_generation")
-                session_generation = int(current_generation(sid) or 1) if callable(current_generation) else 1
-            extractor_node = str(pending_extract.get("extractor_node") or "system.memory_extractor").strip()
-            extractor_node = extractor_node or "system.memory_extractor"
-
-            # [AutoC 2026-05-24] Why: cancelled idle windows must not mark task
-            # ids as extracted. How: commit the total task count and clear the
-            # pending source_task_id list only inside the timer callback after
-            # pending data is popped. Purpose: cancelled idle windows still
-            # contribute to future extraction without losing transcript scope.
-            self._memory_extract_task_counts[sid] = task_count
-            self._memory_extract_last_extracted_task_counts[sid] = task_count
-            self._memory_extract_pending_task_ids[sid] = []
-
-            create_task = ctx.get("create_task")
-            if not callable(create_task):
-                return
-            # [AutoC 2026-05-31] Why: the extractor prompt no longer embeds a
-            # static book taxonomy, so the task input must carry the current
-            # memory books. How: resolve workspace_root from hook context first
-            # and fall back to pending payloads, then prefix the transcript with
-            # the sorted data/memory/*.yaml stems. Purpose: prefer existing books
-            # while still allowing the extractor to create a new semantic book.
-            workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
-            workspace_root = Path(workspace_value) if workspace_value is not None else None
-            mem_dir = workspace_root / "data" / "memory" if workspace_root is not None else None
-            book_names = sorted(
-                p.stem for p in mem_dir.glob("*.yaml")
-            ) if mem_dir is not None and mem_dir.exists() else []
-            book_list_header = ""
-            if book_names:
-                book_list_header = f"当前已有的 memory book 列表：{', '.join(book_names)}\n保存时优先使用已有 book，也可以创建新 book。\n\n"
-
-            # [2026-04-26] child_session_id isolation prevents the system task's
-            # instruction from being written into the main session JSONL history.
-            child_sid = f"child_{uuid.uuid4().hex[:12]}"
-            # [AutoC 2026-08-28] Pass _memory_route_ns so dream_router hook
-            # redirects save_memory writes to the source node's directory.
-            _source_nid = str(pending_extract.get("_source_node_id") or "").strip()
-            _extra_input: dict[str, Any] = {}
-            if _source_nid:
-                _extra_input["_memory_route_ns"] = _source_nid
-            create_task(
+            self._dispatch_memory_extract_locked(
+                ctx=ctx,
                 session_id=sid,
-                session_generation=session_generation,
-                kind=pending_extract.get("kind") or "node",
-                node_id=extractor_node,
-                input_data={
-                    "instruction": book_list_header + transcript,
-                    "child_session_id": child_sid,
-                    "_system_task": True,
-                    **_extra_input,
-                },
-                continuation={},
-                source_inbound_seq=None,
-                caller_task_id=None,
+                pending_extract=pending_extract,
             )
+
+
+def _memory_mutation_happened(task_result: Any) -> bool:
+    """Check the recorded actions for explicit manage_memory writes/deletes."""
+    if not isinstance(task_result, dict):
+        return False
+    actions = task_result.get("_tool_actions")
+    if not isinstance(actions, list):
+        return False
+    for item in actions:
+        if not isinstance(item, dict) or item.get("name") != "manage_memory":
+            continue
+        if str(item.get("action") or "").strip().lower() in ("upsert", "delete"):
+            return True
+    return False
 
 
 def _task_kind_is_node(task: Any) -> bool:
@@ -462,7 +510,9 @@ def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 1200
     # the memory extractor only the precise pending-task dialogue in a stable form.
     parts: list[str] = []
     total = 0
-    for msg in messages:
+    for msg in reversed(messages):
+        if is_dynamic_context(msg):
+            continue
         if isinstance(msg, dict):
             role = str(msg.get("role") or "")
             content: Any = msg.get("content", "")
@@ -485,13 +535,18 @@ def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 1200
             content = str(content)
         if not content.strip():
             continue
+        _m_meta_ext = (msg.get("meta") or msg.get("_meta") or {}) if isinstance(msg, dict) else (getattr(msg, "meta", None) or {})
+        if message_type in ("retry_hint", "output_rejected") or (isinstance(_m_meta_ext, dict) and (_m_meta_ext.get("rejected_draft") or _m_meta_ext.get("is_rejection"))):
+            continue
         is_tool_result = role == "tool" or message_type == "tool_result"
-        limit = 500 if is_tool_result else 2000
+        if is_tool_result:
+            # Skip raw tool outputs (read_file, execute_command, etc.) so memory
+            # extractor focuses on user preferences/instructions and assistant replies.
+            continue
+        limit = 2000
         if len(content) > limit:
             content = content[:limit] + "...<truncated>"
-        if is_tool_result:
-            label = f"Tool ({name})" if name else "Tool"
-        elif role == "user":
+        if role == "user":
             label = "User"
         elif role == "assistant":
             label = "Assistant"
@@ -502,6 +557,7 @@ def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 1200
         if total > max_chars:
             break
         parts.append(line)
+    parts.reverse()
     return "\n\n".join(parts)
 
 

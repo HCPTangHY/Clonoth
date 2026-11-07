@@ -177,13 +177,14 @@ def _execute_command_async_upgrade_threshold(
     tool_args: dict[str, Any],
     runtime_cfg: dict[str, Any] | None,
 ) -> float | None:
-    """Return the adaptive async threshold for execute_command, or None."""
-    # [AutoC 2026-06-27] Why: execute_command has its own hard timeout that must
-    # remain the absolute kill ceiling, while the engine may stop waiting earlier.
-    # How: enable only for execute_command and compute min(threshold, timeout*0.8),
-    # skipping calls whose timeout is too close to the configured threshold. Purpose:
-    # slow shell commands continue in the background without changing tool syntax.
-    if str(tool_name or "") != "execute_command":
+    """Return the adaptive async threshold for execute_command / remote_exec / read_media, or None."""
+    # [AutoC 2026-06-27] Why: execute_command (and remote_exec / read_media) has its own
+    # hard timeout that must remain the absolute kill ceiling, while the engine may stop
+    # waiting earlier. How: compute min(threshold, timeout*0.8), skipping calls whose
+    # timeout is too close to the configured threshold. Purpose: slow shell commands or
+    # long video analyses continue in the background without changing tool syntax.
+    tname = str(tool_name or "")
+    if tname not in ("execute_command", "remote_exec", "read_media"):
         return None
     cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
     if not get_bool(cfg, "meta.execute_command.async_upgrade.enabled", True):
@@ -195,13 +196,13 @@ def _execute_command_async_upgrade_threshold(
         min_value=0.01,
         max_value=3600.0,
     )
-    default_timeout_sec = get_float(
+    default_timeout_sec = 300.0 if tname == "read_media" else (120.0 if tname == "remote_exec" else get_float(
         cfg,
         "meta.execute_command.default_timeout_sec",
         90.0,
         min_value=1.0,
         max_value=3600.0,
-    )
+    ))
     timeout_raw = (tool_args or {}).get("timeout_sec")
     try:
         timeout_sec = float(timeout_raw) if timeout_raw is not None else float(default_timeout_sec)

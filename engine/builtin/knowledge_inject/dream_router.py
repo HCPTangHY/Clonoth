@@ -1,23 +1,26 @@
 """Memory write router for system nodes (dream + memory_extractor).
 
 [AutoC 2026-08-28] Why: system.dream and system.memory_extractor organize/extract
-memory entries for other nodes (ereuna_main, bootstrap.coder, etc.), but namespace
-isolation causes their save_memory/delete_memory calls to write into their own
-directories (data/memory/system.dream/, data/memory/system.memory_extractor/)
-instead of the source node's directory.
+memory entries for other nodes, but namespace isolation causes their
+manage_memory calls to write into their own directories
+(data/memory/system.dream/, data/memory/system.memory_extractor/) instead of the
+source node's directory.
 
-How: register a before_tool_call hook that intercepts save_memory and delete_memory
-when the calling node is a system node. Two routing modes:
+How: register a before_tool_call hook that intercepts manage_memory when the
+calling node is a system node. Two routing modes:
 
-1. Dream mode (_memory_route table): maps book name -> {ns, ws}. Dream's pipeline
-   scans all node directories and builds this table at task creation time.
+1. Dream mode (_memory_route table): maps book name (and exact "book/id" for
+   updates/deletes) -> {ns, ws}. Dream's pipeline scans all node directories and
+   builds this table at task creation time.
 
 2. Extractor mode (_memory_route_ns): a single target namespace string. The
    memory_extract handler captures the source entry node_id when preparing the
    extraction and passes it through input_data.
 
 Purpose: memory writes land in the correct node/workspace directory without
-modifying save_memory or delete_memory tools themselves.
+modifying the memory implementation itself. The real caller node id is preserved
+on the context so policy approval and audit see system.dream /
+system.memory_extractor rather than the redirected namespace.
 """
 from __future__ import annotations
 
@@ -29,7 +32,18 @@ from engine.hooks.types import Handler, HookContext, HookResult
 log = logging.getLogger(__name__)
 
 _SYSTEM_NODES = frozenset({"system.dream", "system.memory_extractor"})
-_ROUTABLE_TOOLS = frozenset({"save_memory", "delete_memory"})
+# Only the unified entry point is routed; retired CRUD names stay unregistered.
+_ROUTABLE_TOOLS = frozenset({"manage_memory"})
+
+
+def _resolve_memory_action(tool_args: dict[str, Any]) -> str:
+    """Return the action manage_memory will actually run for these arguments.
+
+    Mirrors the tool contract: only an explicit ``action`` selects a mutation,
+    anything else is a read, so routing never guesses a write.
+    """
+    act = str(tool_args.get("action") or "").strip().lower()
+    return act or "list"
 
 
 class DreamMemoryRouter(Handler):
@@ -47,7 +61,7 @@ class DreamMemoryRouter(Handler):
         if node_id not in _SYSTEM_NODES:
             return None
 
-        # Only intercept save_memory / delete_memory
+        # Only intercept manage_memory
         tool_call = ctx.tool_call
         if tool_call is None:
             return None
@@ -70,20 +84,43 @@ class DreamMemoryRouter(Handler):
         target_ns = ""
         target_ws = ""
 
-        # Mode 1: Dream route table (book -> {ns, ws})
+        eff_action = _resolve_memory_action(tool_args)
+
+        # Mode 1: Dream route table ('book/id' for exact entries, 'book' fallback)
         memory_route: dict[str, Any] = task_context.get("_memory_route") or {}
         if memory_route:
             book = str(tool_args.get("book") or "default").strip()
-            target = memory_route.get(book)
+            mid = str(tool_args.get("id") or "").strip()
+            target = None
+            if mid and f"{book}/{mid}" in memory_route and memory_route[f"{book}/{mid}"] is None:
+                return HookResult(block=True, reason="Memory identity occurs in multiple scopes",
+                                  error_message="Ambiguous memory book/id; no scope was selected.")
+            if mid:
+                target = memory_route.get(f"{book}/{mid}")
+            exact_target = target is not None
+            if target is None:
+                target = memory_route.get(book)
             if target is None:
                 # Book not in route table (new book created by dream).
-                # Fall back to the first route entry's namespace.
-                _first = next(iter(memory_route.values()), None)
+                # Fall back to a node-level entry, then to any entry.
+                _first = next(
+                    (
+                        v
+                        for v in memory_route.values()
+                        if isinstance(v, dict) and not v.get("ws")
+                    ),
+                    None,
+                ) or next(iter(memory_route.values()), None)
                 if _first:
                     target = _first
             if target:
                 target_ns = str(target.get("ns") or "").strip()
-                target_ws = str(target.get("ws") or "").strip()
+                # Updates of an identified entry keep its original scope. Only
+                # a new entry using the book fallback follows the node-level policy.
+                if node_id == "system.dream" and eff_action == "upsert" and not exact_target:
+                    target_ws = ""
+                else:
+                    target_ws = str(target.get("ws") or "").strip()
 
         # Mode 2: Direct namespace from memory_extractor
         if not target_ns:
@@ -99,22 +136,20 @@ class DreamMemoryRouter(Handler):
         if not target_ns:
             return None
 
-        # Rewrite ToolContext to redirect the write
+        # Route storage independently of caller identity and active workspace.
+        # Neither approval attribution nor later tools may inherit the target's
+        # identity/workspace merely because this call accesses its memory.
         old_node_id = getattr(tool_ctx, "_node_id", "") or getattr(tool_ctx, "node_id", "")
-        tool_ctx._node_id = target_ns  # type: ignore[attr-defined]
-        tool_ctx.node_id = target_ns
-
-        # Clear _node_extra memory_book so _effective_memory_ns falls back to _node_id
-        if hasattr(tool_ctx, "_node_extra"):
-            tool_ctx._node_extra = {}  # type: ignore[attr-defined]
-
-        if target_ws:
-            # Strip the @ prefix for workspace_name (save_memory adds it back)
-            tool_ctx.workspace_name = target_ws.lstrip("@")
+        tool_ctx._caller_node_id = node_id
+        tool_ctx._memory_target = (target_ns, target_ws.lstrip("@"))
+        extra = getattr(tool_ctx, "_node_extra", None)
+        if isinstance(extra, dict):
+            tool_ctx._node_extra = {key: value for key, value in extra.items() if key != "memory_book"}
 
         log.info(
-            "[dream_router] redirected %s book=%s from ns=%s to ns=%s ws=%s",
+            "[dream_router] redirected %s action=%s book=%s from ns=%s to ns=%s ws=%s",
             tool_name,
+            eff_action,
             tool_args.get("book", "default"),
             old_node_id,
             target_ns,

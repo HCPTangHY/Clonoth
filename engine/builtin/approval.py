@@ -109,7 +109,7 @@ def _decision_to_result(decision: Any) -> Any | None:
     if _looks_like_hook_result(decision):
         return decision
     if decision is True:
-        return hook_result(block=True, reason="等待审批")
+        return hook_result(block=True, reason="awaiting approval")
     if isinstance(decision, dict):
         status = str(decision.get("status") or decision.get("safety_level") or "").lower()
         needs_approval = bool(
@@ -120,7 +120,7 @@ def _decision_to_result(decision: Any) -> Any | None:
         if needs_approval:
             return hook_result(
                 block=True,
-                reason="等待审批",
+                reason="awaiting approval",
                 error_message=str(decision.get("error_message") or decision.get("reason") or ""),
             )
         if status in {"denied", "deny", "rejected"}:

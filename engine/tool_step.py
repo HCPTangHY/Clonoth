@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import shutil
 from pathlib import Path
@@ -26,7 +25,7 @@ _DEFAULT_INLINE_LIMITS: dict[str, int] = {
     "execute_command": 24_000,
     "media": 8_000,
 }
-_MEDIA_TOOL_HINTS = ("image", "video", "audio", "base64", "read_video", "read_image")
+_MEDIA_TOOL_HINTS = ("image", "video", "audio", "base64", "read_media", "read_video", "read_image")
 _SEARCH_TOOL_HINTS = ("search", "web", "exa", "mcp_", "gelbooru", "danbooru")
 _HEAD_TAIL_TOOLS = {"execute_command"}
 
@@ -257,33 +256,3 @@ def result_to_raw(
     if formatted is not None:
         return formatted
     return json_fallback(result)
-
-
-def format_tool_trace(entries: list[dict[str, Any]]) -> str:
-    """把一批工具调用结果格式化为 CLONOTH_TOOL_TRACE 块。
-
-    v2: 简化字段名，减少冗余前缀。
-    """
-    lines = ["[CLONOTH_TOOL_TRACE v2]"]
-    for e in entries:
-        lines.append(f"TOOL: {e['name']} {json.dumps(e.get('args', {}), ensure_ascii=False)}")
-        lines.append(f"RESULT_FORMAT: {e.get('format', 'json')}")
-        if e.get("truncated"):
-            lines.append("RESULT_TRUNCATED: true")
-        if e.get("ref"):
-            lines.append(f"RESULT_REF: {e['ref']}")
-        raw = e.get("raw_inline", "")
-        if raw:
-            lines.append("RESULT:")
-            for ln in raw.splitlines():
-                lines.append("  " + ln)
-        else:
-            lines.append("RESULT: <empty>")
-        atts = e.get("attachments")
-        if isinstance(atts, list) and atts:
-            att_paths = [str(a.get('path', '')) for a in atts if isinstance(a, dict) and a.get('path')]
-            if att_paths:
-                lines.append(f"ATTACHMENTS: {', '.join(att_paths)}")
-        lines.append("---")
-    lines.append("[/CLONOTH_TOOL_TRACE]")
-    return "\n".join(lines)

@@ -164,22 +164,29 @@ def assemble_prompt(
     nodes_dir = workspace_root / "config" / "nodes"
     expanded = _expand_includes(raw_str, nodes_dir)
 
+    # Decode only the template. User variables may contain literal paths or
+    # incomplete escapes, and must never be interpreted by the template codec.
+    try:
+        expanded = expanded.encode("raw_unicode_escape").decode("unicode_escape")
+    except UnicodeDecodeError:
+        pass
     merged = _build_variables(workspace_root, node, variables)
-    rendered = _render_variables(expanded, merged)
-    rendered = rendered.encode('raw_unicode_escape').decode('unicode_escape')
 
-    # 拆分静态/动态段
+    # Find boundaries before interpolation: variable text is not template syntax.
     marker = "# %%DYNAMIC%%"
-    if marker in rendered:
-        idx = rendered.index(marker)
-        static_part = rendered[:idx].strip()
-        dynamic_part = rendered[idx + len(marker):].strip()
+    if marker in expanded:
+        static_template, dynamic_template = expanded.split(marker, 1)
+        # Static prefixes use only stable defaults, never per-turn input or time.
+        static_variables = _build_variables(workspace_root, node, None)
+        static_variables.pop("now")
+        static_part = _render_variables(static_template, static_variables).strip()
+        dynamic_part = _render_variables(dynamic_template, merged).strip()
         msgs: list[dict[str, Any]] = []
         if static_part:
             msgs.append({"role": "system", "content": static_part})
         if dynamic_part:
             msgs.append({"role": "system", "content": dynamic_part})
-        return msgs if msgs else [{"role": "system", "content": rendered}]
+        return msgs if msgs else [{"role": "system", "content": ""}]
 
     # 没有标记，整体作为一条 system 消息
-    return [{"role": "system", "content": rendered}]
+    return [{"role": "system", "content": _render_variables(expanded, merged)}]

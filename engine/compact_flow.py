@@ -4,7 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from engine.compact import _format_messages_for_summary
+from engine.compact import (
+    _format_messages_for_summary,
+    compute_effective_keep_recent,
+    is_snipped_message,
+    split_task_segments,
+)
 
 
 @dataclass
@@ -57,35 +62,37 @@ async def prepare_compaction(
             message for message in messages
             if isinstance(message, dict)
             and message.get("role") != "system"
-            and not message.get("_dynamic")
         ]
 
-        # Split into task segments (same logic as apply_compact_summary)
-        segments: list[list[dict[str, Any]]] = []
-        _cur_seg: list[dict[str, Any]] = []
-        _cur_tid: str = ""
-        for msg in compact_messages:
-            _meta = msg.get("_meta") or {}
-            _tid = _meta.get("source_task_id", "") if isinstance(_meta, dict) else ""
-            if _tid != _cur_tid and _cur_seg:
-                segments.append(_cur_seg)
-                _cur_seg = []
-            _cur_tid = _tid
-            _cur_seg.append(msg)
-        if _cur_seg:
-            segments.append(_cur_seg)
+        # Split into prefix_msgs (old compact_summary + snipped stubs) and real task segments
+        prefix_msgs, segments = split_task_segments(compact_messages)
+        snipped_in_prefix = sum(1 for m in prefix_msgs if is_snipped_message(m))
 
-        # Only compress segments before keep_recent
-        if len(segments) <= safe_keep_recent:
+        if len(segments) <= 1 and snipped_in_prefix == 0:
             return CompactPlan(
                 status="skip",
-                reason=f"only {len(segments)} segments, keep_recent={safe_keep_recent}",
+                reason=f"only {len(segments)} real segments, nothing to compress",
                 target_session_id=target_sid,
                 keep_recent=safe_keep_recent,
             )
 
-        compressible = segments[:-safe_keep_recent]
-        compressible_messages: list[dict[str, Any]] = []
+        effective_keep_recent = compute_effective_keep_recent(
+            segments,
+            keep_recent=safe_keep_recent,
+            threshold_tokens=safe_threshold_tokens,
+            prefix_msgs=prefix_msgs,
+        )
+
+        if len(segments) <= effective_keep_recent and snipped_in_prefix == 0:
+            return CompactPlan(
+                status="skip",
+                reason=f"only {len(segments)} segments, effective_keep_recent={effective_keep_recent}",
+                target_session_id=target_sid,
+                keep_recent=effective_keep_recent,
+            )
+
+        compressible = segments[:-effective_keep_recent] if len(segments) > effective_keep_recent else []
+        compressible_messages: list[dict[str, Any]] = list(prefix_msgs)
         for seg in compressible:
             compressible_messages.extend(seg)
 
@@ -121,7 +128,12 @@ async def prepare_compaction(
             "instruction": conversation_text,
             "_compact_dispatch": True,
             "context_mode": "fresh",
-            "_compact_keep_recent": safe_keep_recent,
+            "_compact_keep_recent": effective_keep_recent,
+            # Why: the entry branch may hold segments that are not merged into the
+            # parent yet, so the supervisor cannot re-derive how many leading
+            # segments were summarized. How: carry the exact count. Purpose: the
+            # applied compaction replaces exactly what the compactor summarized.
+            "_compact_compress_count": len(compressible),
             "_compact_threshold_tokens": safe_threshold_tokens,
             "target_session_id": target_sid,
             "_system_task": True,
@@ -133,7 +145,7 @@ async def prepare_compaction(
             dispatch_input=dispatch_input,
             conversation_text=conversation_text,
             target_session_id=target_sid,
-            keep_recent=safe_keep_recent,
+            keep_recent=effective_keep_recent,
         )
     except Exception as exc:
         return CompactPlan(

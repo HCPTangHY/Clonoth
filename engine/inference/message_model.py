@@ -14,6 +14,26 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def get_reasoning_text(meta: Any) -> str:
+    """Read current and legacy display text without changing stored metadata.
+
+    Legacy aliases are fallbacks for reasoning. A distinct thought summary is
+    appended so records containing both forms do not lose visible information.
+    """
+    if not isinstance(meta, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("reasoning", "thinking_text", "thinking"):
+        value = meta.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+            break
+    summary = meta.get("thought_summary")
+    if isinstance(summary, str) and summary and summary not in parts:
+        parts.append(summary)
+    return "\n\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 #  消息级元数据
 # ---------------------------------------------------------------------------
@@ -27,8 +47,8 @@ class MessageMeta:
     [refactor 2026-04-18] 字段重命名与结构调整：
       - raw_parts → metadata：provider 自治命名空间 {provider_name: {...}}
       - thinking_text → reasoning：统一思维链字段命名
-      - has_thinking → has_reasoning
-      from_dict 向后兼容旧快照中的 raw_parts / thinking_text / has_thinking
+      from_dict 兼容旧 raw_parts 和思考文本字段；是否有展示内容由文本推导，
+      不再保存独立的布尔标记。
     """
     # ── 通用字段 ──
     provider: str = ""              # 生成该消息的 provider (claude/gemini/openai)
@@ -66,9 +86,7 @@ class MessageMeta:
     tool_result_visibility: str = ""
 
     # ── 提取层（bot/前端可读）──
-    # [refactor 2026-04-18] thinking_text → reasoning, has_thinking → has_reasoning
-    reasoning: str = ""             # 思维链正文（给 debug/展示用）
-    has_reasoning: bool = False     # 快速判断是否含思维链
+    reasoning: str = ""             # 统一思考展示内容；不是 Provider 的协议回传数据
     inline_data: list = field(default_factory=list)
     # 附件引用列表（图片等 inlineData 的 mime_type + 引用信息，不含原始 base64）
 
@@ -85,7 +103,7 @@ class MessageMeta:
     def to_dict(self) -> dict[str, Any]:
         """序列化为可 JSON 持久化的 dict。省略空值/默认值字段以节省空间。
 
-        [refactor 2026-04-18] 使用新字段名 metadata/reasoning/has_reasoning 序列化。
+        仅保存统一展示文本 reasoning，不重复保存旧摘要字段和布尔标记。
         """
         d: dict[str, Any] = {}
         if self.provider:
@@ -116,8 +134,6 @@ class MessageMeta:
             d["tool_result_visibility"] = self.tool_result_visibility
         if self.reasoning:
             d["reasoning"] = self.reasoning
-        if self.has_reasoning:
-            d["has_reasoning"] = True
         if self.inline_data:
             d["inline_data"] = self.inline_data
         if self.usage:
@@ -133,10 +149,9 @@ class MessageMeta:
         """从 dict 反序列化。
 
         [refactor 2026-04-18] 向后兼容旧快照：
-          - thinking_text → reasoning
-          - has_thinking  → has_reasoning
-          - raw_parts     → metadata["legacy"]（旧数据迁移）
-        新快照优先读取新字段名。
+          - thought_summary / thinking_text / thinking → reasoning
+          - raw_parts → metadata["legacy"]（旧数据迁移）
+        不同的旧摘要和推理文本均保留为展示内容。
         """
         if not isinstance(data, dict):
             return cls()
@@ -149,10 +164,6 @@ class MessageMeta:
                 metadata = {"legacy": {"raw_parts": list(_old_raw_parts)}}
             else:
                 metadata = {}
-
-        # ── 向后兼容：reasoning 优先新字段，回退 thinking_text ──
-        reasoning = str(data.get("reasoning") or data.get("thinking_text") or "")
-        has_reasoning = bool(data.get("has_reasoning") or data.get("has_thinking"))
 
         return cls(
             provider=str(data.get("provider") or ""),
@@ -167,8 +178,7 @@ class MessageMeta:
             tool_rejected=bool(data.get("tool_rejected")),
             tool_rejection_code=str(data.get("tool_rejection_code") or ""),
             tool_result_visibility=str(data.get("tool_result_visibility") or ""),
-            reasoning=reasoning,
-            has_reasoning=has_reasoning,
+            reasoning=get_reasoning_text(data),
             inline_data=list(data.get("inline_data") or []),
             usage=dict(data.get("usage") or {}),
             reasoning_started_at=str(data.get("reasoning_started_at") or ""),

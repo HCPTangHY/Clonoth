@@ -24,10 +24,13 @@ class CreatePayload(BaseModel):
 class SkillPinsPayload(BaseModel):
     session_id: str
     pinned: list[str] = []
+import json
+import os
 import re
 import shutil
 import threading
 import time
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +38,15 @@ import yaml
 
 from clonoth_runtime import get_int
 from engine.node import Node
-from engine.inference.message_assembly import conversational_history
+from engine.builtin.memory_hits import (
+    hit_key as _memory_hit_key,
+    record_hits as _record_hits,
+    flush_hits as _flush_hit_cache,
+    forget_hit as _forget_memory_hit,
+)
+from engine.conversation_store import is_dynamic_context
+from engine.faces.prompt_sections import content_sha1
+from engine.inference.message_assembly import conversational_history, collect_active_injected_hashes
 from toolbox._common import request_guard, resolve_under_allowed_roots
 from toolbox.builtins import SKILL_NAME_RE
 from toolbox.context import ToolContext
@@ -50,13 +61,13 @@ logger = logging.getLogger(__name__)
 PLUGIN_META = {
     "handler_class": "KnowledgeInjector",
     "hook_points": [
-        # [AutoC 2026-08-28] Dream memory router: redirect save_memory/delete_memory
-        # writes from system.dream to the original source node directory.
+        # [AutoC 2026-08-28] Dream memory router: redirect manage_memory writes
+        # from a system node to the original source node directory.
         ("before_tool_call", "_dream_route"),
     ],
     "priority": 50,
     "wants_context": True,
-    "description": "知识与记忆插件：skill/memory 声明式 prompt section 注入、六个 CRUD 元工具（engine）、skills admin/config 端点与设置面板（supervisor）",
+    "description": "知识与记忆插件：skill/memory 声明式 prompt section 注入、manage_skill/manage_memory 统一入口（engine）、skills admin/config 端点与设置面板（supervisor）",
     "author": "core",
     "web": {
         "panels": [
@@ -88,10 +99,11 @@ PLUGIN_META = {
             },
         ],
     },
-    # Why: the six skill and memory CRUD tools now belong to the knowledge
+    # Why: the unified skill and memory entry points belong to the knowledge
     # plugin rather than toolbox.registry.py. How: the concrete declarations are
-    # attached after their functions are defined below. Purpose: keep one source
-    # of truth for knowledge behavior and tool registration metadata.
+    # attached after their functions are defined below, and only the unified
+    # names are registered. Purpose: keep one source of truth for knowledge
+    # behavior and tool registration metadata without reviving retired names.
     "tools": [],
 }
 
@@ -149,6 +161,21 @@ def match_keywords(compiled: list[re.Pattern[str] | str], text: str) -> bool:
     return False
 
 
+def _scan_content(content: Any) -> str:
+    """Extract textual user content, excluding generated attachment bodies."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(part.get("text") or "") for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+        and not str(part.get("text") or "").startswith(
+            ("[Attached file:", "[File:", "[Invalid image attachment:")
+        )
+    )
+
+
 def build_scan_text(
     instruction_text: str,
     history: list[dict[str, Any]] | None,
@@ -159,29 +186,51 @@ def build_scan_text(
     # include the current instruction and append the last scan_depth conversation
     # rounds using the legacy user-message boundary rule. Purpose: keep keyword
     # activation scope unchanged after the files are merged.
-    parts: list[str] = [instruction_text or ""]
+    history = conversational_history(history or [])
+    norm_instr = (instruction_text or "").strip()
+    parts: list[str] = [(instruction_text or "")]
     if history and scan_depth > 0:
+        # [Persistent Dynamic Context] When history already ends with the current
+        # instruction (e.g. preempt appends Preempt_User_Msg before rebuild_dynamic_context,
+        # or compact_done passes ls.messages containing User_N), exclude that trailing
+        # message so scan_depth counts genuine prior rounds rather than double-counting
+        # the current instruction.
+        scan_end = len(history)
+        if norm_instr:
+            for j in range(len(history) - 1, -1, -1):
+                mj = history[j]
+                if not isinstance(mj, dict) or is_dynamic_context(mj):
+                    continue
+                if mj.get("role") == "user":
+                    if _scan_content(mj.get("content")).strip() == norm_instr:
+                        scan_end = j
+                break
         # Why: the old implementation defined a round as a user message that
         # starts after a non-user message. How: walk backward until enough round
         # starts are found. Purpose: preserve keyword activation scope exactly.
         round_starts: list[int] = []
-        for i in range(len(history) - 1, -1, -1):
-            role = history[i].get("role", "")
-            if role != "user":
+        for i in range(scan_end - 1, -1, -1):
+            msg_i = history[i]
+            if msg_i.get("role", "") != "user" or is_dynamic_context(msg_i):
                 continue
-            if i == 0 or history[i - 1].get("role", "") != "user":
+            prev_is_real_user = (
+                i > 0
+                and history[i - 1].get("role", "") == "user"
+                and not is_dynamic_context(history[i - 1])
+            )
+            if not prev_is_real_user:
                 round_starts.append(i)
                 if len(round_starts) >= scan_depth:
                     break
 
         if round_starts:
             start_idx = round_starts[-1]
-            for msg in history[start_idx:]:
+            for msg in history[start_idx:scan_end]:
                 role = msg.get("role", "")
-                if role not in ("user", "assistant"):
+                if role != "user" or is_dynamic_context(msg):
                     continue
-                content = msg.get("content")
-                if isinstance(content, str):
+                content = _scan_content(msg.get("content"))
+                if content.strip():
                     parts.append(content)
     return "\n".join(parts)
 
@@ -425,76 +474,6 @@ def build_skill_messages(
 #  Memory catalog loading, hit tracking, and legacy memory builder
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-#  In-memory hit timestamp cache (replaces per-call YAML read/write)
-# ---------------------------------------------------------------------------
-# [2026-05-24] Why: _update_last_hit_bg was yaml.safe_load-ing 660KB+ files
-# on every LLM call, eating 45% CPU. How: track hits in a memory dict,
-# flush to a lightweight JSON sidecar every 10 min or at shutdown.
-# Purpose: zero-IO hot path, dream reads the JSON when it runs.
-
-import atexit as _atexit
-import json as _json
-
-_hit_cache: dict[str, str] = {}          # {entry_id: iso_timestamp}
-_hit_cache_dirty: bool = False
-_hit_cache_lock = threading.Lock()
-_hit_cache_last_flush: float = 0.0
-_HIT_CACHE_FLUSH_INTERVAL = 600          # 10 minutes
-
-
-def _hit_cache_path(workspace_root: Path) -> Path:
-    return workspace_root / "data" / "memory" / ".hit_cache.json"
-
-
-def _load_hit_cache(workspace_root: Path) -> None:
-    """Load hit cache from disk on first access."""
-    global _hit_cache, _hit_cache_last_flush
-    p = _hit_cache_path(workspace_root)
-    if p.exists():
-        try:
-            _hit_cache = _json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            _hit_cache = {}
-    _hit_cache_last_flush = time.monotonic()
-
-
-def _flush_hit_cache(workspace_root: Path | None = None) -> None:
-    """Write dirty hit cache to disk."""
-    global _hit_cache_dirty, _hit_cache_last_flush
-    with _hit_cache_lock:
-        if not _hit_cache_dirty:
-            return
-        if workspace_root is None:
-            return
-        try:
-            p = _hit_cache_path(workspace_root)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(_json.dumps(_hit_cache), encoding="utf-8")
-            _hit_cache_dirty = False
-            _hit_cache_last_flush = time.monotonic()
-        except Exception:
-            pass
-
-
-def _record_hits(workspace_root: Path, entries: list[dict[str, Any]]) -> None:
-    """Record keyword hits in memory. No YAML, no threads."""
-    global _hit_cache_dirty
-    from datetime import datetime, timezone
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with _hit_cache_lock:
-        if not _hit_cache and _hit_cache_last_flush == 0.0:
-            _load_hit_cache(workspace_root)
-        for e in entries:
-            eid = e.get("id", "")
-            if eid:
-                _hit_cache[eid] = now_iso
-                _hit_cache_dirty = True
-        # Periodic flush
-        if _hit_cache_dirty and (time.monotonic() - _hit_cache_last_flush) > _HIT_CACHE_FLUSH_INTERVAL:
-            threading.Thread(target=_flush_hit_cache, args=(workspace_root,), daemon=True).start()
-
-
 class _MemoryCache:
     """Per-workspace memory catalog cache keyed on time."""
 
@@ -641,6 +620,7 @@ def load_memory_catalog(
                 items.append({
                     "book": book,
                     "id": eid,
+                    "_hit_key": _memory_hit_key(workspace_root, yaml_path, eid),
                     "keywords": keywords,
                     "compiled_keywords": [compile_keyword(k) for k in keywords],
                     "content": content,
@@ -787,10 +767,11 @@ def normalize_skill_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any
 
 def normalize_memory_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Map memory catalog entries to the unified knowledge-entry dictionary."""
-    # Why: memory injection should use the same pipeline as skills, but memory
-    # has no discovery INDEX. How: map constant memories to constant entries,
-    # keyword memories to keyword entries, and skip keywordless non-constant
-    # memories. Purpose: preserve existing memory visibility exactly.
+    # Why: memory injection should use the same pipeline as skills. How: map
+    # constant memories to constant entries, keyword memories to keyword
+    # entries, and keywordless non-constant memories to index entries that stay
+    # discoverable without being injected. Purpose: keep every stored memory
+    # reachable (index + full read by id) while only relevant ones cost tokens.
     entries: list[dict[str, Any]] = []
     for raw in catalog or []:
         if not isinstance(raw, dict):
@@ -809,10 +790,11 @@ def normalize_memory_entries(catalog: list[dict[str, Any]]) -> list[dict[str, An
         elif keywords:
             strategy = "keyword"
         else:
-            continue
+            strategy = "index"
 
         entries.append({
             "id": memory_id,
+            "_hit_key": str(raw.get("_hit_key") or ""),
             "kind": "memory",
             "content": content,
             "strategy": strategy,
@@ -846,8 +828,9 @@ def _filter_entries(
     # in separate files. How: branch only on kind-specific access semantics.
     # Purpose: give the unified budget stage one already-authorized entry list.
     filtered: list[dict[str, Any]] = []
-    skill_allow_set = set(skill_allow or []) if skill_allow is not None else None
-    memory_allow_set = set(memory_allow or []) if memory_allow else None
+    # An allowlist without entries grants no access, including an omitted list.
+    skill_allow_set = set(skill_allow or [])
+    memory_allow_set = set(memory_allow or [])
 
     for entry in entries:
         node_ids = entry.get("node_ids") or []
@@ -857,19 +840,18 @@ def _filter_entries(
         if entry.get("kind") == "skill":
             if skill_mode == "none":
                 continue
-            # Why: the legacy skill builder only skipped all skills for an empty
-            # allowlist when allow was an explicit list, not None. How: preserve
-            # that exact None-versus-empty distinction. Purpose: keep wrappers
-            # and node config behavior backward compatible.
-            if skill_mode == "allowlist" and skill_allow_set is not None and entry.get("id") not in skill_allow_set:
+            if skill_mode == "allowlist" and entry.get("id") not in skill_allow_set:
                 continue
         elif entry.get("kind") == "memory":
             if memory_mode == "none":
                 continue
-            # Why: the legacy memory builder filtered allowlist only when the
-            # allow collection was truthy. How: keep that condition here.
-            # Purpose: knowledge.max_budget_chars=0 remains behavior-compatible.
-            if memory_mode == "allowlist" and memory_allow_set is not None and entry.get("book") not in memory_allow_set:
+            # memory_mode=constant injects the read-only constant baseline only.
+            if memory_mode == "constant" and entry.get("strategy") != "constant":
+                continue
+            # Why: only allowlisted books pass in allowlist mode, and an empty
+            # allowlist keeps nothing. How: compare against the resolved set.
+            # Purpose: book-level authorization cannot be bypassed by omission.
+            if memory_mode == "allowlist" and entry.get("book") not in memory_allow_set:
                 continue
         else:
             continue
@@ -888,6 +870,9 @@ def _new_buckets() -> dict[str, list[dict[str, Any]]]:
         "skill_index": [],
         "memory_constant": [],
         "memory_active": [],
+        # Keywordless non-constant memories stay discoverable through a compact
+        # index; the full body is read back on demand by book+id.
+        "memory_index": [],
     }
 
 
@@ -916,6 +901,9 @@ def _classify_and_match_entries(
                 buckets["memory_constant"].append(entry)
             continue
 
+        if kind == "skill":
+            buckets["skill_index"].append(entry)
+
         if strategy == "keyword":
             scan_text = build_scan_text(instruction_text, history, int(entry.get("scan_depth") or 0))
             if match_keywords(list(entry.get("compiled_keywords") or []), scan_text):
@@ -924,12 +912,11 @@ def _classify_and_match_entries(
                 elif kind == "memory":
                     buckets["memory_active"].append(entry)
                     matched_memories.append(entry)
-            elif kind == "skill":
-                buckets["skill_index"].append(entry)
             continue
 
-        if strategy == "index" and kind == "skill":
-            buckets["skill_index"].append(entry)
+        if strategy == "index":
+            if kind == "memory":
+                buckets["memory_index"].append(entry)
 
     if matched_memories:
         # [2026-05-24] Record hits in memory dict (zero IO).
@@ -946,135 +933,224 @@ def _sort_render_buckets(buckets: dict[str, list[dict[str, Any]]]) -> None:
     # Purpose: keep render order stable after moving logic into one module.
     for key in ("skill_constant", "skill_active", "skill_index"):
         buckets[key].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    for key in ("memory_constant", "memory_active"):
+    for key in ("memory_constant", "memory_active", "memory_index"):
         buckets[key].sort(key=lambda entry: str(entry.get("id") or ""))
 
 
-def _apply_skill_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    """Apply the legacy skill-only budget to skill injectable buckets."""
-    # Why: knowledge.max_budget_chars=0 must use the old independent skill
-    # budget. How: select constant and active skills by priority and append
-    # rejected skills to INDEX. Purpose: preserve both injected content and
-    # discovery behavior for existing configs.
+def _memory_dedup_key(entry: dict[str, Any]) -> str:
+    """Return book-scoped memory deduplication key ``memory:<book>/<id>``."""
+    mem_id = str(entry.get("id") or "")
+    book = str(entry.get("book") or "default").strip() or "default"
+    return f"memory:{book}/{mem_id}"
+
+def _entry_variant_digests(bucket_name: str, entry: dict[str, Any]) -> tuple[str, str]:
+    entry_id = str(entry.get("id") or "")
+    content = str(entry.get("content") or "")
+    header = f"\n## Skill: {entry_id}" if bucket_name == "skill_active" else f"\n## {entry_id}"
+    outline = (_build_skill_outline(entry) if bucket_name == "skill_active"
+               else _build_memory_outline(entry))
+    return (content_sha1(f"{header}\n\n{content}"),
+            content_sha1(f"{header}\n\n{outline}\0{content}"))
+
+
+def _is_entry_already_active(
+    bucket_name: str,
+    entry: dict[str, Any],
+    active_injected: dict[str, str] | None,
+    *,
+    skill_inline_max_chars: int = 6000,
+    memory_inline_max_chars: int = 2000,
+) -> bool:
+    """Recognize either surviving variant; budget changes never re-send its source."""
+    if not active_injected:
+        return False
+    entry_id = str(entry.get("id") or "")
+    content = str(entry.get("content") or "")
+    if not entry_id or not content:
+        return False
+    digests = _entry_variant_digests(bucket_name, entry)
+    keys = ([f"skill:{entry_id}"] if bucket_name == "skill_active"
+            else [_memory_dedup_key(entry), f"memory:{entry_id}"])
+    return any(active_injected.get(key) in digests for key in keys)
+
+def _apply_active_budget(
+    buckets: dict[str, list[dict[str, Any]]],
+    bucket_names: tuple[str, ...],
+    max_budget_chars: int,
+    *,
+    active_injected: dict[str, str] | None = None,
+    skill_inline_max_chars: int = 6000,
+    memory_inline_max_chars: int = 2000,
+) -> None:
+    """Bound new active bodies per build, including outlines but not static indexes.
+
+    Surviving full/outline entries use no incremental budget and are not rendered
+    again. Entries that fit neither form are retried on a future matching turn.
+    This is not a total history token limit; normal compaction enforces that.
+    """
     if max_budget_chars <= 0:
         return
-
-    all_injectable: list[tuple[str, dict[str, Any]]] = []
-    for entry in buckets["skill_constant"]:
-        all_injectable.append(("skill_constant", entry))
-    for entry in buckets["skill_active"]:
-        all_injectable.append(("skill_active", entry))
-    all_injectable.sort(key=lambda item: int(item[1].get("priority") or 0), reverse=True)
-
-    kept_constant: list[dict[str, Any]] = []
-    kept_active: list[dict[str, Any]] = []
+    ranked = [
+        (
+            name,
+            i,
+            entry,
+            _is_entry_already_active(
+                name,
+                entry,
+                active_injected,
+                skill_inline_max_chars=skill_inline_max_chars,
+                memory_inline_max_chars=memory_inline_max_chars,
+            ),
+        )
+        for name in bucket_names
+        for i, entry in enumerate(buckets[name])
+    ]
+    ranked.sort(
+        key=lambda item: (1 if item[3] else 0, int(item[2].get("priority") or 0)),
+        reverse=True,
+    )
     used = 0
-    for origin, entry in all_injectable:
+    for name, i, entry, already_full in ranked:
         body_len = len(str(entry.get("content") or ""))
-        if used + body_len <= max_budget_chars:
+        if already_full:
+            continue
+        inline_max = skill_inline_max_chars if name == "skill_active" else memory_inline_max_chars
+        if body_len <= inline_max and used + body_len <= max_budget_chars:
             used += body_len
-            if origin == "skill_constant":
-                kept_constant.append(entry)
-            else:
-                kept_active.append(entry)
+            continue
+        outline = _build_skill_outline(entry) if name == "skill_active" else _build_memory_outline(entry)
+        if used + len(outline) <= max_budget_chars:
+            used += len(outline)
+            buckets[name][i] = {**entry, "_outline_only": True}
         else:
-            buckets["skill_index"].append(entry)
-
-    buckets["skill_constant"] = kept_constant
-    buckets["skill_active"] = kept_active
-    buckets["skill_constant"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["skill_active"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
+            buckets[name][i] = {**entry, "_budget_dropped": True}
+    for name in bucket_names:
+        buckets[name] = [entry for entry in buckets[name] if not entry.get("_budget_dropped")]
 
 
-def _apply_memory_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    """Apply the legacy memory-only budget to memory injectable buckets."""
-    # Why: the default path must keep memory's old independent budget. How:
-    # select constant and active memories by priority and drop rejected memories
-    # because memories never had an INDEX. Purpose: preserve existing memory
-    # prompt output when no global knowledge budget is configured.
-    if max_budget_chars <= 0:
-        return
-
-    all_injectable: list[tuple[str, dict[str, Any]]] = []
-    for entry in buckets["memory_constant"]:
-        all_injectable.append(("memory_constant", entry))
-    for entry in buckets["memory_active"]:
-        all_injectable.append(("memory_active", entry))
-    all_injectable.sort(key=lambda item: int(item[1].get("priority") or 0), reverse=True)
-
-    kept_constant: list[dict[str, Any]] = []
-    kept_active: list[dict[str, Any]] = []
-    used = 0
-    for origin, entry in all_injectable:
-        body_len = len(str(entry.get("content") or ""))
-        if used + body_len <= max_budget_chars:
-            used += body_len
-            if origin == "memory_constant":
-                kept_constant.append(entry)
-            else:
-                kept_active.append(entry)
-
-    buckets["memory_constant"] = kept_constant
-    buckets["memory_active"] = kept_active
-    buckets["memory_constant"].sort(key=lambda entry: str(entry.get("id") or ""))
-    buckets["memory_active"].sort(key=lambda entry: str(entry.get("id") or ""))
+def _apply_skill_budget(
+    buckets: dict[str, list[dict[str, Any]]],
+    max_budget_chars: int,
+    *,
+    active_injected: dict[str, str] | None = None,
+    skill_inline_max_chars: int = 6000,
+) -> None:
+    _apply_active_budget(
+        buckets,
+        ("skill_active",),
+        max_budget_chars,
+        active_injected=active_injected,
+        skill_inline_max_chars=skill_inline_max_chars,
+    )
 
 
-def _apply_global_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    """Apply one priority-sorted budget pool across skills and memories."""
-    # Why: Phase 3 requires high-priority memories and skills to compete in one
-    # pool. How: rank all injectable entries by priority while remembering their
-    # render bucket, then restore kept entries to their original labels. Purpose:
-    # change budget selection without changing final tag names or prompt layout.
-    if max_budget_chars <= 0:
-        return
+def _apply_memory_budget(
+    buckets: dict[str, list[dict[str, Any]]],
+    max_budget_chars: int,
+    *,
+    active_injected: dict[str, str] | None = None,
+    memory_inline_max_chars: int = 2000,
+) -> None:
+    _apply_active_budget(
+        buckets,
+        ("memory_active",),
+        max_budget_chars,
+        active_injected=active_injected,
+        memory_inline_max_chars=memory_inline_max_chars,
+    )
 
-    all_injectable: list[tuple[str, dict[str, Any]]] = []
-    # Why: equal-priority ties need deterministic behavior. How: start from the
-    # prompt render order before the stable priority sort. Purpose: avoid random
-    # output while still making priority the only cross-kind ranking key.
-    for bucket_name in ("skill_constant", "memory_constant", "skill_active", "memory_active"):
-        for entry in buckets[bucket_name]:
-            all_injectable.append((bucket_name, entry))
-    all_injectable.sort(key=lambda item: int(item[1].get("priority") or 0), reverse=True)
 
-    kept: dict[str, list[dict[str, Any]]] = {
-        "skill_constant": [],
-        "skill_active": [],
-        "memory_constant": [],
-        "memory_active": [],
-    }
-    used = 0
-    for origin, entry in all_injectable:
-        body_len = len(str(entry.get("content") or ""))
-        if used + body_len <= max_budget_chars:
-            used += body_len
-            kept[origin].append(entry)
-        elif origin.startswith("skill_"):
-            # Why: over-budget skill bodies used to remain discoverable through
-            # SKILLS:INDEX. How: append rejected injectable skills to the index
-            # bucket. Purpose: global budgeting does not hide skill metadata.
-            buckets["skill_index"].append(entry)
+def _apply_global_budget(
+    buckets: dict[str, list[dict[str, Any]]],
+    max_budget_chars: int,
+    *,
+    active_injected: dict[str, str] | None = None,
+    skill_inline_max_chars: int = 6000,
+    memory_inline_max_chars: int = 2000,
+) -> None:
+    _apply_active_budget(
+        buckets,
+        ("skill_active", "memory_active"),
+        max_budget_chars,
+        active_injected=active_injected,
+        skill_inline_max_chars=skill_inline_max_chars,
+        memory_inline_max_chars=memory_inline_max_chars,
+    )
 
-    for bucket_name, entries in kept.items():
-        buckets[bucket_name] = entries
-    buckets["skill_constant"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["skill_active"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["memory_constant"].sort(key=lambda entry: str(entry.get("id") or ""))
-    buckets["memory_active"].sort(key=lambda entry: str(entry.get("id") or ""))
+
+def _compact_index_desc(text: str, max_chars: int = 60) -> str:
+    """One-line, whitespace-normalized description for index blocks."""
+    s = " ".join((text or "").split())
+    return s[:max_chars] + ("…" if len(s) > max_chars else "")
+
+
+def _build_skill_outline(entry: dict[str, Any], max_preview_chars: int = 800) -> str:
+    """Describe a large skill by headings plus a short intro instead of the body."""
+    # Why: one oversized skill must not evict everything after it. How: list the
+    # markdown headings and a bounded preview, and point at the file on disk.
+    # Purpose: the model keeps a path to the full text without paying for it.
+    content = str(entry.get("content") or "")
+    headings: list[str] = []
+    intro: list[str] = []
+    intro_chars = 0
+    preview_limit = min(300, max_preview_chars)
+    for line_no, line in enumerate(content.splitlines(), 1):
+        if re.match(r"^#{1,3}\s+.+", line):
+            if len(headings) < 25:
+                headings.append(f"- L{line_no}: {line}")
+        elif intro_chars < preview_limit and not re.match(r"^#+\s+", line):
+            stripped = line.strip()
+            if stripped:
+                intro.append(stripped)
+                intro_chars += len(stripped) + 1
+    preview = "\n".join(intro)[:preview_limit]
+    skill_path = str(entry.get("path") or "") or f"skills/{entry['id']}/SKILL.md"
+    hint = (
+        '[Large skill (共 %d 字符) — 仅展示结构大纲与导言。需要具体章节时请调用 '
+        'read_file(files=[{"path": "%s", "startLine": ..., "endLine": ...}])]'
+        % (len(content), skill_path)
+    )
+    return hint + f"\nDescription: {entry.get('description') or ''}\nOutline:\n" + "\n".join(headings) + f"\nPreview:\n{preview}"
+
+
+def _build_memory_outline(entry: dict[str, Any], max_preview_chars: int = 500) -> str:
+    """Describe a long memory by preview plus headings and a read-back hint."""
+    content = str(entry.get("content") or "")
+    headings = [
+        f"- L{i}: {line}"
+        for i, line in enumerate(content.splitlines(), 1)
+        if re.match(r"^#{1,3}\s+.+", line)
+    ][:25]
+    outline = "\nOutline:\n" + "\n".join(headings) if headings else ""
+    hint = (
+        "\n[Long memory (共 %d 字符) — 如需完整内容请调用 "
+        'manage_memory(action="list", book="%s", id="%s")]'
+        % (len(content), entry.get("book") or "default", entry["id"])
+    )
+    return content[:max_preview_chars] + outline + hint
 
 
 def _render_skill_messages(
     constant_skills: list[dict[str, Any]],
     dynamic_skills: list[dict[str, Any]],
     index_only_skills: list[dict[str, Any]],
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Render skill buckets using the legacy SKILLS tags."""
-    # Why: callers and tests depend on exact SKILLS tag names and section
-    # structure. How: copy the old renderer's joins and header strings while
-    # reading unified entry fields. Purpose: make the refactor output-compatible.
-    static_msgs: list[dict[str, str]] = []
-    dynamic_msgs: list[dict[str, str]] = []
+    skill_inline_max_chars: int = 6000,
+    active_injected: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Render skill buckets using the legacy SKILLS tags.
+
+    [Persistent Dynamic Context] Why: hashing all active skills as one blob would
+    re-inject every skill whenever a single new skill matches. How: after budget
+    calculation has marked ``_outline_only``, compute the sha1 of each individual
+    skill's rendered block and skip entries whose ``skill:<id>`` hash already
+    matches ``active_injected``. Purpose: incremental per-skill deduplication and
+    re-injection only when the source changes or its previous injection leaves
+    the model context. An existing outline can be read in full via tools.
+    """
+    static_msgs: list[dict[str, Any]] = []
+    dynamic_msgs: list[dict[str, Any]] = []
+    active_map = active_injected or {}
 
     if constant_skills:
         parts: list[str] = ["[SKILLS:CONSTANT]"]
@@ -1085,28 +1161,50 @@ def _render_skill_messages(
         static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
     dynamic_parts: list[str] = []
+    skill_hashes: dict[str, str] = {}
     if dynamic_skills:
-        dynamic_parts.append("[SKILLS:ACTIVE]")
+        kept_blocks: list[tuple[str, str]] = []
         for entry in dynamic_skills:
-            dynamic_parts.append(f"\n## Skill: {entry['id']}\n")
-            dynamic_parts.append(str(entry.get("content") or ""))
-        dynamic_parts.append("\n[/SKILLS:ACTIVE]")
+            skill_id = str(entry.get("id") or "")
+            content = str(entry.get("content") or "")
+            rendered_body = (
+                _build_skill_outline(entry)
+                if entry.get("_outline_only") or len(content) > skill_inline_max_chars
+                else content
+            )
+            block_text = f"\n## Skill: {skill_id}\n\n{rendered_body}"
+            key = f"skill:{skill_id}"
+            digest = (
+                content_sha1(f"{block_text}\0{content}")
+                if rendered_body != content
+                else content_sha1(block_text)
+            )
+            if _is_entry_already_active("skill_active", entry, active_map):
+                continue
+            kept_blocks.append((f"\n## Skill: {skill_id}\n", rendered_body))
+            skill_hashes[key] = digest
+        if kept_blocks:
+            dynamic_parts.append("[SKILLS:ACTIVE]")
+            for header, body in kept_blocks:
+                dynamic_parts.append(header)
+                dynamic_parts.append(body)
+            dynamic_parts.append("\n[/SKILLS:ACTIVE]")
 
     if index_only_skills:
-        if dynamic_parts:
-            dynamic_parts.append("")
-        dynamic_parts.append("[SKILLS:INDEX]")
-        dynamic_parts.append(
-            "以下 skill 未被激活。如果当前任务需要，可通过 read_file 读取对应 path 的全文。"
-        )
+        parts = ["[SKILLS:INDEX]",
+                 'If a task needs an unactivated skill, read "skills/<name>/SKILL.md" via read_file.']
         for entry in index_only_skills:
-            dynamic_parts.append(f"- name: {entry['id']}")
-            dynamic_parts.append(f"  description: {_short_text(str(entry.get('description') or ''))}")
-            dynamic_parts.append(f"  path: {entry.get('path') or ''}")
-        dynamic_parts.append("[/SKILLS:INDEX]")
+            desc = _compact_index_desc(str(entry.get("description") or ""))
+            parts.append(f"- {entry['id']}" + (f": {desc}" if desc else ""))
+        parts.append("[/SKILLS:INDEX]")
+        static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
     if dynamic_parts:
-        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
+        dynamic_msgs.append({
+            "role": "system",
+            "content": "\n".join(dynamic_parts),
+            "_injected_hashes": skill_hashes,
+        })
 
     return static_msgs, dynamic_msgs
 
@@ -1114,13 +1212,21 @@ def _render_skill_messages(
 def _render_memory_messages(
     constant_entries: list[dict[str, Any]],
     dynamic_entries: list[dict[str, Any]],
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Render memory buckets using the legacy MEMORY tags."""
-    # Why: memories did not have an INDEX block and used different section
-    # headers from skills. How: keep the old MEMORY renderer's exact tag names
-    # and joins. Purpose: preserve prompt text for existing memory users.
-    static_msgs: list[dict[str, str]] = []
-    dynamic_msgs: list[dict[str, str]] = []
+    index_entries: list[dict[str, Any]] | None = None,
+    memory_inline_max_chars: int = 2000,
+    active_injected: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Render memory buckets using the legacy MEMORY tags.
+
+    [Persistent Dynamic Context] Why: same as ``_render_skill_messages`` — compare
+    each individual memory's rendered block (full text or ``_outline_only``)
+    against ``active_injected["memory:<id>"]`` after budgeting. How: skip unchanged
+    entries and attach ``_injected_hashes`` for the remaining delta. Purpose:
+    per-memory incremental injection across turns and after compaction.
+    """
+    static_msgs: list[dict[str, Any]] = []
+    dynamic_msgs: list[dict[str, Any]] = []
+    active_map = active_injected or {}
 
     if constant_entries:
         parts: list[str] = ["[MEMORY:CONSTANT]"]
@@ -1130,16 +1236,51 @@ def _render_memory_messages(
         parts.append("\n[/MEMORY:CONSTANT]")
         static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
+    if index_entries:
+        parts = ["[MEMORY:INDEX]",
+                 'Unindexed memories (use manage_memory(action="list", book="<book>", id="<id>") to read full content when relevant):']
+        for entry in index_entries:
+            desc = _compact_index_desc(str(entry.get("content") or ""))
+            parts.append(f"- {entry.get('book') or 'default'}/{entry['id']}: {desc}")
+        parts.append("[/MEMORY:INDEX]")
+        static_msgs.append({"role": "system", "content": "\n".join(parts)})
+
     dynamic_parts: list[str] = []
+    memory_hashes: dict[str, str] = {}
     if dynamic_entries:
-        dynamic_parts.append("[MEMORY:ACTIVE]")
+        kept_blocks: list[tuple[str, str]] = []
         for entry in dynamic_entries:
-            dynamic_parts.append(f"\n## {entry['id']}\n")
-            dynamic_parts.append(str(entry.get("content") or ""))
-        dynamic_parts.append("\n[/MEMORY:ACTIVE]")
+            mem_id = str(entry.get("id") or "")
+            content = str(entry.get("content") or "")
+            rendered_body = (
+                _build_memory_outline(entry)
+                if entry.get("_outline_only") or len(content) > memory_inline_max_chars
+                else content
+            )
+            block_text = f"\n## {mem_id}\n\n{rendered_body}"
+            key = _memory_dedup_key(entry)
+            digest = (
+                content_sha1(f"{block_text}\0{content}")
+                if rendered_body != content
+                else content_sha1(block_text)
+            )
+            if _is_entry_already_active("memory_active", entry, active_map):
+                continue
+            kept_blocks.append((f"\n## {mem_id}\n", rendered_body))
+            memory_hashes[key] = digest
+        if kept_blocks:
+            dynamic_parts.append("[MEMORY:ACTIVE]")
+            for header, body in kept_blocks:
+                dynamic_parts.append(header)
+                dynamic_parts.append(body)
+            dynamic_parts.append("\n[/MEMORY:ACTIVE]")
 
     if dynamic_parts:
-        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
+        dynamic_msgs.append({
+            "role": "system",
+            "content": "\n".join(dynamic_parts),
+            "_injected_hashes": memory_hashes,
+        })
 
     return static_msgs, dynamic_msgs
 
@@ -1158,7 +1299,10 @@ def build_knowledge_messages(
     skill_max_budget_chars: int = 0,
     memory_max_budget_chars: int = 0,
     knowledge_max_budget_chars: int = 0,
-) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+    skill_inline_max_chars: int = 6000,
+    memory_inline_max_chars: int = 2000,
+    active_injected: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Build skill and memory messages from already-normalized entries."""
     # Why: build_knowledge_context and legacy wrappers need the same pipeline.
     # How: filter, classify, match, budget, and render unified entries in one
@@ -1174,28 +1318,58 @@ def build_knowledge_messages(
     if not filtered_entries:
         return [], [], [], []
 
+    # [Persistent Dynamic Context] Extract surviving injected_hashes from raw
+    # history before stripping dynamic messages for keyword scanning.
+    effective_active = (
+        active_injected
+        if active_injected is not None
+        else collect_active_injected_hashes(history)
+    )
+    scan_history = conversational_history(history) if history else []
+
     buckets = _classify_and_match_entries(
         workspace_root,
         filtered_entries,
         instruction_text=instruction_text,
-        history=history,
+        history=scan_history,
     )
     _sort_render_buckets(buckets)
 
     if knowledge_max_budget_chars > 0:
-        _apply_global_budget(buckets, knowledge_max_budget_chars)
+        _apply_global_budget(
+            buckets,
+            knowledge_max_budget_chars,
+            active_injected=effective_active,
+            skill_inline_max_chars=skill_inline_max_chars,
+            memory_inline_max_chars=memory_inline_max_chars,
+        )
     else:
-        _apply_skill_budget(buckets, skill_max_budget_chars)
-        _apply_memory_budget(buckets, memory_max_budget_chars)
+        _apply_skill_budget(
+            buckets,
+            skill_max_budget_chars,
+            active_injected=effective_active,
+            skill_inline_max_chars=skill_inline_max_chars,
+        )
+        _apply_memory_budget(
+            buckets,
+            memory_max_budget_chars,
+            active_injected=effective_active,
+            memory_inline_max_chars=memory_inline_max_chars,
+        )
 
     skill_static, skill_dynamic = _render_skill_messages(
         buckets["skill_constant"],
         buckets["skill_active"],
         buckets["skill_index"],
+        skill_inline_max_chars=skill_inline_max_chars,
+        active_injected=effective_active,
     )
     memory_static, memory_dynamic = _render_memory_messages(
         buckets["memory_constant"],
         buckets["memory_active"],
+        buckets["memory_index"],
+        memory_inline_max_chars=memory_inline_max_chars,
+        active_injected=effective_active,
     )
     return skill_static, skill_dynamic, memory_static, memory_dynamic
 
@@ -1207,6 +1381,8 @@ def build_knowledge_context(
     history: list[dict],
     runtime_cfg: dict,
     task_context: dict | None = None,
+    *,
+    active_injected: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Return ``(skill_static, skill_dynamic, memory_static, memory_dynamic)``.
 
@@ -1227,6 +1403,28 @@ def build_knowledge_context(
     # 怎么改：传 memory_book 给 load_memory_catalog，让它扫描正确的目录。
     # 目的：节点只看到自己 namespace 下的记忆条目。
     _mb = _effective_memory_ns(node.extra, node.id)
+    _effective_node_id = node.id
+    # Why: system maintenance nodes run with memories:constant, which should show
+    # the source namespace's constant baseline, not their own empty directory.
+    # How: resolve the routed namespace (extractor passes _memory_route_ns, dream
+    # passes a route table) and use it for both loading and node_ids filtering.
+    # Purpose: the constant block is read-only reference material for a system
+    # node while its own writes still get routed by dream_router.
+    if (
+        node.id in _SYSTEM_MEMORY_NODES
+        and not str((node.extra or {}).get("memory_book") or "").strip()
+    ):
+        from clonoth_runtime import get_entry_node_id
+
+        _routed_ns = str((task_context or {}).get("_memory_route_ns") or "").strip()
+        if not _routed_ns:
+            _route_tbl = (task_context or {}).get("_memory_route")
+            if isinstance(_route_tbl, dict):
+                _first_rt = next((v for v in _route_tbl.values() if isinstance(v, dict)), None)
+                if _first_rt is not None:
+                    _routed_ns = str(_first_rt.get("ns") or "").strip()
+        _mb = _routed_ns or get_entry_node_id(safe_runtime_cfg) or _mb
+        _effective_node_id = _mb
     # [AutoC 2026-08-10] Workspace-scoped memory: load workspace dir first, then node dir.
     _ws_name = str((task_context or {}).get("workspace_name") or "").strip()
     mem_entries = []
@@ -1238,9 +1436,9 @@ def build_knowledge_context(
     _node_mem = load_memory_catalog(workspace_root, memory_book=_mb)
     if _node_mem:
         # Dedup by (book, id) — workspace entries take precedence
-        _seen = {(str(e.get("_book","")), str(e.get("id",""))) for e in mem_entries}
+        _seen = {(str(e.get("book") or e.get("_book") or ""), str(e.get("id") or "")) for e in mem_entries}
         for e in _node_mem:
-            _key = (str(e.get("_book","")), str(e.get("id","")))
+            _key = (str(e.get("book") or e.get("_book") or ""), str(e.get("id") or ""))
             if _key not in _seen:
                 mem_entries.append(e)
     if not mem_entries:
@@ -1268,7 +1466,7 @@ def build_knowledge_context(
     return build_knowledge_messages(
         workspace_root,
         entries,
-        node_id=node.id,
+        node_id=_effective_node_id,
         instruction_text=instruction_text,
         history=history,
         skill_mode=node.skill_access.mode,
@@ -1278,6 +1476,9 @@ def build_knowledge_context(
         skill_max_budget_chars=get_int(safe_runtime_cfg, "skills.max_budget_chars", 0, min_value=0),
         memory_max_budget_chars=get_int(safe_runtime_cfg, "memory.max_budget_chars", 0, min_value=0),
         knowledge_max_budget_chars=get_int(safe_runtime_cfg, "knowledge.max_budget_chars", 0, min_value=0),
+        skill_inline_max_chars=get_int(safe_runtime_cfg, "skills.inline_max_chars", 6000, min_value=0),
+        memory_inline_max_chars=get_int(safe_runtime_cfg, "memory.inline_max_chars", 2000, min_value=0),
+        active_injected=active_injected,
     )
 
 
@@ -1304,6 +1505,50 @@ def _tool_err(message: Any, **fields: Any) -> dict[str, Any]:
     response: dict[str, Any] = {"ok": False, "error": text, "data": data}
     response.update(fields)
     return response
+
+
+def _action_error(action: str) -> str:
+    return f"invalid action: {action!r}, must be 'list', 'upsert', or 'delete'"
+
+
+def _resolve_action(args: dict[str, Any]) -> str:
+    """Resolve the unified tool action: default 'list', mutations must be explicit.
+
+    Why: the same call must mean the same thing for the model, the policy layer,
+    the tool-call log, and the handler. How: only an explicit ``action`` selects a
+    mutation; anything else is a read. Purpose: no cursor-based guessing about
+    whether a call intended to write.
+    """
+    action = str(args.get("action") or "").strip().lower()
+    return action or "list"
+
+
+async def _guard_mutation(
+    ctx: ToolContext,
+    path: Path,
+) -> dict[str, Any] | None:
+    """Ask policy for approval on the real absolute path of one store mutation.
+
+    Why: knowledge tools are auto-approved by name, so the only meaningful write
+    gate is the policy decision for the exact file. How: request the write_file
+    guard with the resolved absolute path, and while the decision is made present
+    the real caller node identity even when dream_router redirected the write to a
+    source namespace. Purpose: approvals and audit trail stay bound to the task
+    that actually writes, not to the node id the router swapped in.
+    """
+    caller_id = str(getattr(ctx, "_caller_node_id", "") or "").strip()
+    original_id = str(getattr(ctx, "node_id", "") or "")
+    restore = bool(caller_id and caller_id != original_id)
+    if restore:
+        ctx.node_id = caller_id
+    try:
+        _op, err = await request_guard(ctx, "write_file", {"path": str(path)})
+    finally:
+        if restore:
+            ctx.node_id = original_id
+    if err is not None:
+        return _tool_err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
+    return None
 
 
 async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1396,12 +1641,17 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
             meta["scan_depth"] = scan_depth
         content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + str(body or "").strip() + "\n"
 
-    # Why: write_file already centralizes policy approval and path checks. How:
-    # import it lazily from toolbox.builtins after moving this function out of that
-    # package. Purpose: preserve the guarded write behavior without a module cycle.
+    try:
+        target = resolve_under_allowed_roots(ctx.workspace_root, path, workspace=ctx.workspace)
+    except ValueError as exc:
+        return _tool_err(exc)
+    # Why: the approval decision must name the file that is actually written. How:
+    # hand write_file the resolved absolute path so its policy guard evaluates the
+    # real location instead of a relative guess. Purpose: one guarded write per
+    # skill mutation with an auditable path.
     from toolbox.builtins.write_file import write_file
 
-    res = await write_file({"path": path, "content": content}, ctx)
+    res = await write_file({"path": str(target), "content": content}, ctx)
     if not res.get("ok"):
         return res
     return _tool_ok(f"Skill written: {path}", path=path, name=name, enabled=enabled)
@@ -1445,6 +1695,7 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                     "description": str(meta.get("description") or ""),
                     "enabled": bool(meta.get("enabled", True)),
                     "strategy": strategy,
+                    "visibility": "private" if str(meta.get("visibility") or "public").strip().lower() == "private" else "public",
                     "keywords": kw_list,
                     "order": item_order,
                     "priority": item_priority,
@@ -1455,7 +1706,8 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         except Exception as e:
             items.append({"name": skill_md.parent.name, "path": skill_md.relative_to(ctx.workspace_root).as_posix(), "error": str(e)})
 
-    return _tool_ok(f"{len(items)} skills", skills=items)
+    # data.result is the model-visible transcript; sibling fields are host data.
+    return _tool_ok(json.dumps(items, ensure_ascii=False, indent=2) if items else "0 skills", skills=items)
 
 
 async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1469,18 +1721,43 @@ async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if not SKILL_NAME_RE.fullmatch(name):
         return _tool_err("invalid skill name")
 
-    skill_dir = resolve_under_allowed_roots(ctx.workspace_root, f"skills/{name}")
+    skill_dir = resolve_under_allowed_roots(ctx.workspace_root, f"skills/{name}", workspace=ctx.workspace)
     if not skill_dir.exists():
         return _tool_err(f"skill not found: {name}")
     if not skill_dir.is_dir():
         return _tool_err(f"not a skill directory: {name}")
 
-    _op, err = await request_guard(ctx, "write_file", {"path": f"skills/{name}/SKILL.md", "delete": True})
-    if err is not None:
-        return _tool_err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
+    # Why: deletion must be approved against the directory that really disappears.
+    # How: guard the resolved absolute SKILL.md path. Purpose: no relative-path
+    # approval can be reused for a different directory.
+    denied = await _guard_mutation(ctx, skill_dir / "SKILL.md")
+    if denied is not None:
+        return denied
 
     shutil.rmtree(skill_dir)
     return _tool_ok(f"Skill deleted: {name}", deleted=True, name=name)
+
+
+async def manage_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Unified skill management: list (default), upsert, or delete."""
+    # Why: one tool now fronts the skill store instead of three CRUD names. How:
+    # resolve the explicit action and delegate to the existing implementation, so
+    # the old names stay retired while the behavior stays identical. Purpose: a
+    # single, predictable contract that matches schema, policy, and audit logs.
+    if not isinstance(args, dict):
+        return _tool_err("arguments must be an object")
+    action = _resolve_action(args)
+    if action == "list":
+        return await list_skills(args, ctx)
+    if action == "upsert":
+        if not str(args.get("name") or "").strip():
+            return _tool_err("upsert requires name")
+        return await create_or_update_skill(args, ctx)
+    if action == "delete":
+        if not str(args.get("name") or "").strip():
+            return _tool_err("delete requires name")
+        return await delete_skill(args, ctx)
+    return _tool_err(_action_error(action))
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1766,10 @@ async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
 
 _MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 _BOOK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
+
+# System maintenance nodes write on behalf of other namespaces. They may add or
+# update ordinary entries, but the constant baseline stays read-only for them.
+_SYSTEM_MEMORY_NODES = frozenset({"system.dream", "system.memory_extractor"})
 
 
 def _load_book(path: Path) -> dict[str, Any]:
@@ -1511,15 +1792,37 @@ def _load_book(path: Path) -> dict[str, Any]:
 
 
 def _save_book(path: Path, data: dict[str, Any]) -> None:
-    """Write a memory book yaml back to disk."""
+    """Write a memory book yaml back to disk atomically."""
     # Why: save_memory and delete_memory still write YAML books directly. How:
-    # retain the old safe_dump format and parent creation. Purpose: keep files
-    # compatible with existing memory books.
+    # dump next to the target and swap it in with one rename. Purpose: a crash,
+    # a denied write, or a full disk must never leave a half-written book behind
+    # - readers see either the old book or the new one.
     path.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(
         data, sort_keys=False, allow_unicode=True, default_flow_style=False,
     )
-    path.write_text(text, encoding="utf-8")
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as file:
+            tmp = Path(file.name)
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def _memory_tool_scope(ctx: ToolContext) -> tuple[str, str]:
+    """Resolve storage routing without replacing the caller's identity/workspace."""
+    target = getattr(ctx, "_memory_target", None)
+    if isinstance(target, tuple) and len(target) == 2:
+        return str(target[0]).strip(), str(target[1]).strip()
+    extra = getattr(ctx, "_node_extra", None) or {}
+    node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
+    return _effective_memory_ns(extra, node_id), str(getattr(ctx, "workspace_name", "") or "").strip()
 
 
 def _invalidate_cache(workspace_root: Path, *, memory_book: str = "") -> None:
@@ -1608,16 +1911,34 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # [2026-05-28] 从节点 extra 获取 memory_book namespace，用于写入子目录和 invalidate 对应缓存。
     # 为什么：持久化子节点的记忆应写入 data/memory/{memory_book}/。
     # 怎么改：传 memory_book 给 memory_dir 来计算实际路径。
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
-    # [AutoC 2026-08-10] scope: "workspace" writes to @{workspace_name}/ subdir.
+    _ns_memory_book, _ws_name = _memory_tool_scope(ctx)
+    # scope: "workspace" writes to @{workspace_name}/ subdir.
     _scope = str(args.get("scope") or "workspace").strip().lower()
-    _ws_name = str(getattr(ctx, 'workspace_name', '') or '').strip()
     if _scope == "workspace" and _ws_name:
         _target_ns = f"{_ns_memory_book}/@{_ws_name}"
     else:
         _target_ns = _ns_memory_book
+    # Why: system nodes see the source node's constant entries read-only. How:
+    # identify the real caller (dream_router rewrote node_id to the target ns)
+    # and refuse constant writes plus any shadowing of an existing constant id.
+    # Purpose: automated maintenance cannot rewrite always-injected context, and
+    # cannot hide it behind a same-id entry in another namespace.
+    _caller_nid = str(
+        getattr(ctx, "_caller_node_id", "") or ctx.node_id or getattr(ctx, "_node_id", "") or ""
+    ).strip()
+    _is_sys_mem_node = _caller_nid in _SYSTEM_MEMORY_NODES
+    if _is_sys_mem_node:
+        if constant:
+            return _tool_err(f"system node ({_caller_nid}) cannot set constant=true")
+        # Background extraction/cleanup must not create historical-scan triggers.
+        scan_depth = 0
+        for _check_ns in dict.fromkeys([_target_ns, _ns_memory_book, ""]):
+            for _cat_item in load_memory_catalog(ctx.workspace_root, memory_book=_check_ns):
+                if _cat_item.get("id") == mid and bool(_cat_item.get("constant", False)):
+                    return _tool_err(
+                        f"system node ({_caller_nid}) cannot modify constant memory: "
+                        f"{_cat_item.get('book')}/{mid}"
+                    )
     book_path = memory_dir(ctx.workspace_root, _target_ns) / f"{book}.yaml"
     data = _load_book(book_path)
     data.setdefault("book", book)
@@ -1638,12 +1959,19 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         "priority": priority,
         "scan_depth": scan_depth,
     }
+    # node_ids is the per-entry visibility list; omitting it means "every node in
+    # the namespace", so only write the key when the caller asked for a subset.
+    if node_ids:
+        new_entry["node_ids"] = node_ids
 
     entries = data["entries"]
     found = False
     for i, e in enumerate(entries):
         if isinstance(e, dict) and str(e.get("id") or "").strip() == mid:
-            # 更新：保留原 created_at 和 source，刷新 updated_at
+            # 更新：保留原 created_at 和 source，刷新 updated_at；
+            # 未显式传 node_ids 时保留原可见性，避免更新把条目 broadcast 给所有节点。
+            if raw_node_ids is None and e.get("node_ids"):
+                new_entry["node_ids"] = e.get("node_ids")
             new_entry["created_at"] = str(e.get("created_at") or "").strip() or _now_iso
             new_entry["source"] = str(e.get("source") or "").strip()
             new_entry["updated_at"] = _now_iso
@@ -1651,10 +1979,17 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             found = True
             break
     if not found:
-        # 新建：写入 created_at，source 由调用方决定（memory_extract 会补 auto）
+        # 新建：写入 created_at；系统提取/整理节点产出的条目标记 source=auto，
+        # dream 的过期清理与提升逻辑只依赖这个来源标记。
+        if _is_sys_mem_node and not new_entry.get("source"):
+            new_entry["source"] = "auto"
         new_entry["created_at"] = _now_iso
         new_entry["updated_at"] = _now_iso
         entries.append(new_entry)
+
+    denied = await _guard_mutation(ctx, book_path)
+    if denied is not None:
+        return denied
 
     _save_book(book_path, data)
     # invalidate 时也传 memory_book，精确清除对应 namespace 的缓存
@@ -1672,17 +2007,25 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     # 看不到自己刚保存的 workspace 记忆。How: 扫描节点级目录与全部 @ 子目录，
     # 每条目标记 scope/workspace 来源；ns 目录不存在时保留 root 兜底。
     book_filter = str(args.get("book") or "").strip() or None
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
+    # Why: dream needs the full body of one entry without a full scan. How: an
+    # explicit id filter returns the untruncated content of exactly that entry.
+    # Purpose: index/outline entries stay readable on demand.
+    id_filter = str(args.get("id") or "").strip() or None
+    _ns_memory_book, _caller_ws = _memory_tool_scope(ctx)
 
     sources: list[tuple[Path, str, str]] = []  # (dir, scope, workspace)
+    # Workspace isolation: a scoped caller only sees node-level entries plus its
+    # own @workspace directory. Cross-workspace listing is reserved for unscoped
+    # maintenance nodes (dream / extractor), which carry no workspace_name.
     base_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
     if base_dir.is_dir():
         sources.append((base_dir, "node", ""))
         for sub in sorted(base_dir.iterdir()):
-            if sub.is_dir() and sub.name.startswith("@"):
-                sources.append((sub, "workspace", sub.name[1:]))
+            if not sub.is_dir() or not sub.name.startswith("@"):
+                continue
+            if _caller_ws and sub.name[1:] != _caller_ws:
+                continue
+            sources.append((sub, "workspace", sub.name[1:]))
     if not sources:
         # ponytail: fallback to root
         root_dir = memory_dir(ctx.workspace_root, "")
@@ -1702,10 +2045,12 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
                 for e in data.get("entries", []):
                     if not isinstance(e, dict):
                         continue
+                    if id_filter and str(e.get("id") or "").strip() != id_filter:
+                        continue
                     result.append({
                         "book": bname,
                         "id": str(e.get("id") or ""),
-                        "content": str(e.get("content") or "")[:200],
+                        "content": str(e.get("content") or "") if id_filter else str(e.get("content") or "")[:200],
                         "keywords": e.get("keywords", []),
                         "constant": bool(e.get("constant", False)),
                         "enabled": bool(e.get("enabled", True)),
@@ -1718,7 +2063,12 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
             except Exception:
                 continue
 
-    return _tool_ok(f"{len(result)} memories", entries=result)
+    if id_filter:
+        return _tool_ok(
+            json.dumps(result, ensure_ascii=False, indent=2) if result else f"memory not found: {id_filter}",
+            entries=result,
+        )
+    return _tool_ok(json.dumps(result, ensure_ascii=False, indent=2) if result else "0 memories", entries=result)
 
 
 async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1730,22 +2080,32 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     if not mid:
         return _tool_err("empty memory id")
 
-    # [2026-05-28] namespace 隔离：使用节点 memory_book 确定存储目录。
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
-    book = str(args.get("book") or "default").strip()
+    if not _MEMORY_ID_RE.fullmatch(mid):
+        return _tool_err("invalid memory id")
+    # Validate before composing paths: book names cannot cross namespaces.
+    _ns_memory_book, _ws_name = _memory_tool_scope(ctx)
+    _explicit_book = str(args.get("book") or "").strip()
+    if _explicit_book and not _BOOK_NAME_RE.fullmatch(_explicit_book):
+        return _tool_err("invalid book name")
+    book = _explicit_book or "default"
     # [AutoC 2026-08-31] 查找顺序与 save_memory 的默认落点（scope=workspace）
     # 对齐：当前 workspace 子目录优先，其次节点级，最后 root 兜底。How: 第一个
     # 包含目标 id 的书文件胜出；书文件存在但不含该 id 时继续向下找。Purpose:
     # 节点能删掉自己刚保存的 workspace 作用域记忆，无需显式传 scope。
-    _ws_name = str(getattr(ctx, "workspace_name", "") or "").strip()
     candidates: list[tuple[Path, str]] = []
     if _ws_name:
         _ws_ns = f"{_ns_memory_book}/@{_ws_name}"
         candidates.append((memory_dir(ctx.workspace_root, _ws_ns) / f"{book}.yaml", _ws_ns))
     candidates.append((memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml", _ns_memory_book))
     candidates.append((memory_dir(ctx.workspace_root, "") / f"{book}.yaml", ""))
+
+    if not _explicit_book and _ns_memory_book and _ns_memory_book != book:
+        # 兼容旧版 save_memory：未显式传 book 时曾以 namespace 作为书名。
+        if _ws_name:
+            _ws_ns = f"{_ns_memory_book}/@{_ws_name}"
+            candidates.append((memory_dir(ctx.workspace_root, _ws_ns) / f"{_ns_memory_book}.yaml", _ws_ns))
+        candidates.append((memory_dir(ctx.workspace_root, _ns_memory_book) / f"{_ns_memory_book}.yaml", _ns_memory_book))
+        candidates.append((memory_dir(ctx.workspace_root, "") / f"{_ns_memory_book}.yaml", ""))
 
     book_path: Path | None = None
     for _cand_path, _cand_ns in candidates:
@@ -1782,18 +2142,52 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     if len(new_entries) == len(entries):
         return _tool_err(f"memory not found: {mid}")
 
+    denied = await _guard_mutation(ctx, book_path)
+    if denied is not None:
+        return denied
+
     data["entries"] = new_entries
     if new_entries:
         _save_book(book_path, data)
     else:
         try:
             book_path.unlink()
-        except Exception:
-            pass
+        except OSError:
+            return _tool_err(f"cannot delete memory book: {book}")
+        if book_path.parent.name.startswith("@"):
+            try:
+                book_path.parent.rmdir()  # Remove only this empty workspace directory.
+            except OSError:
+                pass  # Other books or concurrent writes keep the directory alive.
 
     # [2026-05-28] invalidate 时传 memory_book，精确清除对应 namespace 的缓存
     _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
+    _forget_memory_hit(ctx.workspace_root, book_path, mid)
     return _tool_ok(f"Memory deleted: {book}/{mid}", book=book, id=mid, deleted=True)
+
+
+async def manage_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Unified memory management: list (default), upsert, or delete."""
+    # Why: one tool fronts the memory store instead of three CRUD names. How:
+    # resolve the explicit action, validate the arguments that action needs, and
+    # delegate to the existing implementation. Purpose: schema, policy and audit
+    # agree because nothing is inferred from which fields happen to be present.
+    if not isinstance(args, dict):
+        return _tool_err("arguments must be an object")
+    action = _resolve_action(args)
+    if action == "list":
+        return await list_memories(args, ctx)
+    if action == "upsert":
+        if not str(args.get("id") or "").strip():
+            return _tool_err("upsert requires id")
+        if not str(args.get("content") or "").strip():
+            return _tool_err("upsert requires content")
+        return await save_memory(args, ctx)
+    if action == "delete":
+        if not str(args.get("id") or "").strip():
+            return _tool_err("delete requires id")
+        return await delete_memory(args, ctx)
+    return _tool_err(_action_error(action))
 
 
 # ---------------------------------------------------------------------------
@@ -1805,95 +2199,74 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 # exist. Purpose: let engine.builtin.loader register plugin-owned builtin tools.
 PLUGIN_META["tools"] = [
     {
-        "name": "create_or_update_skill",
-        "description": "Create or update a skill under skills/<name>/SKILL.md.",
+        "name": "manage_skill",
+        "description": (
+            "Manage local skills under skills/<name>/SKILL.md: "
+            "action='list' lists all local skills (default); "
+            "action='upsert' creates or updates a skill (frontmatter normalized); "
+            "action='delete' deletes a skill directory."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "content": {"type": "string", "description": "full SKILL.md content (optional; frontmatter will be normalized)"},
-                "enabled": {"type": "boolean"},
-                "strategy": {"type": "string", "description": "constant (always injected) or normal (keyword-triggered); default normal", "enum": ["constant", "normal"]},
-                "keywords": {"type": "array", "items": {"type": "string"}, "description": "activation keywords; supports /regex/flags syntax"},
-                "order": {"type": "integer", "description": "injection order within the same block; higher values are placed later (closer to conversation)"},
-                "priority": {"type": "integer", "description": "budget priority; higher values are kept first when token budget is exceeded"},
-                "scan_depth": {"type": "integer", "description": "number of recent conversation rounds to scan for keyword matching; 0 = current message only"},
-                "visibility": {"type": "string", "description": "public (constant/keyword activation allowed) or private (injected only when pinned to a workspace); default public", "enum": ["public", "private"]},
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "upsert", "delete"],
+                    "description": "Operation: 'list' (default), 'upsert' (create/update), or 'delete'.",
+                },
+                "name": {"type": "string", "description": "[upsert/delete] Skill name (directory name under skills/)."},
+                "description": {"type": "string", "description": "[upsert] Short skill description."},
+                "content": {"type": "string", "description": "[upsert] Full SKILL.md content (optional; frontmatter will be normalized)."},
+                "enabled": {"type": "boolean", "description": "[upsert] Whether the skill is enabled."},
+                "strategy": {"type": "string", "description": "[upsert] constant (always injected) or normal (keyword-triggered); default normal", "enum": ["constant", "normal"]},
+                "keywords": {"type": "array", "items": {"type": "string"}, "description": "[upsert] Activation keywords; supports /regex/flags syntax."},
+                "order": {"type": "integer", "description": "[upsert] Injection order within the same block; higher values are placed later (closer to conversation)."},
+                "priority": {"type": "integer", "description": "[upsert] Budget priority; higher values are kept first when token budget is exceeded."},
+                "scan_depth": {"type": "integer", "description": "[upsert] Number of recent conversation rounds to scan for keyword matching; 0 = current message only."},
+                "visibility": {"type": "string", "description": "[upsert] public (constant/keyword activation allowed) or private (injected only when pinned to a workspace); default public", "enum": ["public", "private"]},
             },
-            "required": ["name"],
+            "required": ["action"],
         },
-        "func": create_or_update_skill,
+        "func": manage_skill,
     },
     {
-        "name": "list_skills",
-        "description": "List local skills under skills/*/SKILL.md.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-        "func": list_skills,
-    },
-    {
-        "name": "delete_skill",
-        "description": "Delete a skill directory under skills/<name>/.",
+        "name": "manage_memory",
+        "description": (
+            "Manage persistent memory entries in books: "
+            "action='list' lists memory entries (default; passing id returns that entry's full untruncated content); "
+            "action='upsert' saves or updates a memory entry (memory content MUST be concise, high-density, and to the point / 写记忆文字需简明扼要，不啰嗦不水字数); "
+            "action='delete' deletes a memory entry by id."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string"},
-            },
-            "required": ["name"],
-        },
-        "func": delete_skill,
-    },
-    {
-        "name": "save_memory",
-        "description": "Save or update a memory entry in a book. "
-        "Use this when you learn something worth remembering across conversations: "
-        "user preferences, corrections, project context, external resource pointers, "
-        "or character profiles in group chat.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Unique entry id (e.g. user_zhangsan, rule_no_mock)."},
-                "book": {"type": "string", "description": "Book name (file grouping). Default 'default'. Use e.g. 'people' for character profiles, 'rules' for behavioral rules."},
-                "content": {"type": "string", "description": "Memory content text."},
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "upsert", "delete"],
+                    "description": "Operation: 'list' (default), 'upsert' (create/update), or 'delete'. Changes are never inferred from other fields.",
+                },
+                "id": {"type": "string", "description": "[upsert/delete/list] Unique entry id (e.g. user_zhangsan, rule_no_mock). In 'list' mode, specifying id returns full untruncated content."},
+                "book": {"type": "string", "description": "Book name (file grouping). Default 'default' (or all books in 'list' mode when omitted). Use e.g. 'people', 'rules'."},
+                "content": {"type": "string", "description": "[upsert] Memory content text. Must be concise, high-density, and free of filler/padding (文字需简明扼要，不啰嗦不水字数)."},
                 "keywords": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Activation keywords. Supports /regex/flags. When any keyword matches user input, this memory is injected into context.",
+                    "description": "[upsert] Activation keywords. Supports /regex/flags. When any keyword matches user input, this memory is injected into context.",
                 },
-                "constant": {"type": "boolean", "description": "If true, always injected regardless of keywords. Default false."},
-                "enabled": {"type": "boolean", "description": "Whether this entry is active. Default true."},
-                "priority": {"type": "integer", "description": "Budget priority; higher = kept first when budget exceeded."},
-                "scan_depth": {"type": "integer", "description": "Number of recent conversation rounds to scan for keywords. 0 = current message only."},
-                "scope": {"type": "string", "enum": ["workspace", "node"], "description": "Storage scope. 'workspace' (default): saved under the active workspace, isolated per-project. 'node': saved at node level, shared across all workspaces."},
+                "constant": {"type": "boolean", "description": "[upsert] If true, always injected regardless of keywords. Default false."},
+                "enabled": {"type": "boolean", "description": "[upsert] Whether this entry is active. Default true."},
+                "priority": {"type": "integer", "description": "[upsert] Budget priority; higher = kept first when budget exceeded."},
+                "scan_depth": {"type": "integer", "description": "[upsert] Number of recent conversation rounds to scan for keywords. 0 = current message only."},
+                "scope": {"type": "string", "enum": ["workspace", "node"], "description": "[upsert] Storage scope. 'workspace' (default): saved under the active workspace. 'node': shared across all workspaces."},
+                "node_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "[upsert] Optional list of node IDs allowed to see this memory entry (omit for all nodes in the namespace).",
+                },
             },
-            "required": ["id", "content"],
+            "required": ["action"],
         },
-        "func": save_memory,
-    },
-    {
-        "name": "list_memories",
-        "description": "List memory entries (node-level and workspace-scoped), optionally filtered by book name. Each entry carries scope/workspace fields indicating where it is stored.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "book": {"type": "string", "description": "Filter by book name. Omit to list all."},
-            },
-            "required": [],
-        },
-        "func": list_memories,
-    },
-    {
-        "name": "delete_memory",
-        "description": "Delete a memory entry from a book. Lookup order mirrors save_memory's default landing spot: current workspace first, then node level, then root.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Memory entry id to delete."},
-                "book": {"type": "string", "description": "Book name. Default 'default'."},
-            },
-            "required": ["id"],
-        },
-        "func": delete_memory,
+        "func": manage_memory,
     },
 ]
 
@@ -2423,7 +2796,7 @@ def _register_admin_routes(routes: Any) -> None:
         static_router(Path(__file__).parent / "web"),
         prefix="/web",
     )
-    routes.register(client, public=True, description="knowledge_inject 设置面板静态资源")
+    routes.register(client, description="knowledge_inject 设置面板静态资源（短期面板认证）")
 
 
 class KnowledgeInjector:
@@ -2441,8 +2814,6 @@ class KnowledgeInjector:
     priority = 50
 
     def __init__(self, ctx: Any = None) -> None:
-        self._cache_key: tuple | None = None
-        self._cache_val: tuple | None = None
         sections = ctx.contributions.get("prompt_sections") if ctx is not None else None
         if sections is not None:
             # Why: order 50 keeps knowledge content ahead of later sections. How:
@@ -2459,28 +2830,28 @@ class KnowledgeInjector:
             logger.warning("knowledge_inject: neither prompt_sections nor routes face mounted; plugin inactive")
 
     def _compute(self, sctx: Any) -> tuple | None:
-        """Run the unified pipeline once per turn, cached by turn fingerprint."""
+        """Share one pipeline result between renders of the same prompt context."""
         if sctx.node is None:
             return None
-        key = (
-            str(sctx.workspace_root),
-            sctx.node.id,
-            sctx.instruction,
-            id(sctx.history),
-            len(sctx.history),
-        )
-        if self._cache_key == key and self._cache_val is not None:
-            return self._cache_val
+        active_injected = collect_active_injected_hashes(sctx.history)
+        instruction = sctx.instruction
+        inbound = sctx.extra.get("inbound_message")
+        if isinstance(inbound, dict) and not conversational_history([inbound]):
+            instruction = ""
+        key = (instruction, len(sctx.history or ()), tuple(sorted(active_injected.items())))
+        cached = sctx.extra.get("knowledge_result")
+        if cached is not None and cached[0] == key:
+            return cached[1]
         result = build_knowledge_context(
             sctx.workspace_root,
             sctx.node,
-            sctx.instruction,
+            instruction,
             conversational_history(sctx.history),
             sctx.runtime_cfg,
-            task_context={"workspace_name": sctx.workspace_name},
+            task_context={**(sctx.task_context or {}), "workspace_name": sctx.workspace_name},
+            active_injected=active_injected,
         )
-        self._cache_key = key
-        self._cache_val = result
+        sctx.extra["knowledge_result"] = (key, result)
         return result
 
     def render_static(self, sctx: Any) -> list[dict[str, Any]] | None:
@@ -2492,14 +2863,14 @@ class KnowledgeInjector:
         msgs = [m for m in (*skill_static, *memory_static) if m.get("content")]
         return msgs or None
 
-    def render_dynamic(self, sctx: Any) -> list[str] | None:
-        """Contribute skill/memory active and index blocks as dynamic text parts."""
+    def render_dynamic(self, sctx: Any) -> list[dict[str, Any]] | None:
+        """Contribute skill/memory active blocks with their per-entry ``_injected_hashes``."""
         result = self._compute(sctx)
         if result is None:
             return None
         _skill_static, skill_dynamic, _memory_static, memory_dynamic = result
-        parts = [str(m["content"]) for m in (*skill_dynamic, *memory_dynamic) if m.get("content")]
-        return parts or None
+        items = [dict(m) for m in (*skill_dynamic, *memory_dynamic) if m.get("content")]
+        return items or None
 
     # [AutoC 2026-08-28] Dream memory router hook delegate.
     # Registered as ("before_tool_call", "_dream_route") in PLUGIN_META.

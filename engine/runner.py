@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import os
 import signal
 import uuid
@@ -30,23 +31,26 @@ from toolbox.registry import ToolRegistry
 from .inference import run_ai_node
 from .attachments import build_multimodal_content
 from .context import RunContext
-from .model import resolve_provider
+from .model import _current_sticky_sid_var, resolve_provider, wrap_http_with_sticky_session
 from .context_store import load_context_snapshot
-from .inference.tool_format import sanitize_control_tool_history
+from providers.tool_format import sanitize_control_tool_history
 
-from .node import Node, load_node
+from .node import Node, load_node, node_file_candidates
 from engine.faces import nodes as _plugin_nodes
 from .protocol import TaskAction
 # [2026-04-17] write_artifact 移除：截断机制已废弃
 from .tool_step import result_to_raw
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
 # 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
-from .conversation_store import ConversationStore, Message, MessageType
+from .conversation_store import ConversationStore, Message, MessageType, is_dynamic_context
 # Phase 0/1: Signal System — 导入信号总线初始化和桥接函数。
 # 在 _run_node_task 中初始化 bus 并安装 EventLog 桥接，使 LLM 调用信号
 # 自动转发到 data/signals.jsonl 供监控使用。
 from engine.signals import get_bus
 from engine.signals.bridge import install_event_bridge
+
+
+logger = logging.getLogger(__name__)
 
 
 def _provider_init_kwargs(
@@ -69,12 +73,22 @@ def _provider_init_kwargs(
         env_prefix = provider_name.upper().replace("-", "_")
         resolved_api_key = rp.api_key or os.environ.get(f"{env_prefix}_API_KEY", "") or api_key
         resolved_base_url = rp.base_url or os.environ.get(f"{env_prefix}_BASE_URL", "") or None
+    defaults = getattr(rp, "provider_defaults", None) or {}
+    effective_options = _merge_provider_options(defaults, provider_options)
+    effective_options = _merge_provider_options(effective_options, getattr(rp, "provider_options", None) or {})
+    sticky_config = effective_options.get("sticky_session")
+    if sticky_config is None:
+        sticky_config = defaults.get("sticky_session")
+    sticky_id = str(effective_options.get("_sticky_session_id") or _current_sticky_sid_var.get() or "").strip()
+    # Preserve production's model-scoped routing for these requests.
+    if sticky_id.startswith("child_") or rp.model == "gemini-3.8-flash":
+        sticky_id = f"node:{rp.model}"
     return {
-        "http": llm_http,
+        "http": wrap_http_with_sticky_session(llm_http, sticky_config, sticky_id),
         "api_key": resolved_api_key,
         "base_url": resolved_base_url,
         "model": rp.model,
-        "provider_options": provider_options,
+        "provider_options": effective_options,
     }
 
 
@@ -98,8 +112,8 @@ def _merge_provider_options(global_options: dict[str, Any], node_options: dict[s
 def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> Any:
     """Instantiate a provider, passing only kwargs its constructor accepts."""
     # [provider-registry 2026-05-03] Provider 构造函数目前不完全一致。
-    # 原因：OpenAI 不接收 provider_options，而其他 provider 需要；做法：用签名过滤 kwargs，
-    # 若未来插件声明 **kwargs 则传入完整超集；目的：不强迫 Phase 1 改写所有 provider 构造函数。
+    # 按构造签名传入已支持的参数，包括内置渠道的 provider_options。
+    # 声明 **kwargs 的扩展接收完整参数，不要求所有插件采用相同构造函数。
     signature = inspect.signature(provider_cls)
     parameters = signature.parameters
     if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
@@ -125,13 +139,8 @@ def _create_provider_from_registry(
     provider_cls = provider_registry.get(requested_name)
     provider_name = requested_name
     if provider_cls is None:
-        # [provider-registry 2026-05-03] 未注册 provider 保持旧行为：回退到 OpenAI。
-        # 原因：过去未知 provider 会落入默认 OpenAI 分支；做法：registry miss 时取 openai；
-        # 目的：配置错误不改变历史降级语义。
-        provider_cls = provider_registry.get("openai")
-        provider_name = "openai"
-    if provider_cls is None:
-        raise RuntimeError("provider registry did not register the fallback 'openai' provider")
+        # This also validates global and session overrides that bypass node parsing.
+        raise ValueError(f"Unknown provider '{requested_name}'. Available: {provider_registry.list()}")
     init_kwargs = _provider_init_kwargs(
         rp,
         provider_name=provider_name,
@@ -153,26 +162,22 @@ def _fallback_node_info(node_id: str) -> dict[str, str]:
 
 def _node_info_path_and_mtime(workspace_root: Path, node_id: str) -> tuple[Path | None, int]:
     """Resolve the node YAML path and return its mtime using os.stat."""
-    # [2026-05-04] Keep the same lookup order as load_node while avoiding a full
-    # load_node parse on every task. Why: delegate metadata is needed for tool
-    # descriptions, but parsing all target YAML files at task startup is wasteful.
-    # How: stat the system-node path first, then the user-node path, returning the
-    # first existing YAML file and its mtime. Purpose: unchanged YAML files can be
-    # served from the module cache, while hot edits still take effect immediately.
-    candidates = [
-        workspace_root / "engine" / "system_nodes" / f"{node_id}.yaml",
-        workspace_root / "config" / "nodes" / f"{node_id}.yaml",
-    ]
-    for path in candidates:
+    if _plugin_nodes.declared_node(node_id) is not None:
+        source = _plugin_nodes.declared_node_path(node_id)
+        if source:
+            try:
+                return Path(source), int(os.stat(source).st_mtime_ns)
+            except OSError:
+                pass
+        return None, -1
+    # Share load_node's file precedence; path and nanosecond mtime invalidate
+    # the cache when an override appears, changes, or is removed.
+    for path in node_file_candidates(workspace_root, node_id):
         try:
-            stat_result = os.stat(path)
+            if path.is_file():
+                return path, int(path.stat().st_mtime_ns)
         except OSError:
             continue
-        # [2026-05-04] Store nanosecond mtime from os.stat. Why: YAML edits can
-        # happen close together during development. How: use st_mtime_ns instead
-        # of the rounded float mtime. Purpose: make hot edits invalidate the cache
-        # as soon as the filesystem reports a change.
-        return path, int(stat_result.st_mtime_ns)
     return None, -1
 
 
@@ -250,12 +255,8 @@ def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[s
 
 def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> list[dict[str, str]]:
     """发现可切换的根节点（不被任何其他节点 delegate_targets 引用的节点），排除当前节点。"""
-    # 系统节点目录分离：扫描 engine/system_nodes/ 和 config/nodes/ 两个目录，
-    # 合并结果，engine 内建目录优先（同 id 跳过后扫到的）。
-    nodes_dirs = [
-        workspace_root / "engine" / "system_nodes",
-        workspace_root / "config" / "nodes",
-    ]
+    # System nodes are plugin declarations, not switchable user entry points.
+    nodes_dirs = [workspace_root / "config" / "nodes"]
     # [AutoC 2026-08-30] entries keyed by id so plugin declarations can replace
     # file-sourced nodes wholesale (override semantics); targets are recomputed
     # from the final set because an override may change delegate_targets.
@@ -266,14 +267,22 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
         for f in sorted(nodes_dir.iterdir()):
             if f.suffix not in (".yaml", ".yml") or f.name.startswith("_"):
                 continue
-            n = load_node(workspace_root, f.stem)
+            nid = f.stem.removesuffix(".local")
+            try:
+                n = load_node(workspace_root, nid)
+            except (ValueError, TypeError) as exc:
+                logger.warning("Skipping invalid switchable node %r: %s", nid, exc)
+                continue
             if n is None or n.type != "ai" or n.id in entries:
                 continue
+            controls = n.control_tools
+            can_switch = controls in (None, "all") or (isinstance(controls, list) and "switch_node" in controls)
             entries[n.id] = {
                 "id": n.id,
                 "name": n.name,
                 "description": n.description or n.name,
                 "targets": set(n.delegate_targets),
+                "switchable": not n.id.startswith("system.") and n.extra.get("switchable", True) is not False and can_switch,
             }
     # 插件声明节点并入：同 id 覆盖文件来源（Paradox 语义）。
     for decl_entry in _plugin_nodes.iter_declared_nodes():
@@ -290,15 +299,18 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
             for x in (raw_targets if isinstance(raw_targets, list) else [])
             if isinstance(x, str) and x.strip()
         }
+        controls = data.get("control_tools", "all")
+        can_switch = controls in (None, "all") or (isinstance(controls, list) and "switch_node" in controls)
         entries[nid] = {
             "id": nid,
             "name": name,
             "description": str(data.get("description") or "").strip() or name,
             "targets": targets,
+            "switchable": not nid.startswith("system.") and data.get("switchable", True) is not False and can_switch,
         }
     all_nodes: list[dict[str, Any]] = [
         {"id": e["id"], "name": e["name"], "description": e["description"]}
-        for e in entries.values()
+        for e in entries.values() if e["switchable"]
     ]
     all_targets: set[str] = set()
     for e in entries.values():
@@ -345,6 +357,50 @@ def _find_pseudo_history_marker(content: str) -> tuple[str, int]:
     return tail[:separator_pos], pos
 
 
+_ATTACHED_IMAGES_MARK = "\n[Attached images: "
+
+
+def _wrap_dispatch_result_text(text: str, *, message_type: str, source: str = "", task_id: str = "") -> str:
+    """Use identical callback framing on fresh input and history replay."""
+    meta: dict[str, Any] = {}
+    if source:
+        meta["source"] = source
+    if task_id:
+        meta["task_id"] = task_id
+    kind = "async_tool" if message_type == "async_tool_result" else "dispatch"
+    return (
+        f'<dispatch_result kind="{kind}">\n'
+        + json.dumps(meta, ensure_ascii=False)
+        + "\n" + text + "\n</dispatch_result>"
+    )
+
+
+def _wrap_stored_inbound_callback(content: Any, *, message_type: str, meta: dict[str, Any]) -> Any:
+    """Frame raw callback rows without modifying stored text or image blocks."""
+    if message_type not in ("dispatch_result", "async_tool_result"):
+        return content
+    source = str(meta.get("child_node_id") or "").strip()
+    task_id = str(meta.get("child_task_id") or "").strip()
+    if isinstance(content, str):
+        if content.lstrip().startswith("<dispatch_result"):
+            return content
+        return _wrap_dispatch_result_text(content, message_type=message_type, source=source, task_id=task_id)
+    if isinstance(content, list) and content and isinstance(content[0], dict) and content[0].get("type") == "text":
+        text = str(content[0].get("text") or "")
+        if text.lstrip().startswith("<dispatch_result"):
+            return content
+        # ponytail: attachment annotation is the final bracketed suffix; use explicit
+        # attachment metadata if arbitrary callback bodies need to mimic that suffix.
+        cut = text.rfind(_ATTACHED_IMAGES_MARK)
+        body, suffix = (text[:cut], text[cut:]) if cut >= 0 and text.endswith("]") else (text, "")
+        first = dict(content[0])
+        first["text"] = _wrap_dispatch_result_text(
+            body, message_type=message_type, source=source, task_id=task_id,
+        ) + suffix
+        return [first, *content[1:]]
+    return content
+
+
 def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict[str, Any]:
     """将 ConversationStore 的 Message 转为 runner 期望的 history dict 格式。
 
@@ -355,20 +411,28 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     # ConversationStore.update_message and persist the reject result.
     # How: carry id through the history dict. Purpose: ai_step can
     # locate and update the original finish "ok" row in JSONL.
-    d: dict[str, Any] = {"role": msg.role, "content": msg.content}
+    d: dict[str, Any] = {
+        "role": msg.role,
+        "content": _wrap_stored_inbound_callback(
+            msg.content, message_type=msg.message_type,
+            meta=msg.meta if isinstance(msg.meta, dict) else {},
+        ),
+    }
+    if is_dynamic_context(msg):
+        d["_dynamic"] = True
+        if (msg.meta or {}).get("_workspace_context"):
+            d["_workspace_context"] = True
     if msg.id:
         d["id"] = msg.id
-    # [AutoC 2026-06-01] Why: stripping every historical image made later LLM
-    # steps in the same task lose the user's image input. How: keep multimodal
-    # list content when source_task_id matches the active task, but preserve the
-    # old all-strip behavior for callers that do not pass current_task_id. Purpose:
-    # task-local history keeps locked user input while cross-task history stays
-    # compact and safe against stale file:// attachment references.
-    msg_task_id = str(msg.source_task_id or "")
-    if isinstance(d["content"], list) and (not current_task_id or msg_task_id != current_task_id):
-        d["content"] = _strip_images_from_content(d["content"])
-    _meta = dict(msg.meta) if msg.meta else {}
-    # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
+    # Preserve multimodal history across tasks: stripping old images changes
+    # the request prefix and prevents the provider from reusing its cache.
+    _meta = dict(msg.meta) if isinstance(msg.meta, dict) else {}
+    if msg.message_type:
+        d["message_type"] = msg.message_type
+        _meta.setdefault("message_type", msg.message_type)
+    if msg.created_at and not _meta.get("timestamp"):
+        _meta["timestamp"] = msg.created_at
+    # Preserve task attribution for segment-based compaction.
     if msg.source_task_id:
         _meta["source_task_id"] = msg.source_task_id
     if _meta:
@@ -442,45 +506,6 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
     return result[:-1]
 
 
-def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
-    """Strip image_url parts from multimodal content, return plain text with references.
-
-    Historical images should not be re-sent every turn as base64 (expensive and redundant).
-    Current turn's images are passed separately via the attachments mechanism.
-    """
-    text_parts: list[str] = []
-    image_refs: list[str] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        if part.get("type") == "image_url":
-            url = ""
-            image_url = part.get("image_url")
-            if isinstance(image_url, dict):
-                url = str(image_url.get("url", ""))
-            elif isinstance(image_url, str):
-                url = image_url
-
-            # Why: the old generic marker hid the saved attachment path, so later
-            # tasks could not reopen historical images. How: keep file:// paths as
-            # lightweight text references while replacing non-file payloads with an
-            # inline marker. Purpose: avoid re-sending image bytes but preserve a
-            # read_file-compatible path when one exists.
-            if url.startswith("file://"):
-                image_refs.append(f"[图片: {url[7:]}]")
-            else:
-                image_refs.append("[图片: <inline>]")
-        elif part.get("type") == "text":
-            t = str(part.get("text", "")).strip()
-            if t:
-                text_parts.append(t)
-    text = "\n".join(text_parts)
-    if image_refs:
-        refs = "\n".join(image_refs)
-        text = f"{text}\n{refs}" if text else refs
-    return text
-
-
 async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, Any]]:
     try:
         r = await rctx.http.get(
@@ -496,10 +521,7 @@ async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, An
                         continue
                     content = m.get("content", "")
                     if isinstance(content, list):
-                        # Strip image_url parts from historical messages to avoid
-                        # re-encoding large base64 images on every turn.
-                        # Current turn's images are passed separately via attachments.
-                        entry: dict[str, Any] = {"role": str(m.get("role")), "content": _strip_images_from_content(content)}
+                        entry: dict[str, Any] = {"role": str(m.get("role")), "content": content}
                     else:
                         entry = {"role": str(m.get("role")), "content": str(content)}
                     # Preserve message_type for downstream keyword scan filtering
@@ -674,6 +696,8 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
 
         print(f"[engine] worker {wid[:8]} ready (max_concurrent={max_workers})", flush=True)
         _active: set[asyncio.Task] = set()
+        from .runtime_metrics import WorkerMetrics
+        metrics = WorkerMetrics(workspace_root, wid, generation_id, runtime_cfg)
 
         while not stop_event.is_set():
             try:
@@ -685,6 +709,9 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                         if _exc:
                             print(f"[engine] task error: {_exc}", flush=True)
                 _active -= _done
+                metrics.reaped += len(_done)
+                _done.clear()
+                metrics.sample(_active, registry)
 
                 # ---- tools hot-reload check ----
                 try:
@@ -716,6 +743,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                                 _handle_task(http, llm_http, supervisor_url, workspace_root, registry, item, wid)
                             )
                             _active.add(_t)
+                            metrics.claimed += 1
                             continue
 
                 # [AutoC 2026-09-02] 异步工具取消消费：supervisor 的待消费队列
@@ -734,6 +762,8 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                             print(f"[engine] async tool {_aid} cancel requested", flush=True)
                 except Exception:
                     pass
+            except asyncio.CancelledError:
+                stop_event.set()
             except Exception as e:
                 print(f"[engine] error: {e}", flush=True)
             # Stop-aware sleep: wake immediately on stop signal
@@ -741,14 +771,18 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                 await asyncio.wait_for(stop_event.wait(), timeout=poll_sec)
             except asyncio.TimeoutError:
                 pass
+            except asyncio.CancelledError:
+                stop_event.set()
 
-        # ---- Direction 1: graceful shutdown — cancel active tasks and write terminal states ----
-        if _active:
-            print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)
-            for t in _active:
-                t.cancel()
-            # Wait for tasks to handle CancelledError and POST terminal state
-            await asyncio.wait(_active, timeout=15.0)
+        # Follow production's bounded task cancellation; release diagnostics last.
+        try:
+            if _active:
+                print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)
+                for task in _active:
+                    task.cancel()
+                await asyncio.wait(_active, timeout=15.0)
+        finally:
+            metrics.close()
         print(f"[engine] worker {wid[:8]} stopped (generation {generation_id[:8]})", flush=True)
 
 
@@ -787,13 +821,13 @@ async def _handle_task(
     task_id = str(item.get("task_id") or "").strip()
     kind = str(item.get("kind") or "").strip()
     session_id = str(item.get("session_id") or "").strip()
-    session_generation = int(item.get("session_generation") or 0)
-
-    cfg_raw = await fetch_llm_secret(http, sup_url)
-    api_key, base_url, default_model = normalize_llm_secret(cfg_raw)
-
-    _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id))
+    _hb: asyncio.Task | None = None
+    sticky_token = _current_sticky_sid_var.set("")
     try:
+        session_generation = int(item.get("session_generation") or 0)
+        _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id))
+        cfg_raw = await fetch_llm_secret(http, sup_url)
+        api_key, base_url, default_model = normalize_llm_secret(cfg_raw)
         if kind == "node":
             result = await _run_node_task(
                 http=http, llm_http=llm_http, sup_url=sup_url, ws_root=ws_root,
@@ -820,8 +854,12 @@ async def _handle_task(
         print(f"[engine] task {task_id} crashed: {exc}", flush=True)
         _tb.print_exc()
         result = {"action": "fail", "node_id": str(item.get("node_id") or ""), "error": f"引擎内部错误: {exc}"}
+    finally:
+        _current_sticky_sid_var.reset(sticky_token)
 
-    _hb.cancel()
+    if _hb is not None:
+        _hb.cancel()
+        await asyncio.gather(_hb, return_exceptions=True)
     # 重试 complete_task POST，防止因网络/超时导致 task 永久孤立
     try:
         for _complete_attempt in range(3):
@@ -875,7 +913,7 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     bridges that gap so system nodes (turn_summarizer, compactor, etc.)
     correctly suppress switch_node injection.
     """
-    ctx = input_data.get("task_context") if isinstance(input_data.get("task_context"), dict) else {}
+    ctx = dict(input_data["task_context"]) if isinstance(input_data.get("task_context"), dict) else {}
     if input_data.get("_system_task"):
         ctx["is_system_task"] = True
     # [AutoC 2026-08-28] Forward _memory_route from input_data to task_context
@@ -892,6 +930,13 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     _mrws = input_data.get("_memory_route_ws")
     if isinstance(_mrws, str) and _mrws:
         ctx["_memory_route_ws"] = _mrws
+    origin = input_data.get("_dispatch_origin")
+    if isinstance(origin, dict) and origin:
+        ctx["dispatch_origin"] = dict(origin)
+    if input_data.get("_output_chain"):
+        ctx["_output_chain"] = True
+    if input_data.get("caller_task_id"):
+        ctx["caller_task_id"] = str(input_data["caller_task_id"])
     return ctx
 
 
@@ -939,6 +984,8 @@ async def _run_node_task(
         source_inbound_seq=int(source_inbound_seq) if source_inbound_seq is not None else None,
         task_context=_build_task_context(input_data),
     )
+    if task.get("caller_task_id"):
+        rctx.task_context["caller_task_id"] = str(task["caller_task_id"])
     # [AutoC 2026-08-10] Why: apply the durable session workspace after RunContext
     # creation. How: fetch {name, path} from supervisor and resolve into
     # workspace/workspace_name, defaulting to workspace_root when path is absent
@@ -999,20 +1046,15 @@ async def _run_node_task(
         # ---- Child Session 模式（新路径）----
         rctx.child_session_id = child_session_id
 
-        if context_mode == "fork" and fork_from and not is_resume:
+        if context_mode == "fork" and fork_from and not is_resume and not _conv_store.load(child_session_id):
             # fork: 先从父 session 复制历史到子 session
             _conv_store.fork(fork_from, child_session_id)
 
-        if not is_resume:
-            # 从子 session 的 JSONL 加载历史，过滤 system 消息（子节点重建自己的 system prompt）
-            stored = _conv_store.load(child_session_id)
-            history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
-            # [2026-05-07] 子会话恢复时先清理 finish 控制流历史。
-            # 原因：system.compactor 等 child session 可能已有旧 finish tool_call/tool_result 污染。
-            # 做法：在进入提示组装前去掉控制流配对，再保留旧 fake-native 尾部兼容清理。
-            # 目的：父会话不会回放子任务 finish 伪工具。
-            history = sanitize_control_tool_history(history)
-            history = _strip_trailing_pseudo_call(history)
+        # Resume must reload the child's own durable history, not its parent's snapshot.
+        stored = _conv_store.load(child_session_id)
+        history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
+        history = sanitize_control_tool_history(history)
+        history = _strip_trailing_pseudo_call(history)
         # child session 模式不使用 context_ref（让 ai_step 重建 system prompt）
         context_ref = ""
     elif _main_conv_enabled:
@@ -1033,15 +1075,6 @@ async def _run_node_task(
             # 目的：主会话与子会话的历史恢复语义一致。
             history = sanitize_control_tool_history(history)
             history = _strip_trailing_pseudo_call(history)
-            # 仅新 inbound（非 resume）需要 pop 尾部重复 instruction：
-            # shadow_write 会在本轮再次写入 user 消息，若 JSONL 里上一条就是本轮 instruction，
-            # 则要 pop 掉，避免 assemble_initial_messages 再次追加造成重复。
-            if not is_resume:
-                _cur_instr = str(input_data.get("instruction") or "").strip()
-                if _cur_instr and history and history[-1].get("role") == "user":
-                    _last_content = history[-1].get("content", "")
-                    if isinstance(_last_content, str) and _last_content.strip() == _cur_instr:
-                        history.pop()
         context_ref = ""  # 走 ai_step 的 assemble_initial_messages 重建系统提示
     elif context_ref and not is_resume:
         # ====== 旧路径（兼容期保留）：从 snapshot 加载 ======
@@ -1084,6 +1117,12 @@ async def _run_node_task(
         # when present — child sessions carry no provider_override.
         _override_sid = child_session_id or session_id
         session_provider_override = await _fetch_session_provider_override(http, sup_url, _override_sid)
+        dispatch_origin = input_data.get("_dispatch_origin")
+        dispatch_origin = dispatch_origin if isinstance(dispatch_origin, dict) else {}
+        if not session_provider_override and dispatch_origin.get("context_mode") == "fork" and dispatch_origin.get("parent_session_id"):
+            session_provider_override = await _fetch_session_provider_override(
+                http, sup_url, str(dispatch_origin["parent_session_id"]).strip(),
+            )
         # [2026-06-07] Why: resolve_provider needs all provider sections from config.yaml
         # to look up the default model for a non-global provider (e.g. openai-responses).
         # How: load config.yaml and extract provider blocks (dicts with base_url/model/api_key).
@@ -1113,11 +1152,30 @@ async def _run_node_task(
         node_provider_options = getattr(node, "provider_options", {}) or {}
         if not isinstance(node_provider_options, dict):
             node_provider_options = {}
-        _po = _merge_provider_options(global_provider_options, node_provider_options)
-        # [AutoC 2026-06-01] Why: runtime.yaml now supports provider-wide options, but
-        # node YAML must remain the most specific layer. How: read
-        # providers.<provider_type>.options and merge it with node.provider_options.
-        # Purpose: providers receive global defaults unless a node overrides them.
+        # Model defaults override runtime defaults, never explicit node options.
+        # Sticky config is a lower-priority transport fallback: explicit runtime,
+        # node and session settings must still be able to disable it.
+        _po = _merge_provider_options(global_provider_options, {
+            key: value for key, value in rp.provider_defaults.items() if key != "sticky_session"
+        })
+        _po = _merge_provider_options(_po, node_provider_options)
+        context_mode = str(input_data.get("context_mode") or "").strip()
+        if input_data.get("_system_task") or node.id.startswith("system."):
+            sticky_id = f"node:{node.id}"
+        elif child_session_id:
+            if node.persistent or context_mode == "accumulate":
+                parent_id = parent_session_id or session_id
+                context_key = str(input_data.get("_context_key") or "").strip()
+                sticky_id = f"{parent_id}:{node.id}:{context_key}" if not parent_id.startswith("branch_") else child_session_id
+            else:
+                sticky_id = f"node:{node.id}"
+        else:
+            sticky_id = parent_session_id or session_id
+        if dispatch_origin.get("context_mode") == "fork":
+            sticky_id = str(dispatch_origin.get("parent_sticky_session_id") or dispatch_origin.get("parent_session_id") or sticky_id).strip()
+        rctx.sticky_session_id = sticky_id
+        _po["_sticky_session_id"] = sticky_id
+        _current_sticky_sid_var.set(sticky_id)
         #
         # [provider-registry 2026-05-03] Provider 创建改为 registry 查找。
         # 原因：旧 if-elif 每新增 provider 都要改 runner；做法：按 rp.provider_type 找类并传统一 kwargs；
@@ -1163,7 +1221,7 @@ async def _run_node_task(
     # 会破坏对话顺序并复发图片附件。旧 snapshot 路径下此 case 通过 snapshot.messages
     # 直接回放解决，新路径下需要在这里把 instruction 和 attachments 清空。
     # message_assembly.py 同步改为 instruction 为空且无 attachments 时不追加末尾消息。
-    if _main_conv_enabled and not child_session_id and is_resume:
+    if is_resume and (child_session_id or _main_conv_enabled):
         instruction = ""
         input_attachments = None
 
@@ -1204,12 +1262,28 @@ async def _run_node_task(
     if _should_write_user_input and _conv_store and not is_resume:
         from datetime import datetime, timezone
         _target_sid = child_session_id or session_id
+        # A task's initial inbound is immutable across crash retries. Use its
+        # ownership, not text/attachment equality; never discard preempt inputs
+        # or a tail owned by another task. Inspect disk even with use_context=False.
+        _rows = _conv_store.load(_target_sid)
+        _tail = len(_rows) - 1
+        while _tail >= 0 and is_dynamic_context(_rows[_tail]) and _rows[_tail].source_task_id == task_id:
+            _tail -= 1
+        if _tail >= 0:
+            _row = _rows[_tail]
+            if (
+                task_id and _row.source_task_id == task_id and _row.role == "user"
+                and _row.message_type in ("", MessageType.USER_INPUT, "dispatch_result", "async_tool_result")
+                and not (_row.meta or {}).get("preempt")
+            ):
+                _dropped_ids = {row.id for row in _rows[_tail:] if row.id}
+                _conv_store.remove_messages(_target_sid, _dropped_ids)
+                history = [m for m in history if m.get("id") not in _dropped_ids]
         # [AutoC 2026-06-01] Why: persisting only plain instruction text lost
         # image attachments before the next step could reload ConversationStore.
         # How: when attachments are present, build the same multimodal content
-        # that message assembly sends to the provider; otherwise keep the legacy
-        # string content. Purpose: user image input remains available inside the
-        # current task and can still be stripped when another task reloads it.
+        # that message assembly sends to the provider; otherwise keep plain text.
+        # Images remain available when later tasks restore the same history.
         if input_attachments:
             _user_content = build_multimodal_content(instruction, input_attachments, workspace_root=ws_root)
         else:
@@ -1248,16 +1322,17 @@ async def _run_node_task(
             source_task_id=task_id,
         )
         _conv_store.append(_target_sid, _user_msg)
+        rctx.inbound_message_id = _user_msg.id
+        rctx.inbound_message = _message_to_history_dict(_user_msg, current_task_id=task_id)
 
-    if _inbound_message_type == "dispatch_result":
-        # [AutoC 2026-06-04] Why: the model still needs context that this inbound came
-        # from an async child task, but that presentation must not be persisted in
-        # ConversationStore. How: prepend an English, LLM-only wrapper after the raw
-        # callback row has been stored. Purpose: storage remains pure while the caller
-        # node receives an actionable instruction.
-        _prefix_parts = [f"[Async task completed] Node {_inbound_node_id or 'unknown'} finished."]
-        _prefix_parts.append(f"Result:\n{instruction}")
-        instruction = "\n".join(_prefix_parts)
+    if not is_resume and _inbound_message_type in ("dispatch_result", "async_tool_result"):
+        # Label system-delivered results only after persisting the raw inbound.
+        # Resumes reuse history and must not append another callback message.
+        # The two callback routes use the same wrapper, distinguished by kind.
+        instruction = _wrap_dispatch_result_text(
+            instruction, message_type=_inbound_message_type,
+            source=_inbound_node_id, task_id=_inbound_child_task_id,
+        )
 
     # Phase 0/1: Signal System — 初始化信号总线并安装 JSONL 桥接。
     # get_bus() 返回全局单例，install_event_bridge 是幂等的（多次调用只注册一次）。
@@ -1354,6 +1429,9 @@ async def _run_node_task(
         print(f"[engine] Failed to write task record: {_tr_err}", flush=True)
 
     _result = action.to_dict()
+    # Keep provenance outside result: output-chain model input receives only the answer.
+    if rctx.response_info and action.action in ("finish", "ask"):
+        _result["response_info"] = dict(rctx.response_info)
     # [AutoC 2026-06-09] Why: when a task is suspended (output chain) and
     # later resumed, the engine creates a fresh RunContext with empty
     # tool_call_log/total_usage. How: persist runtime state in the result
@@ -1373,9 +1451,12 @@ async def _run_node_task(
     # 轮摘要节点化：传递 _tool_call_count 和 _total_tokens 给 supervisor 做门控判断
     _result["_tool_call_count"] = _tool_call_count
     _result["_total_tokens"] = _total_tokens
-    # P3 记忆提取互斥：传递本轮使用的工具名列表，供 supervisor 判断是否跳过提取
+    # Forward canonical actions for memory-extraction mutual exclusion.
     if rctx.tool_call_log:
-        _result["_tool_names"] = list(set(tc["name"] for tc in rctx.tool_call_log))
+        _result["_tool_actions"] = [
+            {"name": tc["name"], "action": tc["action"]}
+            for tc in rctx.tool_call_log if tc.get("name") and tc.get("action")
+        ]
     return _result
 
 

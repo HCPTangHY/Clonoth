@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
 from engine.compact import (
     count_real_task_segments,
+    invalidate_stale_usage,
     is_compact_circuit_open,
-    microcompact_messages,
+    is_snipped_message,
     record_compact_failure,
     should_compact,
 )
@@ -35,13 +35,10 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
 
         prompt_tokens          # 历史+上轮内容，含上轮动态（真实）
         + completion_tokens    # 上轮输出，本轮成为历史（真实）
-        + tail chars//3        # 上轮末尾新增（finish 结果等）与新 user（估算）
+        + tail chars//2        # 新 user、工具结果与增量动态上下文（估算）
 
-    This turn's dynamic injection is deliberately NOT counted: the stale
-    previous-turn dynamic still sits inside the real prompt_tokens, and the
-    two renders are near-identical between turns, so the residual phantom
-    stands in for the new one. Net error is only the turn-to-turn delta of
-    the dynamic content, not its full size.
+    Historical dynamic rows are already included in measured prompt_tokens.
+    New dynamic rows in the tail are additional tokens and must be counted.
     Purpose: the first before_step check of a task sees real usage and can
     compact before the first LLM request goes out.
     """
@@ -50,7 +47,7 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         usage = (msg.get("_meta") or {}).get("usage")
-        if not isinstance(usage, dict):
+        if not isinstance(usage, dict) or usage.get("_compacted_stale"):
             continue
         pt = usage.get("prompt_tokens")
         if isinstance(pt, bool) or not isinstance(pt, (int, float)) or pt <= 0:
@@ -62,9 +59,6 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
         for tail in messages[i + 1:]:
             if not isinstance(tail, dict):
                 continue
-            if tail.get("_dynamic"):
-                # 抵消项：本轮动态不数，由基数里残留的上轮动态顶替。
-                continue
             content = tail.get("content", "")
             if isinstance(content, str):
                 tail_chars += len(content)
@@ -72,7 +66,17 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
                 for part in content:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         tail_chars += len(part["text"])
-        return int(pt) + int(ct) + tail_chars // 3
+        # Subtract tokens of images stripped from the task that recorded this prompt_tokens
+        asst_tid = str((msg.get("_meta") or {}).get("source_task_id") or "")
+        stripped_imgs = 0
+        if asst_tid:
+            for prev in messages[:i + 1]:
+                if isinstance(prev, dict):
+                    pmeta = prev.get("_meta") or {}
+                    if isinstance(pmeta, dict) and str(pmeta.get("source_task_id") or "") == asst_tid:
+                        stripped_imgs += int(pmeta.get("_stripped_images_count") or 0)
+        seeded = int(pt) + int(ct) + tail_chars // 2 - stripped_imgs * 1600
+        return max(seeded, tail_chars // 2)
     return None
 
 
@@ -143,73 +147,8 @@ def _compact_target_session_id(ls: Any) -> str:
 
 
 async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
-    """Run first-step microcompact and proactive snip cleanup.
-
-    Why: these operations reduce stale context before the next model call. How:
-    copy the old first-iteration logic from ai_step.py into this helper. Purpose:
-    preserve the old trigger timing while keeping CompactChecker readable.
-    """
-    modified = False
-    _messages, cleared = microcompact_messages(ls.messages)
-    if cleared:
-        logger.info("microcompact: cleared %d tool_results", cleared)
-        modified = True
-
-    try:
-        from engine.task_record import load_task_records, snip_history, snip_store
-
-        last_ts = None
-        for msg in reversed(ls.messages):
-            meta = msg.get("_meta", {})
-            if isinstance(meta, dict) and (meta.get("message_type") == "assistant" or msg.get("role") == "assistant"):
-                ts_str = meta.get("timestamp", "")
-                if ts_str:
-                    try:
-                        last_ts = datetime.fromisoformat(ts_str)
-                        if last_ts.tzinfo is None:
-                            last_ts = last_ts.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        pass
-                break
-        if last_ts is not None:
-            gap_hours = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
-            if gap_hours >= 1.0:
-                proactive_max = max(int(gap_hours) * 2, 2)
-                # [AutoC 2026-05-13] Why: proactive L2 cleanup used to snip the
-                # branch copy when child_session_id/session_id pointed at a fork.
-                # How: use the same parent-first compact target helper as the
-                # threshold path. Purpose: all persisted snips affect the durable
-                # parent session.
-                snip_sid = _compact_target_session_id(ls)
-                snip_records = load_task_records(ls.rctx.workspace_root, snip_sid)
-                if snip_records:
-                    snipped, snip_count, snipped_ids = snip_history(
-                        ls.messages,
-                        snip_records,
-                        keep_recent_tasks=3,
-                        max_snip=proactive_max,
-                    )
-                    if snip_count > 0:
-                        ls.messages = snipped
-                        ctx.messages = ls.messages
-                        store = getattr(ls.rctx, "conversation_store", None)
-                        if store:
-                            try:
-                                persisted = snip_store(store.load(snip_sid), snip_records, snipped_ids)
-                                store.replace_all(snip_sid, persisted)
-                            except Exception as persist_error:
-                                logger.warning("proactive snip persist failed: %s", persist_error)
-                        logger.info(
-                            "proactive snip: replaced %d tasks (gap=%.1fh, max=%d)",
-                            snip_count,
-                            gap_hours,
-                            proactive_max,
-                        )
-                        modified = True
-    except Exception as snip_error:
-        logger.warning("proactive snip failed: %s", snip_error)
-
-    return modified
+    """Idle cleanup hook (microcompact and proactive snip disabled to preserve Prefix KV Cache)."""
+    return False
 
 
 async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
@@ -240,65 +179,84 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     try:
         _conv_store = getattr(ls.rctx, 'conversation_store', None)
         if _conv_store:
+            _conv_store.invalidate_cache(compact_sid)
+            _runtime_sid = str(getattr(ls.rctx, "session_id", "") or "").strip()
+            if _runtime_sid and _runtime_sid != compact_sid:
+                _conv_store.invalidate_cache(_runtime_sid)
+                _branch_disk_msgs = _conv_store.load(_runtime_sid)
+                _disk_summary_ids = {
+                    str(getattr(m, "id", "") or "")
+                    for m in _branch_disk_msgs
+                    if getattr(m, "message_type", "") == "summary" or getattr(m, "source_task_id", "") == "compact_summary"
+                }
+                _mem_summary_ids = {
+                    str(m.get("id") or "")
+                    for m in ls.messages
+                    if isinstance(m, dict) and (
+                        m.get("message_type") == "summary"
+                        or (m.get("_meta") or {}).get("source_task_id") == "compact_summary"
+                        or str(m.get("content") or "").startswith("[Below is a structured summary")
+                    )
+                }
+                if _disk_summary_ids and not (_disk_summary_ids <= _mem_summary_ids):
+                    # Concurrent task already compacted parent and synced our branch on disk while we were in-flight
+                    from engine.runner import _message_to_history_dict
+                    from providers.tool_format import sanitize_control_tool_history
+                    _reloaded = [
+                        _message_to_history_dict(m, current_task_id=str(getattr(ls.rctx, "task_id", "") or ""))
+                        for m in _branch_disk_msgs if getattr(m, "role", "") != "system"
+                    ]
+                    _reloaded = sanitize_control_tool_history(_reloaded)
+                    invalidate_stale_usage(_reloaded)
+                    _sys_prefix = [m for m in ls.messages if isinstance(m, dict) and m.get("role") == "system"]
+                    ls.messages[:] = _sys_prefix + _reloaded
+                    from engine.inference.message_assembly import rebuild_dynamic_context
+                    from engine.inference.ai_step import _persist_dynamic_messages
+                    rebuild_dynamic_context(
+                        ls.messages, workspace_root=ls.rctx.workspace_root,
+                        node=ls.node, runtime_cfg=ls.runtime_cfg, history=ls.messages,
+                        instruction=str(getattr(ls.rctx, "user_text", "") or ""),
+                        is_block_mode=ls.is_block_mode, system_prompt=ls.system_prompt,
+                        session_id=ls.rctx.session_id,
+                        workspace_name=getattr(ls.rctx, "workspace_name", "") or "",
+                        task_context=ls.rctx.task_context,
+                    )
+                    from engine.builtin.workspace_context import WorkspaceContext
+                    await WorkspaceContext().handle(ctx)
+                    _persist_dynamic_messages(ls)
+                    ls.last_prompt_tokens = None
+                    if not should_compact(ls.messages, ls.compact_threshold, None):
+                        logger.info("skip compact: branch %s was already synced by a concurrent compaction", _runtime_sid)
+                        return None
             _stored_msgs = _conv_store.load(compact_sid)
-            # [2026-05-17] Why: compact_summary is already compressed history,
-            # not a real task segment, so counting it can trigger an endless
-            # LLM compactor loop. How: use the shared counter that skips old
-            # compact summaries and only counts consecutive real task ids.
-            # Purpose: builtin compact and legacy ai_step compact make the same
-            # dispatch decision before asking the compactor LLM to summarize.
-            _seg_count = count_real_task_segments(_stored_msgs)
-            if _seg_count <= ls.compact_keep_recent:
+            _is_entry_branch = bool(
+                getattr(ls.rctx, "parent_session_id", "")
+                and not getattr(ls.rctx, "child_session_id", "")
+            )
+            _seg_source_msgs = (
+                _branch_disk_msgs
+                if (_is_entry_branch and _runtime_sid and _runtime_sid != compact_sid and _branch_disk_msgs)
+                else _stored_msgs
+            )
+            _seg_count = count_real_task_segments(_seg_source_msgs)
+            _snipped_stubs = sum(1 for m in _seg_source_msgs if is_snipped_message(m))
+            _min_segs = 2 if (_seg_source_msgs is not _stored_msgs) else (1 if _is_entry_branch else 2)
+            if _seg_count < _min_segs and _snipped_stubs == 0:
                 logger.info(
-                    "skip compact: only %d task segments (keep_recent=%d), not enough to compress",
-                    _seg_count, ls.compact_keep_recent,
+                    "skip compact: only %d real task segments (min=%d, snipped=%d), not enough to compress",
+                    _seg_count, _min_segs, _snipped_stubs,
                 )
                 ls.compacted = True
                 return None
     except Exception as _seg_err:
         logger.warning("segment pre-check failed, proceeding with compact: %s", _seg_err)
 
-    try:
-        from engine.task_record import (
-            load_task_records,
-            snip_history,
-            snip_store,
-        )
-
-        # [AutoC 2026-05-13] Why: L2 persisted snips must affect the parent
-        # ConversationStore, not an entry branch fork. How: reuse compact_sid for
-        # transcripts and store replacement. Purpose: the next fork starts from
-        # already-snipped durable history.
-        snip_sid = compact_sid
-        snip_records = load_task_records(ls.rctx.workspace_root, snip_sid)
-        if snip_records:
-            snipped, snip_count, snipped_ids = snip_history(ls.messages, snip_records)
-            if snip_count > 0:
-                ls.messages = snipped
-                ctx.messages = ls.messages
-                store = getattr(ls.rctx, "conversation_store", None)
-                if store:
-                    try:
-                        stored = store.load(snip_sid)
-                        persisted = snip_store(stored, snip_records, snipped_ids)
-                        store.replace_all(snip_sid, persisted)
-                    except Exception as persist_error:
-                        logger.warning("failed to persist snipped history: %s", persist_error)
-                await ls.rctx.emit_event("snip_compact", {
-                    "node_id": ls.node.id,
-                    "step": ctx.step,
-                    "snipped_tasks": snip_count,
-                })
-                logger.info("snip_compact: replaced %d tasks, skipping LLM compact", snip_count)
-                ls.compacted = True
-                ctx.extra["compact_modified"] = True
-                return None
-    except Exception as snip_error:
-        logger.warning("snip compact failed, falling through to LLM compact: %s", snip_error)
-
+    # [2026-10-26] Disabled L2 snip_compact: incremental 2-task snipping repeatedly
+    # mutates the head of conversation history every 1-2 turns, invalidating the entire
+    # 300k+ token Prefix KV Cache. Exceeding threshold_tokens now goes directly to
+    # system.compactor with hysteresis low-watermark compaction.
     ls.compacted = True
     try:
-        await ls.rctx.emit_event("compact_start", {"node_id": ls.node.id, "step": ctx.step})
         # [2026-06-06] Why: automatic compact should keep its threshold, breaker,
         # segment, and snip checks, but must not maintain a separate summary prompt
         # builder. How: call the shared planner after all automatic pre-checks pass.
@@ -322,6 +280,7 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
                 "original_chars": original_chars,
             })
         if plan.status == "dispatch":
+            await ls.rctx.emit_event("compact_start", {"node_id": ls.node.id, "step": ctx.step})
             ctx_ref = _persist_ctx(ls, ctx.step)
             return TaskAction(
                 action=ACTION_DISPATCH,

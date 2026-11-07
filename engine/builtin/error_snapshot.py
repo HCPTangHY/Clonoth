@@ -13,6 +13,7 @@ modifying any core code path.
 
 import json
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,24 +59,23 @@ class ErrorSnapshotHandler:
             step = getattr(ctx, "step", 0)
             filename = f"{ts.strftime('%Y%m%d_%H%M%S')}_{sid}_s{step}.json"
 
-            # Get the messages that were (or would be) sent to the provider.
-            # ctx.messages is the storage-format list — more complete for replay.
-            messages = list(ctx.messages) if ctx.messages else []
-
-            # Also capture the provider-converted payload for forensics.
-            # This is what actually gets sent to the API.
+            # Retain internal history separately from the reconstructed API payload.
+            messages = deepcopy(ctx.messages or [])
             converted_payload = None
+            converted_payload_reconstructed = False
             try:
-                provider = ctx.provider
-                provider_name = type(provider).__name__
-                if hasattr(provider, '_build_payload'):
-                    # Reconstruct what _build_payload would produce
-                    from engine.inference.llm_call import _build_messages_for_provider
-                    ls = ctx.extra.get("loop_state")
-                    formatter = getattr(ls, "formatter", None) if ls else None
-                    llm_msgs = _build_messages_for_provider(messages, formatter, provider)
-                    payload = provider._build_payload(llm_msgs)
-                    converted_payload = payload.get("messages")
+                ls = ctx.extra.get("loop_state")
+                request_history = getattr(ls, "request_history", None)
+                formatter = getattr(ls, "formatter", None)
+                tool_mode = getattr(formatter, "mode", None) or getattr(ctx.node, "tool_mode", "native")
+                # Reconstruction uses the public provider contract, not captured wire data.
+                converted_payload = ctx.provider.build_payload(
+                    deepcopy(request_history if request_history is not None else messages),
+                    tools=deepcopy(ctx.tools) or None,
+                    tool_mode=tool_mode,
+                    stream=bool(getattr(ls, "use_stream", False)),
+                )
+                converted_payload_reconstructed = True
             except Exception as conv_err:
                 converted_payload = {"conversion_error": str(conv_err)}
 
@@ -92,6 +92,7 @@ class ErrorSnapshotHandler:
                 "message_count": len(messages),
                 "messages": messages,
                 "converted_payload": converted_payload,
+                "converted_payload_reconstructed": converted_payload_reconstructed,
             }
 
             snap_path = snap_dir / filename

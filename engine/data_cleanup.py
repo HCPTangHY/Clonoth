@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """data_cleanup.py — Periodic cleanup for Clonoth data directory.
 
-Crontab every 6h. Pure Python, no LLM calls.
+Scheduling is configured externally. Pure Python, no LLM calls.
 
-1. events.jsonl rotation (>50MB → keep 3 backups)
-2. temp files: chat_dump/chunk/compact/messages, temp_summary (>24h)
-3. artifacts (>24h)
-4. attachments (>24h)
+1. Local events/signals rotation with bounded backup counts.
+2. Temporary files older than 24h; data/temp also has a 1GiB size cap.
+3. Artifacts and attachments older than 24h.
+
+Supervisor owns session and context-snapshot cleanup, including active-task
+protection. This script never deletes those histories or snapshots.
 """
 
 import logging
@@ -26,6 +28,7 @@ EVENTS_MAX_BYTES = 50 * 1024 * 1024   # 50 MB
 EVENTS_BACKUPS = 3
 
 TEMP_MAX_AGE = 24 * 3600              # 24 h
+TEMP_MAX_BYTES = 1024 * 1024 * 1024   # 1 GiB hard cap for data/temp
 ARTIFACT_MAX_AGE = 24 * 3600          # 24 h
 ATTACH_MAX_AGE = 24 * 3600            # 24 h
 
@@ -33,24 +36,16 @@ TEMP_GLOBS = [
     "chat_dump_*", "chat_chunk_*", "chat_compact_*", "chat_messages_*",
 ]
 
-# Child Session 隔离（Phase C）：过期 child session 的 JSONL 文件清理
-# child_*.jsonl 超过此时间未修改则删除。与 runtime.yaml 中 child_session.ttl_hours 对齐。
-CHILD_SESSION_MAX_AGE = 24 * 3600     # 24 h（与默认 TTL 一致）
-
-# Phase D：node_contexts 目录清理。child session 已替代 snapshot 机制，
-# 保留 48h 宽裕期后清理旧文件（比 child session TTL 长一倍，确保兼容期充分）。
-NODE_CONTEXTS_MAX_AGE = 48 * 3600     # 48 h
-
 
 def _log_init():
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+    if sys.stdout.isatty():
+        handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=handlers,
     )
 
 
@@ -100,7 +95,7 @@ def rotate_signals():
 # ── generic dir purge ─────────────────────────
 def purge_dir(directory: Path, max_age: float, label: str, recursive=False):
     """Delete files older than max_age seconds. Remove empty sub-dirs if recursive."""
-    if not directory.exists():
+    if directory.is_symlink() or not directory.is_dir():
         return
     cutoff = time.time() - max_age
     deleted = 0
@@ -173,27 +168,62 @@ def purge_expired_tool_result_artifacts():
     logging.info("[tool_results] deleted %d stale task dirs", deleted)
 
 
-# ── Child Session JSONL cleanup ───────────────
-def purge_expired_child_sessions():
-    """清理过期的 child session JSONL 文件。
-
-    Child Session 隔离（Phase C）：扫描 data/conversations/ 下所有 child_*.jsonl，
-    按文件修改时间判断是否超过 CHILD_SESSION_MAX_AGE。超期则删除文件。
-    映射表的清理由 supervisor 侧在 dispatch 时懒过期处理。
-    """
-    conv_dir = DATA_DIR / "conversations"
-    if not conv_dir.exists():
+# ── Temporary-directory capacity ─────────────
+def enforce_dir_size_cap(directory: Path, max_bytes: int, label: str):
+    """Delete oldest regular files until the data directory is within its cap."""
+    if max_bytes < 0:
+        raise ValueError("directory size cap must be non-negative")
+    if directory.is_symlink() or not directory.is_dir():
         return
-    cutoff = time.time() - CHILD_SESSION_MAX_AGE
+    # Do not authorize an external directory through a symlinked parent.
+    data_root = DATA_DIR.parent.resolve() / DATA_DIR.name
+    if not directory.resolve().is_relative_to(data_root):
+        logging.warning("[%s_cap] directory is outside data/: %s", label, directory)
+        return
+
+    files = []
+    total = 0
+    for dirpath, _, filenames in os.walk(directory, followlinks=False):
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                st = path.stat()
+                total += st.st_size
+                files.append((st.st_mtime_ns, st.st_size, path))
+            except OSError:
+                continue
+    if total <= max_bytes:
+        logging.info("[%s_cap] %d bytes <= %d byte cap, skip", label, total, max_bytes)
+        return
+
+    files.sort(key=lambda item: (item[0], str(item[2])))
     deleted = 0
-    for p in conv_dir.glob("child_*.jsonl"):
+    freed = 0
+    for _, size, path in files:
+        if total <= max_bytes:
+            break
         try:
-            if p.is_file() and p.stat().st_mtime < cutoff:
-                p.unlink()
-                deleted += 1
-        except Exception:
-            pass
-    logging.info("[child_sessions] deleted %d expired files", deleted)
+            path.unlink()
+        except OSError as exc:
+            logging.warning("[%s_cap] could not remove %s: %s", label, path, exc)
+            continue
+        total -= size
+        freed += size
+        deleted += 1
+
+    for dirpath, _, _ in os.walk(directory, topdown=False, followlinks=False):
+        path = Path(dirpath)
+        if path == directory:
+            continue
+        try:
+            path.rmdir()
+        except OSError:
+            pass  # Nonempty, unavailable or concurrently removed directory.
+    report = logging.warning if total > max_bytes else logging.info
+    report("[%s_cap] removed %d files (%d bytes freed), remaining %d bytes (cap %d)",
+           label, deleted, freed, total, max_bytes)
 
 
 # ── main ──────────────────────────────────────
@@ -204,14 +234,11 @@ def main():
     tasks = [
         (rotate_events, {}),
         (rotate_signals, {}),
-        # Phase D：node_contexts 已被 child session 替代，启用定期清理
-        (purge_dir, dict(directory=DATA_DIR / "node_contexts",
-                         max_age=NODE_CONTEXTS_MAX_AGE, label="node_contexts",
-                         recursive=True)),
-        (purge_expired_child_sessions, {}),
         (purge_temp_globs, {}),
         (purge_dir, dict(directory=DATA_DIR / "temp",
                          max_age=TEMP_MAX_AGE, label="temp", recursive=True)),
+        (enforce_dir_size_cap, dict(directory=DATA_DIR / "temp",
+                                   max_bytes=TEMP_MAX_BYTES, label="temp")),
         (purge_dir, dict(directory=DATA_DIR / "temp_summary",
                          max_age=TEMP_MAX_AGE, label="temp_summary")),
         (purge_expired_tool_result_artifacts, {}),
