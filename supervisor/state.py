@@ -19,6 +19,7 @@ from .eventlog import EventLog, SYSTEM_SESSION_ID
 from engine.builtin.loader import auto_discover_and_register
 from engine.hooks import HookRegistry
 from .policy import PolicyEngine
+from .session_approval import approval_action, stored_approval_rules, validate_approval_rules
 from .session import SessionMixin
 from .session_store import SessionStore
 from .task_router import TaskRouterMixin
@@ -819,6 +820,54 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "is_override": bool(target),
             }
 
+    def _effective_approval_rules_locked(self, session_id: str, task_id: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
+        """Resolve live grants through stored parent relationships, never channel names."""
+        task = self.tasks.get(task_id) if task_id else None
+        # Synchronous dispatch keeps task.session_id on the parent for routing;
+        # its execution/history session is stored separately in task.input.
+        sid = str(task.input.get("child_session_id") or task.session_id) if task else session_id
+        seen: set[str] = set()
+        while sid and sid not in seen:
+            seen.add(sid)
+            info = self.sessions.get(sid)
+            entry = self._session_store._registry.get(sid, {})
+            rules = stored_approval_rules(info.approval_rules if info is not None else entry.get("approval_rules"))
+            if rules is not None:
+                return rules, sid
+            parent = str(entry.get("parent_session_id") or "")
+            if not parent:
+                parent = self.entry_branch_parents.get(sid, "")
+            if not parent and task and task.session_id == sid and task.caller_task_id:
+                task = self.tasks.get(task.caller_task_id)
+                parent = task.session_id if task else ""
+            sid = parent
+        return None, None
+
+    def get_session_approval_rules(self, session_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            info = self.sessions.get(session_id)
+            entry = self._session_store._registry.get(session_id)
+            if info is None and (entry is None or entry.get("reset")):
+                return None
+            effective, source = self._effective_approval_rules_locked(session_id)
+            own = info.approval_rules if info is not None else entry.get("approval_rules")
+            return {"rules": stored_approval_rules(own),
+                    "effective_rules": effective, "source_session_id": source}
+
+    def set_session_approval_rules(self, session_id: str, rules: dict[str, Any] | None) -> dict[str, Any] | None:
+        clean = validate_approval_rules(rules) if rules is not None else None
+        with self._lock:
+            info = self.sessions.get(session_id)
+            entry = self._session_store._registry.get(session_id)
+            if info is None and (entry is None or entry.get("reset")):
+                return None
+            self._session_store.update_approval_rules(session_id, clean)
+            if info is not None:
+                info.approval_rules = clean
+            self.eventlog.append(session_id=session_id, component="supervisor",
+                                 type_="session_approval_rules_changed", payload={"session_id": session_id})
+            return self.get_session_approval_rules(session_id)
+
     def get_session_provider_override(self, session_id: str) -> dict[str, Any] | None:
         """读取 session 级 provider 覆盖配置。"""
         sid = (session_id or "").strip()
@@ -1518,6 +1567,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         node_id: str | None = None,
         task_id: str | None = None,
         workspace: str | None = None,
+        tool_name: str | None = None,
     ) -> OpRequestOut:
         _ws = Path(workspace) if workspace else None
         decision = self.policy.evaluate(op=op, parameters=parameters, workspace=_ws)
@@ -1576,19 +1626,34 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 approval_id=None,
             )
 
-        # [AutoC 2026-05-31] Why: request_guard can now identify the active tool
-        # call. How: forward that identity to create_approval. Purpose: the emitted
-        # approval_requested event can be merged into the same ToolCallCard.
-        approval = self.create_approval(
-            session_id=session_id,
-            operation=op,
-            details=parameters,
-            tool_call_id=tool_call_id,
-            node_id=node_id,
-            task_id=task_id,
-            trust_level=_tl,
-        )
-        return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id, trust_level=_tl)
+        with self._lock:
+            # A repeated request must not bypass an already-issued human approval.
+            for pending in self.approvals.values():
+                if (pending.status == ApprovalStatus.pending
+                        and pending.session_id == session_id and pending.operation == op
+                        and pending.details == parameters
+                        and (pending.tool_call_id or "") == (tool_call_id or "")
+                        and (pending.task_id or "") == (task_id or "")
+                        and (pending.node_id or "") == (node_id or "")):
+                    return OpRequestOut(safety_level=SafetyLevel.approval_required,
+                                        reason=decision.reason, approval_id=pending.approval_id, trust_level=_tl)
+            rules, source = self._effective_approval_rules_locked(session_id, task_id)
+            name = str(parameters.get("tool_name") or "") if op == "tool_call" else str(tool_name or op)
+            if rules is not None and approval_action(rules, tool=name, operation=op, trust_level=_tl) == "allow":
+                return OpRequestOut(safety_level=SafetyLevel.auto,
+                                    reason=f"auto-approved: session rules ({source})", trust_level=_tl)
+
+            # Keep rule evaluation and creation atomic with a concurrent rule edit.
+            approval = self.create_approval(
+                session_id=session_id,
+                operation=op,
+                details=parameters,
+                tool_call_id=tool_call_id,
+                node_id=node_id,
+                task_id=task_id,
+                trust_level=_tl,
+            )
+            return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id, trust_level=_tl)
 
     # ------------------------------------------------------------------ #
     #  Admin / 杂项

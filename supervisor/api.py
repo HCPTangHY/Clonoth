@@ -587,6 +587,8 @@ def create_app(
     @app.post("/v1/inbound", response_model=InboundMessageOut)
     async def inbound(msg: InboundMessageIn, request: Request) -> InboundMessageOut:
         st: SupervisorState = app.state.state
+        if "approval_rules" in msg.model_fields_set:
+            verify_admin_token(request)
         direct_session_id = str(msg.session_id or "").strip()
         if direct_session_id:
             # [AutoC 2026-06-18] Direct session inbound is reserved for authenticated
@@ -671,6 +673,8 @@ def create_app(
         # setting the override and the task picking it up.
         if msg.provider_override and isinstance(msg.provider_override, dict):
             st.set_session_provider_override(session_id, msg.provider_override)
+        if "approval_rules" in msg.model_fields_set:
+            st.set_session_approval_rules(session_id, msg.approval_rules)
 
         evt = st.eventlog.append(
             session_id=session_id,
@@ -1755,6 +1759,33 @@ def create_app(
         base = st.get_session_active_node(session_id)
         return _resolve_session_active_node_effective(st=st, cs=cs, session_id=session_id, base=base)
 
+    @app.get("/v1/sessions/{session_id}/approval_rules")
+    async def session_approval_rules_get(session_id: str, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        result = app.state.state.get_session_approval_rules(session_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return result
+
+    @app.put("/v1/sessions/{session_id}/approval_rules")
+    async def session_approval_rules_put(session_id: str, request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        verify_admin_token(request)
+        try:
+            result = app.state.state.set_session_approval_rules(session_id, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return result
+
+    @app.delete("/v1/sessions/{session_id}/approval_rules")
+    async def session_approval_rules_delete(session_id: str, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        result = app.state.state.set_session_approval_rules(session_id, None)
+        if result is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return result
+
     @app.get("/v1/sessions/{session_id}/provider_override")
     async def session_provider_override_get(session_id: str, request: Request) -> dict[str, Any]:
         """查询 session 级 provider 覆盖配置。"""
@@ -2017,6 +2048,7 @@ def create_app(
             node_id=inp.node_id,
             task_id=inp.task_id,
             workspace=inp.workspace,
+            tool_name=inp.tool_name,
         )
 
     @app.get("/v1/admin/state", response_model=AdminStateOut)

@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SafetyLevel(str, Enum):
@@ -80,6 +80,13 @@ class InboundMessageIn(BaseModel):
     # creation, before the entry task is dispatched. Purpose: the model chosen on
     # the welcome page takes effect on the very first response, with no race.
     provider_override: dict[str, Any] | None = None
+    approval_rules: dict[str, Any] | None = None
+
+    @field_validator("approval_rules", mode="before")
+    @classmethod
+    def validate_session_approval_rules(cls, value: Any) -> dict[str, Any] | None:
+        from .session_approval import validate_approval_rules
+        return validate_approval_rules(value) if value is not None else None
 
 
 class InboundMessageOut(BaseModel):
@@ -225,6 +232,7 @@ class Approval(BaseModel):
 
 class OpRequestIn(BaseModel):
     session_id: str
+    tool_name: str | None = None
     # read_file / write_file / execute_command / restart / tool_call（统一工具级审批）
     op: str
     parameters: dict[str, Any] = Field(default_factory=dict)

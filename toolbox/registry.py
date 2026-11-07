@@ -719,6 +719,8 @@ class ToolRegistry:
         """
         if name not in self._tool_funcs:
             return _error_tool_response(f"tool not found: {name}")
+        # The per-call context also carries this identity into inner file guards.
+        ctx.tool_name = name
         from ._common import request_guard
         _op, _err = await request_guard(
             ctx, "tool_call",

@@ -66,6 +66,8 @@ class ToolContext:
     # Defaults to workspace_root when unset. AI can change it via set_workspace.
     workspace: Path | None = None
     workspace_name: str = ""
+    # Preserve the outer tool identity through its internal path/command guards.
+    tool_name: str = ""
 
     @property
     def effective_workspace(self) -> Path:
@@ -103,6 +105,7 @@ class ToolContext:
                 # at runtime. Purpose: the supervisor can attach approval state to
                 # the active tool card while preserving legacy empty values.
                 "tool_call_id": self.tool_call_id or "",
+                "tool_name": self.tool_name or "",
                 "node_id": self.node_id or getattr(self, "_node_id", "") or "",
                 "task_id": self.task_id or "",
                 "workspace": str(self.workspace) if self.workspace else None,

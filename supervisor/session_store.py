@@ -87,6 +87,8 @@ def _session_info_from_entry(
         updated_at=updated_at,
         entry_node_id=str(entry.get("entry_node_id") or ""),
     )
+    from .session_approval import stored_approval_rules
+    info.approval_rules = stored_approval_rules(entry.get("approval_rules"))
     # Auto-restore any dict-typed fields (provider_override, workspace, ...)
     # that have a default_factory=dict on SessionInfo.
     import dataclasses as _dc
@@ -241,6 +243,17 @@ class SessionStore:
             entry["provider_override"] = dict(provider_override or {})
             self._flush()
 
+    def update_approval_rules(self, session_id: str, rules: dict[str, Any] | None) -> None:
+        entry = self._registry.get(session_id)
+        if entry is not None:
+            old = entry.get("approval_rules")
+            entry["approval_rules"] = rules
+            try:
+                self._flush(raise_errors=True)
+            except Exception:
+                entry["approval_rules"] = old
+                raise
+
     def update_workspace(self, session_id: str, workspace: dict[str, Any]) -> None:
         """更新 session 的 workspace 并落盘。"""
         entry = self._registry.get(session_id)
@@ -356,7 +369,7 @@ class SessionStore:
     #  内部：原子写入
     # ------------------------------------------------------------------ #
 
-    def _flush(self) -> None:
+    def _flush(self, *, raise_errors: bool = False) -> None:
         """将内存 registry 原子写入 sessions.json。
 
         策略：先写临时文件，再 os.replace 覆盖目标文件。
@@ -377,6 +390,8 @@ class SessionStore:
             tmp_path = None  # rename 成功，不需要清理
         except Exception as exc:
             logger.error("sessions.json: atomic write failed: %s", exc)
+            if raise_errors:
+                raise
         finally:
             if tmp_path is not None:
                 try:
