@@ -9,10 +9,8 @@ tool_access:
   mode: allowlist
   allow:
     - request_restart
-    - create_schedule
-    - list_schedules
-    - delete_schedule
-    - cancel_active_tasks
+    - manage_schedule
+    - manage_workers
 skills:
   mode: none
 prompt: |

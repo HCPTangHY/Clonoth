@@ -48,6 +48,9 @@ write_file:
     - pattern: "data/schedules.yaml"
       decision: approval_required
       reason: "schedule changes require approval"
+    - pattern: "data/mcp_clients.yaml"
+      decision: approval_required
+      reason: "MCP configuration can start processes and access external services"
     - pattern: "engine/**"
       decision: approval_required
       reason: "engine source changes require approval"

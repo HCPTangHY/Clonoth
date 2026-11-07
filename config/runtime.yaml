@@ -12,9 +12,14 @@ engine:
   poll_interval_sec: 1.0
   max_workers: 4               # 并发 task 处理数（默认 4）
 
+  memory_metrics:
+    enabled: true              # 仅记录运行统计，不记录对话内容
+    interval_sec: 60.0
+    tracemalloc: false
+
   compact:
     threshold_tokens: 256000   # prompt token 数超过此值时触发自动压缩（优先用 LLM 返回的真实值，无则按字符估算）
-    keep_recent: 6             # 压缩时保留最近的消息条数
+    keep_recent: 6             # 优先保留最近的任务段；空间不足时调整保留量
 
   # Child Session 隔离：dispatch 子节点使用独立 session，替代 node_contexts snapshot 机制
   child_session:
@@ -29,7 +34,7 @@ engine:
 
   retry:
     max_retries: 3             # LLM 调用失败时最大重试次数（0 = 不重试）
-    initial_delay_sec: 1.0     # 首次重试等待秒数
+    initial_delay_sec: 2.0     # 首次重试等待秒数
     max_delay_sec: 30.0        # 退避等待上限秒数
     backoff_multiplier: 2.0    # 指数退避倍数
     # 可重试的 HTTP 状态码：429(限流) 500 502 503 504(服务端错误)
@@ -107,7 +112,7 @@ memory:
     enabled: true             # true = 入口节点 finish 后由 supervisor 创建记忆提取后置任务
     node_id: "system.memory_extractor"  # 记忆提取节点 id
     min_messages: 4           # 会话中非 system 消息少于此数时跳过
-    min_increment: 6          # 自上次提取后新增消息数达到此值才再次触发
+    min_increment: 6          # 未提取的入口任务数达到此值时，立即安排后台提取
     idle_fallback_delay_sec: 60  # 新增消息未达到 min_increment 时，空闲此秒数后仍触发提取
 
   dream:

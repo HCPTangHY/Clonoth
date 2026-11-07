@@ -1,5 +1,6 @@
 id: bootstrap.cmd_reviewer
 type: ai
+switchable: false
 name: "命令审核节点"
 description: "审核并执行 shell 命令。接收调用方的命令请求，判断安全性后执行。"
 tool_access:

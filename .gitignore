@@ -40,6 +40,8 @@ pnpm-debug.log*
 *.secrets
 *.pem
 *.key
+*.admin_token
+/config/nodes/*.local.yaml
 
 # Runtime state and local data
 /data/
@@ -69,3 +71,60 @@ test_*.py
 *.test.*
 *.spec.*
 tools/
+
+# Keep regression tests delivered with provider changes.
+!/tests/
+/tests/*
+!/tests/test_gemini_provider_split.py
+!/tests/test_provider_history_contract.py
+!/tests/test_inference_tool_format_migration.py
+!/tests/test_policy_audit_fixes.py
+!/tests/test_pseudo_authorization_audit.py
+!/tests/test_supervisor_audit_fixes.py
+!/tests/test_mcp_audit_fixes.py
+!/tests/test_toolbox_failure_audit.py
+!/tests/test_reasoning_metadata.py
+!/tests/test_openai_migration.py
+!/tests/test_anthropic_migration.py
+!/tests/test_gemini_migration.py
+!/tests/test_responses_migration.py
+!/tests/test_provider_registry_migration.py
+!/tests/test_reasoning_contract.py
+
+# Adapter and host-side response regression checks.
+!/tests/test_discord_adapter_migration.py
+!/tests/test_panel_auth_migration.py
+!/tests/test_adapter_response_info.py
+!/tests/test_child_session_retention.py
+!/adapters/web/frontend/test/offline.test.ts
+!/adapters/web/frontend/test/storeLifecycle.test.ts
+
+# Toolbox and administration-tool regression checks.
+!/tests/test_toolbox_io_migration.py
+!/tests/test_toolbox_mutation_migration.py
+!/tests/test_toolbox_management_migration.py
+!/tests/test_manage_workers_migration.py
+!/tests/test_admin_tools_migration.py
+
+# Public regression tests for the engine migration.
+!/tests/test_engine_host_migration.py
+!/tests/test_engine_execution_migration.py
+!/tests/test_engine_history_migration.py
+!/tests/test_engine_knowledge_migration.py
+!/tests/test_engine_mcp_migration.py
+!/tests/test_engine_root_ac_migration.py
+!/tests/test_attachment_validation_migration.py
+!/tests/test_compact_segment_migration.py
+!/tests/test_data_cleanup_migration.py
+!/tests/test_model_sticky_migration.py
+!/tests/test_node_prompt_migration.py
+!/tests/test_engine_dp_cleanup.py
+!/tests/test_engine_rw_migration.py
+!/tests/test_engine_rw_metrics.py
+!/tests/test_engine_rw_callbacks.py
+!/tests/test_engine_rw_memory.py
+!/tests/test_plugins_migration.py
+!/tests/test_plugins_frontend.cjs
+
+# Include source regression tests added by subsequent migrations.
+!/tests/test_*.py

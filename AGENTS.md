@@ -92,7 +92,7 @@ Inbound message → Supervisor creates Task → Engine executes Node → Tool ca
 | `engine/inference/ai_step.py` | Single LLM inference step |
 | `engine/inference/pseudo_handlers.py` | Built-in pseudo-tool handlers (dispatch, finish, intermediate_reply, etc.) |
 | `engine/builtin/compact.py` | Context compaction (L1/L2/L3) |
-| `engine/turn_summary.py` | Turn-level summarization |
+| `engine/builtin/turn_summary.py` | Turn-summary node declaration; scheduled by Supervisor |
 | `engine/conversation_store.py` | Conversation JSONL read/write |
 | `engine/hooks/registry.py` | Hook registration and dispatch |
 | `providers/llm_call.py` | Unified LLM call with retry/fallback |
