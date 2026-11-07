@@ -76,6 +76,14 @@ export interface ChatStoreState extends ChatState {
   // events from the same task share the same task_id regardless of session.
   viewingChildTaskId: string | null;
   childSessionMessages: Readonly<Record<string, WsMessage[]>>;
+  // [2026-09-13] 子会话历史加载后是否为空：区分“还在加载”与“已确认无记录”，
+  // 供子会话视图显示明确提示。
+  childSessionEmpty: Readonly<Record<string, boolean>>;
+  // [2026-10-02] 子会话历史请求失败（非 404）：不能让视图一直停在“正在加载”。
+  // Why: historyLoader 之前失败直接 return，childSessionMessages 仍是 viewChildSession
+  // 写入的空数组、childSessionEmpty 也没写，MessageList 只能一直显示加载文案。
+  // How: 失败单独落一个 per-session 标记；Purpose: 视图区分 加载中/无记录/失败 并给重试。
+  childSessionLoadFailed: Readonly<Record<string, boolean>>;
   taskActivities: Readonly<Record<string, TaskActivity>>;
   contextUsage: ContextUsageState | null;
   contextUsageBySession: Readonly<Record<string, ContextUsageState>>;
@@ -115,6 +123,7 @@ export type HistoryToolResult = {
   rawInline?: string;
   format?: string;
   elapsedMs?: number;
+  summary?: string;
   attachments?: Attachment[];
   rejected?: boolean;
   rejectionCode?: string;
@@ -229,7 +238,7 @@ export function createConversationMeta(id = createConversationId(), sessionId = 
   return { id, sessionId, title: '新对话', updatedAt: timestamp };
 }
 
-export function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'activeTaskBySession' | 'childNodes' | 'viewingChildSessionId' | 'viewingChildConversationKey' | 'viewingChildTaskId' | 'childSessionMessages' | 'taskActivities' | 'contextUsage' | 'contextUsageBySession' | 'historyFullyLoaded' | 'historyLoadedCount' | 'historyTotal' | 'isLoadingMoreHistory'> {
+export function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'activeTaskBySession' | 'childNodes' | 'viewingChildSessionId' | 'viewingChildConversationKey' | 'viewingChildTaskId' | 'childSessionMessages' | 'childSessionEmpty' | 'childSessionLoadFailed' | 'taskActivities' | 'contextUsage' | 'contextUsageBySession' | 'historyFullyLoaded' | 'historyLoadedCount' | 'historyTotal' | 'isLoadingMoreHistory'> {
   return {
     conversations: [],
     activeConversationId: null,
@@ -242,6 +251,8 @@ export function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activ
     viewingChildConversationKey: null,
     viewingChildTaskId: null,
     childSessionMessages: {},
+    childSessionEmpty: {},
+    childSessionLoadFailed: {},
     taskActivities: {},
     contextUsage: null,
     contextUsageBySession: {},
@@ -352,6 +363,48 @@ export function normalizeChildNodeStatus(status: string | undefined): ChildNodeS
   }
   return 'running';
 }
+// [2026-10-02] 子节点终态（completed/failed/cancelled）。侧边栏与会话树只对
+// 真正的终态应用 30 秒自动隐藏；非终态即使残留 completedAt 也必须留在界面上。
+export const CHILD_NODE_TERMINAL_STATUSES = new Set<ChildNodeStatus>(['completed', 'failed', 'cancelled']);
+
+export function isTerminalChildNodeStatus(status: ChildNodeStatus): boolean {
+  return CHILD_NODE_TERMINAL_STATUSES.has(status);
+}
+
+// 终态子节点在侧边栏/浮动面板中的可见时长（与 ChildNodePanel 的一秒刷新配合）。
+export const CHILD_NODE_TERMINAL_VISIBLE_MS = 30_000;
+
+export function shouldHideChildNode(
+  child: Pick<ChildNodeState, 'status' | 'completedAt'>,
+  now: number = Date.now(),
+): boolean {
+  // Why: 只有“真正的终态 + 真正的完成时间”才该淡出。running/awaiting_approval
+  // 行带着历史 completedAt（会话恢复、同 session 新任务、旧事件残留）时，
+  // 30 秒规则会把一条正在跑的子节点当成遗留行隐藏。
+  if (!isTerminalChildNodeStatus(child.status)) return false;
+  if (!child.completedAt) return false;
+  const completedAt = Date.parse(child.completedAt);
+  if (Number.isNaN(completedAt)) return false;
+  return now - completedAt > CHILD_NODE_TERMINAL_VISIBLE_MS;
+}
+
+// ── Child Session History View State ───────────────────────────────────────
+
+export type ChildSessionHistoryView = 'content' | 'loading' | 'empty' | 'failed';
+
+export function resolveChildSessionHistoryView(
+  messageCount: number,
+  empty: boolean | undefined,
+  failed: boolean | undefined,
+): ChildSessionHistoryView {
+  // [2026-10-02] 明确区分四种子会话视图状态。Why: 加载失败过去没有任何落点，
+  // 视图只能一直停在“正在加载”。How: 有消息=content；失败=failed（可重试）；
+  // 确认无记录=empty；其余=loading。Purpose: 三个状态在 UI 上互斥且可测。
+  if (messageCount > 0) return 'content';
+  if (failed) return 'failed';
+  if (empty) return 'empty';
+  return 'loading';
+}
 
 export function mergeChildNodesFromSessionChildren(
   existing: Record<string, ChildNodeState>,
@@ -360,16 +413,31 @@ export function mergeChildNodesFromSessionChildren(
 ): Record<string, ChildNodeState> {
   const result = { ...existing };
   for (const child of children) {
-    const nodeId = child.node_id || child.session_id;
-    const existing_node = result[nodeId];
-    result[nodeId] = {
+    // [2026-09-13] 键修正：按 sessionId 建键。旧代码用 node_id 建键，与实时
+    // 事件路径（按 sessionId）不一致：同类多个子节点互相覆盖合并成一行，
+    // API 行与事件行重复渲染，existing_node 查询永远落空。
+    // 另外 completedAt 改用后端的 completed_at（仅终态有值），避免 running 行
+    // 因误设 completedAt 被浮动面板 30 秒自动隐藏。
+    const key = child.session_id;
+    const existing_node = result[key];
+    const status = normalizeChildNodeStatus(child.status);
+    // [2026-10-02] 子节点重新进入非终态（会话被恢复/同一 session 开了新任务）时，
+    // 不能沿用上一次终态的 completedAt，否则侧边栏与会话树的 30 秒规则会把一条
+    // 正在跑的 running 行当成“已完成 30 秒”隐藏掉。How: completedAt 只允许写在
+    // 终态上；taskId 变更时连旧的 startedAt/completedAt 一起丢弃。
+    const nextTaskId = child.task_id || existing_node?.taskId;
+    const taskChanged = Boolean(child.task_id && existing_node?.taskId && child.task_id !== existing_node.taskId);
+    const terminal = CHILD_NODE_TERMINAL_STATUSES.has(status);
+    result[key] = {
       sessionId: child.session_id,
-      nodeId: child.node_id || existing_node?.nodeId || nodeId,
+      nodeId: child.node_id || existing_node?.nodeId || child.session_id,
       parentConversationId,
-      status: normalizeChildNodeStatus(child.status),
-      taskId: child.task_id || existing_node?.taskId,
-      startedAt: child.started_at || existing_node?.startedAt,
-      completedAt: child.updated_at || existing_node?.completedAt,
+      status,
+      taskId: nextTaskId,
+      startedAt: child.started_at || (taskChanged ? undefined : existing_node?.startedAt),
+      completedAt: terminal
+        ? (child.completed_at || (taskChanged ? undefined : existing_node?.completedAt))
+        : undefined,
     };
   }
   return result;

@@ -1124,10 +1124,13 @@ export interface StructuredMessage {
   tool_result_format?: string;
   elapsed_ms?: number;
   tool_result_elapsed_ms?: number;
+  tool_summary?: string;
+  tool_result_summary?: string;
   tool_attachments?: Array<{ name?: string; size?: number; url?: string; type?: string; path?: string; mime_type?: string }>;
   provider?: string;
   tool_mode?: string;
   provider_metadata?: Record<string, unknown>;
+  response_info?: import('../types/message').ResponseInfo;
   usage?: Record<string, unknown>;
   tool_call_ids?: string[];
   // [thinking-time 2026-06-01] Precise reasoning timing from backend meta.
@@ -1182,6 +1185,26 @@ export async function getSessionHistoryPage(
   } catch {
     return { messages: [], total: 0, has_more: false };
   }
+}
+
+/**
+ * [2026-10-02] 子会话历史严格读取（错误必须冒泡）。
+ * Why: getSessionHistoryPage 为了容忍旧后端，把所有失败都吞成“空页”，调用方
+ * 无法区分“确实没有记录”“会话已被清理(404)”“网络/后端失败”，子会话视图只能
+ * 一直停在“正在加载”。How: 复用 apiFetch（非 2xx 抛错，消息以状态码开头），
+ * 只把响应体形状归一成 messages 数组。Purpose: 调用方按错误类型分别落
+ * “已确认无记录”与“加载失败（可重试）”两种状态。
+ */
+export async function getSessionHistoryStrict(
+  sessionId: string, limit = 0, taskId?: string, offset = 0,
+): Promise<StructuredMessage[]> {
+  let path = `/sessions/${sessionId}/history?limit=${limit}&offset=${offset}`;
+  if (taskId) path += `&task_id=${encodeURIComponent(taskId)}`;
+  const resp = await apiFetch(path);
+  const data = await resp.json();
+  if (Array.isArray(data)) return data as StructuredMessage[];
+  if (data && Array.isArray(data.messages)) return data.messages as StructuredMessage[];
+  return [];
 }
 
 export async function getSessionChildren(sessionId: string): Promise<ChildSessionInfo[]> {

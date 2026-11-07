@@ -263,6 +263,14 @@ function getChildNodeIdFromAgentConversationKey(conversationKey: string): string
 export function getChildNodeSessionId(event: SupervisorEvent, payload: Record<string, unknown>): string {
   const input = getNestedRecord(payload, 'input');
   const taskContext = getNestedRecord(input, 'task_context');
+  // [2026-09-13] dispatch 子任务（spawn_worker / dispatch:{id}）跑在 entry
+  // branch 上，事件 session_id 是 branch id；而 /children 返回的键是 dispatch
+  // session id（input.parent_session_id）。两条路径必须同键，否则同一子节点
+  // 在 store 里分裂成两条互不相通的记录，实时流也无法路由进子会话视图。
+  if (Object.keys(getNestedRecord(input, '_dispatch_origin')).length > 0) {
+    const dispatchSessionId = getStringValue(input.parent_session_id);
+    if (dispatchSessionId) return dispatchSessionId;
+  }
   return getStringValue(payload.child_session_id)
     || getStringValue(input.child_session_id)
     || getStringValue(taskContext.child_session_id)
@@ -306,7 +314,10 @@ export function updateChildNodesByEvent(
       status,
       taskId: getStringValue(payload.task_id) || previous?.taskId,
       startedAt: previous?.startedAt || event.ts,
-      completedAt: isTerminal ? event.ts : previous?.completedAt,
+      // [2026-10-02] 非终态事件（task_started/approval_decided 等）必须清掉
+      // 上一次终态留下的 completedAt：同一子会话被恢复或复用开新任务时，
+      // 残留值会让 30 秒终态隐藏规则把正在跑的行隐藏掉。
+      completedAt: isTerminal ? event.ts : undefined,
     },
   };
 }

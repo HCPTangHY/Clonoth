@@ -10,6 +10,7 @@ import { ChildNodePanel, MessageList } from '../components/chat';
 import { SystemDashboard } from '../components/dashboard/SystemDashboard';
 import { Header, Sidebar } from '../components/layout';
 import { EventLogPanel } from '../components/log';
+import { PluginSlotHost } from '../components/plugins/PluginSlotHost';
 import { SettingsHeader } from '../components/settings/SettingsHeader';
 import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
@@ -42,6 +43,7 @@ export interface AppViewDefinition {
   id: string;
   sidebar: (ctx: AppViewContext) => ReactNode;
   header: (ctx: AppViewContext) => ReactNode;
+  mainTop?: (ctx: AppViewContext) => ReactNode;
   main: (ctx: AppViewContext) => ReactNode;
   composer?: (ctx: AppViewContext) => ReactNode;
   rightTop?: (ctx: AppViewContext) => ReactNode;
@@ -119,6 +121,17 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
           sessionId={safeSessionId(ctx.sessionId)}
           title={ctx.title}
           viewingChildNodeId={ctx.viewingChildNodeId || ctx.viewingChildSessionId || undefined}
+        />
+      );
+    },
+    mainTop: (ctx) => {
+      if (!ctx.sessionId || (!ctx.activeConversationId && !ctx.viewingChildSessionId)) return null;
+      return (
+        <PluginSlotHost
+          key={ctx.sessionId}
+          className="pointer-events-none flex max-h-[40dvh] min-w-0 flex-col items-center overflow-y-auto bg-transparent"
+          data={{ sessionId: ctx.sessionId, isChildSession: Boolean(ctx.viewingChildSessionId) }}
+          slot="chat_top"
         />
       );
     },

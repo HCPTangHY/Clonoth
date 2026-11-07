@@ -72,7 +72,7 @@ function getDispatchCallbackTitle(message: WsMessage): string {
   const source = message.source || {};
   const nodeId = (source.childNodeId || source.nodeId || '').trim();
   const callerNodeId = (source.callerNodeId || '').trim();
-  const hasStructuredSource = Boolean(nodeId || callerNodeId || source.childSessionId || source.childTaskId);
+  const hasStructuredSource = Boolean(nodeId || callerNodeId || source.summary || source.childSessionId || source.childTaskId);
   if (!hasStructuredSource) return '子节点回调';
   const displayNodeId = nodeId || '未知';
   return callerNodeId ? `${callerNodeId} 委派的 ${displayNodeId} 已完成` : `子节点 ${displayNodeId} 已完成`;
@@ -119,6 +119,16 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
   // backend-provided source.childSessionId and leave normal messages without an
   // action. Purpose: navigation stays structured and does not parse the callback text.
   const childSessionId = message.role === 'dispatch_callback' ? message.source.childSessionId?.trim() || '' : '';
+  // Why: child result summaries moved out of backend text into structured source
+  // metadata. How: render source.summary directly below the dynamic dispatch title.
+  // Purpose: users see the summary without duplicating it in payload.text.
+  const dispatchSummary = message.role === 'dispatch_callback' ? message.source.summary?.trim() || '' : '';
+  // [2026-09-10] response_info 是宿主展示元数据（provider/model + 回复 notices），
+  // 既不是 provider replay 元数据，也不是回复正文。notices 独立渲染成折叠块，
+  // 与 markdown 正文分离；结构异常时回退为空数组，不影响正文渲染。
+  const responseNotices = Array.isArray(message.source.responseInfo?.notices)
+    ? message.source.responseInfo.notices.filter((notice) => typeof notice.text === 'string')
+    : [];
   // Why: consecutive assistant cards look fragmented with repeated headers and
   // borders. How: hide the top border when the previous message is also assistant,
   // hide the bottom border when the next message is also assistant, and suppress the
@@ -189,6 +199,21 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
             )}
           </header>
         )}
+
+        {dispatchSummary && (
+          <div className="mb-2 text-xs text-purple-700">
+            {dispatchSummary}
+          </div>
+        )}
+
+        {responseNotices.map((notice, index) => (
+          <details key={`${notice.code || 'notice'}:${index}`} className="mb-1.5 text-[0.65rem] text-[var(--duties-secondary)]">
+            <summary className="w-fit cursor-pointer font-mono text-[var(--duties-secondary)]">
+              {notice.label || '回复说明'}{message.source.responseInfo?.model ? ` · ${message.source.responseInfo.model}` : ''}
+            </summary>
+            <p className="mt-1 whitespace-pre-wrap">{notice.text}</p>
+          </details>
+        ))}
 
         <div className={BLOCK_STACK_CLASS}>
           {mergeThinkingBlocksForDisplay(message.blocks)

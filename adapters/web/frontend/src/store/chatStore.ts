@@ -70,6 +70,9 @@ import {
 } from './sessionRecovery';
 import {
   HISTORY_PAGE_SIZE,
+  captureStoreGeneration,
+  invalidateStoreGeneration,
+  isCurrentStoreGeneration,
   loadChildSessionHistoryIntoStore,
   loadSessionHistoryIntoStore,
 } from './historyLoader';
@@ -119,11 +122,33 @@ async function uploadMessageAttachments(
 async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   if (startupLoaded) return;
   startupLoaded = true;
+  // [2026-10-02] 捕获 store 世代：resetState（登出）会让这一轮的所有异步结果作废。
+  // Why: 登出与启动列表/首个会话历史会并发；旧响应若写回就会把上一个账号的会话
+  // 列表/消息填进已清空的 store，并重新拉一条事件泵（登出后仍有 socket 与轮询）。
+  // How: 每次 await 之后比对世代，不匹配就整轮退出（不写 store、不启泵）。
+  // Purpose: 登出即彻底断开，重新登录只由新的一轮 startup 建立连接。
+  const storeGeneration = captureStoreGeneration();
 
   // [2026-09-02] Why: a fixed 50-row page could hide older web conversations once
   // the registry grows. How: paginate channel=web until a short page ends the scan.
   // Purpose: the sidebar always reflects every web session, not just the newest 50.
-  const serverSessions = await listAllSessions('web');
+  let serverSessions: Awaited<ReturnType<typeof listAllSessions>> = [];
+  try {
+    serverSessions = await listAllSessions('web');
+  } catch {
+    // 请求飞行期间登出：旧世代不得重启事件泵。
+    if (!isCurrentStoreGeneration(storeGeneration)) return;
+    // [2026-10-02] 启动列表失败（后端刚重启/网络抖动）不能把启动流程锁死。
+    // Why: startupLoaded 在函数开头就被置 true，这里直接 throw 会让本次挂载
+    // 既没有会话列表、也没有事件流，且后续 loadStartup 全部被短路。How: 复位
+    // 启动标记并启动事件泵（WS 自带重连与历史恢复）。Purpose: 重登/重载后
+    // 事件流一定建立，列表与历史可被下一次挂载或重连恢复补上。
+    startupLoaded = false;
+    startEventPump(set, get);
+    return;
+  }
+  // [2026-10-02] 登出后旧响应必须整体丢弃：不写回旧会话列表、不重启事件泵。
+  if (!isCurrentStoreGeneration(storeGeneration)) return;
   const userSessions = (serverSessions || []).filter((session) =>
     !isEntryBranchSessionId(session.session_id)
     && !session.parent_session_id
@@ -183,7 +208,10 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   if (activeConv?.sessionId) {
     void loadContextUsageIntoStore(activeConv.sessionId, set, get);
     await loadSessionHistoryIntoStore(activeConv.id, activeConv.sessionId, set, get);
+    // 历史加载期间登出：后续的两个恢复请求属于旧账号，不再发出。
+    if (!isCurrentStoreGeneration(storeGeneration)) return;
     await replayPendingApprovals(activeConv.sessionId, set, get);
+    if (!isCurrentStoreGeneration(storeGeneration)) return;
     void restoreGeneratingStateFromBackend(activeConv.id, activeConv.sessionId, set, get, { reloadHistory: false });
   }
 }
@@ -202,6 +230,12 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     // reaching into module internals.
     stopEventPump();
     resetEventPumpState();
+    // [2026-10-02] 递增 store 世代：作废 reset 之前发出的 startup/parent/child
+    // 历史响应（含子会话请求序号表）。Why: 登出清空缓存后，在飞的旧响应仍会
+    // 写回旧会话/旧消息，child 历史还会重建 childSessionMessages。How: 世代
+    // 在 historyLoader 里统一比较（parent 与 child 两条路径共用）。Purpose:
+    // 登出后 store 只接受重新登录后的响应。
+    invalidateStoreGeneration();
     startupLoaded = false;
     set({
       ...createInitialChatState(),
@@ -267,6 +301,17 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       childSessionMessages: {
         ...state.childSessionMessages,
         [trimmed]: [],
+      },
+      // [2026-09-13] 进入子会话视图时重置空态标记，历史加载完成后重新写入。
+      childSessionEmpty: {
+        ...state.childSessionEmpty,
+        [trimmed]: false,
+      },
+      // [2026-10-02] 同时复位失败标记：viewChildSession 既是首次进入，也是重试入口，
+      // 重试期间视图必须回到“加载中”，不能停在上一轮的失败态。
+      childSessionLoadFailed: {
+        ...state.childSessionLoadFailed,
+        [trimmed]: false,
       },
       contextUsage: state.contextUsageBySession[trimmed] || state.contextUsage,
     }));

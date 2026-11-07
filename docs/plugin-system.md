@@ -11,20 +11,26 @@ Provider Registry 位于 `providers/__init__.py`。它的职责是把配置中�
 包加载时会调用 `auto_discover()`。它会扫描 `providers/` 目录下的普通 Python 模块，并跳过包、`__init__.py` 和 `base.py`。每个模块被导入后，注册表会检查其中定义的类：
 
 1. 类必须是 `BaseProvider` 的子类。
-2. 类不能是 `BaseProvider` 本身。
+2. 类不能是 `BaseProvider` 本身，也不能含有未实现的抽象方法。
 3. 类必须定义在当前被扫描的模块中。
 4. 类属性 `provider_name` 必须是非空字符串。
 
 满足条件的类会按小写后的 `provider_name` 注册到 `ProviderRegistry`。同名注册会用新的类覆盖旧的类，这使重复导入、热重载和测试环境中的重复注册保持幂等。
+
+Provider 的卸载记录以注册表实例和渠道名称作为键。同一个键重新注册时，旧卸载记录被移除但不会立即执行；旧插件卸载不会删除新插件的登记。共享 `DisposalLedger` 的 `record()`、`add()` 支持可选 `key`，不传时仍逐条累计；`forget()` 用于移除已手动释放的记录，`counts()` 只返回各插件的登记数量。
 
 当前内置 provider 名称包括：
 
 | provider_name | 类 |
 | --- | --- |
 | `openai` | `OpenAIProvider` |
+| `deepseek` | `DeepSeekProvider` |
 | `anthropic` | `AnthropicProvider` |
-| `gemini` | `GeminiProvider` |
+| `gemini-aistudio` | `GeminiAIStudioProvider` |
+| `gemini-vertex` | `GeminiVertexProvider` |
 | `openai-responses` | `OpenAIResponsesProvider` |
+
+`providers/gemini.py` 保存 Gemini 共同实现，`provider_name` 为空，因此不会注册为渠道。两个具体类型分别定义在 `gemini_aistudio.py` 和 `gemini_vertex.py`。旧名称 `gemini` 不再接受，不提供兼容别名。
 
 ### BaseProvider ABC
 
@@ -36,16 +42,48 @@ Provider Registry 位于 `providers/__init__.py`。它的职责是把配置中�
 | --- | --- |
 | `provider_name: str` | 自动发现和节点配置使用的稳定 key。 |
 | `__init__(model: str, name: str = "")` | 保存模型名和 provider 实例名。未传 `name` 时回落到 `provider_name`。 |
-| `chat(messages, tools)` | 非流式模型调用，返回 `ProviderResponse`。 |
-| `chat_stream(messages, tools, on_text, on_thinking)` | 流式模型调用，返回 `ProviderResponse`。 |
+| `prepare_history(messages, tool_mode)` | Provider 内部选择历史表示；接收完整内部消息，在独立副本上转换。 |
+| `build_payload(messages, tools, tool_mode, stream)` | Provider 构造 API 请求体；诊断也使用该公开接口，不猜测私有方法签名。 |
+| `chat(messages, tools, tool_mode)` | 非流式模型调用，接收内部历史，返回 `ProviderResponse`。 |
+| `chat_stream(messages, tools, tool_mode, on_text, on_thinking)` | 流式模型调用，输入契约与非流式一致。 |
 
 `ProviderResponse` 是 provider 返回给引擎的统一结果结构。正常的供应商错误，例如超时、HTTP 4xx/5xx 或非法响应，应尽量返回 `ProviderResponse(ok=False, error="...")`，而不是依赖异常作为常规控制流。
 
+### 思考展示与协议回传
+
+`ProviderResponse.reasoning` 是统一的思考展示文本，可以来自接口返回的推理文本或摘要。不再增加独立的 `thought_summary` 响应字段；历史消息只保存 `reasoning`，不另存可以由文本推导的 `has_reasoning`。流式 `stream_end` 事件中的同名标记表示本次是否输出过思考片段，继续保留。
+
+Engine 保存展示文本与 Provider 元数据，不再将展示内容复制为 `reasoning_content`。OpenAI 兼容接口与 DeepSeek 将实际返回的原生思考字段保存在各自的 `provider_meta` 中。OpenAI 默认只读取和展示思考，不发送非标准思考字段；配置 `reasoning_field` 后，才从同渠道的原始数据恢复对应请求字段。DeepSeek 默认使用 `reasoning_content`，仅对带有旧 DeepSeek 元数据标识的同渠道历史保留兼容读取；新记录以私有原始字段为准。关闭思考或使用文本工具历史时不发送该字段，不将其他渠道的展示文本用作回传数据。
+
+Gemini、Anthropic、Responses 的原始响应块、签名与加密数据继续由对应 Provider 保存和处理。即使其中包含与展示文本相同的内容，也不能因此删除或改写原始块。签名或加密校验失败时，可在本次请求的独立副本中删除被拒绝的协议数据并有界重试；这不会修改已保存的元数据。
+
+旧历史中的 `thought_summary`、`thinking_text` 和 `thinking` 继续用于恢复展示。旧正文与摘要同时存在且不同的，合并到统一展示文本中；读取过程不修改历史文件。前端继续使用现有的思考展示结构。
+
+### 历史输入与转换职责
+
+Engine 向所有 Provider 传入本轮有效的内部历史及 `tool_mode`，不按渠道名称或能力开关选择历史表示。内部历史包含结构化 `tool_calls` 和 `_meta`；Provider 负责把这些信息转换为其 API 接受的字段，不能将内部字典直接发送到远端。
+
+Engine 只准备请求副本、过滤临时消息和展示信息、解析已允许的本地附件，并运行 `before_llm_call`。主请求、备用请求、压缩后重建请求共用这一准备流程。普通重试复用钩子处理后的输入，并为每次 Provider 调用提供独立副本。
+
+公共工具协议实现位于 `providers/tool_format.py`。Engine 仍可通过原有模块路径使用工具定义和响应解析功能，但 Provider 不依赖 `engine.inference`。各 Provider 自行决定采用普通格式转换、保留自身元数据，或直接处理内部工具记录。`tool_mode` 默认 `native`；节点运行时明确传入配置的模式。
+
+旧历史中的文本工具结果，只在能够匹配已有调用时，才在请求副本中恢复为结构化结果；之后再按 Provider 选择的模式转换。持久化和压缩所用清理函数的默认行为不变，不重写原始历史。
+
+Gemini 重放原始响应前，会核对其中的函数调用与清理后的工具记录。完整记录保留原始 `parts` 和签名；不一致的调用及其已有结果仅作为文本保留，不补造结果，也不将签名移到其他调用上。这是因为并行调用可能只有第一个 `functionCall` 携带签名，不能删除其中一个片段后假定剩余签名仍适用。规则见 [Google 的签名处理说明](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures)。
+
+Responses 同样核对原始 `raw_output` 中的 `function_call.call_id`、名称与参数是否对应当前工具记录。损坏缓存不再重新引入已移除的调用，也不补造工具输出。流式正文与摘要按增量到达顺序展示；仅收到最终完成对象时，从该对象补充展示内容和工具调用。
+
+图片限制同样属于 Provider：通用附件解析不再统一删除 assistant 图片；OpenAI Chat Completions 与 Anthropic 分别处理其 assistant 图片限制，DeepSeek 在自己的请求构造中处理不支持的图片输入。
+
+备用响应使用实际响应渠道记录历史元数据，不改变下一轮的默认 Provider。错误快照通过公开构造器重建请求体，标记 `converted_payload_reconstructed: true`；这不是网络抓包，也不表示记录了每一次备用请求。
+
+自定义 Provider 的 `chat`、`chat_stream` 必须接受 `tool_mode`，并在其内部完成历史转换。可以复用基类的 `prepare_history`，也可以自行处理内部历史；不会获得引擎按名称提供的特殊处理。
+
 ### provider_name 与运行时解析
 
-节点配置中的 `provider` 字段就是 `ProviderRegistry` 的 key。节点加载时会用 `provider_registry.list()` 校验该字段；未注册的值会回退为空字符串。模型解析阶段再把空值视为默认 `openai`。
+节点配置中的 `provider` 字段就是 `ProviderRegistry` 的 key。明确填写的名称必须已经注册，否则节点加载时报错。字段为空时仍继承全局默认渠道。
 
-运行器创建 provider 时会调用 `provider_registry.get(name)`。如果找不到请求的 provider，当前行为会回退到 `openai`，以保持旧配置的降级语义。实例化时会准备以下参数，并根据构造函数签名过滤不支持的参数：
+运行器创建 provider 时会调用 `provider_registry.get(name)`。未注册的全局或会话级渠道名称同样报错，不会静默回退到 `openai`。实例化时会准备以下参数，并根据构造函数签名过滤不支持的参数：
 
 - `http`
 - `api_key`
@@ -306,8 +344,10 @@ class MyProvider(BaseProvider):
         self,
         *,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
     ) -> ProviderResponse:
+        # messages 是内部历史，需由本 Provider 按 tool_mode 转换并构造请求。
         # 目的：把供应商响应转换为统一的 ProviderResponse。
         # 做法：在这里完成请求、错误归一化和工具调用解析。
         # 原因：引擎只依赖 BaseProvider 合约，不理解供应商私有格式。
@@ -318,13 +358,15 @@ class MyProvider(BaseProvider):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> ProviderResponse:
         # 目的：提供与非流式接口一致的最终结果。
         # 做法：流式片段通过回调送出，结束时仍返回 ProviderResponse。
         # 原因：推理循环需要统一读取文本、工具调用、reasoning、usage 和附件。
-        return await self.chat(messages=messages, tools=tools)
+        return await self.chat(messages=messages, tools=tools, tool_mode=tool_mode)
 ```
 
 ## 开发指南：新增 Hook Handler
@@ -432,10 +474,10 @@ if routes is not None:
 ```
 
 - 默认挂在 `/v1/plugins/{owner}` 下；`mount="sessions"` 挂到 `/v1/sessions`。
-- `public=True` 豁免全局鉴权（用于静态资源）；其余路由走 `/v1/` 统一鉴权中间件。
+- `public=True` 明确豁免全局鉴权，只用于确实允许匿名访问的路由。插件面板不需要此选项；其余路由走 `/v1/` 统一鉴权中间件。
 - 与 core 端点路径冲突时拒绝挂载（core 优先）。
 - 卸载插件时挂载自动摘除（DisposalLedger 归档）。
-- 静态界面资源用 `routes.register(static_router(dir), public=True)`。
+- 静态界面资源通过 `static_router(dir)` 放在插件的 `/web/` 下，保持默认鉴权。Web 宿主用 Bearer 身份申请 `/v1/admin/auth/panel-session`，取得最多 120 秒有效的 HttpOnly、SameSite=Strict Cookie；该 Cookie 只用于对应插件已登记的静态 GET/HEAD 路由，不授权插件 API。退出时撤销，服务重启后自动失效。现有插件 API 的认证方式保持不变。
 - 路由插件（如 retry_api、plugin_manager）在 PLUGIN_META 声明 `"wants_context": true`，构造时注册路由；engine 进程无 routes face，构造器取不到即跳过。
 
 ### 前端贡献（PLUGIN_META.web）

@@ -132,6 +132,14 @@ export type MessageStatus =
   | 'failed'
   | 'cancelled';
 
+// Host-owned presentation data, never provider replay metadata or reply text.
+export interface ResponseInfo {
+  provider?: string;
+  model?: string;
+  usage?: Record<string, unknown>;
+  notices?: Array<{ code?: string; label?: string; text: string }>;
+}
+
 export interface MessageSource {
   inboundSeq?: number;
   taskId?: string;
@@ -141,6 +149,7 @@ export interface MessageSource {
   llmRequestId?: string;
   provider?: string;
   providerMetadata?: Record<string, unknown>;
+  responseInfo?: ResponseInfo;
   usage?: Record<string, unknown>;
   nodeId?: string;
   nodeName?: string;

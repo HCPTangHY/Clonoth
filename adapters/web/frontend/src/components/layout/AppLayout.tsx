@@ -36,13 +36,14 @@ function rightMax(sidebarCollapsed: boolean): number {
 interface AppLayoutProps extends PropsWithChildren {
   sidebar: ReactNode;
   header: ReactNode;
+  mainTop?: ReactNode;
   composer?: ReactNode;
   logPanel?: ReactNode;
   rightPanel?: ReactNode;
   rightOverlay?: ReactNode;
 }
 
-export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rightOverlay, children }: AppLayoutProps) => {
+export const AppLayout = ({ sidebar, header, mainTop, composer, logPanel, rightPanel, rightOverlay, children }: AppLayoutProps) => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { rightPanelOpen, setRightPanelOpen } = useSettingsStore();
   const sidebarWidth = useSettingsStore((s) => s.sidebarWidth);
@@ -216,7 +217,16 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, rig
             )}
           </div>
         </div>
-        <section className="relative min-h-0 flex-1 overflow-hidden">{children}</section>
+        <section className="relative min-h-0 flex-1 overflow-hidden">
+          {children}
+          {/* View-owned overlay controls float below the header without shrinking the
+              message viewport. Only each plugin's visible pixels accept input. */}
+          {mainTop && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10">
+              {mainTop}
+            </div>
+          )}
+        </section>
         {composer && (
           <div className="flex-shrink-0 border-t border-[var(--duties-border)] bg-[var(--duties-bg)]">{composer}</div>
         )}

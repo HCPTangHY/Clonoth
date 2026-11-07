@@ -4,7 +4,8 @@
 // authentication no longer requires editing App.tsx or unrelated settings pages.
 import { useEffect, useState } from 'react';
 
-import { checkAdminAuth, checkHealth, getModelConfig, getNodes } from '../../../api/supervisorClient';
+import { checkAdminAuth, checkHealth, getModelConfig, getNodes, pluginApiRequest } from '../../../api/supervisorClient';
+import { useChatStore } from '../../../store/chatStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
 import { Button } from '../../common';
@@ -78,16 +79,44 @@ export const GeneralSettingsPage = () => {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     // [2026-06-01] Logout clears admin-only caches with the token.
     // Why: node and model lists are protected data and should not remain visible
     // after authentication is removed. How: reset token, auth flag, nodes, and model
     // config together. Purpose: later settings pages correctly show the login need.
+    // [2026-09-12] 退出时必须同时回收面板短期 Cookie。Why: Cookie 只在打开面板期间
+    // 需要，退出后若残留，任何访问者仍能加载插件静态页面。How: 先在本地清掉 token
+    // （已挂载面板的续期 effect 立即中止，不再续期），再用事先捕获的 Bearer 凭据
+    // 调服务端撤销接口。Purpose: 本地续期在退出瞬间停止，服务端 Cookie 也被回收；
+    // 撤销失败只降级提示，不阻断本地退出。插件 API 的 boot token 用途不变（见
+    // PluginPanel）。
+    // [2026-10-02] 登出必须整体复位 chat store，而不是只停事件泵。
+    // Why: stopEventPump() 只断开 socket 与定时器，chatStore 的 startupLoaded 仍是
+    // true，登录后 MainApp 重新挂载时 loadStartup() 被直接短路 —— 会话列表与
+    // 私有缓存（messages/childSessionMessages/childNodes/contextUsage）都停留在
+    // 上一个账号的状态，且事件流再也不会启动（页面看起来“登录了但完全不刷新”）。
+    // How: 复用 chatStore.resetState()：它内部 stopEventPump + resetEventPumpState、
+    // 清空会话/子会话/工具/审批等私有缓存，并把 startupLoaded 复位为 false。
+    // Purpose: 重新登录后 MainApp 的 loadStartup() 会重新拉会话列表并通过
+    // startEventPump() 建立一条新的 socket + children 轮询（旧定时器已在
+    // resetState 里清掉，不会重复创建）。
+    const token = adminToken;
+    useChatStore.getState().resetState();
     setAdminToken(null);
     setAuthenticated(false);
     setAvailableNodes([]);
     setModelConfig(null);
     setTokenInput('');
+    if (token) {
+      try {
+        await pluginApiRequest('/admin/auth/panel-session', {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } catch {
+        console.warn('已退出本地登录，但无法确认面板 Cookie 已撤销。');
+      }
+    }
   };
 
   return (
@@ -98,6 +127,11 @@ export const GeneralSettingsPage = () => {
         <p className="mt-2 max-w-xl text-sm text-[var(--duties-secondary)]">管理调度器连接和管理员访问。</p>
       </div>
 
+      {window.location.protocol === 'http:' && (
+        <p className="mb-4 text-sm text-[var(--duties-secondary)]" role="note">
+          当前使用 HTTP，连接未加密。可用于本地部署；通过不可信网络访问时请使用 HTTPS。
+        </p>
+      )}
       <div className="mb-4 border border-[var(--duties-border)] p-4">
         <p className="mb-2 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">连接</p>
         <div className="flex items-center gap-2 text-sm">

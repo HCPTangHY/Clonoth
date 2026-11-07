@@ -20,10 +20,10 @@ from typing import Any
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.14.0",
-    "description": "Web IDE：文件面板 + 编辑器 + @文件引用 + 文件管理（新建/重命名/删除/剪切移动）+ 工作区内容搜索",
+    "version": "0.16.5",
+    "description": "Web IDE：文件管理、编辑器、Git、搜索、@文件引用和会话待办清单",
     "author": "clonoth",
-    # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
+    # supervisor：静态面板与 API；engine：文件引用、待办工具与进度摘要。
     "processes": ["supervisor", "engine"],
     "web": {
         "panels": [
@@ -37,6 +37,13 @@ PLUGIN_META = {
             }
         ],
         "slots": [
+            {
+                "slot_id": "ide.todo_progress",
+                "slot": "chat_top",
+                "priority": 50,
+                "mode": "append",
+                "script": {"file": "web/todo_progress.js"},
+            },
             {
                 "slot_id": "ide.file_preview",
                 "slot": "workspace_file_preview",
@@ -120,38 +127,51 @@ PLUGIN_META = {
 
 # ── @引用展开（engine 进程，before_llm_call） ────────────────────
 # 语义：用户消息中的 @path 在落库（JSONL）与前端渲染中保持字面量；
-# 仅在每次 LLM 出站请求前展开为文件内容附加段（附加在首次引用该文件的
-# 消息尾部）。同一文件在一次请求内只展开一次。fallback 路径
-# （fallback_provider 重发）不经过此 hook，引用不展开，属已知边界。
+# LLM 请求副本将引用快照渲染为附加段；原始正文不变。
+# 每条持久消息独立冻结文件版本，同文新输入也可读取最新版本。
+# 主请求和备用请求共用此 hook；快照与消息一起存储、压缩和清理。
 
 _MENTION_RE = re.compile(r"@([A-Za-z0-9_./~:-]+)")
 _MAX_EXPAND_CHARS = 32 * 1024
+_MAX_EXPAND_READ_BYTES = _MAX_EXPAND_CHARS * 4 + 4
+_MAX_EXPAND_CACHE_ENTRIES = 128
 _expand_cache: dict[str, tuple[float, str | None]] = {}
 
 
-def _read_truncated(target: Path) -> str | None:
+def _read_truncated(target: Path, *, use_cache: bool = True) -> str | None:
     """读文件并截断，mtime 缓存；二进制或不可解码文件返回 None。"""
     key = target.as_posix()
     try:
-        mtime_ns = target.stat().st_mtime_ns
+        st = target.stat()
+        mtime_ns = st.st_mtime_ns
     except OSError:
         _expand_cache.pop(key, None)
         return None
     cached = _expand_cache.get(key)
-    if cached and cached[0] == mtime_ns:
+    if use_cache and cached and cached[0] == mtime_ns:
         return cached[1]
     try:
-        raw = target.read_bytes()
+        with target.open("rb") as f:
+            raw = f.read(_MAX_EXPAND_READ_BYTES)
     except OSError:
         return None
     text: str | None = None
     if b"\x00" not in raw[:4096]:
         try:
             text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            text = None
-    if text is not None and len(text) > _MAX_EXPAND_CHARS:
+        except UnicodeDecodeError as exc:
+            # Handle multi-byte UTF-8 sequence split at the _MAX_EXPAND_READ_BYTES boundary
+            if len(raw) == _MAX_EXPAND_READ_BYTES and exc.start >= len(raw) - 3:
+                try:
+                    text = raw[:exc.start].decode("utf-8")
+                except UnicodeDecodeError:
+                    text = None
+            else:
+                text = None
+    if text is not None and (len(text) > _MAX_EXPAND_CHARS or st.st_size > len(raw)):
         text = text[:_MAX_EXPAND_CHARS] + "\n... (truncated)"
+    if len(_expand_cache) >= _MAX_EXPAND_CACHE_ENTRIES and key not in _expand_cache:
+        _expand_cache.pop(next(iter(_expand_cache)), None)
     _expand_cache[key] = (mtime_ns, text)
     return text
 
@@ -182,6 +202,7 @@ def _expand_file_mentions(ctx) -> None:
     if not ws_root:
         return
     ws_root = Path(ws_root).resolve()
+    freeze = ctx.extra.get("freeze_message_metadata")
     expanded: set[str] = set()
     for msg in ctx.messages:
         if msg.get("role") != "user":
@@ -189,38 +210,63 @@ def _expand_file_mentions(ctx) -> None:
         text, writer = _msg_text_and_writer(msg)
         if not text or "@" not in text:
             continue
-        parts: list[str] = []
-        for m in _MENTION_RE.finditer(text):
-            # 只剥 ./ 前缀对，不逐字符剥点——保住 .env.example 这类点开头文件。
-            raw = m.group(1)
-            while raw.startswith("./"):
-                raw = raw[2:]
-            if not raw or ("." not in raw and "/" not in raw):
+        if callable(freeze):
+            from engine.conversation_store import is_dynamic_context
+            meta = msg.get("_meta") or {}
+            if meta.get("ide.reference_rendered"):
+                continue  # A cache-warm fork may already contain the rendered request.
+            if is_dynamic_context(msg) or meta.get("message_type", "user_input") != "user_input":
                 continue
-            target = (ws_root / raw).resolve()
-            try:
-                target.relative_to(ws_root)
-            except ValueError:
-                continue
-            if not target.is_file():
-                continue
-            key = target.as_posix()
-            if key in expanded:
-                continue
-            body = _read_truncated(target)
-            if body is None:
-                continue
-            expanded.add(key)
-            parts.append(f"[Referenced file: {raw}]\n```\n{body}\n```")
-        if parts:
-            writer(text + "\n\n" + "\n\n".join(parts))
+            # Persist an empty snapshot too: a missing/denied file must not start
+            # appearing in an old message after a later workspace or file change.
+            snapshot = freeze(msg, "ide.reference_snapshot", lambda: {
+                "workspace": str(ws_root),
+                "suffix": _reference_suffix(text, ws_root, set(), use_cache=False),
+            })
+            if snapshot is not None:
+                if snapshot.get("suffix"):
+                    writer(text + snapshot["suffix"])
+                msg.setdefault("_meta", {})["ide.reference_rendered"] = True
+            continue
+        # Legacy direct hook callers have no durable store; retain only their
+        # per-request expansion contract, without claiming cross-request freezing.
+        suffix = _reference_suffix(text, ws_root, expanded)
+        if suffix:
+            writer(text + suffix)
+
+
+def _reference_suffix(text: str, ws_root: Path, expanded: set[str], *, use_cache: bool = True) -> str:
+    parts: list[str] = []
+    for m in _MENTION_RE.finditer(text):
+        raw = m.group(1)
+        while raw.startswith("./"):
+            raw = raw[2:]
+        if not raw or ("." not in raw and "/" not in raw):
+            continue
+        target = (ws_root / raw).resolve()
+        try:
+            target.relative_to(ws_root)
+        except ValueError:
+            continue
+        if not target.is_file():
+            continue
+        key = target.as_posix()
+        if key in expanded:
+            continue
+        body = _read_truncated(target, use_cache=use_cache)
+        if body is None:
+            continue
+        expanded.add(key)
+        parts.append(f"[Referenced file: {raw}]\n```\n{body}\n```")
+    return "\n\n" + "\n\n".join(parts) if parts else ""
 
 
 def register(ctx) -> None:
-    """双进程入口：supervisor 挂路由；engine 挂 @引用展开 hook。"""
+    """双进程入口：Supervisor 注册 API，Engine 注册引用和待办能力。"""
     routes = getattr(ctx.contributions, "get", lambda _name: None)("routes")
     if routes is None:
-        # engine 进程：注册 before_llm_call 展开处理。
+        # [2026-10-27] 停用 Engine 侧 read_todos / update_todos 工具与每步 before_step 轮询钩子
+        # engine 进程：仅注册 before_llm_call @path 引用展开处理。
         dispose = ctx.hooks.register("before_llm_call", _expand_file_mentions, priority=50)
         return [dispose]
 
@@ -233,7 +279,10 @@ def register(ctx) -> None:
     # 鉴权依赖全局 /v1/ 中间件（public 默认 False）。
     MAX_WRITE_BYTES = 4 * 1024 * 1024
 
+    from .todo import add_routes
+
     api = APIRouter()
+    add_routes(api)
 
     def _state(request: Request):
         st = getattr(request.app.state, "state", None)
@@ -709,4 +758,4 @@ def register(ctx) -> None:
         static_router(Path(__file__).parent / "web"),
         prefix="/web",
     )
-    routes.register(client, public=True, description="ide 面板静态资源")
+    routes.register(client, description="ide 面板静态资源（需鉴权）")

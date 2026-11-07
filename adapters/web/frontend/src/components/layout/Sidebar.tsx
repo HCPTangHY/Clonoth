@@ -6,6 +6,7 @@
 import { useMemo } from 'react';
 
 import { useChatStore, type ChildNodeState, type ConversationMeta } from '../../store/chatStore';
+import { shouldHideChildNode } from '../../store/chatTypes';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { Button, getChildNodeStatusLabel, Icon, StatusDot } from '../common';
@@ -38,6 +39,14 @@ function groupChildNodesByConversation(
     if (!knownConversationIds.has(child.parentConversationId)) return;
     // [AutoC 2026-06-04] Filter out system nodes.
     if (child.nodeId.startsWith('system.')) return;
+    // [2026-09-14] 与浮动面板（ChildNodePanel）保持同一条规则：终态子节点在
+    // completedAt 超过 30 秒后从会话树隐藏。Why: registry 里保留 24 小时的已结束
+    // 子会话（dispatch/_worker 等）会一直挂在侧边栏，任务早已结束却像遗留的幽灵行。
+    // [2026-10-02] How: 改用 chatTypes.shouldHideChildNode 的共享规则，只有
+    // “真正的终态”才计时。旧写法只看 completedAt 是否存在，running/awaiting_approval
+    // 行一旦残留历史完成时间（会话恢复、同 session 新任务），就会被误隐藏。
+    // Purpose: 侧边栏和浮动面板对同一条子节点给出完全一致的可见性。
+    if (shouldHideChildNode(child)) return;
     grouped[child.parentConversationId] = [...(grouped[child.parentConversationId] || []), child];
   });
 

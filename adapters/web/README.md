@@ -54,15 +54,20 @@ npm run build
 
 构建产物输出到 `dist/` 目录。
 
-### 4. 测试
+### 4. 离线检查（测试）
+
+`package.json` 只提供 `dev` / `build` / `preview`，本仓没有引入 vitest。回归检查是一组零依赖脚本：用 Vite 自带的 esbuild 把 `test/offline.test.ts` 打成单文件，再由 Node 原生 `assert` 执行。
 
 ```bash
-# 运行全部测试
-npm test
-
-# 单次运行
-npm run test:run
+npm ci
+node test/build.mjs && node /tmp/clonoth-offline.mjs
 ```
+
+输出路径可用 `CLONOTH_OFFLINE_OUT=/path/to/out.mjs` 覆盖。
+
+若终端环境继承了 `NODE_CHANNEL_FD`（部分 agent 运行时会在 Node 退出时触发 libuv 断言），用 `env -u NODE_CHANNEL_FD -u NODE_CHANNEL_SERIALIZATION_MODE` 前缀执行同样的命令即可。
+
+覆盖范围：子会话按 sessionId 建索引、dispatch 子任务事件路由、子会话历史空态、`response_info` 的 request 归属与 notices 独立性、reasoning 展示契约（`thinking_blocks` 优先，`thought_summary` 仅旧数据兜底）、manual/smart/yolo 审批边界、插件面板入口同源校验。两仓默认都没有 `node_modules`，先 `npm ci` 才能跑。
 
 ## 部署方式
 
@@ -137,4 +142,4 @@ cp -a dist/. /path/to/production/adapters/web/frontend/dist/
 - Zustand（状态管理）
 - js-yaml（配置文件解析）
 - react-markdown + remark-gfm（Markdown 渲染）
-- Vitest + Testing Library（测试）
+- 无测试框架依赖（离线检查见「测试」）

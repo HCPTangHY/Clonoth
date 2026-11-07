@@ -25,6 +25,7 @@
   },
   "include": [
     "src",
+    "test",
     "vite.config.ts",
     "tailwind.config.ts"
   ],

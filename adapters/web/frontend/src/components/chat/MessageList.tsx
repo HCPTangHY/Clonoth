@@ -7,6 +7,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { ToolExecution, WsMessage } from '../../types/message';
 import { useChatStore } from '../../store';
+import { resolveChildSessionHistoryView } from '../../store/chatTypes';
+import { Button } from '../common';
 import { MessageCard } from './MessageCard';
 import { WorkingGroup } from './WorkingGroup';
 
@@ -121,6 +123,28 @@ export const MessageList = ({ messages, toolsById }: MessageListProps) => {
   const [hasInitialized, setHasInitialized] = useState(false);
   const prevMessageCountRef = useRef(0);
   const lastScrolledUserIdRef = useRef<string | null>(null);
+
+  // [2026-09-13] 子会话视图空态：区分“正在加载”“已确认无记录”“未选择会话”，
+  // 避免点击已清理的子节点行时误显默认文案。
+  // [2026-10-02] 补上“加载失败”态：子会话历史 404/网络失败过去只是静默 return，
+  // 视图会永远停在“正在加载子会话记录…”。四态互斥由 chatTypes 的纯函数决定。
+  const childViewState = useChatStore((state) => {
+    const childId = state.viewingChildSessionId;
+    if (!childId) return 'none';
+    return resolveChildSessionHistoryView(
+      state.childSessionMessages[childId]?.length ?? 0,
+      state.childSessionEmpty?.[childId],
+      state.childSessionLoadFailed?.[childId],
+    );
+  });
+  const retryChildSession = useCallback(() => {
+    // 复用 viewChildSession 作为重试入口（它同时负责进入子会话）：会复位空态/
+    // 失败态、把消息列表清回加载中并重新拉取历史，old 流程不新增 store API。
+    const store = useChatStore.getState();
+    const childId = store.viewingChildSessionId;
+    if (!childId) return;
+    store.viewChildSession(childId, store.viewingChildTaskId || undefined, store.viewingChildConversationKey || undefined);
+  }, []);
 
   // [AutoC 2026-06-15] Dynamic padding: when a new user message appears,
   // insert a large padding at the bottom so the user message sits at the
@@ -310,8 +334,19 @@ export const MessageList = ({ messages, toolsById }: MessageListProps) => {
 
   if (messages.length === 0) {
     return (
-      <div className="flex h-full items-center justify-center p-6 text-sm text-[var(--duties-tertiary)]">
-        请选择或创建一个对话。
+      <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-sm text-[var(--duties-tertiary)]">
+        {childViewState === 'failed' ? (
+          <>
+            <span>子会话记录加载失败（网络或后端异常）。</span>
+            <Button onClick={retryChildSession} variant="ghost">重试</Button>
+          </>
+        ) : childViewState === 'empty' ? (
+          <span>该子会话已清理或没有可显示的记录。</span>
+        ) : childViewState === 'loading' ? (
+          <span>正在加载子会话记录…</span>
+        ) : (
+          <span>请选择或创建一个对话。</span>
+        )}
       </div>
     );
   }

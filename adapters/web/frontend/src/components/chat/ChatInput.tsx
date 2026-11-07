@@ -302,8 +302,13 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
           edge, right-aligned flex wrap; PluginSlotHost renders nothing when the
           slot has no contribution. */}
       <div className="pointer-events-none absolute inset-x-2 bottom-full z-10 sm:inset-x-3">
+        {/* [2026-09-08] Why: this strip used to span the composer's full width
+            with pointer-events-auto, so it swallowed clicks meant for the chat
+            flow above it. How: shrink the row to its content width and pin it
+            right; the completer dropdown still expands when open. Purpose: only
+            real chip/dropdown pixels intercept pointer events. */}
         <PluginSlotHost
-          className="pointer-events-auto mb-1 flex flex-wrap items-center justify-end gap-1"
+          className="pointer-events-auto mb-1 ml-auto flex w-fit max-w-full flex-wrap items-center justify-end gap-1"
           data={inputSlotData}
           slot="input_above"
         />

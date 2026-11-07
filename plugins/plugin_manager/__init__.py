@@ -94,4 +94,4 @@ def register(ctx) -> None:
         static_router(Path(__file__).parent / "web"),
         prefix="/web",
     )
-    routes.register(client, public=True, description="plugin_manager 管理界面静态资源")
+    routes.register(client, description="plugin_manager 管理界面静态资源（需鉴权）")

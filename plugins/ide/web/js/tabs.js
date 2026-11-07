@@ -204,6 +204,15 @@ function renderTabs() {
         showContextMenu(e.clientX, e.clientY, items);
       });
     }
+    el.tabIndex = 0;
+    el.setAttribute('role', 'button');
+    el.setAttribute('aria-label', isTree ? '文件' : baseName(tab.path));
+    el.setAttribute('aria-pressed', String(tab.path === activePath));
+    el.addEventListener('keydown', (event) => {
+      if (event.target === el && (event.key === 'Enter' || event.key === ' ')) {
+        event.preventDefault(); activate(tab.path);
+      }
+    });
     el.addEventListener('click', () => activate(tab.path));
     tabbarEl.insertBefore(el, tabbarEl.querySelector('.bar-end'));
   }

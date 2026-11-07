@@ -129,17 +129,29 @@ function renderDiff(tab) {
         // 与普通文件标签同一渲染层：行号、语法高亮、折叠、缩进、主题
         ...codeCommonExtensions(tab.path),
         decoPlugin,
+        // [2026-09-13] 只读但保留鼠标选择：editable.of(false) 会禁用 CM 的
+        // 选择处理，导致 diff 视图无法拖选文本复制。只设 readOnly 即可。
         EditorState.readOnly.of(true),
-        EditorView.editable.of(false),
       ],
     }),
   });
   tab._view = view;
-  applyScrollFraction(view.scrollDOM, tab.scroll || 0);
-  view.requestMeasure();
+  restoreEditorScroll(view, tab.scroll || 0);
 }
 
-// ── editor ───────────────────────────────────────────────────────────────
+// [2026-09-13] 滚动恢复移到 CodeMirror 首次测量之后。Why: 视图刚创建时
+// cm-scroller 的 scrollHeight 是估算值（viewport 行高尚未测量），同步设置
+// scrollTop 会被钳制甚至归零，测量后也没有机制再修正，切回标签就回到顶部。
+// How: requestMeasure 的 write 阶段在 CM 布局后应用比例，再叠加两帧 rAF
+// 校正渐进测量造成的高度变化。Purpose: 切换标签页后滚动位置保持。
+function restoreEditorScroll(view, frac) {
+  const apply = () => applyScrollFraction(view.scrollDOM, frac);
+  view.requestMeasure({ write: apply });
+  requestAnimationFrame(() => {
+    apply();
+    requestAnimationFrame(apply);
+  });
+}
 
 // ── 共享代码视图层 ────────────────────────────────────────────────────────
 // 普通文件标签与 diff 标签（apply_diff 逆推 / git 变更 / 提交差异）共用同一
@@ -156,7 +168,8 @@ function diffBasePath(p) {
 function codeCommonExtensions(path) {
   const { EditorState, EditorView, lineNumbers, highlightActiveLine, highlightActiveLineGutter,
           drawSelection, bracketMatching, foldGutter, syntaxHighlighting,
-          highlightSelectionMatches, indentUnit, markdown, markdownLanguage } = CM;
+          highlightSelectionMatches, indentUnit, markdown, markdownLanguage,
+          rectangularSelection, crosshairCursor } = CM;
   const base = diffBasePath(path);
   const langExts = isMarkdown(base)
     ? [markdown({ base: markdownLanguage })]
@@ -168,6 +181,10 @@ function codeCommonExtensions(path) {
     drawSelection(),
     bracketMatching(),
     foldGutter(),
+    // [2026-09-13] 框选：Alt+拖动进行矩形列选择；crosshairCursor 在 Alt 按下
+    // 时显示十字光标，提示框选模式。挂共享层，普通编辑与 diff 视图都有。
+    rectangularSelection(),
+    crosshairCursor(),
     // [AutoC 2026-08-24] 高对比浅色配色（Atom One Light 色系）。
     syntaxHighlighting(hlStyle()),
     highlightSelectionMatches(),
@@ -246,8 +263,7 @@ function renderEditor(tab) {
   // 游标位置按文档长度钳制（文档可能被外部改短），滚动按比例恢复。
   const head = Math.min(tab.cursor || 0, view.state.doc.length);
   view.dispatch({ selection: { anchor: head } });
-  applyScrollFraction(view.scrollDOM, tab.scroll || 0);
-  view.requestMeasure();
+  restoreEditorScroll(view, tab.scroll || 0);
 }
 
 // [AutoC 2026-08-24] Markdown 渲染：marked 解析 + 本地 sanitize。
@@ -280,6 +296,11 @@ function renderMarkdown(tab) {
   body.addEventListener('click', (e) => {
     // 链接点击正常跳转，不触发编辑
     if (e.target.closest('a')) return;
+    // [2026-09-13] 拖选文本的 mouseup 同样会触发 click（mousedown/mouseup
+    // 目标不同时，click 冒泡到共同祖先）。有选区时保留选择便于复制，
+    // 不进入编辑模式。
+    const sel = window.getSelection();
+    if (sel && sel.toString()) return;
     setTabMode(tab, 'edit');
     // 进入编辑后立即获得焦点，让光标落在点击位置附近
     requestAnimationFrame(() => {
@@ -287,7 +308,8 @@ function renderMarkdown(tab) {
     });
   });
   viewEl.appendChild(body);
-  applyScrollFraction(viewEl, tab.scroll || 0);
+  // [2026-09-13] 图片等子资源加载会改变内容高度，下一帧再应用滚动比例。
+  requestAnimationFrame(() => applyScrollFraction(viewEl, tab.scroll || 0));
 }
 
 function setTabMode(tab, mode) {

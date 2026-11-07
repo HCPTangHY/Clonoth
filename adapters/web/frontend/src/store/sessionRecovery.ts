@@ -17,7 +17,7 @@ import { reduceChatEvent } from './eventReducer';
 import { isConversationGenerating } from './eventRouting';
 import { getActiveConversation } from './chatTypes';
 import type { StoreGetter, StoreSetter } from './chatTypes';
-import { loadSessionHistoryIntoStore } from './historyLoader';
+import { captureStoreGeneration, isCurrentStoreGeneration, loadSessionHistoryIntoStore } from './historyLoader';
 
 export async function loadContextUsageIntoStore(sessionId: string, set: StoreSetter, get: StoreGetter): Promise<void> {
   // [AutoC 2026-06-16] Keep context usage refresh outside chatStore actions.
@@ -25,12 +25,14 @@ export async function loadContextUsageIntoStore(sessionId: string, set: StoreSet
   // need the same backend read. How: call getContextWindow and route the normalized
   // payload through the store's public updateContextUsage action. Purpose: preserve
   // one display/update path while avoiding duplicated API code.
+  const generation = captureStoreGeneration();
   let response: ContextWindowResponse;
   try {
     response = await getContextWindow(sessionId);
   } catch {
     return;
   }
+  if (!isCurrentStoreGeneration(generation)) return;
   get().updateContextUsage({ ...response, session_id: response.session_id || sessionId });
 }
 
@@ -40,13 +42,14 @@ export async function replayPendingApprovals(sessionId: string, set: StoreSetter
   // How: fetch pending approvals and replay them as synthetic reducer events only for
   // the active session. Purpose: users can still decide outstanding approvals after
   // session recovery without chatStore importing reducer details.
+  const generation = captureStoreGeneration();
   let approvals: any[];
   try {
     approvals = await getSessionPendingApprovals(sessionId);
   } catch {
     return;
   }
-  if (!approvals || approvals.length === 0) return;
+  if (!isCurrentStoreGeneration(generation) || !approvals || approvals.length === 0) return;
 
   const state = get();
   const active = getActiveConversation(state);
@@ -115,6 +118,7 @@ export async function restoreGeneratingStateFromBackend(
   // tasks, keep user-entry tasks only, update generating maps, then reload history
   // if work is still active. Purpose: active streams continue rendering after network
   // recovery without making eventPump depend on chatStore.
+  const generation = captureStoreGeneration();
   let runningTasks: import('../api/supervisorClient').RunningTaskInfo[] = [];
   try {
     runningTasks = await getSessionRunningTasks(sessionId);
@@ -122,6 +126,7 @@ export async function restoreGeneratingStateFromBackend(
     // Best effort
   }
 
+  if (!isCurrentStoreGeneration(generation)) return;
   const userEntryTasks = runningTasks.filter((task) => {
     if (task.is_user_entry !== undefined) return task.is_user_entry;
     if (task.source_inbound_seq !== undefined) return task.source_inbound_seq != null;

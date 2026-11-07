@@ -30,6 +30,7 @@ import {
   isDispatchResultHistoryMessage,
 } from './chatTypes';
 import type { HistoryThinkingSegment, HistoryToolCall, HistoryToolResult } from './chatTypes';
+import { normalizeResponseInfo } from './eventReducerState';
 
 // ── Tool Argument Summary ──────────────────────────────────────────────────
 
@@ -97,6 +98,8 @@ export function buildHistoryToolResultIndex(messages: readonly StructuredMessage
       rawInline,
       format: message.tool_result_format || message.format || undefined,
       elapsedMs,
+      // [2026-09-10] 后端落盘的 tool summary 优先于前端按参数推导的摘要。
+      summary: message.tool_result_summary || message.tool_summary || undefined,
       attachments: attachments.length > 0 ? attachments : undefined,
       rejected: rejected || undefined,
       rejectionCode: message.tool_rejection_code || undefined,
@@ -321,7 +324,11 @@ export function normalizeHistoryThinkingSegments(message: StructuredMessage): Hi
     return normalized ? [normalized] : [];
   }
 
-  const text = typeof message.thinking === 'string' ? message.thinking : message.thinking_text || '';
+  // [2026-09-10] 统一 reasoning 展示契约：thinking_blocks 优先（上方已返回），
+  // thinking / thinking_text 次之，thought_summary 仅用作旧数据兜底。
+  const legacyThoughtSummary = (message as unknown as Record<string, unknown>).thought_summary;
+  const thoughtSummary = typeof legacyThoughtSummary === 'string' ? legacyThoughtSummary : '';
+  const text = typeof message.thinking === 'string' ? message.thinking : message.thinking_text || thoughtSummary;
   if (!text.trim()) return [];
 
   return [{
@@ -369,7 +376,7 @@ export function createHistoryToolExecutions(
       status: historyToolStatus(result),
       arguments: toolCall.arguments,
       argumentsText: toolCall.arguments ? JSON.stringify(toolCall.arguments) : undefined,
-      summary: summarizeArguments(toolCall.name, toolCall.arguments),
+      summary: result?.summary || summarizeArguments(toolCall.name, toolCall.arguments),
       result: result?.result,
       rawInline: result?.rawInline,
       format: result?.format,
@@ -639,6 +646,9 @@ export function hydrateStructuredHistory(
         llmRequestId: sourceMessage.llm_request_id || undefined,
         provider: sourceMessage.provider || undefined,
         providerMetadata: sourceMessage.provider_metadata,
+        // [2026-09-12] 历史 JSONL 里的 response_info 可能是旧形状（notices 非数组），
+        // 复用 live 路径的规范化函数，避免 MessageCard 在渲染时抛错。
+        responseInfo: normalizeResponseInfo(sourceMessage.response_info),
         usage: sourceMessage.usage,
       },
       blocks,
@@ -820,6 +830,7 @@ export function hydrateStructuredHistory(
           taskId: message.child_task_id || message.dispatch_task_id || message.source_task_id || undefined,
           childTaskId: message.child_task_id || message.dispatch_task_id || undefined,
           callerNodeId: message.caller_node_id || undefined,
+          summary: message.summary || undefined,
           childSessionId: message.child_session_id || undefined,
           llmRequestId: message.llm_request_id || undefined,
           provider: message.provider || undefined,

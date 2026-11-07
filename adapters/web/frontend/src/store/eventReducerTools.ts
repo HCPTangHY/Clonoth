@@ -108,6 +108,7 @@ export function upsertToolExecution(
     status,
     arguments: parsedArguments,
     argumentsText: argumentsTextFromPatch,
+    summary: patch.summary !== undefined ? patch.summary : current?.summary,
     result: patch.result !== undefined ? patch.result : current?.result,
     rawInline: patch.rawInline !== undefined ? patch.rawInline : current?.rawInline,
     format: patch.format !== undefined ? patch.format : current?.format,

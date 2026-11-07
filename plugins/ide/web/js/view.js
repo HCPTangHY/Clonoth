@@ -5,13 +5,24 @@
 let loadSeq = 0;
 let treeBooted = false;   // 文件树只初始化一次，切换标签时保留展开状态
 let treeRootEl = document.createElement('div');
+// [2026-09-13] 文件树视图滚动像素。Why: 切到文件标签时 viewEl.innerHTML=''
+// 清空内容会把 scrollTop 钐制为 0，切回时无人恢复；stashScroll 之前
+// 明确跳过 TREE_TAB，导致切回文件树永远回顶。How: 按像素保存/恢复
+// （树内容确定，像素比比例精确），git/搜索整页视图激活时不归入此值。
+let treeScrollTop = 0;
 
 function showStatus(text) {
   viewEl.innerHTML = '<div class="status">' + esc(text) + '</div>';
 }
 
 function stashScroll() {
-  const tab = viewPath && viewPath !== TREE_TAB ? findTab(viewPath) : null;
+  // [2026-09-13] 文件树标签：git/搜索整页视图激活时 viewEl 里不是文件树，
+  // 不归入 treeScrollTop（它们各自重渲染，滚动语义另议）。
+  if (viewPath === TREE_TAB) {
+    if (!gitViewActive && !searchViewActive) treeScrollTop = viewEl.scrollTop;
+    return;
+  }
+  const tab = viewPath ? findTab(viewPath) : null;
   if (!tab) return;
   if (tab.kind === 'text') {
     if (tab._view) {
@@ -36,6 +47,10 @@ function renderView() {
     if (treeBooted) {
       viewEl.innerHTML = '';
       viewEl.appendChild(treeRootEl);
+      // [2026-09-13] 切回时恢复文件树滚动：treeRootEl 重新挂载后内容高度
+      // 立即有效，同步设置即可；叠一帧 rAF 校正偶发的布局未完成。
+      viewEl.scrollTop = treeScrollTop;
+      requestAnimationFrame(() => { viewEl.scrollTop = treeScrollTop; });
     } else {
       bootTree();
     }

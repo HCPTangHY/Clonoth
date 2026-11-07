@@ -69,6 +69,11 @@ const MainApp = () => {
   // hydrates ConversationMeta and structured history through reducer-shaped data.
   // How: call loadStartup once from the store singleton. Purpose: avoid mounting the
   // legacy startup loader and its old message accumulator.
+  // [2026-10-02] 契约：loadStartup 内部用 startupLoaded 一次性门闩，并负责调用
+  // startEventPump。MainApp 只在已登录时挂载（登录门在下方 App 里），所以“登出 ->
+  // 重新登录”必须让 chatStore 回到未启动状态，否则这里被短路、事件流永不启动。
+  // 复位统一由 GeneralSettingsPage 的 handleLogout 调用 chatStore.resetState()
+  // 完成（停泵 + 清私有会话缓存 + startupLoaded=false）；MainApp 不重复建 socket。
   useEffect(() => {
     useChatStore.getState().loadStartup();
   }, []);
@@ -149,6 +154,7 @@ const MainApp = () => {
       <AppLayout
         composer={view.composer?.(viewContext)}
         header={view.header(viewContext)}
+        mainTop={view.mainTop?.(viewContext)}
         logPanel={view.rightBottom?.(viewContext)}
         rightOverlay={view.rightOverlay?.(viewContext)}
         rightPanel={view.rightTop?.(viewContext)}

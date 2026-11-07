@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { useChatStore, type ChildNodeState } from '../../store/chatStore';
+import { shouldHideChildNode } from '../../store/chatTypes';
 import { getChildNodeStatusLabel, StatusDot } from '../common';
 
 interface ChildNodePanelProps {
@@ -32,10 +33,9 @@ function selectChildNodesForConversation(
       // [AutoC 2026-06-04] Why: completed/failed/cancelled child nodes should not
       // persist in the panel indefinitely. How: hide terminal nodes whose completedAt
       // is older than 30 seconds. Purpose: brief flash of completion then auto-hide.
-      if (child.completedAt) {
-        const elapsed = Date.now() - new Date(child.completedAt).getTime();
-        if (elapsed > 30_000) return false;
-      }
+      // [2026-10-02] 规则已抽到 chatTypes.shouldHideChildNode 并与 Sidebar 共用：
+      // 只有真正的终态才计时隐藏，非终态即使带着历史 completedAt 也继续显示。
+      if (shouldHideChildNode(child)) return false;
       return true;
     })
     .sort((a, b) => (a.startedAt || '').localeCompare(b.startedAt || ''));

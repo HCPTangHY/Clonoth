@@ -247,6 +247,21 @@ const TOOL_META_MAP: Record<string, ToolMeta> = {
   preempt_task: { icon: 'priority_high', label: '追加指令', descTemplate: '' },
   get_context_window: { icon: 'data_usage', label: '上下文窗口', descTemplate: '' },
   read_video: { icon: 'movie', label: '读取视频', descTemplate: '' },
+  read_media: { icon: 'perm_media', label: '读取媒体', descTemplate: '' },
+  manage_skill: { icon: 'bookmarks', label: '技能管理', descTemplate: '' },
+  manage_schedule: { icon: 'schedule', label: '定时管理', descTemplate: '' },
+  manage_tool: { icon: 'build', label: '工具管理', descTemplate: '' },
+  manage_mcp_client: { icon: 'extension', label: 'MCP管理', descTemplate: '' },
+  manage_workers: { icon: 'groups', label: '子代理管理', descTemplate: '' },
+  dispatch_to: { icon: 'call_split', label: '委派节点', descTemplate: '' },
+  spawn_worker: { icon: 'person_add', label: '派发Worker', descTemplate: '' },
+  search_web: { icon: 'travel_explore', label: '联网搜索', descTemplate: '' },
+  generate_image: { icon: 'image', label: '生成图片', descTemplate: '' },
+  generate_nai_image: { icon: 'palette', label: 'NAI生图', descTemplate: '' },
+  remote_exec: { icon: 'dns', label: '远程执行', descTemplate: '' },
+  llm_complete: { icon: 'psychology', label: 'LLM补全', descTemplate: '' },
+  read_todos: { icon: 'checklist', label: '读取待办', descTemplate: '' },
+  update_todos: { icon: 'edit_note', label: '更新待办', descTemplate: '' },
 
   discord_manage: { icon: 'smart_toy', label: 'Discord', descTemplate: '' },
   clonoth_debug: { icon: 'bug_report', label: '调试', descTemplate: '' },
@@ -400,6 +415,34 @@ function getToolInlineSummary(tool: ToolExecution): string {
     case 'create_or_update_tool': {
       const tn = getStringValue(args.name);
       return tn ? `工具 ${tn}` : '';
+    }
+    case 'manage_skill':
+    case 'manage_schedule':
+    case 'manage_tool':
+    case 'manage_mcp_client':
+    case 'manage_workers': {
+      const act = getStringValue(args.action) || 'list';
+      const tgt = getStringValue(args.name || args.id || args.target);
+      return tgt ? `${act} ${tgt}` : act;
+    }
+    case 'dispatch_to': {
+      const tgt = getStringValue(args.target);
+      const inst = getStringValue(args.instruction || args.text);
+      const clip = inst.length > 26 ? `${inst.slice(0, 24)}…` : inst;
+      return tgt ? `${tgt}: ${clip}` : clip;
+    }
+    case 'search_web': {
+      const act = getStringValue(args.action) || 'search';
+      if (act === 'fetch') {
+        const urls = Array.isArray(args.urls) ? args.urls : [];
+        return urls.length > 0 ? `抓取 ${urls.length} 个链接` : '抓取网页';
+      }
+      const q = getStringValue(args.query);
+      return q ? (q.length > 28 ? `${q.slice(0, 25)}…` : q) : '';
+    }
+    case 'read_media': {
+      const p = getStringValue(args.path || args.image_path || args.video_path);
+      return p ? basename(p) : '';
     }
     default: break;
   }

@@ -17,8 +17,9 @@ export const autoApprovedApprovalIds: Set<string> = loadAutoApproved();
 export function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGetter): void {
   // [AutoC 2026-08-10] Auto-approve based on supervisor trust_level + client prefs.
   // trust_level comes from the supervisor policy layer via the event payload.
-  // Only 'workspace' level can be auto-approved. 'trusted' and 'external' always
-  // require manual approval regardless of client preference.
+  // [AutoC 2026-09-20] manual/smart only auto-approve workspace-level operations;
+  // 'trusted' and 'external' need manual review at those levels. yolo bypasses the
+  // trust gate entirely (see gate below).
   if (event.type !== 'approval_requested') return;
   const payload = event.payload || {};
   const approvalId = typeof payload.approval_id === 'string' ? payload.approval_id : '';
@@ -27,15 +28,20 @@ export function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: Sto
   // Read trust_level from supervisor policy decision
   const trustLevel = typeof payload.trust_level === 'string' ? payload.trust_level : '';
 
-  // Only workspace-level operations can be auto-approved.
-  // 'trusted' (workspace_root, extra_roots) and 'external' always require manual review.
-  // Empty trust_level (no-path operations like execute_command) falls back to
-  // client preference below.
-  if (trustLevel === 'trusted' || trustLevel === 'external') return;
+  const prefs = useClientPrefsStore.getState();
+
+  // [AutoC 2026-09-20] Why: yolo promises "auto-approve everything", yet the
+  // unconditional trust gate below blocked trusted/external approvals (e.g. reads
+  // outside the workspace) even in yolo, contradicting that level's own description.
+  // How: apply the trust gate only for manual/smart; yolo short-circuits it and
+  // approves by user preference. Purpose: manual and smart keep the
+  // outside-workspace guard, yolo behaves as advertised. Server-side deny rules
+  // (.env, policy.yaml, destructive patterns, ...) are not approvable at all and
+  // stay in force for every level.
+  if (prefs.approvalLevel !== 'yolo' && (trustLevel === 'trusted' || trustLevel === 'external')) return;
 
   const state = get();
   const toolName = getToolNameForApprovalEvent(state, event);
-  const prefs = useClientPrefsStore.getState();
   if (!toolName || !shouldAutoApproveTool(toolName, prefs.autoApproveTools, prefs.approvalLevel)) return;
 
   autoApprovedApprovalIds.add(approvalId);
