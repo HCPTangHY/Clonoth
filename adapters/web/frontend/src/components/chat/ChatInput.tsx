@@ -17,7 +17,8 @@ import {
   useState,
 } from 'react';
 
-import { type ApprovalLevel, useChatStore, useClientPrefsStore } from '../../store';
+import { type ApprovalLevel, useChatStore } from '../../store';
+import { useSessionApproval } from '../../store/useSessionApproval';
 import { isConversationGenerating } from '../../store/eventRouting';
 import type { Attachment } from '../../types';
 import { Icon } from '../common';
@@ -27,10 +28,11 @@ import { PluginSlotHost } from '../plugins/PluginSlotHost';
 
 const APPROVAL_LEVEL_ORDER: ApprovalLevel[] = ['manual', 'smart', 'yolo'];
 
-const APPROVAL_LEVEL_DISPLAY: Record<ApprovalLevel, { icon: string; label: string }> = {
+const APPROVAL_LEVEL_DISPLAY: Record<ApprovalLevel | 'custom', { icon: string; label: string }> = {
   manual: { icon: 'shield', label: '审批' },
   smart: { icon: 'bolt', label: '自动' },
   yolo: { icon: 'lock_open', label: '放行' },
+  custom: { icon: 'tune', label: '自定义' },
 };
 
 const FALLBACK_LINE_HEIGHT_PX = 20;
@@ -96,9 +98,9 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentsRef = useRef<Attachment[]>([]);
-  const approvalLevel = useClientPrefsStore((state) => state.approvalLevel) || 'smart';
-  const setApprovalLevel = useClientPrefsStore((state) => state.setApprovalLevel);
-  const approvalDisplay = APPROVAL_LEVEL_DISPLAY[approvalLevel] || APPROVAL_LEVEL_DISPLAY.smart;
+  const approval = useSessionApproval();
+  const approvalLevel = approval.level;
+  const approvalDisplay = APPROVAL_LEVEL_DISPLAY[approvalLevel];
   const contextUsage = useChatStore((state) => {
     const activeConversation = state.activeConversationId
       ? state.conversations.find((conversation) => conversation.id === state.activeConversationId)
@@ -244,13 +246,10 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
   };
 
   const cycleApprovalLevel = () => {
-    // [2026-06-05] Why: chat users need the same safety-level switch that exists in
-    // client settings. How: advance through the explicit manual → smart → yolo order
-    // and persist through clientPrefsStore. Purpose: the footer button remains compact
-    // while still changing the real approval behavior.
-    const currentIndex = APPROVAL_LEVEL_ORDER.indexOf(approvalLevel);
+    // Only an explicit choice replaces custom or policy-default session rules.
+    const currentIndex = approvalLevel === 'custom' ? -1 : APPROVAL_LEVEL_ORDER.indexOf(approvalLevel);
     const nextIndex = currentIndex >= 0 ? (currentIndex + 1) % APPROVAL_LEVEL_ORDER.length : 0;
-    setApprovalLevel(APPROVAL_LEVEL_ORDER[nextIndex]);
+    approval.setLevel(APPROVAL_LEVEL_ORDER[nextIndex]);
   };
 
   const handleFileSelect = () => {
@@ -367,9 +366,10 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
             </button>
             <button
               aria-label={`审批级别：${approvalDisplay.label}。点击切换`}
-              className="inline-flex h-8 items-center gap-1 border border-[var(--duties-border)] px-2 font-mono text-xs text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]"
+              className="inline-flex h-8 items-center gap-1 rounded-lg border border-[var(--duties-border)] px-2 font-mono text-xs text-[var(--duties-secondary)] transition-all duration-150 hover:bg-zinc-500/10 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400 disabled:opacity-50"
+              disabled={approval.busy}
               onClick={cycleApprovalLevel}
-              title={`审批级别：${approvalDisplay.label}`}
+              title={`${approval.sessionId ? '当前会话' : '新会话默认'}审批规则：${approvalDisplay.label}`}
               type="button"
             >
               {/* [2026-06-05] Why: the requested compact label includes both an
@@ -377,8 +377,9 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
                   the two rendered values instead of relying only on flex gap. Purpose:
                   the visible text and tests match the documented manual/smart/yolo labels. */}
               <Icon name={approvalDisplay.icon} size={16} />
-              <span>{approvalDisplay.label}</span>
+              <span>{approval.busy ? '读取中' : approvalDisplay.label}</span>
             </button>
+            {approval.error && <span role="alert" className="max-w-48 text-xs leading-relaxed text-[var(--duties-secondary)]">{approval.error}</span>}
             {/* Reserved slot: plugins may append toolbar controls on the left. */}
             <PluginSlotHost
               className="flex min-w-0 items-center gap-1.5"

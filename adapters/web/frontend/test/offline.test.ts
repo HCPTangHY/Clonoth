@@ -23,8 +23,8 @@ import { createInitialChatState } from '../src/store/eventReducer';
 import { loadChildSessionHistoryIntoStore } from '../src/store/historyLoader';
 import { mergeSource, normalizeResponseInfo } from '../src/store/eventReducerState';
 import { normalizeHistoryThinkingSegments } from '../src/store/historyHydration';
-import { maybeAutoApproveApprovalRequest, autoApprovedApprovalIds } from '../src/store/approvalManager';
-import { shouldAutoApproveTool, useClientPrefsStore, type ApprovalLevel } from '../src/store/clientPrefsStore';
+import { compileApprovalPreset, identifyApprovalPreset } from '../src/store/sessionApprovalRules';
+import { shouldAutoApproveTool } from '../src/store/clientPrefsStore';
 import { resolvePanelEntry } from '../src/components/plugins/panelEntry';
 import type { SupervisorEvent } from '../src/types/chat';
 import type { ChatStoreState, StoreGetter, StoreSetter } from '../src/store/chatTypes';
@@ -155,78 +155,18 @@ check('approval levels keep manual and smart guards, yolo bypasses them', () => 
   assert.equal(shouldAutoApproveTool('request_restart', {}, 'yolo'), true);
 });
 
-function approvalEvent(id: string, trustLevel: string): SupervisorEvent {
-  return {
-    seq: 1, event_id: `e-${id}`, ts: 'T', session_id: 's', type: 'approval_requested',
-    payload: { approval_id: id, trust_level: trustLevel, tool_name: 'read_file' },
-  };
-}
-
-const emptyStoreState = { toolExecutionsById: {} } as unknown as ChatStoreState;
-const getStore = () => emptyStoreState;
-
-const withLevel = (level: 'manual' | 'smart' | 'yolo', run: () => void) => {
-  const previous = useClientPrefsStore.getState().approvalLevel;
-  useClientPrefsStore.setState({ approvalLevel: level });
-  try {
-    run();
-  } finally {
-    useClientPrefsStore.setState({ approvalLevel: previous });
-  }
-};
-
-// Approval decisions go through `fetch`. Capture the requests instead of letting
-// anything reach the network: the promise never resolves, so an approved id stays
-// in the set and can be asserted, while a non-approved path leaves zero calls.
-const approvalFetchCalls: string[] = [];
-globalThis.fetch = ((input: RequestInfo | URL) => {
-  const url = typeof input === 'string'
-    ? input
-    : input instanceof URL
-      ? input.href
-      : String((input as Request).url);
-  approvalFetchCalls.push(url);
-  return new Promise<Response>(() => { /* offline: never resolves */ });
-}) as typeof fetch;
-
-function observeApproval(level: ApprovalLevel, id: string, trustLevel: string) {
-  approvalFetchCalls.length = 0;
-  autoApprovedApprovalIds.delete(id);
-  withLevel(level, () => {
-    maybeAutoApproveApprovalRequest(approvalEvent(id, trustLevel), getStore);
-  });
-  return { approved: autoApprovedApprovalIds.has(id), calls: [...approvalFetchCalls] };
-}
-
-check('smart keeps the outside-workspace gate', () => {
-  const observed = observeApproval('smart', 'smart-external', 'external');
-  try {
-    assert.equal(observed.approved, false);
-    assert.deepEqual(observed.calls, []);
-  } finally {
-    autoApprovedApprovalIds.delete('smart-external');
-  }
-});
-
-check('manual never auto-approves even inside the workspace', () => {
-  const observed = observeApproval('manual', 'manual-workspace', 'workspace');
-  try {
-    assert.equal(observed.approved, false);
-    assert.deepEqual(observed.calls, []);
-  } finally {
-    autoApprovedApprovalIds.delete('manual-workspace');
-  }
-});
-
-check('yolo approves outside-workspace operations through the approval API', () => {
-  const observed = observeApproval('yolo', 'yolo-external', 'external');
-  try {
-    assert.equal(observed.approved, true);
-    assert.equal(observed.calls.length, 1);
-    assert.match(observed.calls[0], /\/v1\/approvals\/yolo-external$/);
-  } finally {
-    autoApprovedApprovalIds.delete('yolo-external');
-  }
+check('session presets serialize sparse rules and recognize normalized smart rules', () => {
+  const rules = compileApprovalPreset('smart', { read_file: true, search_web: false, request_restart: false });
+  assert.equal(rules.rules.length, 4);
+  assert.deepEqual(rules.rules[3], { tool: 'search_web', action: 'ask' });
+  assert.equal(identifyApprovalPreset(rules).level, 'smart');
+  const reordered = { ...rules, rules: [...rules.rules].reverse() };
+  assert.equal(identifyApprovalPreset(reordered).level, 'smart');
+  assert.equal(identifyApprovalPreset(null).level, 'custom');
+  assert.equal(identifyApprovalPreset(compileApprovalPreset('manual')).level, 'manual');
+  assert.equal(identifyApprovalPreset(compileApprovalPreset('yolo')).level, 'yolo');
+  assert.equal(identifyApprovalPreset({ ...rules, rules: [{ tool: 'mcp_*', action: 'ask' }] }).level, 'custom');
+  assert.equal(identifyApprovalPreset({ ...rules, rules: [...rules.rules, { operation: 'write_file', action: 'ask' }] }).level, 'custom');
 });
 
 // ── plugin panel entry validation ─────────────────────────────────────────

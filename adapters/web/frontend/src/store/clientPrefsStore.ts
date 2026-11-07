@@ -1,8 +1,5 @@
-// [2026-06-01] Browser-local client preferences store.
-// Why: auto-approval and rendering defaults are build-local frontend behavior and
-// must not modify backend policy or session data. How: keep a small Zustand store
-// backed by localStorage with explicit defaults and safe fallback rules. Purpose:
-// each deployed frontend can choose its own approval and display preferences.
+// Browser-local display preferences and approval defaults for NEW sessions.
+// Existing sessions always render and execute their server-owned approval rules.
 import { create } from 'zustand';
 
 export type TitleGenerationMode = 'auto' | 'manual' | 'first-message';
@@ -137,9 +134,7 @@ export const useClientPrefsStore = create<ClientPrefsState>((set, get) => ({
   ...mergePrefs(readStoredPrefs()),
 
   setApprovalLevel: (level) => set((state) => {
-    // [2026-06-05] Why: approval level changes affect every future approval request.
-    // How: persist the new level with the existing public preference snapshot. Purpose:
-    // a reload preserves the selected safety mode before the next WebSocket event.
+    // Defaults are sent only when a new conversation submits its first message.
     const nextState = { ...state, approvalLevel: level };
     persistPrefs(publicPrefs(nextState));
     return { approvalLevel: level };

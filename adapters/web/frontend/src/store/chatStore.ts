@@ -6,6 +6,9 @@
 // history hydration helpers moved to historyLoader.ts. Purpose: this file now owns
 // only startup session loading and the Zustand useChatStore action surface.
 import { create } from 'zustand';
+import { useClientPrefsStore } from './clientPrefsStore';
+import { compileApprovalPreset } from './sessionApprovalRules';
+import { useSessionApprovalStore } from './sessionApprovalStore';
 
 import {
   cancelActiveTasks,
@@ -565,6 +568,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     saveLastActiveConversationId(conversationId);
     const conversationKey = `web:${conversationId}`;
     const existingConversation = get().conversations.find((conversation) => conversation.id === conversationId);
+    const defaults = useClientPrefsStore.getState();
+    const initialApprovalRules = existingConversation?.sessionId ? undefined
+      : compileApprovalPreset(defaults.approvalLevel, defaults.autoApproveTools);
 
     set((current) => ({
       conversations: upsertConversationMeta(current.conversations, {
@@ -591,8 +597,10 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         use_context: true,
         entry_node_id: entryNodeId,
         provider_override: providerOverride ?? undefined,
+        approval_rules: initialApprovalRules,
       });
       sessionId = result.session_id;
+      void useSessionApprovalStore.getState().load(sessionId);
       const inboundSeq = result.inbound_seq;
       if (inboundSeq != null) {
         const optimisticId = `message:${conversationId}:user:inbound:${inboundSeq}`;

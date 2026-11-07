@@ -389,6 +389,57 @@ check('a startup that reached no sessions still lets the next login establish on
   assert.equal(liveIntervals(), 1);
 });
 
+check('session approval reads are isolated, save failure keeps confirmed rules, reset drops stale reads', async () => {
+  resetEnvironment();
+  const { useSessionApprovalStore } = await import('../src/store/sessionApprovalStore');
+  const { compileApprovalPreset } = await import('../src/store/sessionApprovalRules');
+  const a = compileApprovalPreset('yolo');
+  const b = compileApprovalPreset('manual');
+  const gate = deferred();
+  handler = async (url, init) => {
+    if (init?.method === 'PUT') return json({ detail: 'save rejected' }, 403);
+    if (url.endsWith('/A/approval_rules')) await gate.promise;
+    return json({ rules: url.includes('/A/') ? a : b, effective_rules: url.includes('/A/') ? a : b, source_session_id: 'source' });
+  };
+  const pending = useSessionApprovalStore.getState().load('A');
+  await useSessionApprovalStore.getState().load('B');
+  assert.deepEqual(useSessionApprovalStore.getState().sessions.B.value?.effective_rules, b);
+  gate.resolve();
+  await pending;
+  assert.deepEqual(useSessionApprovalStore.getState().sessions.A.value?.effective_rules, a);
+  await useSessionApprovalStore.getState().save('B', a);
+  assert.deepEqual(useSessionApprovalStore.getState().sessions.B.value?.effective_rules, b);
+  assert.match(useSessionApprovalStore.getState().sessions.B.error, /403/);
+  const late = deferred();
+  handler = async () => { await late.promise; return json({ rules: a, effective_rules: a, source_session_id: 'A' }); };
+  const read = useSessionApprovalStore.getState().load('A');
+  useSessionApprovalStore.getState().reset();
+  late.resolve(); await read;
+  assert.deepEqual(useSessionApprovalStore.getState().sessions, {});
+});
+
+check('first inbound includes sparse defaults but later messages never overwrite session rules', async () => {
+  resetEnvironment();
+  const { useClientPrefsStore } = await import('../src/store/clientPrefsStore');
+  useClientPrefsStore.setState({ approvalLevel: 'smart', autoApproveTools: { search_web: false, read_file: true } });
+  const bodies: Record<string, any>[] = [];
+  handler = (url, init) => {
+    if (url === '/v1/inbound') {
+      bodies.push(JSON.parse(String(init?.body)));
+      return json({ session_id: 'new-session', inbound_seq: bodies.length, accepted: true });
+    }
+    if (url.endsWith('/approval_rules')) return json({ rules: null, effective_rules: null, source_session_id: null });
+    return defaultHandler(url);
+  };
+  await useChatStore.getState().sendMessage('first');
+  await useChatStore.getState().sendMessage('second');
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].approval_rules.default_action, 'allow');
+  assert.equal(bodies[0].approval_rules.rules.length, 4);
+  assert.equal('approval_rules' in bodies[1], false);
+  resetEnvironment();
+});
+
 // ── runner ────────────────────────────────────────────────────────────────
 
 let failed = 0;

@@ -1,8 +1,4 @@
-// [2026-06-01] Client-only settings page.
-// Why: users need frontend-local controls for approval automation, title behavior,
-// and rendering defaults without changing Supervisor policy. How: bind form controls
-// directly to clientPrefsStore, which persists in browser localStorage. Purpose:
-// each build or browser profile can keep independent preferences.
+// Browser display/new-session defaults and explicit server-owned session rules.
 import { useEffect, useMemo, useState } from 'react';
 
 import { getAllToolNames, getConfig, getNodes } from '../../../api/supervisorClient';
@@ -13,6 +9,7 @@ import {
   useClientPrefsStore,
 } from '../../../store/clientPrefsStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { useSessionApproval } from '../../../store/useSessionApproval';
 import type { NodeDef } from '../../../types';
 import { inferToolRisk, riskClassName, riskLabel, type RiskLevel } from '../../../utils/toolRisk';
 
@@ -123,8 +120,8 @@ const APPROVAL_LEVEL_OPTIONS: Array<{ value: ApprovalLevel; label: string; descr
   // [2026-06-05] Why: users now choose one of three approval safety levels. How: keep
   // the display labels and descriptions in a typed list used by the radio group.
   // Purpose: copy and behavior stay aligned when the settings section renders.
-  { value: 'manual', label: '手动审批', description: '所有工具操作都需要手动确认。最安全。' },
-  { value: 'smart', label: '智能放行', description: '除重启外自动放行；后端路径策略仍然生效。推荐。' },
+  { value: 'manual', label: '手动审批', description: 'policy 要求审核的操作保留手动确认。' },
+  { value: 'smart', label: '智能放行', description: '默认自动放行；重启、工作区外路径及单独关闭的工具保留审批。' },
   { value: 'yolo', label: '全部放行', description: '包括重启与工作区外路径在内全部自动放行；服务端 deny 规则仍会拒绝。' },
 ];
 
@@ -217,17 +214,24 @@ function ToolRuleToggle({ rule, checked, disabled = false, onChange }: { rule: T
 
 export const ClientSettingsPage = () => {
   const {
-    approvalLevel,
-    autoApproveTools,
+    approvalLevel: defaultApprovalLevel,
+    autoApproveTools: defaultAutoApproveTools,
     titleGeneration,
     thinkingDefaultCollapsed,
     toolResultsDefaultCollapsed,
-    setApprovalLevel,
-    setAutoApproveTool,
+    setApprovalLevel: setDefaultApprovalLevel,
+    setAutoApproveTool: setDefaultAutoApproveTool,
     setTitleGeneration,
     setThinkingDefaultCollapsed,
     setToolResultsDefaultCollapsed,
   } = useClientPrefsStore();
+  const sessionApproval = useSessionApproval();
+  const [approvalScope, setApprovalScope] = useState<'session' | 'default'>('session');
+  const editingSession = Boolean(sessionApproval.sessionId && approvalScope === 'session');
+  const approvalLevel = editingSession ? sessionApproval.level : defaultApprovalLevel;
+  const autoApproveTools = editingSession ? sessionApproval.tools : defaultAutoApproveTools;
+  const setApprovalLevel = editingSession ? sessionApproval.setLevel : setDefaultApprovalLevel;
+  const setAutoApproveTool = editingSession ? sessionApproval.setTool : setDefaultAutoApproveTool;
   const { adminToken, entryNodeId, setEntryNodeId } = useSettingsStore();
   const [allToolNames, setAllToolNames] = useState<string[]>([]);
   const [entryNodes, setEntryNodes] = useState<NodeDef[]>([]);
@@ -317,7 +321,7 @@ export const ClientSettingsPage = () => {
           <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">前端本地</p>
           <h1 className="mt-2 font-mono text-xl font-semibold tracking-[-0.04em]">客户端设置</h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--duties-secondary)]">
-            这些偏好只保存在当前浏览器中，不会修改后端策略、共享会话状态或服务器配置。
+            显示偏好和新会话默认值保存在当前浏览器。当前会话审批规则保存在服务器，不受页面关闭影响。
           </p>
         </header>
 
@@ -344,10 +348,33 @@ export const ClientSettingsPage = () => {
           <div className="mb-3">
             <h2 className="font-mono text-sm font-semibold">自动审批规则</h2>
             <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
-              选择前端本地自动审批等级。后端的工作区、信任目录和其他安全策略仍然会继续生效。
+              规则仅处理后端 policy 提交审核的操作，不改变 policy 的直接放行或拒绝。已有待审批仍需手动处理。
             </p>
           </div>
 
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            {sessionApproval.sessionId && (
+              <button type="button" onClick={() => setApprovalScope('session')} aria-pressed={editingSession}
+                className="rounded-lg bg-zinc-500/10 px-3 py-2 text-sm transition-all duration-150 hover:bg-zinc-500/20 active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-zinc-400">当前会话</button>
+            )}
+            <button type="button" onClick={() => setApprovalScope('default')} aria-pressed={!editingSession}
+              className="rounded-lg bg-zinc-500/10 px-3 py-2 text-sm transition-all duration-150 hover:bg-zinc-500/20 active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-zinc-400">新会话默认值</button>
+            {editingSession && <button type="button" onClick={sessionApproval.clear} disabled={sessionApproval.busy}
+              className="rounded-lg px-3 py-2 text-sm transition-all duration-150 hover:bg-zinc-500/10 active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-zinc-400 disabled:opacity-50">清除会话规则</button>}
+          </div>
+          <p className="mb-3 text-xs leading-relaxed text-[var(--duties-secondary)]">
+            {editingSession ? '只修改当前会话及继承其规则的子任务。' : '只用于之后创建的新会话，不修改已有会话。'}
+          </p>
+          {editingSession && sessionApproval.error && <p role="alert" className="mb-3 text-sm leading-relaxed">{sessionApproval.error}
+            <button type="button" onClick={sessionApproval.reload} className="ml-2 rounded-lg px-2 py-1 transition-all duration-150 hover:bg-zinc-500/10 active:scale-[0.98]">重试</button>
+          </p>}
+          {editingSession && sessionApproval.busy && <p role="status" className="mb-3 animate-pulse rounded-lg bg-zinc-500/10 p-3 text-sm">正在同步会话规则…</p>}
+          {editingSession && approvalLevel === 'custom' && !sessionApproval.busy && (
+            <div className="mb-4 rounded-xl border border-zinc-500/20 bg-zinc-500/5 p-4 text-sm leading-relaxed">
+              <p>{sessionApproval.effectiveRules ? '自定义规则。选择下方预设会替换当前会话规则。' : '未配置会话规则，使用 policy 默认处理。可选择下方预设。'}</p>
+              {sessionApproval.effectiveRules && <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-xs">{JSON.stringify(sessionApproval.effectiveRules, null, 2)}</pre>}
+            </div>
+          )}
           <div aria-label="审批等级" className="space-y-2" role="radiogroup">
             {APPROVAL_LEVEL_OPTIONS.map((option) => (
               <label
@@ -356,13 +383,12 @@ export const ClientSettingsPage = () => {
               >
                 <input
                   checked={approvalLevel === option.value}
+                  disabled={editingSession && sessionApproval.busy}
                   className="mt-1 h-4 w-4 flex-shrink-0 accent-[var(--duties-text)]"
                   name="approval-level"
                   onChange={() => {
-                    // [2026-06-05] Why: the radio group is the primary approval
-                    // control. How: write the selected level through clientPrefsStore.
-                    // Purpose: all approval renderers and chatStore immediately use
-                    // the same persisted safety level.
+                    // The selected scope determines whether this saves the session
+                    // or changes browser defaults for future conversations.
                     setApprovalLevel(option.value);
                   }}
                   type="radio"
@@ -380,7 +406,7 @@ export const ClientSettingsPage = () => {
               <div className="mb-3">
                 <h3 className="font-mono text-xs font-semibold text-[var(--duties-text)]">智能放行细化</h3>
                 <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
-                  Level 2 默认自动放行除重启外的工具。展开分类后，可以关闭某个工具的自动放行。
+                  智能模式保留重启和工作区外路径审批。展开分类后，可以关闭某个工具的自动放行。
                 </p>
               </div>
               <div className="space-y-2">
@@ -408,7 +434,7 @@ export const ClientSettingsPage = () => {
                         <div className="space-y-2 border-t border-[var(--duties-border)] p-2">
                           {category.rows.map((rule) => {
                             const checked = shouldAutoApproveTool(rule.toolName, autoApproveTools, 'smart');
-                            const disabled = rule.toolName === 'request_restart';
+                            const disabled = rule.toolName === 'request_restart' || (editingSession && sessionApproval.busy);
                             return (
                               <ToolRuleToggle
                                 checked={checked}

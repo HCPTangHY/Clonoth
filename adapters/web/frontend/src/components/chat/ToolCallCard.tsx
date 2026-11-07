@@ -7,7 +7,6 @@
 import { useMemo, useState, type ReactNode } from 'react';
 
 import { decideApproval } from '../../api/supervisorClient';
-import { autoApprovedApprovalIds } from '../../store/approvalManager';
 import { useClientPrefsStore } from '../../store/clientPrefsStore';
 import { usePluginsStore } from '../../store/pluginsStore';
 import type { ToolExecution, ToolStatus } from '../../types/message';
@@ -1098,7 +1097,6 @@ interface ToolApprovalSectionProps {
   tool: ToolExecution;
   approvalDetails: Record<string, unknown>;
   approvalOperation: string;
-  isAutoApprovedPending: boolean;
   approvalLoading: boolean;
   approvalError: string;
   onApproval: (approvalId: string, decision: ApprovalDecision) => void;
@@ -1108,7 +1106,6 @@ function ToolApprovalSection({
   tool,
   approvalDetails,
   approvalOperation,
-  isAutoApprovedPending,
   approvalLoading,
   approvalError,
   onApproval,
@@ -1132,16 +1129,6 @@ function ToolApprovalSection({
           <div><span className="text-[var(--duties-tertiary)]">原因：</span> {getStringValue(approvalDetails.reason)}</div>
         )}
       </div>
-      {isAutoApprovedPending ? (
-        <div className="inline-flex items-center gap-1 rounded-sm bg-gray-100 px-2 py-1 text-xs font-semibold text-gray-600">
-          {/* Why: auto-approved tools should not present manual buttons while the
-              local client decision is being submitted. How: show a muted badge
-              instead. Purpose: users can distinguish local auto-approval from a
-              pending manual decision. */}
-          <Icon name="check_circle" size={14} />
-          <span>已自动放行</span>
-        </div>
-      ) : (
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -1166,7 +1153,6 @@ function ToolApprovalSection({
           </button>
           {approvalLoading && <span className="text-[var(--duties-tertiary)]">提交中…</span>}
         </div>
-      )}
       {approvalError && <div className="text-xs font-semibold text-red-600">{approvalError}</div>}
     </div>
   );
@@ -1250,8 +1236,6 @@ function ToolDetailsSection({ tool, expanded, canExpand, isFailed, argumentDispl
 
 export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
   const toolResultsDefaultCollapsed = useClientPrefsStore(state => state.toolResultsDefaultCollapsed);
-  const autoApproveTools = useClientPrefsStore(state => state.autoApproveTools);
-  const approvalLevel = useClientPrefsStore(state => state.approvalLevel);
   // [2026-06-01] Tool detail expansion now follows clientPrefsStore.
   // Why: result disclosure was hard-coded as collapsed. How: initialize the local
   // disclosure state from the browser preference. Purpose: each frontend can choose
@@ -1276,9 +1260,6 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
   const approvalDetails = getApprovalDetailsRecord(tool);
   const approvalOperation = getApprovalOperation(tool);
   const canExpand = Boolean(argumentDisplay || resultDisplay || tool.taskId || tool.nodeId || tool.nodeName || tool.approvalDetails);
-  const isAutoApprovedPending = tool.status === 'awaiting_approval'
-    && tool.approvalStatus === 'pending'
-    && Boolean(tool.approvalId && autoApprovedApprovalIds.has(tool.approvalId));
 
   const handleApproval = async (approvalId: string, decision: ApprovalDecision) => {
     // Why: the same tool card owns the approval action. How: call the existing
@@ -1368,7 +1349,6 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
         tool={tool}
         approvalDetails={approvalDetails}
         approvalOperation={approvalOperation}
-        isAutoApprovedPending={isAutoApprovedPending}
         approvalLoading={approvalLoading}
         approvalError={approvalError}
         onApproval={handleApproval}

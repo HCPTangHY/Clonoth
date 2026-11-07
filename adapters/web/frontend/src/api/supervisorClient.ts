@@ -108,6 +108,28 @@ export async function uploadAttachment(
   return resp.json();
 }
 
+import type { SessionApprovalRules, SessionApprovalState } from '../store/sessionApprovalRules';
+
+export async function getSessionApprovalRules(sessionId: string): Promise<SessionApprovalState> {
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/approval_rules`, {
+    headers: authHeaders(getStoredAdminToken()),
+  });
+  if (!resp.ok) throw new Error(`读取会话审批规则失败 (${resp.status})`);
+  return resp.json();
+}
+
+export async function updateSessionApprovalRules(
+  sessionId: string, rules: SessionApprovalRules | null,
+): Promise<SessionApprovalState> {
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/approval_rules`, {
+    method: rules === null ? 'DELETE' : 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(getStoredAdminToken()) },
+    ...(rules === null ? {} : { body: JSON.stringify(rules) }),
+  });
+  if (!resp.ok) throw new Error(`保存会话审批规则失败 (${resp.status})`);
+  return resp.json();
+}
+
 // ── Inbound (send message) ──
 
 export async function postInbound(params: {
@@ -117,6 +139,7 @@ export async function postInbound(params: {
   use_context?: boolean;
   entry_node_id?: string;
   provider_override?: Record<string, unknown> | null;
+  approval_rules?: SessionApprovalRules;
   // [AutoC 2026-06-18] Optional direct target session for the System session browser.
   // Why: arbitrary existing sessions cannot always be addressed by web conversation_key.
   // How: include session_id and Admin Token when the temporary session view sends a
@@ -137,6 +160,7 @@ export async function postInbound(params: {
       use_branch: false,
       entry_node_id: params.entry_node_id,
       ...(params.provider_override ? { provider_override: params.provider_override } : {}),
+      ...(params.approval_rules ? { approval_rules: params.approval_rules } : {}),
       ...(params.session_id ? { session_id: params.session_id } : {}),
     }),
   });

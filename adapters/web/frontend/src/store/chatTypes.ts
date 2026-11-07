@@ -160,7 +160,6 @@ export const CHILD_NODE_STATUS_BY_EVENT: Readonly<Record<string, ChildNodeStatus
 };
 
 export const LS_KEY_TITLES = 'clonoth_conversation_titles';
-export const LS_KEY_AUTO_APPROVED = 'clonoth_auto_approved_ids';
 export const LS_KEY_LAST_ACTIVE_CONVERSATION = 'clonoth_last_active_conversation_id';
 
 // ── LocalStorage Utilities ─────────────────────────────────────────────────
@@ -194,23 +193,6 @@ export function saveLastActiveConversationId(id: string | null): void {
   try {
     if (id) localStorage.setItem(LS_KEY_LAST_ACTIVE_CONVERSATION, id);
     else localStorage.removeItem(LS_KEY_LAST_ACTIVE_CONVERSATION);
-  } catch {}
-}
-
-export function loadAutoApproved(): Set<string> {
-  try {
-    const raw = localStorage.getItem(LS_KEY_AUTO_APPROVED);
-    return raw ? new Set(JSON.parse(raw)) : new Set();
-  } catch {
-    return new Set();
-  }
-}
-
-export function saveAutoApproved(ids: Set<string>) {
-  try {
-    const arr = [...ids];
-    const trimmed = arr.length > 200 ? arr.slice(-200) : arr;
-    localStorage.setItem(LS_KEY_AUTO_APPROVED, JSON.stringify(trimmed));
   } catch {}
 }
 

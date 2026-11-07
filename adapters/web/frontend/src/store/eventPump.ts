@@ -2,13 +2,12 @@
 // [AutoC 2026-06-16] Extracted from chatStore.ts.
 // Why: chatStore.ts mixed the realtime connection loop with UI actions and history
 // recovery. How: keep WebSocket connection, reconnect state, and event routing here,
-// while delegating approval policy to approvalManager and receiving Zustand set/get
+// while refreshing server-owned approval rules and receiving Zustand set/get
 // as parameters. Purpose: this module owns realtime side effects without importing the store singleton or
 // creating store dependency cycles.
 
 import { connectGlobalWS, disconnectGlobalWS, getSessionChildren } from '../api';
-import { maybeAutoApproveApprovalRequest, resetApprovalState } from './approvalManager';
-export { autoApprovedApprovalIds } from './approvalManager';
+import { useSessionApprovalStore } from './sessionApprovalStore';
 import { dispatchPluginEvent } from './pluginRuntime';
 import { reduceChatEvent } from './eventReducer';
 import {
@@ -114,13 +113,10 @@ export function stopEventPump(): void {
 }
 
 export function resetEventPumpState(): void {
-  // [AutoC 2026-06-16] Reset event-pump-owned and approval-owned state.
-  // Why: approval automation moved to approvalManager while reconnect timers remain
-  // here. How: clear this module's timer and delegate approval cleanup. Purpose:
-  // tests and user logout flows return to the same clean state as before.
+  // Logout invalidates cached rules and in-flight reads as well as live events.
   clearReconnectTimer();
   stopChildrenPolling();
-  resetApprovalState();
+  useSessionApprovalStore.getState().reset();
 }
 
 export function startEventPump(set: StoreSetter, get: StoreGetter): void {
@@ -239,7 +235,9 @@ export function startEventPump(set: StoreSetter, get: StoreGetter): void {
         };
       });
 
-      maybeAutoApproveApprovalRequest(event, get);
+      if (event.type === 'session_approval_rules_changed') {
+        useSessionApprovalStore.getState().refresh();
+      }
 
       if (shouldReconcileTerminalTask) {
         set((state) => ({ conversations: sortConversationsByRecency(state.conversations) }));
@@ -257,6 +255,7 @@ export function startEventPump(set: StoreSetter, get: StoreGetter): void {
       const wasReconnecting = get().connectionStatus === 'reconnecting';
       set({ connectionStatus: 'open' });
       if (wasReconnecting) {
+        useSessionApprovalStore.getState().refresh();
         const state = get();
         const active = state.conversations.find((conversation) => conversation.id === state.activeConversationId);
         if (active?.sessionId) {
