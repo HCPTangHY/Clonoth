@@ -6,14 +6,20 @@ import binascii
 import dataclasses
 import hashlib
 import json
+import logging
+import math
 import os
+import tempfile
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
 from clonoth_runtime import resolve_env_ref
+
+logger = logging.getLogger(__name__)
 
 _MCP_IMPORT_ERROR: Exception | None = None
 
@@ -57,7 +63,7 @@ _MCP_IMAGE_MIME_EXTENSIONS = {
 
 def _ensure_sdk() -> None:
     if _MCP_IMPORT_ERROR is not None:
-        raise RuntimeError(f"MCP Python SDK 未安装或导入失败：{_MCP_IMPORT_ERROR}")
+        raise RuntimeError(f"MCP Python SDK not installed or failed to import: {_MCP_IMPORT_ERROR}")
 
 
 def _config_path(workspace_root: Path) -> Path:
@@ -68,13 +74,117 @@ def _default_config() -> dict[str, Any]:
     return {"version": 1, "clients": {}}
 
 
-def _normalize_transport(v: Any) -> str:
-    s = str(v or "stdio").strip().lower().replace("-", "_")
-    if s in {"streamablehttp", "streamable_http", "http", "streamable"}:
-        return "streamable_http"
-    if s in {"sse"}:
-        return "sse"
-    return "stdio"
+
+_TRANSPORT_ALIASES = {
+    "stdio": "stdio",
+    "sse": "sse",
+    "http": "streamable_http",
+    "streamable": "streamable_http",
+    "streamable_http": "streamable_http",
+    "streamablehttp": "streamable_http",
+}
+
+
+def normalize_transport(value: Any, *, default: str | None = "stdio") -> str:
+    """Return the canonical transport name or raise on an unknown one.
+
+    Why: a typo in a hand-edited config used to fall through to stdio, which
+    then tried to spawn a process named after a URL. How: normalize the three
+    accepted spellings and reject everything else; ``default=None`` makes the
+    value mandatory (used by the mutation path). Purpose: an unknown transport
+    is a configuration error, never a silent downgrade.
+    """
+    raw = None if value is None else str(value).strip()
+    if not raw:
+        if default is None:
+            raise ValueError("transport is required (stdio, sse or streamable_http)")
+        return default
+    key = raw.lower().replace("-", "_")
+    canonical = _TRANSPORT_ALIASES.get(key)
+    if canonical is None:
+        raise ValueError(
+            f"unknown transport: {raw!r} (expected stdio, sse or streamable_http)"
+        )
+    return canonical
+
+
+def _require_scalar_mapping(value: Any, field: str) -> dict[str, str]:
+    """Validate one string->scalar mapping (env/headers) and stringify it."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object of scalar values")
+    cleaned: dict[str, str] = {}
+    for key, item in value.items():
+        if isinstance(item, (dict, list, tuple, set)):
+            raise ValueError(f"{field} value for {key!r} must be a scalar")
+        cleaned[str(key)] = "" if item is None else str(item)
+    return cleaned
+
+
+def validate_client_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Validate one client spec and return the record to persist.
+
+    Why: upsert used to coerce whatever the model sent (`args` as a string,
+    `enabled` as "yes", an unknown transport as stdio), so one bad payload
+    produced a config the runtime could not honour. How: validate every field
+    here, before any approval request or file write, and return the exact
+    record to store. Purpose: one validation point for the mutation path and
+    for anything else that must decide whether a spec is usable.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError("MCP client spec must be an object")
+    client_id = _normalize_client_id(spec.get("id"))
+    if "transport" not in spec:
+        raise ValueError("transport is required (stdio, sse or streamable_http)")
+    transport = normalize_transport(spec.get("transport"), default=None)
+    enabled = spec.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+
+    record: dict[str, Any] = {"transport": transport, "enabled": enabled}
+    description = spec.get("description")
+    if description is not None:
+        if not isinstance(description, str):
+            raise ValueError("description must be a string")
+        if description.strip():
+            record["description"] = description.strip()
+
+    if transport == "stdio":
+        command = spec.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("stdio client requires a non-empty command")
+        record["command"] = command.strip()
+        args = spec.get("args")
+        if args is None:
+            args = []
+        if not isinstance(args, list):
+            raise ValueError("args must be a list of strings")
+        record["args"] = [str(item) for item in args]
+        record["env"] = _require_scalar_mapping(spec.get("env"), "env")
+        if "stateful" in spec and spec["stateful"] is not None:
+            if not isinstance(spec["stateful"], bool):
+                raise ValueError("stateful must be a boolean")
+            record["stateful"] = spec["stateful"]
+        ttl = spec.get("idle_ttl_sec")
+        if ttl is not None:
+            if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+                raise ValueError("idle_ttl_sec must be a positive number of seconds")
+            if not math.isfinite(float(ttl)):
+                raise ValueError("idle_ttl_sec must be finite")
+            if float(ttl) <= 0:
+                raise ValueError("idle_ttl_sec must be a positive number of seconds")
+            record["idle_ttl_sec"] = float(ttl)
+    else:
+        if "stateful" in spec or "idle_ttl_sec" in spec:
+            raise ValueError("stateful/idle_ttl_sec only apply to stdio clients")
+        url = spec.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError(f"{transport} client requires a non-empty url")
+        record["url"] = url.strip()
+        record["headers"] = _require_scalar_mapping(spec.get("headers"), "headers")
+
+    return {"id": client_id, **record}
 
 
 def _normalize_client_id(client_id: Any) -> str:
@@ -86,51 +196,91 @@ def _normalize_client_id(client_id: Any) -> str:
     return s
 
 
-def _load_raw_config(workspace_root: Path) -> dict[str, Any]:
-    p = _config_path(workspace_root)
-    if not p.exists():
-        return _default_config()
-
+def _parse_raw_config(text: str) -> dict[str, Any]:
+    """Reject damaged documents instead of treating them as an empty store."""
     try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
-    except Exception:
-        return _default_config()
-
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError("MCP configuration contains invalid YAML") from exc
+    if data is None:
+        return _default_config()  # Production treats an empty document as empty config.
     if not isinstance(data, dict):
-        return _default_config()
+        raise ValueError("MCP configuration must be a mapping")
 
     raw_clients = data.get("clients")
+    if raw_clients is None:
+        raw_clients = {}
     clients: dict[str, Any] = {}
-
     if isinstance(raw_clients, dict):
         for cid, spec in raw_clients.items():
-            if isinstance(cid, str) and isinstance(spec, dict):
-                clients[cid] = dict(spec)
+            if not isinstance(cid, str) or not cid.strip() or not isinstance(spec, dict):
+                raise ValueError("MCP clients must map non-empty string ids to objects")
+            clients[cid] = dict(spec)
     elif isinstance(raw_clients, list):
+        # Keep the production reader's legacy list format, without silently
+        # dropping malformed or duplicate records during a later mutation.
         for item in raw_clients:
             if not isinstance(item, dict):
-                continue
+                raise ValueError("Each MCP client must be an object")
             cid = item.get("id")
-            if isinstance(cid, str) and cid.strip():
-                copied = dict(item)
-                copied.pop("id", None)
-                clients[cid.strip()] = copied
+            if not isinstance(cid, str) or not cid.strip():
+                raise ValueError("Each MCP client must have a non-empty string id")
+            cid = cid.strip()
+            if cid in clients:
+                raise ValueError(f"Duplicate MCP client id: {cid}")
+            copied = dict(item)
+            copied.pop("id", None)
+            clients[cid] = copied
+    else:
+        raise ValueError("MCP configuration clients must be a mapping or a list")
+    try:
+        version = int(data.get("version") or 1)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("MCP configuration version must be an integer") from exc
+    return {**data, "version": version, "clients": clients}
 
-    return {
-        "version": int(data.get("version") or 1),
-        "clients": clients,
-    }
+
+def _load_raw_config(workspace_root: Path) -> dict[str, Any]:
+    try:
+        text = _config_path(workspace_root).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _default_config()
+    return _parse_raw_config(text)
+
+
+def save_raw_config_content(workspace_root: Path, text: str) -> None:
+    """Validate and atomically replace a config, including admin-panel writes."""
+    _parse_raw_config(text)
+    p = _config_path(workspace_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=p.parent,
+            prefix=f".{p.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            tmp = Path(stream.name)
+            try:
+                os.fchmod(stream.fileno(), p.stat().st_mode & 0o777)
+            except FileNotFoundError:
+                pass  # New configs retain the temporary file's private mode.
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, p)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def _save_raw_config(workspace_root: Path, cfg: dict[str, Any]) -> None:
-    p = _config_path(workspace_root)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    text = yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True)
-    p.write_text(text, encoding="utf-8")
+    save_raw_config_content(
+        workspace_root, yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True),
+    )
 
 
 def _normalize_public_spec(client_id: str, spec: dict[str, Any]) -> dict[str, Any]:
-    transport = _normalize_transport(spec.get("transport"))
+    transport = normalize_transport(spec.get("transport"))
     out: dict[str, Any] = {
         "id": client_id,
         "enabled": bool(spec.get("enabled", True)),
@@ -147,6 +297,10 @@ def _normalize_public_spec(client_id: str, spec: dict[str, Any]) -> dict[str, An
         out["args"] = [str(x) for x in args] if isinstance(args, list) else []
         env = spec.get("env")
         out["env"] = {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {}
+        if "stateful" in spec:
+            out["stateful"] = bool(spec.get("stateful"))
+        if isinstance(spec.get("idle_ttl_sec"), (int, float)) and spec["idle_ttl_sec"] > 0:
+            out["idle_ttl_sec"] = float(spec["idle_ttl_sec"])
     else:
         out["url"] = str(spec.get("url") or "")
         headers = spec.get("headers")
@@ -164,8 +318,86 @@ def list_clients(workspace_root: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for client_id in sorted(clients.keys()):
         spec = clients.get(client_id)
-        if isinstance(spec, dict):
+        if not isinstance(spec, dict):
+            continue
+        try:
             out.append(_normalize_public_spec(client_id, spec))
+        except ValueError as exc:
+            # Why: one hand-edited broken record must not hide every other
+            # client from the listing. How: keep the id and the reason, drop
+            # the unusable fields. Purpose: the operator sees what to fix while
+            # discovery skips the record (get_client_spec still raises).
+            out.append({
+                "id": client_id,
+                "enabled": bool(spec.get("enabled", True)),
+                "transport": str(spec.get("transport") or ""),
+                "transport_error": str(exc),
+            })
+    return out
+
+
+def _redact_url(url: str) -> tuple[str, bool, bool]:
+    """Strip credentials and the query string from a remote MCP endpoint."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "", False, False
+    hidden_userinfo = bool(parts.username or parts.password)
+    hidden_query = bool(parts.query)
+    host = parts.hostname or ""
+    try:
+        if parts.port:
+            host = f"{host}:{parts.port}"
+    except ValueError:
+        pass
+    return urlunsplit((parts.scheme, host, parts.path, "", "")), hidden_query, hidden_userinfo
+
+
+def redact_client_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Return the model-facing view of one client with every secret removed.
+
+    Why: the CRUD tool's answer and listing text land in model context and in
+    conversation history, so command paths, argv, env values, URL credentials,
+    URL query strings and header values must not survive. How: keep the
+    structural facts (transport, enabled, command basename, argument count,
+    env/header key names) and replace values with ``***``. Purpose: an operator
+    can still tell which client is broken without the model ever reading a
+    credential. The config file keeps the real values for the runtime.
+    """
+    transport = str(spec.get("transport") or "")
+    out: dict[str, Any] = {
+        "id": str(spec.get("id") or ""),
+        "enabled": bool(spec.get("enabled", True)),
+        "transport": transport,
+    }
+    error = spec.get("transport_error")
+    if error:
+        out["transport_error"] = str(error)
+        out["redacted"] = True
+        return out
+    description = spec.get("description")
+    if isinstance(description, str) and description.strip():
+        out["description"] = description.strip()
+
+    if transport == "stdio":
+        command = str(spec.get("command") or "")
+        out["command"] = Path(command).name or command
+        args = spec.get("args")
+        out["args_count"] = len(args) if isinstance(args, list) else 0
+        env = spec.get("env")
+        out["env"] = {str(key): "***" for key in env} if isinstance(env, dict) else {}
+        if "stateful" in spec:
+            out["stateful"] = bool(spec.get("stateful"))
+        if "idle_ttl_sec" in spec:
+            out["idle_ttl_sec"] = spec.get("idle_ttl_sec")
+    else:
+        url, hidden_query, hidden_userinfo = _redact_url(str(spec.get("url") or ""))
+        out["url"] = url
+        out["url_query_hidden"] = hidden_query
+        out["url_userinfo_hidden"] = hidden_userinfo
+        headers = spec.get("headers")
+        out["headers"] = {str(key): "***" for key in headers} if isinstance(headers, dict) else {}
+    out["redacted"] = True
     return out
 
 
@@ -182,43 +414,21 @@ def get_client_spec(workspace_root: Path, client_id: str) -> dict[str, Any]:
 
 
 def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
-    cid = _normalize_client_id(spec.get("id"))
-    transport = _normalize_transport(spec.get("transport"))
-    enabled = bool(spec.get("enabled", True))
-    description = str(spec.get("description") or "").strip()
+    """Validate and persist one client record; returns its public shape.
 
-    record: dict[str, Any] = {
-        "transport": transport,
-        "enabled": enabled,
-    }
-    if description:
-        record["description"] = description
-
-    if transport == "stdio":
-        command = str(spec.get("command") or "").strip()
-        if not command:
-            raise ValueError("stdio client requires non-empty command")
-        args = spec.get("args")
-        env = spec.get("env")
-        record["command"] = command
-        record["args"] = [str(x) for x in args] if isinstance(args, list) else []
-        record["env"] = {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {}
-    else:
-        url = str(spec.get("url") or "").strip()
-        if not url:
-            raise ValueError(f"{transport} client requires non-empty url")
-        headers = spec.get("headers")
-        record["url"] = url
-        record["headers"] = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {}
-
+    The whole record is validated before the config file is touched, so a bad
+    payload never leaves a half-written or unusable entry behind.
+    """
+    validated = validate_client_spec(spec)
+    cid = str(validated.pop("id"))
     cfg = _load_raw_config(workspace_root)
     clients = cfg.get("clients")
     if not isinstance(clients, dict):
         clients = {}
         cfg["clients"] = clients
-    clients[cid] = record
+    clients[cid] = validated
     _save_raw_config(workspace_root, cfg)
-    return _normalize_public_spec(cid, record)
+    return _normalize_public_spec(cid, validated)
 
 
 def delete_client(workspace_root: Path, client_id: str) -> bool:
@@ -385,7 +595,15 @@ def _normalize_tool_entry(tool: Any) -> dict[str, Any]:
         input_schema = raw.get("input_schema")
     if not isinstance(input_schema, dict):
         input_schema = {"type": "object", "properties": {}, "required": []}
-    return {"name": name, "description": description, "input_schema": input_schema}
+    annotations = raw.get("annotations")
+    return {
+        "name": name,
+        "description": description,
+        "input_schema": input_schema,
+        # Kept because tool purity must come from the server's own annotations
+        # (readOnlyHint/destructiveHint), never from name matching.
+        "annotations": annotations if isinstance(annotations, dict) else {},
+    }
 
 
 @asynccontextmanager
@@ -427,7 +645,11 @@ async def open_session(workspace_root: Path, client_id: str):
             _sh_kw: dict[str, Any] = {}
             if _hdrs:
                 import httpx as _httpx
-                _sh_kw["http_client"] = _httpx.AsyncClient(headers=_hdrs)
+                # The SDK closes only clients it creates itself. Own the supplied
+                # client here, after transport/session cleanup, including errors.
+                _sh_kw["http_client"] = await stack.enter_async_context(
+                    _httpx.AsyncClient(headers=_hdrs)
+                )
             transport_obj = await stack.enter_async_context(
                 streamable_http_client(url, **_sh_kw)
             )
@@ -440,69 +662,674 @@ async def open_session(workspace_root: Path, client_id: str):
         yield session
 
 
+# ---------------------------------------------------------------------------
+#  Persistent stdio session actor pool (single-task lifecycle per client)
+# ---------------------------------------------------------------------------
+
+STDIO_IDLE_TTL_SEC = 900.0        # 普通 stdio MCP 默认空闲 15 分钟 (900s) 自动退出
+STDIO_STATEFUL_IDLE_TTL_SEC = 1800.0  # spec 标记 stateful 的 stdio MCP 空闲 30 分钟 (1800s) 自动退出
+_START_TIMEOUT_SEC = 45.0
+_STOP_TIMEOUT_SEC = 5.0
+# 每个请求最多一次“从未到达服务器”的重新派发（不是重放）。
+_SESSION_ATTEMPTS = 2
+_SESSION_CLOSED_MESSAGE = (
+    "MCP session closed before the request completed; the call was not retried"
+)
+_TOOL_SCHEMA_CACHE: dict[tuple[int, str], tuple[str, list[dict[str, Any]]]] = {}
+
+
+def resolve_idle_ttl(spec: dict[str, Any] | None) -> float:
+    """Resolve the idle TTL (seconds) for one stdio client spec.
+
+    Behaviour used to be decided by a hard-coded list of client names; now only
+    the spec decides, so an operator can mark any server as stateful.
+    """
+    data = spec or {}
+    raw_ttl = data.get("idle_ttl_sec")
+    if isinstance(raw_ttl, (int, float)) and not isinstance(raw_ttl, bool) and raw_ttl > 0:
+        return float(raw_ttl)
+    return STDIO_STATEFUL_IDLE_TTL_SEC if bool(data.get("stateful")) else STDIO_IDLE_TTL_SEC
+
+
+class MCPConnectionError(RuntimeError):
+    """The MCP transport is gone while a request was in flight.
+
+    Why: a business call must never be replayed, so a dead pipe has to be a
+    distinguishable failure instead of a generic exception a caller might retry.
+    """
+
+    reason = "connection_lost"
+
+
+class MCPConnectError(MCPConnectionError):
+    """No live session could be obtained for the request (retired/failed start)."""
+
+    reason = "connect_failed"
+
+
+class _SessionReset(MCPConnectionError):
+    """Internal: the request was still queued when the session ended.
+
+    It never reached the server, so dispatching it again is not a replay.
+    """
+
+    reason = "session_reset"
+
+
+def _consume_task(task: Any) -> None:
+    """Retrieve a finished task's exception so asyncio stops warning about it."""
+    if task is None or not getattr(task, "done", lambda: False)() or task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:
+        pass
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, EOFError)):
+        return True
+    name = type(exc).__name__
+    return any(
+        marker in name
+        for marker in (
+            "BrokenResource", "ClosedResource", "EndOfStream",
+            "ConnectionReset", "ConnectionError", "BrokenPipe", "EOF",
+        )
+    )
+
+
+def _map_sdk_error(exc: BaseException) -> BaseException:
+    """Translate a session exception into the failure a caller may act on."""
+    if isinstance(exc, MCPConnectionError):
+        return exc
+    if _is_transport_error(exc):
+        return MCPConnectionError(
+            f"MCP transport failed ({type(exc).__name__}: {exc}); the call was not retried"
+        )
+    # A business/tool error: reported once, and the session stays usable.
+    return exc
+
+
+class _Call:
+    """One queued request plus the future its caller awaits."""
+
+    __slots__ = ("op", "tool_name", "arguments", "future", "dispatched", "abandoned")
+
+    def __init__(self, op: str, tool_name: str, arguments: dict[str, Any]) -> None:
+        self.op = op
+        self.tool_name = tool_name
+        self.arguments = arguments
+        self.future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.dispatched = False
+        self.abandoned = False
+
+
+class _StdioSessionActor:
+    """Maintains a persistent stdio_client + ClientSession inside one dedicated asyncio.Task.
+
+    Why: anyio cancel scopes inside mcp.client.stdio require entering and exiting
+    on the exact same asyncio.Task, while stateful MCP servers need their child
+    process to survive across consecutive tool calls. How: run the context
+    manager inside one background worker task, dispatch list_tools/call_tool
+    through an asyncio.Queue, and auto-exit after the idle TTL so idle servers
+    do not permanently hold RAM in every worker.
+
+    Cancellation / retry contract (the reason for this shape):
+
+    * a call that is still queued when it is cancelled or times out is skipped
+      by the worker and never reaches the server;
+    * a call that is already in flight and gets cancelled or times out takes
+      down only this client's session (this actor has no independent per-call
+      server-side cancellation path) — every
+      other client's actor is untouched, and requests that were never
+      dispatched are re-dispatched on the fresh session instead of failing;
+    * a request the server already received is never re-sent, whatever failed.
+    """
+
+    def __init__(self, spec_sig: str, command: str, args: list[str], env: dict[str, str], *, client_id: str = "", idle_ttl_sec: float = STDIO_IDLE_TTL_SEC) -> None:
+        self.spec_sig = spec_sig
+        self.client_id = client_id
+        self.command = command
+        self.args = args
+        self.env = env
+        self.idle_ttl_sec = idle_ttl_sec
+        self._queue: asyncio.Queue | None = None
+        self._task: asyncio.Task | None = None
+        self._active: _Call | None = None
+        self._accepting = False
+        self._start_lock = asyncio.Lock()
+        self.retired = False
+
+    def is_alive(self) -> bool:
+        return (
+            self._task is not None
+            and not self._task.done()
+            and self._queue is not None
+            and self._accepting
+        )
+
+    async def _ensure_started(self) -> asyncio.Queue:
+        async with self._start_lock:
+            if self.retired:
+                raise MCPConnectError("MCP session was removed after a configuration change")
+            if self.is_alive():
+                return self._queue  # type: ignore[return-value]
+            loop = asyncio.get_running_loop()
+            q: asyncio.Queue = asyncio.Queue()
+            ready = loop.create_future()
+            self._queue = q
+            self._accepting = True
+            task = loop.create_task(
+                self._worker_loop(q, ready),
+                name=f"mcp-stdio-session:{self.client_id or 'client'}",
+            )
+            self._task = task
+            try:
+                await asyncio.wait_for(ready, timeout=_START_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                await self._discard_worker(task)
+                raise MCPConnectError(
+                    f"MCP session for '{self.client_id}' did not initialize within "
+                    f"{_START_TIMEOUT_SEC:.0f}s; the call was not retried"
+                ) from None
+            except BaseException:
+                await self._discard_worker(task)
+                raise
+            return q
+
+    async def _discard_worker(self, task: asyncio.Task) -> None:
+        """Cancel a worker that never became usable and forget its state."""
+        if not task.done():
+            task.cancel()
+        await asyncio.wait({task}, timeout=_STOP_TIMEOUT_SEC)
+        _consume_task(task)
+        if self._task is task:
+            self._task = None
+            self._queue = None
+            self._accepting = False
+
+    async def _worker_loop(self, q: asyncio.Queue, ready: asyncio.Future) -> None:
+        me = asyncio.current_task()
+        params = StdioServerParameters(command=self.command, args=self.args, env=self.env)
+        try:
+            async with stdio_client(params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    if not ready.done():
+                        ready.set_result(True)
+                    while True:
+                        try:
+                            call: _Call = await asyncio.wait_for(
+                                q.get(), timeout=self.idle_ttl_sec
+                            )
+                        except asyncio.TimeoutError:
+                            # Idle TTL reached: exit the context managers on this
+                            # task so the child process is released.
+                            break
+                        if call.abandoned or call.future.done():
+                            # Cancelled or timed out while it was still queued:
+                            # never execute it.
+                            continue
+                        call.dispatched = True
+                        self._active = call
+                        try:
+                            if call.op == "list":
+                                res = await session.list_tools()
+                            else:
+                                res = await session.call_tool(
+                                    call.tool_name, arguments=call.arguments or {}
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            if not call.future.done():
+                                call.future.set_exception(_map_sdk_error(exc))
+                            if _is_transport_error(exc):
+                                # The pipe is gone: leave the loop so the next
+                                # request reconnects instead of queueing forever.
+                                break
+                        else:
+                            if not call.future.done():
+                                call.future.set_result(res)
+                        # Only a completed request clears the active slot: a
+                        # cancelled or failed one must stay visible to
+                        # _fail_pending so its caller is released.
+                        self._active = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not ready.done():
+                ready.set_exception(MCPConnectError(f"MCP session failed to initialize: {exc}"))
+        finally:
+            active, self._active = self._active, None
+            self._accepting = False
+            if self._queue is q:
+                self._queue = None
+            if self._task is me:
+                self._task = None
+            self._fail_pending(q, active)
+            if not ready.done():
+                ready.set_exception(MCPConnectError("MCP session closed during initialization"))
+
+    def _fail_pending(self, q: asyncio.Queue, active: _Call | None) -> None:
+        """Resolve every request still owned by a session that just ended."""
+        pending: list[_Call] = []
+        if active is not None:
+            pending.append(active)
+        while True:
+            try:
+                pending.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        for call in pending:
+            if call.future.done():
+                continue
+            if call.dispatched or self.retired:
+                # The server may have seen it (or this client is gone for good):
+                # one explicit failure, never a retry.
+                call.future.set_exception(MCPConnectionError(_SESSION_CLOSED_MESSAGE))
+            else:
+                # Never dispatched, so the server cannot have seen it: handing it
+                # to the next session is not a replay.
+                call.future.set_exception(
+                    _SessionReset("MCP session ended before the request was dispatched")
+                )
+
+    async def stop(self) -> None:
+        """End this session without waiting behind its in-flight request."""
+        self._accepting = False
+        q, t = self._queue, self._task
+        self._queue = None
+        self._task = None
+        if q is None or t is None or t.done():
+            _consume_task(t)
+            return
+        t.cancel()
+        try:
+            await asyncio.wait({t}, timeout=_STOP_TIMEOUT_SEC)
+        except asyncio.CancelledError:
+            raise
+        _consume_task(t)
+
+    async def request(self, op: str, tool_name: str = "", arguments: dict[str, Any] | None = None, *, timeout: float = 120.0) -> Any:
+        if self.retired:
+            raise MCPConnectError("MCP session was removed after a configuration change")
+        last: BaseException | None = None
+        for attempt in range(_SESSION_ATTEMPTS):
+            q = await self._ensure_started()
+            call = _Call(op, tool_name, dict(arguments or {}))
+            await q.put(call)
+            try:
+                return await asyncio.wait_for(call.future, timeout=timeout)
+            except asyncio.TimeoutError:
+                await self._abandon(call)
+                raise
+            except asyncio.CancelledError:
+                await self._abandon(call)
+                raise
+            except _SessionReset as exc:
+                last = exc
+                if attempt + 1 < _SESSION_ATTEMPTS and not self.retired:
+                    # Undispatched request only: re-dispatching it cannot duplicate
+                    # a side effect, and it is what keeps a concurrent caller
+                    # alive when another caller's cancellation dropped the
+                    # session.
+                    continue
+                raise MCPConnectionError(_SESSION_CLOSED_MESSAGE) from None
+            except MCPConnectionError as exc:
+                last = exc
+                if (
+                    op == "list"
+                    and not call.dispatched
+                    and not self.retired
+                    and attempt + 1 < _SESSION_ATTEMPTS
+                ):
+                    # Schema discovery is idempotent: a bounded retry is allowed
+                    # here. A business call is never retried.
+                    continue
+                raise
+        raise (last if isinstance(last, BaseException) else MCPConnectionError(
+            _SESSION_CLOSED_MESSAGE
+        ))
+
+    async def _abandon(self, call: _Call) -> None:
+        """Drop one request; touch the shared session only if it was in flight."""
+        call.abandoned = True
+        if not call.future.done():
+            call.future.cancel()
+        if not call.dispatched:
+            # Still queued: the worker skips it and the session keeps serving
+            # every other caller of this client.
+            return
+        # This actor has no independent per-call server-side cancellation path:
+        # close this client's session rather than risk leaving a pending call
+        # on it. Undispatched queued requests move to the fresh session.
+        await self.stop()
+
+
+_STDIO_ACTORS: dict[tuple[int, str], _StdioSessionActor] = {}
+
+# Why: bridge bookkeeping lives in the runtime module, not in the plugin
+# package. importlib.reload() re-executes engine/builtin/mcp/__init__.py and
+# drops every module global there while the watcher task and the stdio children
+# keep running, which is exactly the leak this dict prevents. How: the plugin
+# package reads and writes this one dict through shared_state(). Purpose: one
+# reload-safe home for the process-wide MCP state.
+_BRIDGE_STATE: dict[str, Any] = {
+    "task": None,
+    "generation": 0,
+    "registry": None,
+    "hooks": None,
+    "workspace_root": None,
+    "disposers": {},       # client_id -> [(registered tool name, disposer)]
+    "specs": {},           # client_id -> spec used for the live registrations
+    "failed_clients": set(),
+    "retry_pending": True,
+    "actors": {},          # read-only view of the current loop's actor pool
+}
+
+
+def shared_state() -> dict[str, Any]:
+    """Return the live MCP bridge/session state (one dict per process).
+
+    Why: the plugin package is re-executed on reload, so its module globals
+    cannot be the only record of the running watcher and its registrations;
+    state that survives reload must live in this module. How: hand back the one
+    ``_BRIDGE_STATE`` dict and refresh its ``actors`` view from the pool of the
+    running event loop. Purpose: a reload can find, release and replace the
+    previous incarnation, and diagnostics/tests get one inspection surface
+    without duplicating bookkeeping.
+    """
+    try:
+        loop_id: int | None = id(asyncio.get_running_loop())
+    except RuntimeError:
+        loop_id = None
+    _BRIDGE_STATE["actors"] = {
+        client_id: actor
+        for (pool_loop, client_id), actor in list(_STDIO_ACTORS.items())
+        if loop_id is not None and pool_loop == loop_id
+    }
+    return _BRIDGE_STATE
+
+
+def _cache_get(client_id: str, spec_sig: str) -> list[dict[str, Any]] | None:
+    entry = _TOOL_SCHEMA_CACHE.get((id(asyncio.get_running_loop()), client_id))
+    if entry is None or entry[0] != spec_sig:
+        return None
+    return list(entry[1])
+
+
+def _cache_set(client_id: str, spec_sig: str, tools: list[dict[str, Any]]) -> None:
+    _TOOL_SCHEMA_CACHE[(id(asyncio.get_running_loop()), client_id)] = (spec_sig, tools)
+
+
+def _cache_drop(client_id: str) -> None:
+    _TOOL_SCHEMA_CACHE.pop((id(asyncio.get_running_loop()), client_id), None)
+
+
+def _cache_clear_loop(loop_id: int) -> None:
+    for key in [key for key in _TOOL_SCHEMA_CACHE if key[0] == loop_id]:
+        _TOOL_SCHEMA_CACHE.pop(key, None)
+
+
+def _stdio_spec_signature(spec: dict[str, Any]) -> str:
+    """Use the same process identity for acquisition and configuration cleanup."""
+    return json.dumps({
+        "c": str(spec.get("command") or "").strip(),
+        "a": [str(x) for x in (spec.get("args") or [])],
+        "e": {str(k): resolve_env_ref(v) for k, v in (spec.get("env") or {}).items()},
+    }, sort_keys=True)
+
+
+def _stdio_actor_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, "_clonoth_stdio_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(loop, "_clonoth_stdio_lock", lock)
+    return lock
+
+
+async def reconcile_stdio_actors(clients: list[dict[str, Any]]) -> bool:
+    """Retire obsolete sessions without holding the pool lock during shutdown."""
+    active = {
+        str(spec["id"]): spec for spec in clients
+        if spec.get("enabled", True) and spec.get("transport") == "stdio"
+    }
+    loop_id = id(asyncio.get_running_loop())
+    retired: list[tuple[tuple[int, str], _StdioSessionActor]] = []
+    complete = True
+    async with _stdio_actor_lock():
+        for key, actor in list(_STDIO_ACTORS.items()):
+            if key[0] != loop_id:
+                continue
+            cid = key[1]
+            spec = active.get(cid)
+            try:
+                if spec is not None and not actor.retired and actor.spec_sig == _stdio_spec_signature(spec):
+                    actor.idle_ttl_sec = resolve_idle_ttl(spec)
+                    continue
+            except Exception:
+                complete = False
+                logger.warning("MCP session configuration invalid: %s", cid, exc_info=True)
+            actor.retired = True
+            _cache_drop(cid)
+            retired.append((key, actor))
+    for key, actor in retired:
+        try:
+            await actor.stop()
+        except Exception:
+            # Keep the retired pool entry so the next refresh can retry cleanup.
+            complete = False
+            logger.warning("MCP session cleanup failed: %s", key[1], exc_info=True)
+            continue
+        async with _stdio_actor_lock():
+            if _STDIO_ACTORS.get(key) is actor:
+                _STDIO_ACTORS.pop(key, None)
+    return complete
+
+
+async def _get_stdio_actor(workspace_root: Path, client_id: str) -> _StdioSessionActor | None:
+    _ensure_sdk()
+    loop = asyncio.get_running_loop()
+    key = (id(loop), client_id)
+    while True:
+        async with _stdio_actor_lock():
+            # Read under the pool lock, including after awaiting old-session
+            # shutdown: a stale snapshot must not recreate a deleted client.
+            spec = get_client_spec(workspace_root, client_id)
+            if not bool(spec.get("enabled", True)):
+                raise RuntimeError(f"MCP client is disabled: {client_id}")
+            if str(spec.get("transport") or "stdio") != "stdio":
+                return None
+            command = str(spec.get("command") or "").strip()
+            if not command:
+                raise RuntimeError("stdio client missing command")
+            sig = _stdio_spec_signature(spec)
+            idle_ttl = resolve_idle_ttl(spec)
+            existing = _STDIO_ACTORS.get(key)
+            if existing is not None:
+                same_loop = getattr(existing, "_loop_ref", lambda: loop)() is loop
+                if same_loop and not existing.retired and existing.spec_sig == sig:
+                    existing.idle_ttl_sec = idle_ttl
+                    return existing
+                existing.retired = True
+                _cache_drop(client_id)
+                if not same_loop:
+                    _STDIO_ACTORS.pop(key, None)
+                    continue
+            else:
+                args = [str(x) for x in (spec.get("args") or [])]
+                env = os.environ.copy()
+                for k, v in (spec.get("env") or {}).items():
+                    env[str(k)] = resolve_env_ref(v)
+                actor = _StdioSessionActor(
+                    sig, command, args, env, client_id=client_id, idle_ttl_sec=idle_ttl
+                )
+                try:
+                    import weakref as _wr
+                    actor._loop_ref = _wr.ref(loop)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                _STDIO_ACTORS[key] = actor
+                return actor
+        # Keep shutdown outside the shared lock so other clients remain usable.
+        await existing.stop()
+        async with _stdio_actor_lock():
+            if _STDIO_ACTORS.get(key) is existing:
+                _STDIO_ACTORS.pop(key, None)
+
+
+async def close_stdio_actor(client_id: str) -> bool:
+    """Retire one client's session; return False when it had none.
+
+    Why: operators and tests need to drop one stuck server without touching the
+    others. How: mark the pool entry retired (so it can never be restarted),
+    stop it outside the pool lock, then remove it. Purpose: one client's
+    cleanup cannot break another client's session.
+    """
+    key = (id(asyncio.get_running_loop()), client_id)
+    async with _stdio_actor_lock():
+        actor = _STDIO_ACTORS.get(key)
+        if actor is None:
+            return False
+        actor.retired = True
+        _cache_drop(client_id)
+    try:
+        await actor.stop()
+    finally:
+        async with _stdio_actor_lock():
+            if _STDIO_ACTORS.get(key) is actor:
+                _STDIO_ACTORS.pop(key, None)
+    return True
+
+
+async def close_stdio_actors() -> int:
+    """Stop all active stdio actors in the current event loop and return count stopped."""
+    loop_id = id(asyncio.get_running_loop())
+    _cache_clear_loop(loop_id)
+    keys = [k for k in list(_STDIO_ACTORS.keys()) if k[0] == loop_id]
+    stopped = 0
+    for k in keys:
+        actor = _STDIO_ACTORS.pop(k, None)
+        if actor is not None:
+            actor.retired = True
+            try:
+                await actor.stop()
+                stopped += 1
+            except Exception:
+                pass
+    return stopped
+
+
+_LIST_TIMEOUT_SEC = 45.0
+
+
 async def list_tools(workspace_root: Path, client_id: str) -> dict[str, Any]:
-    async with open_session(workspace_root, client_id) as session:
-        res = await session.list_tools()
-        raw = _to_plain(res)
-        tools = raw.get("tools") if isinstance(raw, dict) else []
-        items = [_normalize_tool_entry(t) for t in tools] if isinstance(tools, list) else []
-        return {"ok": True, "client_id": client_id, "tools": items}
+    """Discover one client's tools (idempotent, so a bounded retry is allowed)."""
+    actor = await _get_stdio_actor(workspace_root, client_id)
+    if actor is not None:
+        cached = _cache_get(client_id, actor.spec_sig)
+        if cached is not None:
+            return {"ok": True, "client_id": client_id, "tools": cached}
+        was_alive = actor.is_alive()
+        try:
+            res = await actor.request("list", timeout=_LIST_TIMEOUT_SEC)
+        finally:
+            if not was_alive:
+                # Stop right after schema discovery so startup/reload does not
+                # leave every MCP server resident in RAM before it is called.
+                await actor.stop()
+    else:
+        async with open_session(workspace_root, client_id) as session:
+            res = await session.list_tools()
+    raw = _to_plain(res)
+    tools = raw.get("tools") if isinstance(raw, dict) else []
+    items = [_normalize_tool_entry(t) for t in tools] if isinstance(tools, list) else []
+    if actor is not None and items:
+        _cache_set(client_id, actor.spec_sig, items)
+    return {"ok": True, "client_id": client_id, "tools": items}
 
 
-# [2026-06-10] Default MCP tool call timeout in seconds.
-# Why: MCP servers can hang indefinitely (network issues, server bugs).
-# How: wrap session.call_tool in asyncio.wait_for with a configurable timeout.
-# Purpose: prevent tool calls from blocking the engine forever.
 MCP_CALL_TIMEOUT = 120.0
 
 
+def _tool_failure(client_id: str, tool_name: str, reason: str, message: str) -> dict[str, Any]:
+    """Build one explicit tool failure; the caller never retries it."""
+    return {
+        "ok": False,
+        "error": message,
+        "data": {
+            "result": f"ERROR: {message}",
+            "client_id": client_id,
+            "tool_name": tool_name,
+            "reason": reason,
+            "attachments": [],
+        },
+        "attachments": [],
+    }
+
+
 async def call_tool(workspace_root: Path, client_id: str, tool_name: str, arguments: dict[str, Any] | None, *, timeout: float = MCP_CALL_TIMEOUT) -> dict[str, Any]:
-    async with open_session(workspace_root, client_id) as session:
-        try:
-            res = await asyncio.wait_for(
-                session.call_tool(tool_name, arguments=arguments or {}),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            return {
-                "ok": False,
-                "error": f"MCP tool '{tool_name}' on client '{client_id}' timed out after {timeout}s",
-                "data": {"result": f"MCP tool call timed out after {timeout}s", "client_id": client_id, "tool_name": tool_name, "attachments": []},
-                "attachments": [],
-            }
-        # Why: MCP image content can be much larger than the context budget. How:
-        # serialize the result through the MCP-aware helper that saves oversized
-        # images to disk and returns AttachmentCollector-compatible metadata.
-        # Purpose: keep tool history compact while still exposing generated files.
-        result, attachments = _to_plain_mcp_result(workspace_root, client_id, res)
-        # [AutoC 2026-05-31] Why: MCP SDK results have provider-specific content
-        # payloads, but the engine now consumes a unified ok/data/error contract.
-        # How: flatten text, image, and resource parts into data.result while keeping
-        # the original processed MCP payload under data.mcp_result. Purpose: make MCP
-        # tool history readable and preserve structured data plus attachments.
-        result_text_parts: list[str] = []
-        if isinstance(result, dict) and isinstance(result.get("content"), list):
-            for part in result["content"]:
-                if isinstance(part, dict):
-                    if part.get("type") == "text":
-                        result_text_parts.append(str(part.get("text", "")))
-                    elif part.get("type") == "image":
-                        result_text_parts.append(f"[image: {part.get('mimeType') or part.get('mime_type') or part.get('mime') or '?'}]")
-                    elif part.get("type") == "resource":
-                        resource = part.get("resource")
-                        uri = part.get("uri") or (resource.get("uri") if isinstance(resource, dict) else None)
-                        result_text_parts.append(f"[resource: {uri or '?'}]")
-        result_text = "\n".join(result_text_parts) if result_text_parts else json.dumps(result, ensure_ascii=False, indent=2)
-        is_error = bool(result.get("isError") or result.get("is_error")) if isinstance(result, dict) else False
-        return {
-            "ok": not is_error,
-            "data": {
-                "result": result_text,
-                "mcp_result": result,
-                "client_id": client_id,
-                "tool_name": tool_name,
-                "attachments": attachments or [],
-            },
-            "error": result_text if is_error else None,
+    """Run one MCP tool call exactly once and report the outcome.
+
+    Why: the previous implementation retried any exception, which re-executed
+    business calls that had already reached the server (double charges, double
+    writes). How: a business call is dispatched once; each failure class is
+    mapped to a distinct ``reason`` so callers can tell a dead transport from a
+    tool error and from a timeout. Purpose: one call, one result.
+    """
+    try:
+        actor = await _get_stdio_actor(workspace_root, client_id)
+        if actor is not None:
+            res = await actor.request("call", tool_name, arguments or {}, timeout=timeout)
+        else:
+            async with open_session(workspace_root, client_id) as session:
+                res = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments=arguments or {}),
+                    timeout=timeout,
+                )
+    except asyncio.TimeoutError:
+        return _tool_failure(
+            client_id, tool_name, "timeout",
+            f"MCP tool '{tool_name}' on client '{client_id}' timed out after {timeout}s; "
+            "the call was not retried",
+        )
+    except MCPConnectError as exc:
+        return _tool_failure(client_id, tool_name, "connect_failed", str(exc))
+    except MCPConnectionError as exc:
+        return _tool_failure(client_id, tool_name, "connection_lost", str(exc))
+    except Exception as exc:
+        # A business/tool error: reported once, and the session stays usable.
+        return _tool_failure(client_id, tool_name, "tool_error", str(exc))
+
+    result, attachments = _to_plain_mcp_result(workspace_root, client_id, res)
+    result_text_parts: list[str] = []
+    if isinstance(result, dict) and isinstance(result.get("content"), list):
+        for part in result["content"]:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    result_text_parts.append(str(part.get("text", "")))
+                elif part.get("type") == "image":
+                    result_text_parts.append(f"[image: {part.get('mimeType') or part.get('mime_type') or part.get('mime') or '?'}]")
+                elif part.get("type") == "resource":
+                    resource = part.get("resource")
+                    uri = part.get("uri") or (resource.get("uri") if isinstance(resource, dict) else None)
+                    result_text_parts.append(f"[resource: {uri or '?'}]")
+    result_text = "\n".join(result_text_parts) if result_text_parts else json.dumps(result, ensure_ascii=False, indent=2)
+    is_error = bool(result.get("isError") or result.get("is_error")) if isinstance(result, dict) else False
+    if not is_error and result_text.lstrip().startswith("ERROR:"):
+        is_error = True
+    return {
+        "ok": not is_error,
+        "data": {
+            "result": result_text,
+            "mcp_result": result,
+            "client_id": client_id,
+            "tool_name": tool_name,
             "attachments": attachments or [],
-        }
+        },
+        "error": result_text if is_error else None,
+        "attachments": attachments or [],
+    }

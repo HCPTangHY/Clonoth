@@ -239,12 +239,18 @@ function clientToForm(c) {
     headersText: kvToText(c.headers),
   };
 }
-function formToEntry(f) {
-  const entry = {
-    transport: f.transport,
-    enabled: !!f.enabled,
-    description: f.description,
-  };
+// 手动检查字段保留（在此页面的控制台执行）：
+// console.assert(formToEntry({transport: 'stdio'}, {stateful: true, idle_ttl_sec: 1800}).idle_ttl_sec === 1800);
+function formToEntry(f, prev) {
+  // 保留未显示的字段，只移除目标传输方式不适用的已知字段。
+  const entry = { ...(prev || {}) };
+  const obsolete = f.transport === 'stdio'
+    ? ['url', 'headers']
+    : ['command', 'args', 'env', 'stateful', 'idle_ttl_sec'];
+  for (const key of obsolete) delete entry[key];
+  entry.transport = f.transport;
+  entry.enabled = !!f.enabled;
+  entry.description = f.description;
   if (f.transport === 'stdio') {
     entry.command = f.command;
     entry.args = textToList(f.argsText);
@@ -257,18 +263,56 @@ function formToEntry(f) {
 }
 
 // ── data ───────────────────────────────────────────────────
+// 原文解析失败不能退化成空配置：保存是整份 jsyaml.dump 覆写，退化成空会把文件
+// 里其余 Client 一起抹掉。这里直接抛错，交给现有的加载失败路径展示。
+function parseRawDoc(content) {
+  let doc;
+  try {
+    doc = jsyaml.load(content);
+  } catch (e) {
+    throw new Error('配置原文 YAML 解析失败（' + e.message + '），已停止加载以免保存时覆盖原配置。');
+  }
+  if (doc == null) doc = {}; // 保留生产对空配置的兼容处理。
+  if (typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error('配置原文根节点不是映射，已停止加载以免保存时覆盖原配置。');
+  }
+  if (doc.clients == null) doc.clients = {};
+  if (Array.isArray(doc.clients)) {
+    // 与运行时一致，兼容旧版列表格式，但不丢弃无效或重复记录。
+    const clients = Object.create(null);
+    for (const item of doc.clients) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)
+          || typeof item.id !== 'string' || !item.id.trim()) {
+        throw new Error('客户端列表包含无效记录，已停止加载。');
+      }
+      const cid = item.id.trim();
+      if (Object.prototype.hasOwnProperty.call(clients, cid)) {
+        throw new Error('客户端列表包含重复 ID，已停止加载。');
+      }
+      const { id, ...entry } = item;
+      clients[cid] = entry;
+    }
+    doc.clients = clients;
+  }
+  if (!doc.clients || typeof doc.clients !== 'object') {
+    throw new Error('配置原文 clients 不是映射或列表，已停止加载。');
+  }
+  for (const [cid, entry] of Object.entries(doc.clients)) {
+    if (!cid.trim() || !entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('客户端配置包含无效记录，已停止加载。');
+    }
+  }
+  return doc;
+}
+
 async function loadAll() {
+  S.rawDoc = null; // 请求或解析失败后，禁止继续保存旧副本。
   const [clients, raw] = await Promise.all([
     api('/admin/config/mcp-clients'),
     api('/admin/config/mcp-clients/raw'),
   ]);
   S.clients = Array.isArray(clients) ? clients : [];
-  try {
-    S.rawDoc = jsyaml.load(raw.content) || {};
-  } catch (e) {
-    S.rawDoc = {};
-  }
-  if (!S.rawDoc.clients || typeof S.rawDoc.clients !== 'object') S.rawDoc.clients = {};
+  S.rawDoc = parseRawDoc(raw.content);
   if (S.selectedId && !S.clients.some((c) => c.id === S.selectedId)) {
     S.selectedId = null; S.form = null;
   }
@@ -277,7 +321,10 @@ async function loadAll() {
 }
 
 async function saveRaw(doc) {
-  const content = jsyaml.dump({ version: 1, clients: doc.clients }, { indent: 2, lineWidth: -1, noRefs: true, sortKeys: false });
+  if (!doc || !doc.clients || typeof doc.clients !== 'object' || Array.isArray(doc.clients)) {
+    throw new Error('配置原文未加载成功，已阻止写入以免覆盖现有配置。');
+  }
+  const content = jsyaml.dump({ ...doc, version: doc.version || 1 }, { indent: 2, lineWidth: -1, noRefs: true, sortKeys: false });
   await api('/admin/config/mcp-clients/raw', { method: 'PUT', body: JSON.stringify({ content }) });
 }
 
@@ -445,9 +492,11 @@ function setMsg(text, ok) {
 
 async function save() {
   if (!S.form) return;
+  if (!S.rawDoc || !S.rawDoc.clients) { setMsg('配置原文未加载成功，已阻止保存以免覆盖现有配置。', false); return; }
   try {
-    // 只替换被编辑的条目，其余条目（含未知字段）原样保留。
-    S.rawDoc.clients[S.form.id] = formToEntry(S.form);
+    // 只替换被编辑的条目，其余条目原样保留；条目内未显示的字段由 formToEntry
+    // 合并自原记录（stateful、idle_ttl_sec 及扩展字段）。
+    S.rawDoc.clients[S.form.id] = formToEntry(S.form, S.rawDoc.clients[S.form.id]);
     await saveRaw(S.rawDoc);
     S.dirty = false;
     broadcastChanged();
@@ -514,8 +563,8 @@ if (MODE === 'editor') {
         api('/admin/config/mcp-clients/raw'),
       ]);
       S.clients = Array.isArray(clients) ? clients : [];
-      try { S.rawDoc = jsyaml.load(raw.content) || {}; } catch (e) { S.rawDoc = {}; }
-      if (!S.rawDoc.clients || typeof S.rawDoc.clients !== 'object') S.rawDoc.clients = {};
+      S.rawDoc = null; // 解析失败时保持 null：下面 catch 展示错误，不进入编辑器
+      S.rawDoc = parseRawDoc(raw.content);
       const c = S.clients.find((x) => x.id === id);
       if (!c) throw new Error('Client 不存在：' + id);
       S.selectedId = id;

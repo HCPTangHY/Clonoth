@@ -2,7 +2,7 @@
 
 三个进程面按可用 face 分流（参照 retry_api / plugin_manager 的双进程形态）：
 
-- engine 进程（tools face 可用）：PLUGIN_META 声明三个配置 CRUD 元工具；
+- engine 进程（tools face 可用）：PLUGIN_META 声明统一的配置管理工具；
   构造时启动后台桥任务——先做一次全量发现，之后每 10 秒比对
   data/mcp_clients.yaml 的 mtime，变化即重发现。发现结果通过
   register_builtin_tool 注册为一等工具（mcp_{cid}_{name}），写入 reload
@@ -16,20 +16,20 @@ CRUD 工具保存/删除配置后立即在本 worker 刷新，并 POST /v1/tools
 bump reload-seq：其他 worker 的 MCP 工具经快照存活、经 mtime 监视在 10 秒
 内跟进新配置。
 
-已知边界：引擎启动后的第一个任务可能赶不上首次发现完成（旧实现由
-runner 启动预载保证），从第二个任务起工具必然可见；内置插件的卸载是
-临时性的（下一个 AI 任务会重新自动注册），这是全部内置插件的既有语义。
+首次工具列表构建前可调用 wait_mcp_initial_discovery，最多等待15秒；
+失败或未完成的客户端由后续监视周期重试。内置插件的卸载是临时性的（下一个 AI 任务会重新自动
+注册），这是全部内置插件的既有语义。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from . import mcp_runtime
@@ -43,49 +43,128 @@ def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
     return {"ok": True, "data": {"result": result_text, **fields}}
 
 
-def _err(message: Any) -> dict[str, Any]:
+def _err(message: Any, **fields: Any) -> dict[str, Any]:
     text = str(message)
-    return {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
+    data = {"result": f"ERROR: {text}", **fields}
+    response: dict[str, Any] = {"ok": False, "error": text, "data": data}
+    response.update(fields)
+    return response
 
 
 # ---------------------------------------------------------------------------
-#  CRUD meta tools（engine 进程，经 PLUGIN_META["tools"] 由 loader 注册）
+#  CRUD meta tool（engine 进程，经 PLUGIN_META["tools"] 由 loader 注册）
 # ---------------------------------------------------------------------------
 
-async def create_or_update_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+
+def _config_write_path(ctx: Any) -> str:
+    """Absolute path of the config file this plugin mutates (audited approval)."""
+    return str(Path(getattr(ctx, "workspace_root")) / "data" / "mcp_clients.yaml")
+
+
+async def _request_config_write(ctx: Any, **parameters: Any) -> dict[str, Any] | None:
+    """Ask the policy engine for one guarded write; None means allowed."""
+    from toolbox._common import request_guard
+
+    _op, err = await request_guard(
+        ctx, "write_file", {"path": _config_write_path(ctx), **parameters}
+    )
+    if err is None:
+        return None
+    # Keep approval failures distinguishable from user denial through this wrapper.
+    return {**_err(err.get("error", "denied")), **err}
+
+
+async def _list_mcp_clients(ctx: Any) -> dict[str, Any]:
+    """List clients with every secret replaced (this answer reaches the model)."""
+    try:
+        clients = mcp_runtime.list_clients(ctx.workspace_root)
+    except Exception as exc:
+        return _err(exc)
+    redacted = [mcp_runtime.redact_client_spec(client) for client in clients]
+    if not redacted:
+        return _ok("0 MCP clients (data/mcp_clients.yaml is empty)", clients=[])
+    lines = [f"{len(redacted)} MCP clients (config: data/mcp_clients.yaml):"]
+    for client in redacted:
+        enabled = "enabled" if client.get("enabled", True) else "disabled"
+        line = f"- {client.get('id')} | {client.get('transport')} | {enabled}"
+        target = str(client.get("command") or client.get("url") or "")
+        if target:
+            line += f" | {target}"
+        if client.get("transport_error"):
+            line += f" | INVALID: {client['transport_error']}"
+        if client.get("description"):
+            line += f" | {client['description']}"
+        lines.append(line)
+    return _ok("\n".join(lines), clients=redacted)
+
+
+async def _upsert_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Validate → approval → write → refresh live tools."""
+    try:
+        # Validated before the guard: a bad payload must never open an approval
+        # prompt, and it must never reach the file.
+        record = mcp_runtime.validate_client_spec(args)
+    except ValueError as exc:
+        return _err(exc)
+    client_id = str(record["id"])
+    denied = await _request_config_write(ctx, mcp_client_id=client_id)
+    if denied is not None:
+        return denied
     try:
         spec = mcp_runtime.upsert_client(ctx.workspace_root, args)
-    except Exception as e:
-        return _err(e)
+    except Exception as exc:
+        return _err(exc)
     tool_count = await _refresh_and_notify(ctx)
     return _ok(
-        f"MCP client saved: {spec.get('id', '')} ({tool_count} tools live)",
-        client=spec,
+        f"MCP client saved: {client_id} ({tool_count} tools live)",
+        client=mcp_runtime.redact_client_spec(spec),
         path="data/mcp_clients.yaml",
         tools=tool_count,
     )
 
 
-async def list_mcp_clients(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
-    try:
-        clients = mcp_runtime.list_clients(ctx.workspace_root)
-        return _ok(f"{len(clients)} MCP clients", clients=clients)
-    except Exception as e:
-        return _err(e)
-
-
-async def delete_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
-    client_id = str(args.get("id", "")).strip()
+async def _delete_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Delete one client, but only once it is known to exist."""
+    client_id = str(args.get("id") or "").strip()
     if not client_id:
         return _err("empty client id")
     try:
-        ok = mcp_runtime.delete_client(ctx.workspace_root, client_id)
-        if not ok:
+        mcp_runtime.get_client_spec(ctx.workspace_root, client_id)
+    except ValueError as exc:
+        # Missing/invalid client: nothing to approve, nothing to write.
+        return _err(exc)
+    denied = await _request_config_write(ctx, delete_mcp_client=client_id)
+    if denied is not None:
+        return denied
+    try:
+        if not mcp_runtime.delete_client(ctx.workspace_root, client_id):
             return _err(f"client not found: {client_id}")
-        tool_count = await _refresh_and_notify(ctx)
-        return _ok(f"MCP client deleted: {client_id} ({tool_count} tools live)", deleted=True, id=client_id, tools=tool_count)
-    except Exception as e:
-        return _err(e)
+    except Exception as exc:
+        return _err(exc)
+    tool_count = await _refresh_and_notify(ctx)
+    return _ok(
+        f"MCP client deleted: {client_id} ({tool_count} tools live)",
+        deleted=True,
+        id=client_id,
+        tools=tool_count,
+    )
+
+
+async def manage_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Unified MCP client management tool: list, upsert, or delete.
+
+    A missing action is always a listing (it must never write), and action
+    aliases are rejected: a policy denying ':delete' must not be bypassable by
+    spelling the same intent differently.
+    """
+    action = str(args.get("action") or "").strip().lower()
+    if not action or action == "list":
+        return await _list_mcp_clients(ctx)
+    if action == "upsert":
+        return await _upsert_mcp_client(args, ctx)
+    if action == "delete":
+        return await _delete_mcp_client(args, ctx)
+    return _err(f"invalid action: {action!r}, must be 'list', 'upsert', or 'delete'")
 
 
 async def _refresh_and_notify(ctx: Any) -> int:
@@ -119,44 +198,222 @@ async def _refresh_and_notify(ctx: Any) -> int:
 #  动态工具发现（engine 进程后台桥）
 # ---------------------------------------------------------------------------
 
-# 模块级桥状态：__init__ 每次进入 AI 节点都会重跑（builtin 自动发现的既有
-# 语义），后台任务与 disposer 列表必须跨重入存活。
-_BRIDGE: dict[str, Any] = {
-    "started": False,
-    "hooks": None,
-    "disposers": [],
-    "lock": None,
-}
+# 桥状态跨重入、跨 reload 存活：每次进 AI 节点或 reload 插件包都会重跑
+# 本模块的模块级代码，而旧的后台任务/工具注册/子进程不能跟着丢。
+# 因此状态存在 mcp_runtime.shared_state()（不被 reload 重新执行）里，
+# 本模块只是它的一个读写者。
+_BRIDGE_TASK_NAME = "mcp-bridge"
+# After asking a watcher to stop cooperatively, how long to wait before
+# cancelling it; the watcher never blocks for more than one watch interval.
+_BRIDGE_STOP_GRACE_SEC = 2.0
+_BRIDGE_STOP_HARD_SEC = 5.0
+
+
+def _bridge_state() -> dict[str, Any]:
+    return mcp_runtime.shared_state()
+
+
+def _same_loop(task: Any) -> bool:
+    try:
+        return task.get_loop() is asyncio.get_running_loop()
+    except Exception:
+        return False
+
+
+async def _stop_bridge_task(task: Any, stop_event: Any) -> None:
+    """Ask one watcher to stop, cancelling it only if it does not comply.
+
+    Why: a cancellation request alone is not a completed ownership hand-off;
+    teardown must also wait for the watcher to leave. How: flip an explicit
+    stop flag the idle loop is already waiting on, wait for it to exit, and
+    cancel only as a backstop.
+    Purpose: unload is complete and deterministic, not "probably soon".
+    """
+    if task is None or task is asyncio.current_task() or not _same_loop(task):
+        # A task from another loop cannot be driven from here; its generation
+        # check makes it exit on its own next wake-up.
+        return
+    if not task.done() and stop_event is not None:
+        stop_event.set()
+        await asyncio.wait({task}, timeout=_BRIDGE_STOP_GRACE_SEC)
+    if not task.done():
+        task.cancel()
+        await asyncio.wait({task}, timeout=_BRIDGE_STOP_HARD_SEC)
+    if task.done() and not task.cancelled():
+        try:
+            task.exception()
+        except Exception:
+            pass
 
 
 def _start_engine_bridge(tools_face: Any, ctx: Any) -> None:
-    if _BRIDGE["started"]:
-        return
+    """Start the discovery watcher, releasing whatever the previous load owned.
+
+    Why: this runs from McpPlugin.__init__, i.e. again on every plugin reload.
+    A previous incarnation's watcher task, tool registrations and stdio children
+    must be released first, otherwise a reload leaks an old loop plus a child
+    process per MCP client. How: bump the generation, create this load's stop
+    event, and hand the previous task/event to the new watcher, which releases
+    them before discovering. Purpose: exactly one bridge exists at any time,
+    old or new, never both.
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         # 无运行中的事件循环（非 engine 推理路径）：不启动后台桥。
         return
-    _BRIDGE["started"] = True
-    _BRIDGE["hooks"] = getattr(ctx, "hooks", None)
-    loop.create_task(_bridge_loop(tools_face))
+    state = _bridge_state()
+    previous = state.get("task")
+    previous_stop = state.get("stop")
+    generation = int(state.get("generation") or 0) + 1
+    state["generation"] = generation
+    initial = state.get("initial_discovery")
+    if initial is not None and not initial[2].done():
+        initial[2].set_result(False)
+    state["initial_discovery"] = (generation, tools_face, loop.create_future())
+    stop_event = asyncio.Event()
+    state["stop"] = stop_event
+    task = loop.create_task(
+        _bridge_main(
+            tools_face, getattr(ctx, "hooks", None), previous, previous_stop,
+            generation, stop_event,
+        ),
+        name=_BRIDGE_TASK_NAME,
+    )
+    state["task"] = task
 
 
-async def _bridge_loop(registry: Any) -> None:
-    ws = Path(getattr(registry, "workspace_root"))
-    await refresh_mcp_tools(registry)
-    last_mtime = _config_mtime(ws)
+async def wait_mcp_initial_discovery(timeout: float = 15.0, *, registry: Any = None) -> bool:
+    """Wait for the current generation's first attempt, not all clients' success.
+
+    The 15-second startup budget follows the upstream discovery wait. A timeout
+    or caller cancellation never cancels the shared watcher/future. Replacement
+    generations share this caller's original deadline, so reload cannot extend it.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
     while True:
-        await asyncio.sleep(_WATCH_INTERVAL_SEC)
+        state = _bridge_state()
+        initial = state.get("initial_discovery")
+        if initial is None or (registry is not None and initial[1] is not registry):
+            return False
+        generation, _, ready = initial
+        if ready.get_loop() is not loop:
+            return False
+        try:
+            if ready.done():
+                completed = ready.result()
+            else:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                completed = await asyncio.wait_for(asyncio.shield(ready), remaining)
+        except asyncio.TimeoutError:
+            return False
+        if state.get("initial_discovery") is initial and state.get("generation") == generation:
+            return bool(completed)
+        if loop.time() >= deadline:
+            return False
+
+
+async def _bridge_main(
+    registry: Any, hooks: Any, previous: Any, previous_stop: Any,
+    generation: int, stop_event: asyncio.Event,
+) -> None:
+    """Release the previous bridge, then watch the config file."""
+    initial = _bridge_state().get("initial_discovery")
+    try:
+        await _stop_bridge_task(previous, previous_stop)
+        if _bridge_state().get("generation") != generation or stop_event.is_set():
+            return
+        await _drop_bridge_ownership()
+        state = _bridge_state()
+        if state.get("generation") != generation or stop_event.is_set():
+            return
+        state["registry"] = registry
+        state["hooks"] = hooks
+        state["workspace_root"] = Path(getattr(registry, "workspace_root"))
+        await _bridge_loop(registry, generation, stop_event)
+    finally:
+        if initial is not None and initial[0] == generation and not initial[2].done():
+            initial[2].set_result(False)
+        state = _bridge_state()
+        if state.get("task") is asyncio.current_task():
+            state["task"] = None
+        if state.get("stop") is stop_event:
+            state["stop"] = None
+
+
+async def _drop_bridge_ownership(*, close_actors: bool = True) -> None:
+    """Dispose every tool this bridge registered and close its sessions."""
+    state = _bridge_state()
+    registry = state.get("registry")
+    for client_id in list(state.get("disposers") or {}):
+        _discard_client_tools(registry, client_id)
+    state["registry"] = None
+    state["hooks"] = None
+    state["workspace_root"] = None
+    state["failed_clients"] = set()
+    state["retry_pending"] = True
+    if close_actors:
+        try:
+            await mcp_runtime.close_stdio_actors()
+        except Exception:
+            logger.warning("MCP session teardown failed", exc_info=True)
+
+
+async def shutdown_bridge() -> None:
+    """Stop the watcher, dispose every MCP tool and close the stdio actors.
+
+    Public entry used by McpPlugin.teardown() and by tests: after it returns,
+    this process holds no MCP watcher task, no mcp_* registration from this
+    plugin and no stdio child.
+    """
+    state = _bridge_state()
+    state["generation"] = int(state.get("generation") or 0) + 1
+    initial = state.pop("initial_discovery", None)
+    if initial is not None and not initial[2].done():
+        initial[2].set_result(False)
+    task = state.get("task")
+    stop_event = state.get("stop")
+    state["task"] = None
+    state["stop"] = None
+    await _stop_bridge_task(task, stop_event)
+    await _drop_bridge_ownership()
+
+
+async def _bridge_loop(registry: Any, generation: int, stop_event: asyncio.Event) -> None:
+    state = _bridge_state()
+    ws = Path(getattr(registry, "workspace_root"))
+    last_mtime: int | None | object = object()
+    initial = state.get("initial_discovery")
+    while True:
+        if int(state.get("generation") or 0) != generation or stop_event.is_set():
+            return  # superseded or asked to stop: never leave a second watcher
         try:
             mtime = _config_mtime(ws)
-            if mtime != last_mtime:
+            changed = mtime != last_mtime
+            if changed or state.get("retry_pending", True):
+                await refresh_mcp_tools(registry, retry_only=not changed)
+                # Use the pre-discovery timestamp: edits made while discovery
+                # was waiting on a server must trigger another refresh.
                 last_mtime = mtime
-                await refresh_mcp_tools(registry)
         except asyncio.CancelledError:
             raise
         except Exception:
+            state["retry_pending"] = True
             logger.warning("mcp bridge watch iteration failed", exc_info=True)
+        if (initial is not None and initial[0] == generation
+                and state.get("generation") == generation and not stop_event.is_set()
+                and not initial[2].done()):
+            initial[2].set_result(True)
+        # Idle wait is an explicit stop handshake, not a bare sleep: teardown
+        # sets the flag and the watcher exits on the same loop iteration.
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=_WATCH_INTERVAL_SEC)
+        except asyncio.TimeoutError:
+            continue
+        return
 
 
 def _config_mtime(workspace_root: Path) -> int | None:
@@ -166,75 +423,226 @@ def _config_mtime(workspace_root: Path) -> int | None:
         return None
 
 
-async def refresh_mcp_tools(registry: Any) -> int:
-    """重发现 MCP 客户端并把其工具注册为一等工具。
+# Regex constructs that are valid ECMA-262 but rejected by Python's re.
+# A pattern using them must be preserved verbatim, not dropped as invalid.
+_JS_ONLY_PATTERN = re.compile(r"[\\][pP]\{|[\\]k<[A-Za-z_$]|[\\]u\{|\(\?<[A-Za-z_$]")
 
-    先逆序调用上一轮全部 disposer（配置删除的客户端随之摘除），再重新
-    发现注册。注册走 register_builtin_tool：写入 reload 快照，且 disposer
-    归档进 disposal ledger（插件卸载可逆）。
-    """
-    lock = _BRIDGE.get("lock")
-    if lock is None:
-        lock = _BRIDGE["lock"] = asyncio.Lock()
-    async with lock:
-        for dispose in _BRIDGE["disposers"]:
+
+def _sanitize_schema_patterns(schema: dict[str, Any]) -> None:
+    # [2026-09-29] Why: MCP servers may publish regex `pattern` values with
+    # escapes that are invalid in ECMA-262 (observed: "^agent\\_run\\_" from
+    # the exa server — markdown escaping leaking into a machine field).
+    # OpenAI-compatible providers such as DeepSeek compile patterns and reject
+    # the whole request on failure, while Anthropic treats schemas as opaque,
+    # How: walk the schema, rewrite `\_` to `_` (identical literal match), and
+    # drop only patterns that are invalid in ECMA-262 too (Python-only
+    # compile failures such as \p{L} or (?<name>x) are preserved verbatim).
+    # Purpose: one upstream defect must not break an entire channel, and a
+    # valid JavaScript constraint must not be dropped just because Python's re
+    # rejects the syntax. Dropping is transport-safe (pattern is advisory).
+    stack: list[Any] = [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in list(node.items()):
+                if key == "pattern" and isinstance(value, str):
+                    fixed = value.replace("\\_", "_")
+                    if fixed != value:
+                        logger.info(
+                            "MCP tool schema pattern sanitized: %r -> %r", value, fixed
+                        )
+                        node[key] = fixed
+                        value = fixed
+                    if _JS_ONLY_PATTERN.search(value):
+                        # Valid ECMA-262 that Python's re cannot compile: keep it
+                        # verbatim instead of dropping a working constraint.
+                        continue
+                    try:
+                        re.compile(value)
+                    except re.error:
+                        logger.warning(
+                            "MCP tool schema pattern dropped (invalid in every dialect): %r", value
+                        )
+                        del node[key]
+                elif isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(item for item in node if isinstance(item, (dict, list)))
+
+
+def _discard_client_tools(registry: Any, client_id: str) -> None:
+    """Remove one client's registrations without disturbing other clients."""
+    state = _bridge_state()
+    forget = getattr(state.get("hooks"), "remove_plugin_disposer", None)
+    for name, dispose in reversed(state["disposers"].pop(client_id, [])):
+        try:
+            dispose()
+        except Exception:
+            logger.warning("MCP tool disposer failed: %s", name, exc_info=True)
+        if callable(forget):
             try:
-                dispose()
+                forget(dispose)
             except Exception:
-                pass
-        _BRIDGE["disposers"].clear()
+                logger.warning("MCP disposer cleanup failed: %s", name, exc_info=True)
+        # Defensive cleanup scoped to the exact tool names we registered.
+        for attr in ("_tool_specs", "_tool_funcs", "_builtin_specs", "_builtin_funcs"):
+            mapping = getattr(registry, attr, None)
+            if isinstance(mapping, dict):
+                mapping.pop(name, None)
+    state["specs"].pop(client_id, None)
 
-        count = 0
+
+def _refresh_lock() -> asyncio.Lock:
+    """Per-loop refresh lock (one global lock would bind to the first loop)."""
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, "_clonoth_mcp_refresh_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(loop, "_clonoth_mcp_refresh_lock", lock)
+    return lock
+
+
+def _tool_is_pure(tool: dict[str, Any]) -> bool:
+    """Purity comes only from the server's own annotations.
+
+    Why: the previous heuristic guessed from tool names and client ids, so a
+    tool named ``search_*`` that writes to a database ran in parallel with its
+    siblings. How: readOnlyHint with no destructiveHint, exactly as published.
+    Purpose: parallel scheduling only where the server says it is safe.
+    """
+    annotations = tool.get("annotations")
+    if not isinstance(annotations, dict):
+        return False
+    return annotations.get("readOnlyHint") is True and not annotations.get("destructiveHint")
+
+
+def _purge_stale_mcp_tools(registry: Any) -> None:
+    """Drop mcp_* entries left behind by a previous incarnation of this bridge."""
+    for attr in ("_tool_specs", "_tool_funcs", "_builtin_specs", "_builtin_funcs"):
+        mapping = getattr(registry, attr, None)
+        if isinstance(mapping, dict):
+            for name in list(mapping):
+                if isinstance(name, str) and name.startswith("mcp_"):
+                    mapping.pop(name, None)
+
+
+async def refresh_mcp_tools(registry: Any, *, retry_only: bool = False) -> int:
+    """Discover per client; retain unchanged registrations on transient failure.
+
+    Deleted, disabled and reconfigured clients lose their old registrations
+    immediately. Other clients are replaced only after discovery succeeds.
+    Failed clients are retried by the existing ten-second watcher.
+    """
+    async with _refresh_lock():
+        state = _bridge_state()
+        state["retry_pending"] = True
+        generation = state.get("generation")
         ws = Path(getattr(registry, "workspace_root"))
         try:
             clients = mcp_runtime.list_clients(ws)
         except Exception:
+            logger.warning("MCP configuration unreadable; keeping existing registrations", exc_info=True)
+            return sum(len(items) for items in state["disposers"].values())
+
+        if state.get("registry") is not registry:
+            # First refresh for this registry: adopt it and drop whatever a
+            # previous incarnation of the bridge left registered there.
+            _purge_stale_mcp_tools(registry)
+            state["registry"] = registry
+        if state.get("workspace_root") is None:
+            state["workspace_root"] = ws
+
+        active = {
+            str(client["id"]): client for client in clients
+            if client.get("id") and client.get("enabled", True)
+            and not client.get("transport_error")
+        }
+        for cid in list(state["disposers"]):
+            if cid not in active or state["specs"].get(cid) != active[cid]:
+                _discard_client_tools(registry, cid)
+        cleanup_complete = False
+        try:
+            cleanup_complete = await mcp_runtime.reconcile_stdio_actors(clients)
+        except Exception:
+            # One session's shutdown must not prevent discovery for other clients.
+            logger.warning("MCP session cleanup failed; continuing discovery", exc_info=True)
+
+        if state.get("generation") != generation:
             return 0
-
-        for client in clients:
-            if not isinstance(client, dict):
+        failed: set[str] = set()
+        for cid, client in active.items():
+            if (
+                retry_only and cid not in state["failed_clients"]
+                and cid in state["disposers"] and state["specs"].get(cid) == client
+            ):
                 continue
-            cid = str(client.get("id") or "").strip()
-            if not cid or not client.get("enabled", True):
-                continue
+            replacing = False
             try:
-                result = await mcp_runtime.list_tools(ws, cid)
-                # 兼容统一 data 包装与旧顶层两种 schema（自旧 load_mcp_tools 原样保留）。
-                result_data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else {}
-                tools = result_data.get("tools") if isinstance(result_data.get("tools"), list) else (result.get("tools") if isinstance(result, dict) else [])
-                if not isinstance(tools, list):
-                    continue
-            except Exception:
-                logger.warning("MCP client '%s' tool list unavailable, skipping", cid)
-                continue
-
-            for tool in tools:
-                if not isinstance(tool, dict):
-                    continue
-                raw_name = str(tool.get("name") or "").strip()
-                if not raw_name:
-                    continue
-                reg_name = f"mcp_{cid}_{raw_name}"
-                desc = str(tool.get("description") or "").strip()
-                schema = tool.get("input_schema")
-                if not isinstance(schema, dict):
-                    schema = {"type": "object", "properties": {}, "required": []}
-                dispose = registry.register_builtin_tool(
-                    reg_name,
-                    f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
-                    schema,
-                    _make_mcp_tool(ws, cid, raw_name),
+                result = await asyncio.wait_for(
+                    mcp_runtime.list_tools(ws, cid), timeout=mcp_runtime.MCP_CALL_TIMEOUT,
                 )
-                _BRIDGE["disposers"].append(dispose)
-                hooks = _BRIDGE.get("hooks")
-                add = getattr(hooks, "add_plugin_disposer", None)
-                if callable(add):
+                if state.get("generation") != generation:
+                    return 0
+                if not isinstance(result, dict) or result.get("ok") is False:
+                    raise ValueError("MCP tool discovery failed")
+                result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                tools = result_data.get("tools") if isinstance(result_data.get("tools"), list) else result.get("tools")
+                if not isinstance(tools, list):
+                    raise ValueError("MCP discovery returned no tool list")
+
+                _discard_client_tools(registry, cid)
+                replacing = True
+                state["disposers"][cid] = []
+                for tool in tools:
+                    if not isinstance(tool, dict):
+                        continue
+                    raw_name = str(tool.get("name") or "").strip()
+                    if not raw_name:
+                        continue
+                    reg_name = f"mcp_{cid}_{raw_name}"
+                    desc = str(tool.get("description") or "").strip()
+                    schema = tool.get("input_schema")
+                    if not isinstance(schema, dict):
+                        schema = {"type": "object", "properties": {}, "required": []}
+                    _sanitize_schema_patterns(schema)
+                    pure = _tool_is_pure(tool)
                     try:
-                        add("mcp", dispose)
-                    except Exception:
-                        pass
-                count += 1
-        return count
+                        dispose = registry.register_builtin_tool(
+                            reg_name,
+                            f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
+                            schema,
+                            _make_mcp_tool(ws, cid, raw_name),
+                            pure=pure,
+                        )
+                    except TypeError:
+                        dispose = registry.register_builtin_tool(
+                            reg_name,
+                            f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
+                            schema,
+                            _make_mcp_tool(ws, cid, raw_name),
+                        )
+                    state["disposers"][cid].append((reg_name, dispose))
+                    add = getattr(state.get("hooks"), "add_plugin_disposer", None)
+                    if callable(add):
+                        try:
+                            # Keyed by (client, tool) so a refresh replaces the
+                            # previous undo closure instead of stacking dead ones.
+                            add("mcp", dispose, key=(cid, reg_name))
+                        except TypeError:
+                            add("mcp", dispose)
+                        except Exception:
+                            pass
+                state["specs"][cid] = client
+            except Exception:
+                if state.get("generation") != generation:
+                    return 0
+                if replacing:
+                    _discard_client_tools(registry, cid)
+                failed.add(cid)
+                logger.warning("MCP client '%s' discovery failed; will retry", cid, exc_info=True)
+        state["failed_clients"] = failed
+        state["retry_pending"] = bool(failed) or not cleanup_complete
+        return sum(len(items) for items in state["disposers"].values())
 
 
 def _make_mcp_tool(workspace_root: Path, client_id: str, tool_name: str) -> Callable:
@@ -291,17 +699,11 @@ def _workspace_root(request: Request) -> Path:
 
 
 def list_mcp_clients_endpoint(request: Request) -> list[dict[str, Any]]:
-    ws = _workspace_root(request)
-    p = ws / "data" / "mcp_clients.yaml"
-    if not p.exists():
-        return []
     try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return []
-    clients = data.get("clients") if isinstance(data, dict) else None
-    if not isinstance(clients, dict):
-        return []
+        data = mcp_runtime._load_raw_config(_workspace_root(request))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    clients = data["clients"]
     res: list[dict[str, Any]] = []
     for cid, spec in sorted(clients.items()):
         if not isinstance(spec, dict):
@@ -320,9 +722,10 @@ def get_mcp_clients_raw_endpoint(request: Request) -> dict[str, str]:
 
 
 def update_mcp_clients_raw_endpoint(payload: RawContent, request: Request) -> dict[str, Any]:
-    p = _workspace_root(request) / "data" / "mcp_clients.yaml"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(payload.content, encoding="utf-8")
+    try:
+        mcp_runtime.save_raw_config_content(_workspace_root(request), payload.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True}
 
 
@@ -333,16 +736,15 @@ def _register_admin_routes(routes: Any) -> None:
     router.add_api_route("/mcp-clients", list_mcp_clients_endpoint, methods=["GET"])
     router.add_api_route("/mcp-clients/raw", get_mcp_clients_raw_endpoint, methods=["GET"])
     router.add_api_route("/mcp-clients/raw", update_mcp_clients_raw_endpoint, methods=["PUT"])
-    routes.register(router, mount="admin/config", description="MCP 客户端配置端点")
+    routes.register(router, mount="admin/config", key="mcp:config", description="MCP 客户端配置端点")
 
-    # 设置面板静态资源。public：iframe 无法携带 Authorization 头，页面本身不含
-    # 秘密，数据全部经鉴权 XHR 获取。
+    # 面板与依赖资源需要鉴权；宿主用 Bearer 换取短期静态资源 Cookie。
     client = APIRouter()
     client.include_router(
         static_router(Path(__file__).parent / "web"),
         prefix="/web",
     )
-    routes.register(client, public=True, description="MCP 设置面板静态资源")
+    routes.register(client, key="mcp:panel", description="MCP 设置面板静态资源（需鉴权）")
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +767,22 @@ class McpPlugin:
         if tools is not None:
             _start_engine_bridge(tools, ctx)
 
+    def teardown(self) -> Any:
+        """Release this plugin's tools, watcher task and stdio children.
+
+        Why: the loader archives teardown() as the plugin's disposer, so an
+        unload/reload has to undo the background bridge — a fire-and-forget
+        cancel leaves the old watcher, its tool registrations and one child
+        process per MCP client behind. How: schedule the async release on the
+        running loop and hand the task back. Purpose: unloading is complete
+        when the returned task completes, and nothing survives the unload.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop (process teardown path): nothing can be awaited here.
+            return None
+        return loop.create_task(shutdown_bridge(), name="mcp-bridge-teardown")
 
 PLUGIN_META = {
     "handler_class": "McpPlugin",
@@ -387,42 +805,32 @@ PLUGIN_META = {
     },
     "tools": [
         {
-            "name": "create_or_update_mcp_client",
-            "description": "Create or update an MCP client config in data/mcp_clients.yaml. Supports stdio, sse, and streamable_http transports. New tools go live immediately on this worker; other workers follow within seconds.",
+            "name": "manage_mcp_client",
+            "description": (
+                "Manage MCP client configurations in data/mcp_clients.yaml: "
+                "action='list' lists all configured MCP clients; "
+                "action='upsert' creates or updates an MCP client (stdio, sse, or streamable_http; tools go live immediately); "
+                "action='delete' removes an MCP client by id."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string"},
-                    "description": {"type": "string"},
-                    "enabled": {"type": "boolean"},
-                    "transport": {"type": "string", "enum": ["stdio", "sse", "streamable_http", "streamable-http", "http"]},
-                    "command": {"type": "string"},
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "env": {"type": "object"},
-                    "url": {"type": "string"},
-                    "headers": {"type": "object"},
+                    "action": {"type": "string", "enum": ["list", "upsert", "delete"], "description": "Operation: 'list' (default), 'upsert' (create/update), or 'delete'."},
+                    "id": {"type": "string", "description": "[upsert/delete] MCP client ID."},
+                    "description": {"type": "string", "description": "[upsert] Client description."},
+                    "enabled": {"type": "boolean", "description": "[upsert] Whether the client is enabled."},
+                    "transport": {"type": "string", "enum": ["stdio", "sse", "streamable_http", "streamable-http", "http"], "description": "[upsert] Transport type."},
+                    "command": {"type": "string", "description": "[upsert stdio] Executable command."},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "[upsert stdio] Command arguments."},
+                    "env": {"type": "object", "description": "[upsert stdio] Environment variables."},
+                    "stateful": {"type": "boolean", "description": "[upsert stdio] Whether the server holds cross-call state (uses 1800s idle TTL instead of 900s)."},
+                    "idle_ttl_sec": {"type": "number", "description": "[upsert stdio] Optional custom idle timeout in seconds before reaping the stdio subprocess."},
+                    "url": {"type": "string", "description": "[upsert sse/http] Remote MCP endpoint URL."},
+                    "headers": {"type": "object", "description": "[upsert sse/http] Optional HTTP headers."},
                 },
-                "required": ["id", "transport"],
+                "required": ["action"],
             },
-            "func": create_or_update_mcp_client,
-        },
-        {
-            "name": "list_mcp_clients",
-            "description": "List configured MCP clients.",
-            "input_schema": {"type": "object", "properties": {}, "required": []},
-            "func": list_mcp_clients,
-        },
-        {
-            "name": "delete_mcp_client",
-            "description": "Delete an MCP client config by id. Its tools are removed from this worker immediately; other workers follow within seconds.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                },
-                "required": ["id"],
-            },
-            "func": delete_mcp_client,
+            "func": manage_mcp_client,
         },
     ],
 }
