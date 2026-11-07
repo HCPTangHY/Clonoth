@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -86,6 +87,11 @@ def _parse_superusers(raw: str) -> set[int]:
 SUPERUSERS: set[int] = _parse_superusers(os.environ.get("DISCORD_SUPERUSERS", ""))
 
 
+def _parse_key_roles(raw: str) -> set[str]:
+    """Parse the comma-separated context role allowlist."""
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
 @dataclass
 class DiscordRuntime:
     """Shared Discord adapter state passed into all split modules."""
@@ -99,6 +105,7 @@ class DiscordRuntime:
     child_node_display_names: dict[str, str]
     base_url: str
     history_max_len: int
+    key_roles: set[str] = field(default_factory=set)
     restart_signal: str = _RESTART_SIGNAL
     split_signal: str = _SPLIT_SIGNAL
     react_pattern: re.Pattern[str] = _REACT_PATTERN
@@ -111,6 +118,8 @@ class DiscordRuntime:
     router_task: asyncio.Task[Any] | None = None
     channel_history: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     history_seq_counter: int = 0
+    # ponytail: bounded recent-card IDs; persistent cross-restart filtering is not provided.
+    transient_msg_ids: deque[int] = field(default_factory=lambda: deque(maxlen=1000))
     # [2026-05-14 refactor note] callbacks.py uses this factory so ApprovalView
     # can stay in agent.py without creating a callbacks -> agent import cycle.
     approval_view_factory: Callable[[str], discord.ui.View] | None = None
@@ -135,9 +144,13 @@ def create_runtime() -> DiscordRuntime:
     # loads .env and adds any DISCORD_SUPERUSERS values on top of that set.
     runtime_superusers = set(SUPERUSERS)
     runtime_superusers.update(_parse_superusers(os.environ.get("DISCORD_SUPERUSERS", "")))
+    workspace = Path(os.environ.get("CLONOTH_WORKSPACE", "") or CLONOTH_WORKSPACE)
     rt = DiscordRuntime(
         dc_client=_create_discord_client(),
-        workspace=Path(os.environ.get("CLONOTH_WORKSPACE", "") or CLONOTH_WORKSPACE),
+        workspace=workspace,
+        # DISCORD_KEY_ROLES 可显式覆盖；未设置时由 _initialize_sdk 在确定
+        # 有效 workspace 后从 runtime config 解析身份组白名单。
+        key_roles=_parse_key_roles(os.environ.get("DISCORD_KEY_ROLES", "")),
         superusers=runtime_superusers,
         agent_log_channel_id=int(os.environ.get("DISCORD_LOG_CHANNEL", str(AGENT_LOG_CHANNEL_ID))),
         bridge_port=int(os.environ.get("DISCORD_BRIDGE_PORT", str(BRIDGE_PORT))),
@@ -152,10 +165,81 @@ def create_runtime() -> DiscordRuntime:
 
 
 
+def _load_extra_roots(rt: DiscordRuntime) -> list[Path]:
+    """Load policy.yaml extra_roots exactly as the former on_ready block did."""
+    extra_roots: list[Path] = []
+    try:
+        policy_path = rt.workspace / "data" / "policy.yaml"
+        if policy_path.exists():
+            policy_data = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+            if isinstance(policy_data, dict):
+                raw_roots = policy_data.get("extra_roots", [])
+                if isinstance(raw_roots, list):
+                    for item in raw_roots:
+                        if isinstance(item, str) and item.strip():
+                            p = Path(item)
+                            p = p.resolve() if p.is_absolute() else (rt.workspace / p).resolve()
+                            extra_roots.append(p)
+        if extra_roots:
+            print(f"[bot] extra_roots: {extra_roots}")
+    except Exception as exc:
+        print(f"[bot] 加载 extra_roots 失败: {exc}")
+    return extra_roots
+
+
+async def _resolve_workspace(rt: DiscordRuntime) -> None:
+    """确定有效工作区——必须先于读取 policy / admin token。
+
+    共享客户端的 /v1/health 是公开端点，不需要 token；旧版 Supervisor 不返回
+    workspace_root 时保留本地默认值。
+    """
+    if os.environ.get("CLONOTH_WORKSPACE"):
+        return
+    for attempt in range(10):
+        try:
+            health = await rt.clonoth_client.get_health()
+        except Exception as e:
+            if attempt < 9:
+                print(f"[bot] 获取 workspace_root 失败 (第 {attempt + 1} 次)，2s 后重试: {e}")
+                await asyncio.sleep(2)
+                continue
+            print(f"[bot] 获取 workspace_root 全部失败，使用默认值 {rt.workspace}: {e}")
+            return
+        if health.workspace_root:
+            rt.workspace = Path(health.workspace_root)
+            print(f"[bot] workspace_root 从 Supervisor 获取: {rt.workspace}")
+        else:
+            print(f"[bot] Supervisor 未返回 workspace_root，使用默认值 {rt.workspace}")
+        return
+
+
+async def _resolve_key_roles(rt: DiscordRuntime) -> None:
+    """按有效 workspace 解析身份组白名单（环境变量优先）。"""
+    if os.environ.get("DISCORD_KEY_ROLES") is not None:
+        return
+    from clonoth_runtime import get_str, load_runtime_config
+    raw = get_str(
+        load_runtime_config(rt.workspace),
+        "supervisor.process_manager.discord_key_roles", "",
+    )
+    rt.key_roles = _parse_key_roles(raw)
+    if rt.key_roles:
+        print(f"[bot] key_roles: {sorted(rt.key_roles)}")
+
+
 async def _initialize_sdk(rt: DiscordRuntime) -> None:
     """Initialize SDK objects and EventRouter after Discord is ready."""
+    # 共享客户端先不带 token：/v1/health 为公开端点，用来确定有效 workspace；
+    # 确定之后才从该 workspace 读取 admin token（避免从错误实例读到令牌）。
+    rt.clonoth_client = ClonothClient(rt.base_url)
+
+    await _start_bridge(rt)
+
+    await _resolve_workspace(rt)
+    await _resolve_key_roles(rt)
+
     # 读取 Supervisor admin token 用于鉴权受保护的端点（!model 等）
-    _token_path = Path(os.environ.get("CLONOTH_WORKSPACE", "") or CLONOTH_WORKSPACE) / "data" / ".admin_token"
+    _token_path = rt.workspace / "data" / ".admin_token"
     admin_token = ""
     try:
         if _token_path.exists():
@@ -163,22 +247,19 @@ async def _initialize_sdk(rt: DiscordRuntime) -> None:
             print(f"[bot] admin_token loaded from {_token_path}")
     except Exception as exc:
         print(f"[bot] 读取 admin_token 失败: {exc}")
-    rt.clonoth_client = ClonothClient(
-        rt.base_url,
-        admin_token=admin_token,
-        admin_token_path=str(_token_path),
-    )
-
-    await _start_bridge(rt)
+    rt.clonoth_client.set_admin_token(admin_token, str(_token_path))
 
     print(f"[bot] CLONOTH_WORKSPACE = {rt.workspace}")
     if not rt.superusers:
         print("[bot] ⚠ DISCORD_SUPERUSERS 未配置；取消任务与审批按钮已默认禁用。")
 
+    extra_roots = _load_extra_roots(rt)
     rt.bot_config = BotConfig(
         base_url=rt.base_url,
         entry_node_id=rt.entry_node_id,
         conversation_key_prefix="discord",
+        workspace_root=rt.workspace,
+        extra_roots=extra_roots,
         auto_approve_internal=True,
     )
     rt.session_state = SessionState()
@@ -280,6 +361,7 @@ def register_events(rt: DiscordRuntime) -> None:
         if clean_text:
             entry = _format_member_entry(
                 message.author, clean_text, msg_time=message.created_at, reply_author=reply_author_name,
+                key_roles=rt.key_roles,
             )
             _push_history(rt, channel_id, entry, message=message, msg_id=message.id)
 

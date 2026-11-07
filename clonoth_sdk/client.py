@@ -81,6 +81,22 @@ class ClonothClient:
                 pass
         return self._admin_token
 
+    def set_admin_token(self, admin_token: str = "", admin_token_path: str = "") -> None:
+        """切换 token 来源（用于启动阶段确定工作区后再读取 token）。
+
+        适配器需要先用 /v1/health（公开端点）探测有效工作区，才能定位正确的
+        admin token 文件，而 ClonothClient 此时已经创建。此方法让同一个共享
+        客户端重新绑定 token 来源，不产生额外客户端资源。
+
+        Args:
+            admin_token: 初始 token（文件缺失时使用）
+            admin_token_path: token 文件路径，每次请求时重新读取
+        """
+        self._admin_token = (admin_token or "").strip()
+        self._admin_token_path = admin_token_path or ""
+        # 清空已生效 token，下一次请求重建共享 httpx 客户端以带上新请求头。
+        self._last_token = ""
+
     def _http(self) -> httpx.AsyncClient:
         """获取或创建共享 httpx 客户端。token 变化时自动重建。"""
         current_token = self._resolve_admin_token()
@@ -394,11 +410,18 @@ class ClonothClient:
         resp = await self._http().get(f"{self._base_url}/v1/health")
         resp.raise_for_status()
         d = resp.json()
+        if not isinstance(d, dict):
+            d = {}
+        # [2026-10-31] Why: workspace_root 是新版 Supervisor 才有的字段。How: 缺失或
+        # 非字符串时回退空字符串。Purpose: 新旧 Supervisor 都能解析，调用方据空字符串
+        # 判断沿用本地默认工作区。
+        raw_root = d.get("workspace_root")
         return HealthInfo(
             status=d.get("status", "ok"),
             run_id=d.get("run_id", ""),
             started_at=str(d.get("started_at", "")),
             uptime_seconds=float(d.get("uptime_seconds", 0)),
+            workspace_root=raw_root if isinstance(raw_root, str) else "",
         )
 
     async def get_openai_config(self) -> OpenAIConfig:

@@ -41,6 +41,9 @@ pip install discord.py aiohttp pyyaml python-dotenv
 | `DISCORD_ENTRY_NODE` | 否 | `main` | 入口节点 ID |
 | `DISCORD_NODE_NAMES` | 否 | `{}` | 节点显示名映射，JSON 格式 |
 | `DISCORD_HISTORY_LEN` | 否 | `15` | 每个频道保留的历史消息条数 |
+| `DISCORD_KEY_ROLES` | 否 | 空 | 上下文筛选：仅这些身份组名会写进模型可见的上下文身份标注（逗号分隔）。不是访问控制，不限制任何命令或权限。未设置时读 runtime config 的 `supervisor.process_manager.discord_key_roles` |
+
+启动顺序：Bot 先通过 `/v1/health`（公开端点）确定有效 workspace，再读取该 workspace 下的 `data/.admin_token` 与 `data/policy.yaml` 的 `extra_roots`。若未设置 `CLONOTH_WORKSPACE` 且 Supervisor 为旧版本（health 不含 `workspace_root`），回退到项目根目录。
 
 ## 部署步骤
 
@@ -74,7 +77,7 @@ Discord Bot 依赖 Supervisor API。启动 Bot 前确认 Supervisor 已在 `CLON
 ```bash
 # 方式一：直接运行
 cd /path/to/clonoth
-python -m platform.discord.app
+python -m adapters.discord.app
 
 # 方式二：通过兼容性入口
 python adapters/discord/main.py
@@ -92,7 +95,7 @@ Type=simple
 User=www
 WorkingDirectory=/path/to/clonoth
 EnvironmentFile=/path/to/clonoth/.env
-ExecStart=/usr/local/bin/python3.11 -m platform.discord.app
+ExecStart=/usr/local/bin/python3.11 -m adapters.discord.app
 Restart=always
 RestartSec=5
 

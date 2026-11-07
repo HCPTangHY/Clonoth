@@ -21,7 +21,7 @@ from aiohttp import web
 
 from clonoth_sdk import TriggerInfo
 
-from .context import _build_context_text, _build_reply_context, _ensure_channel
+from .context import _build_context_text, _build_reply_context, _ensure_channel, register_transient_msg
 from .messaging import _collect_attachments, _safe_restart
 
 
@@ -367,32 +367,44 @@ async def _handle_agent_inner(
     existing_sid = rt.session_state.get_session_id(conversation_key)
     preempt_succeeded = False
     preempted_src_seq = None
+    preempted_task_id = None
     if existing_sid:
         try:
             running_tasks = await rt.clonoth_client.get_running_tasks(existing_sid)
             for running_task in running_tasks:
                 if running_task.task_id and running_task.is_user_entry:
+                    rt_src_seq = running_task.source_inbound_seq or 0
+                    rt_trigger = rt.session_state.get_trigger(rt_src_seq) if rt_src_seq else None
                     if not is_dm:
-                        rt_src_seq = running_task.source_inbound_seq or 0
-                        rt_trigger = rt.session_state.get_trigger(rt_src_seq) if rt_src_seq else None
                         if rt_trigger:
-                            rt_msg = rt_trigger.platform_data.get("message")
+                            rt_msg = rt_trigger.platform_data.get("origin_message") or rt_trigger.platform_data.get("message")
                             if rt_msg and rt_msg.author.id != message.author.id:
                                 continue
                         elif rt_src_seq:
                             # [AutoC 2026-06-24] Trigger reclaimed by stale cleanup — ghost task, skip
                             logger.info("preempt_v2: skip ghost task %s (trigger seq=%s gone)", running_task.task_id[:8], rt_src_seq)
                             continue
+                    branch_wm = rt_trigger.platform_data.get("context_watermark") if rt_trigger else None
+                    preempt_text = (
+                        _build_context_text(
+                            rt, channel_id, message.author, user_input,
+                            reply_context=reply_context, exclude_last=True,
+                            min_seq_override=branch_wm,
+                        )
+                        if branch_wm is not None else full_text
+                    )
                     try:
                         ok = await rt.clonoth_client.preempt_task(
                             running_task.task_id,
-                            message=full_text,
+                            message=preempt_text,
                             attachments=inbound_attachments or None,
                         )
                         if ok:
                             preempt_succeeded = True
                             preempted_src_seq = running_task.source_inbound_seq
+                            preempted_task_id = running_task.task_id
                             logger.info("preempt_v2: injected into task %s", running_task.task_id[:8])
+                            break
                     except Exception:
                         pass
         except Exception:
@@ -400,32 +412,46 @@ async def _handle_agent_inner(
 
     if preempt_succeeded:
         session_id = existing_sid
-        old_trigger = None
-        old_trigger_seq = None
-        if preempted_src_seq:
-            old_trigger = rt.session_state.get_trigger(preempted_src_seq)
-            old_trigger_seq = preempted_src_seq
-        # [2026-05-14 refactor note] old_trigger_seq is kept to preserve the
-        # old branch structure during the move; the original code did not use it.
-        _ = old_trigger_seq
-
+        old_trigger = rt.session_state.get_trigger(preempted_src_seq) if preempted_src_seq else None
         cancel_view = CancelView(rt, session_id)
+        cancel_view.task_id = preempted_task_id
         try:
             status_msg = await message.reply("⏳ 处理中...", view=cancel_view)
+            register_transient_msg(rt, status_msg)
         except Exception:
             status_msg = None
 
-        if old_trigger:
+        live_trigger = rt.session_state.get_trigger(preempted_src_seq) if preempted_src_seq else None
+        if old_trigger and live_trigger is old_trigger:
             old_status = old_trigger.platform_data.get("status_msg")
             if old_status:
                 try:
                     await old_status.delete()
                 except Exception:
                     pass
+            # Completion may consume the trigger while the old card is deleted.
+            # The preempt was accepted already; do not submit the same input again.
+            if rt.session_state.get_trigger(preempted_src_seq) is not old_trigger:
+                if status_msg:
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                return
+            old_trigger.platform_data.setdefault("origin_message", old_trigger.platform_data.get("message"))
             old_trigger.platform_data["message"] = message
             old_trigger.platform_data["status_msg"] = status_msg
             old_trigger.platform_data["cancel_view"] = cancel_view
             old_trigger.platform_data["last_typing_time"] = time.time()
+            old_trigger.platform_data["context_watermark"] = new_wm
+        elif old_trigger and live_trigger is None:
+            # The task completed while Discord was creating its new status card.
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            preempt_succeeded = False
         elif preempted_src_seq:
             new_trigger = TriggerInfo(
                 inbound_seq=preempted_src_seq,
@@ -436,6 +462,7 @@ async def _handle_agent_inner(
                     "message": message, "channel_id": channel_id,
                     "status_msg": status_msg, "cancel_view": cancel_view,
                     "last_typing_time": time.time(),
+                    "context_watermark": new_wm,
                 },
             )
             rt.session_state.register_trigger(new_trigger)
@@ -498,9 +525,6 @@ async def _handle_agent_inner(
                 )
         except Exception:
             pass
-    if my_inbound_seq:
-        rt.session_state.register_watermark(my_inbound_seq, channel_id, new_wm)
-
     cancel_view = CancelView(rt, session_id)
     if my_inbound_seq:
         trigger = TriggerInfo(
@@ -513,12 +537,14 @@ async def _handle_agent_inner(
                 "status_msg": None,
                 "cancel_view": cancel_view,
                 "last_typing_time": time.time(),
+                "context_watermark": new_wm,
             },
         )
         rt.session_state.register_trigger(trigger)
 
     try:
         status_msg: discord.Message | None = await message.reply("⏳ 处理中...", view=cancel_view)
+        register_transient_msg(rt, status_msg)
     except Exception:
         status_msg = None
 
@@ -728,7 +754,7 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
 
     if sub == "provider":
         if len(parts) < 3:
-            await message.reply("Usage: `!model provider <type>` (e.g. openai, anthropic, gemini)", mention_author=False)
+            await message.reply("Usage: `!model provider <type>` (e.g. openai, anthropic, gemini-aistudio, gemini-vertex)", mention_author=False)
             return True
         provider_type = parts[2].strip()
         try:

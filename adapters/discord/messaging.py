@@ -2,7 +2,7 @@
 
 [2026-05-14 refactor note] This module was split out of the main entry point so
 message output and file handling share DiscordRuntime explicitly. The functions
-avoid importing context.py to keep the requested one-way import structure.
+reuse context's name normalization for outbound mention matching.
 """
 from __future__ import annotations
 
@@ -11,12 +11,15 @@ import datetime
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import discord  # type: ignore[import-untyped]
+
+from .context import _sanitize_name
 
 
 _CST = datetime.timezone(datetime.timedelta(hours=8))
@@ -159,6 +162,51 @@ def _current_message_media_text(message: discord.Message) -> str:
     return " ".join(parts).strip()
 
 
+# Adapter policy only; model history and other transports have no Discord limit.
+INTERMEDIATE_REPLY_LIMIT = 1500
+_OUTBOUND_MENTION_OR_CODE = re.compile(
+    r"```[\s\S]*?(?:```|$)|``[^\r\n]*?(?:``|$)|`[^`\r\n]*?(?:`|$)|<@!?(?!&)([^>\r\n]+)>"
+)
+
+
+def _resolve_outbound_mentions(rt: Any, channel: Any, text: str) -> str:
+    """Resolve display names at send time, without altering stored model text."""
+    if "<@" not in text:
+        return text
+    candidates: dict[int, Any] = {}
+    for entry in reversed(rt.channel_history.get(channel.id, [])):
+        author = getattr(entry.get("message"), "author", None)
+        if isinstance(getattr(author, "id", None), int):
+            candidates.setdefault(author.id, author)
+    for member in getattr(getattr(channel, "guild", None), "members", ()) or ():
+        candidates.setdefault(member.id, member)
+
+    def resolve(match: re.Match[str]) -> str:
+        target = match.group(1)
+        if target is None or target.strip().isdigit():
+            return match.group(0)
+        target = target.strip().lstrip("@").strip()
+        identity = re.fullmatch(r"(.+?)\[([^\[\]]+)\]", target)
+        targets = [identity[2], identity[1]] if identity else [target]
+        for name in targets:
+            # Accounts take precedence over display names; ambiguous names do not ping.
+            for attrs in (("name",), ("display_name", "global_name", "nick")):
+                matches = {
+                    uid for uid, member in candidates.items()
+                    if any(isinstance(value := getattr(member, attr, None), str)
+                           and name.casefold() in (value.casefold(), _sanitize_name(value).casefold())
+                           for attr in attrs)
+                }
+                if len(matches) == 1:
+                    return f"<@{next(iter(matches))}>"
+                if matches:
+                    return match.group(0)
+        # Preserve unresolved syntax; do not turn <@everyone> into a mass mention.
+        return match.group(0)
+
+    return _OUTBOUND_MENTION_OR_CODE.sub(resolve, text)
+
+
 def _truncate(text: str, limit: int = 2000) -> str:
     if len(text) > limit:
         return text[:limit - 4] + "..."
@@ -172,13 +220,14 @@ async def _send_split_text(
     *,
     reply_to: discord.Message | None = None,
     files: list[discord.File] | None = None,
+    max_len: int = 2000,
 ) -> list[discord.Message]:
-    """发送文本到频道，支持 [SPLIT] 分段和 2000 字符截断。"""
+    """Send split text with an adapter-local per-message length limit."""
     sent: list[discord.Message] = []
     if rt.split_signal in text:
         parts = [p.strip() for p in text.split(rt.split_signal) if p.strip()]
         for i, part in enumerate(parts):
-            part = _truncate(part)
+            part = _truncate(_resolve_outbound_mentions(rt, channel, part), limit=max_len)
             split_files = files if (i == 0 and files) else None
             if i == 0 and reply_to:
                 sent.append(await reply_to.reply(content=part, files=split_files or [], suppress_embeds=True))
@@ -193,7 +242,7 @@ async def _send_split_text(
                 except Exception:
                     await asyncio.sleep(delay)
     else:
-        text = _truncate(text)
+        text = _truncate(_resolve_outbound_mentions(rt, channel, text), limit=max_len)
         if reply_to:
             sent.append(await reply_to.reply(content=text, files=files or [], suppress_embeds=True))
         else:
@@ -201,7 +250,10 @@ async def _send_split_text(
     return sent
 
 
-def _record_bot_reply(rt: Any, channel_id: int, text: str, *, msg_id: int | None = None) -> None:
+def _record_bot_reply(
+    rt: Any, channel_id: int, text: str, *, msg_id: int | None = None,
+    context_watermark: int | None = None,
+) -> None:
     """将 Bot 回复记入频道历史。"""
     ts = datetime.datetime.now(_CST).strftime("%H:%M")
     # [2026-05-14 refactor note] This mirrors context._push_history locally to
@@ -221,6 +273,15 @@ def _record_bot_reply(rt: Any, channel_id: int, text: str, *, msg_id: int | None
     rt.history_seq_counter += 1
     if len(q) > rt.history_max_len:
         q.pop(0)
+
+    _commit_context_watermark(rt, channel_id, context_watermark)
+
+
+def _commit_context_watermark(rt: Any, channel_id: int, context_watermark: int | None) -> None:
+    """Commit delivered context without adding synthetic history for reactions."""
+    if context_watermark is not None and rt.session_state is not None:
+        watermarks = rt.session_state.last_ctx_seq
+        watermarks[channel_id] = max(watermarks.get(channel_id, -1), context_watermark)
 
 
 def _atts_to_discord_files(rt: Any, attachments: list[dict[str, Any]]) -> list[discord.File]:

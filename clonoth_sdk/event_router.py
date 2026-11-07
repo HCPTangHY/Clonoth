@@ -242,6 +242,11 @@ class EventRouter:
         # Purpose: switching transports does not leave old status messages behind.
         stale = self._state.cleanup_stale_triggers(timeout=600.0)
         for trigger in stale:
+            if trigger.platform_data.get("background"):
+                await self._finalize_background_progress(
+                    trigger, trigger.platform_data.get("_stale_main_state"), "⚠️ 请求超时",
+                )
+                continue
             try:
                 await self._cb.delete_status_message(trigger)
             except Exception:
@@ -509,6 +514,43 @@ class EventRouter:
             return conv_key
         return ""
 
+    def _ensure_background_trigger(
+        self, event: Event, payload: dict,
+    ) -> tuple[int, TriggerInfo] | None:
+        """Track an owned entry task without borrowing another inbound's UI."""
+        src_seq = int(payload.get("source_inbound_seq") or 0)
+        if src_seq <= 0 or payload.get("node_id") != self._entry_node_id:
+            return None
+        existing = self._state.resolve_trigger(src_seq, event.session_id)
+        if existing:
+            return existing
+        conv_key = self._resolve_owned_route_conversation_key(event, payload)
+        if not conv_key:
+            return None
+        parent_sid = self._state.get_session_id(conv_key) or event.session_id
+        trigger = TriggerInfo(
+            inbound_seq=src_seq,
+            conversation_key=conv_key,
+            session_id=event.session_id,
+            is_dm=bool(self._state.get_dm_channel(event.session_id)
+                       or self._state.get_dm_channel(parent_sid)),
+            task_id=str(payload.get("task_id") or "") or None,
+            platform_data={"background": True},
+        )
+        self._state.register_trigger(trigger)
+        return src_seq, trigger
+
+    async def _finalize_background_progress(
+        self, trigger: TriggerInfo, state: MainTaskState | None, status: str,
+    ) -> None:
+        """Adapter-owned UI cleanup stays behind an optional public callback."""
+        callback = getattr(self._cb, "finalize_main_progress", None)
+        if callable(callback):
+            try:
+                await callback(trigger, state, status)
+            except Exception:
+                logger.exception("finalize_main_progress failed")
+
     def _register_dispatch_child_session(self, event: Event, payload: dict) -> None:
         """Map dispatch child sessions to their parent conversation key."""
         try:
@@ -577,6 +619,22 @@ class EventRouter:
     #  outbound_message — 主节点回复 / fallback 发送
     # ------------------------------------------------------------------
 
+    async def _notify_response_info(self, event: Event, trigger=None) -> None:
+        """Optional presentation callback; never append notices to reply text."""
+        info = event.payload.get("response_info")
+        callback = getattr(self._cb, "send_response_notice", None)
+        if not callable(callback) or not isinstance(info, dict) or not info.get("notices"):
+            return
+        if not event.payload.get("text") and not event.payload.get("attachments"):
+            return
+        try:
+            conv_key = trigger.conversation_key if trigger else (
+                self._state.get_conversation_key(event.session_id) or ""
+            )
+            await callback(trigger, conv_key, info)
+        except Exception:
+            logger.exception("send_response_notice failed")
+
     async def _handle_outbound_message(self, event: Event) -> None:
         """处理 outbound_message 事件。
 
@@ -597,19 +655,40 @@ class EventRouter:
             main_state = self._state.remove_main_state(src_seq)
             text = strip_protocol_markers((p.get("text") or "").strip())
             attachments = p.get("attachments") or []
+            if trigger.platform_data.get("background"):
+                node_id = p.get("node_id") or ""
+                reply_node_id = p.get("reply_node_id") or node_id
+                status = "✓ 完成"
+                try:
+                    if (text or attachments) and not (
+                        node_id.startswith("system.") or reply_node_id.startswith("system.")
+                    ):
+                        await self._cb.send_to_channel(
+                            trigger.conversation_key, text, attachments, node_id=reply_node_id,
+                        )
+                        await self._notify_response_info(event, trigger)
+                except Exception:
+                    status = "⚠️ 回复发送失败"
+                    logger.exception("background send_to_channel failed")
+                finally:
+                    await self._finalize_background_progress(trigger, main_state, status)
+                return
             try:
                 await self._cb.send_reply(
                     trigger, text, attachments, main_state=main_state,
                 )
+                await self._notify_response_info(event, trigger)
             except Exception as e:
                 logger.error("send_reply failed: %s", e)
             return
 
         # Path 2: Fallback（子节点 / 调度任务输出）
         node_id = p.get("node_id", "") or ""
-        # 过滤系统内部节点，不向平台发送
-        if node_id.startswith("system."):
-            logger.debug("Skip system node outbound: %s", node_id)
+        # 输出链处理不改变对外发言人；保留原始执行 ID，旧事件只有 node_id。
+        reply_node_id = p.get("reply_node_id") or node_id
+        # 内部归属节点与内部执行节点都不对外发送
+        if node_id.startswith("system.") or reply_node_id.startswith("system."):
+            logger.debug("Skip system node outbound: %s / %s", node_id, reply_node_id)
             return
 
         conv_key = self._state.get_conversation_key(event.session_id) or ""
@@ -620,8 +699,9 @@ class EventRouter:
 
         try:
             await self._cb.send_to_channel(
-                conv_key, text, attachments, node_id=node_id,
+                conv_key, text, attachments, node_id=reply_node_id,
             )
+            await self._notify_response_info(event)
         except Exception as e:
             logger.error("send_to_channel failed: %s", e)
 
@@ -660,7 +740,13 @@ class EventRouter:
                 main_state.stream_parts.clear()
             if text or attachments:
                 try:
-                    await self._cb.send_intermediate_reply(trigger, text, attachments)
+                    if trigger.platform_data.get("background"):
+                        await self._cb.send_to_channel(
+                            trigger.conversation_key, text, attachments, node_id=node_id,
+                        )
+                    else:
+                        await self._cb.send_intermediate_reply(trigger, text, attachments)
+                    await self._notify_response_info(event, trigger)
                 except Exception as e:
                     logger.error("send_intermediate_reply failed: %s", e)
             return
@@ -688,6 +774,7 @@ class EventRouter:
                 await self._cb.send_to_channel(
                     conv_key, text, attachments, node_id=node_id,
                 )
+                await self._notify_response_info(event)
             except Exception as e:
                 logger.error(
                     "intermediate_reply send_to_channel failed: %s", e,
@@ -761,6 +848,8 @@ class EventRouter:
         result = None
         if not is_system:
             result = self._state.resolve_trigger(src_seq, event.session_id)
+            if not result and event.type == "node_started":
+                result = self._ensure_background_trigger(event, p)
 
         # 入口节点 → 主任务进度
         if result and node_id == self._entry_node_id:
@@ -849,6 +938,8 @@ class EventRouter:
         is_system = (node_id or "").startswith("system.")
 
         # 主节点进度
+        if not is_system and node_id == self._entry_node_id:
+            self._ensure_background_trigger(event, p)
         if (
             not is_system
             and src_seq
@@ -1066,7 +1157,10 @@ class EventRouter:
             if result:
                 trigger_seq, trigger = result
                 self._state.consume_trigger(trigger_seq)
-                self._state.remove_main_state(trigger_seq)
+                main_state = self._state.remove_main_state(trigger_seq)
+                if trigger.platform_data.get("background"):
+                    await self._finalize_background_progress(trigger, main_state, "⚠️ 已取消")
+                    return
                 try:
                     await self._cb.edit_status_message(
                         trigger, "⚠️ 任务已取消。",
@@ -1125,7 +1219,10 @@ class EventRouter:
         if result:
             trigger_seq, trigger = result
             self._state.consume_trigger(trigger_seq)
-            self._state.remove_main_state(trigger_seq)
+            main_state = self._state.remove_main_state(trigger_seq)
+            if trigger.platform_data.get("background"):
+                await self._finalize_background_progress(trigger, main_state, "⚠️ 已取消")
+                return
             try:
                 await self._cb.edit_status_message(
                     trigger, "⚠️ 任务已取消。",
@@ -1153,11 +1250,14 @@ class EventRouter:
         # Why: session fallback can clear a different branch's trigger or child progress. How:
         # cleanup_for_task_preempted consumes only the matching source trigger and removes only the
         # exact child task key when present. Purpose: a preempt event cannot affect sibling branches.
+        main_state = self._state.get_main_state(src_seq)
         trigger, child_states = self._state.cleanup_for_task_preempted(
             src_seq, event.session_id, task_id=task_id,
         )
 
-        if trigger:
+        if trigger and trigger.platform_data.get("background"):
+            await self._finalize_background_progress(trigger, main_state, "⚡ 被打断")
+        elif trigger:
             try:
                 await self._cb.edit_status_message(
                     trigger, "⚡ 已被新消息打断。",
@@ -1274,6 +1374,11 @@ class EventRouter:
                 conv_key, channel_id=ch_id,
             )
 
+        for trigger in cleaned_triggers:
+            if trigger.platform_data.get("background"):
+                await self._finalize_background_progress(
+                    trigger, trigger.platform_data.get("_stale_main_state"), "🔄 上下文已重置",
+                )
         try:
             await self._cb.on_context_reset(conv_key, reason, cleaned_triggers)
         except Exception as e:

@@ -17,7 +17,10 @@ import discord  # type: ignore[import-untyped]
 from clonoth_sdk import ChildTaskState, MainTaskState, TriggerInfo
 from clonoth_sdk.types import Event
 
+from .context import register_transient_msg, unregister_transient_msg
 from .messaging import (
+    INTERMEDIATE_REPLY_LIMIT,
+    _commit_context_watermark,
     _atts_to_discord_files,
     _extract_reactions,
     _format_progress_log,
@@ -94,12 +97,36 @@ def _tool_inline_summary(tool_name: str, args: dict) -> str:
         return f'写入记忆 {str(args.get("id") or "")[:30]}'
     if name == "delete_memory":
         return f'删除记忆 {str(args.get("id") or "")[:30]}'
-    if name == "read_image":
-        p = str(args.get("image_path") or "")
-        return f"读取图片 {_basename(p)}" if p else "读取图片"
+    if name in ("read_media", "read_image", "read_video"):
+        paths = args.get("paths")
+        if isinstance(paths, list) and len(paths) > 1:
+            return f"读取 {len(paths)} 个媒体文件"
+        p = str(args.get("path") or args.get("image_path") or args.get("video_path") or (paths[0] if isinstance(paths, list) and paths else "") or "")
+        return f"读取媒体 {_basename(p)}" if p else "读取媒体"
+    if name == "search_web":
+        act = str(args.get("action") or "search")
+        if act == "fetch":
+            urls = args.get("urls") or []
+            return f"抓取 {len(urls)} 个网页" if isinstance(urls, list) and urls else "抓取网页"
+        eng = str(args.get("engine") or "auto")
+        q = str(args.get("query") or "")[:25]
+        return f'搜索({eng}) "{q}"' if q else f"搜索({eng})"
+    if name == "generate_image":
+        m = str(args.get("model") or "sunburst")
+        return f"生成图片({m})"
+    if name == "generate_nai_image":
+        return "NAI 生图"
+    if name in ("manage_skill", "manage_schedule", "manage_mcp_client", "manage_tool", "manage_workers"):
+        act = str(args.get("action") or "list")
+        tgt = str(args.get("name") or args.get("id") or args.get("target") or "")[:24]
+        return f"{name}({act}) {tgt}".strip()
     if name == "discord_manage":
         port = args.get("port", "")
         return f"Discord({port})" if port else "Discord"
+    if name == "dispatch_to":
+        target = str(args.get("target") or "")
+        inst = str(args.get("instruction") or args.get("text") or "")[:30]
+        return f"委派 {target}: {inst}" if inst else f"委派 {target}"
     if name.startswith("dispatch_to_") or name.startswith("dispatch:"):
         target = name.replace("dispatch_to_", "").replace("dispatch:", "")
         inst = str(args.get("instruction") or args.get("text") or "")[:30]
@@ -217,12 +244,30 @@ class DiscordCallbacks:
         except Exception:
             return None
 
+    async def finalize_main_progress(
+        self,
+        trigger: TriggerInfo,
+        state: MainTaskState | None,
+        status: str,
+    ) -> None:
+        """Settle background progress and release its adapter-owned state."""
+        try:
+            if state is not None:
+                await self._settle_log_msg(state, status)
+        finally:
+            seq = trigger.inbound_seq
+            self._dot_states.pop(seq, None)
+            self._last_edit_time.pop(seq, None)
+            self._last_edit_time.pop(f"log:{seq}", None)
+
     async def _settle_log_msg(
         self,
         state: MainTaskState | ChildTaskState,
         status: str,
     ) -> None:
         """统一处理日志消息的终态转换（保留不删除）。"""
+        # Record the terminal state before I/O, including when a send is pending.
+        state.platform_data["terminal_status"] = status
         log_msg = state.platform_data.get("log_msg") or state.platform_data.get("msg")
         if not log_msg:
             return
@@ -234,6 +279,19 @@ class DiscordCallbacks:
             await log_msg.edit(content=display)
         except Exception:
             pass
+
+    async def send_response_notice(self, trigger, conversation_key: str, response_info: dict) -> None:
+        """Send host annotations separately; do not record them in model history."""
+        message = trigger.platform_data.get("message") if trigger else None
+        channel = message.channel if message else await self._resolve_channel_from_conv_key(conversation_key)
+        if channel is None:
+            return
+        notices = response_info.get("notices") or []
+        text = "\n".join(n["text"] for n in notices if isinstance(n, dict) and isinstance(n.get("text"), str))
+        if text:
+            embed = discord.Embed(title="回复说明", description=discord.utils.escape_markdown(text[:3900]), colour=0x6E6E73)
+            notice_msg = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            register_transient_msg(self.rt, notice_msg)
 
     async def send_reply(
         self,
@@ -262,23 +320,31 @@ class DiscordCallbacks:
             should_restart = True
             text = text.rstrip()[:-len(self.rt.restart_signal)].strip()
 
+        reaction_sent = False
         if text:
             text, reacts = _extract_reactions(self.rt, text)
             for r in reacts:
                 try:
                     await msg.add_reaction(r.strip())
+                    reaction_sent = True
                 except Exception:
                     pass
+        if reaction_sent and not text and not attachments:
+            _commit_context_watermark(self.rt, channel_id, pd.get("context_watermark"))
 
         ch = msg.channel
         if text or attachments:
             files = _atts_to_discord_files(self.rt, attachments) if attachments else []
             try:
-                await _send_split_text(self.rt, ch, text or "", reply_to=msg, files=files or None)
+                sent = await _send_split_text(self.rt, ch, text or "", reply_to=msg, files=files or None)
             except Exception:
-                pass
-            if text:
-                _record_bot_reply(self.rt, channel_id, text)
+                logger.warning("Failed to send reply to channel %s", channel_id, exc_info=True)
+            else:
+                if sent:
+                    _record_bot_reply(
+                        self.rt, channel_id, text or "[附件]", msg_id=sent[0].id,
+                        context_watermark=pd.get("context_watermark"),
+                    )
 
         seq = trigger.inbound_seq
         self._dot_states.pop(seq, None)
@@ -289,6 +355,7 @@ class DiscordCallbacks:
             if self.rt.bot_restart_view_factory:
                 view = self.rt.bot_restart_view_factory(channel_id)
                 confirm_msg = await ch.send("🔄 **Bot 重启需要管理员确认**", view=view)
+                register_transient_msg(self.rt, confirm_msg)
                 view._msg = confirm_msg
             else:
                 asyncio.create_task(_safe_restart(self.rt, channel_id=channel_id, delay=2.0))
@@ -308,26 +375,32 @@ class DiscordCallbacks:
         dc_files = _atts_to_discord_files(self.rt, attachments or [])
 
         if text or dc_files:
+            reaction_sent = False
             if text:
                 text, reacts = _extract_reactions(self.rt, text)
                 for r in reacts:
                     try:
                         await msg.add_reaction(r.strip())
+                        reaction_sent = True
                     except Exception:
                         pass
+            if reaction_sent and not text and not dc_files:
+                _commit_context_watermark(self.rt, channel_id, pd.get("context_watermark"))
             if text or dc_files:
-                int_sent_id = None
                 try:
                     int_sent = await _send_split_text(
                         self.rt, msg.channel, text or "",
                         reply_to=msg, files=dc_files or None,
+                        max_len=INTERMEDIATE_REPLY_LIMIT,
                     )
-                    if int_sent:
-                        int_sent_id = int_sent[0].id
                 except Exception:
-                    pass
-                if text:
-                    _record_bot_reply(self.rt, channel_id, text, msg_id=int_sent_id)
+                    logger.warning("Failed to send intermediate reply to channel %s", channel_id, exc_info=True)
+                else:
+                    if int_sent:
+                        _record_bot_reply(
+                            self.rt, channel_id, text or "[附件]", msg_id=int_sent[0].id,
+                            context_watermark=pd.get("context_watermark"),
+                        )
 
         logger.info("send_intermediate_reply ch=%s atts=%d", channel_id, len(dc_files))
 
@@ -340,8 +413,7 @@ class DiscordCallbacks:
         node_id: str = "",
     ) -> None:
         if not conversation_key.startswith("discord:"):
-            logger.debug("send_to_channel SKIP non-discord conv_key=%s", conversation_key)
-            return
+            raise ValueError("send_to_channel requires a Discord conversation key")
 
         poller_restart = False
         if text and text.rstrip().endswith(self.rt.restart_signal):
@@ -356,14 +428,11 @@ class DiscordCallbacks:
             text = f"{prefix}\n{text}"
 
         ch = await self._resolve_channel_from_conv_key(conversation_key)
-        if ch:
-            files = _atts_to_discord_files(self.rt, attachments) if attachments else []
-            try:
-                await _send_split_text(self.rt, ch, text or "", files=files or None)
-            except Exception as e:
-                logger.error("send_to_channel failed: %s", e)
-        else:
-            logger.warning("send_to_channel: channel not found for %s", conversation_key)
+        if ch is None:
+            raise RuntimeError(f"send_to_channel: channel not found for {conversation_key}")
+        files = _atts_to_discord_files(self.rt, attachments) if attachments else []
+        # The SDK catches delivery failures and settles progress without retrying.
+        await _send_split_text(self.rt, ch, text or "", files=files or None)
 
         if poller_restart:
             try:
@@ -391,6 +460,9 @@ class DiscordCallbacks:
                 await status_msg.edit(content=content, view=None)
             except Exception:
                 pass
+            else:
+                if partial:
+                    unregister_transient_msg(self.rt, status_msg)
 
         stale_main = pd.get("_stale_main_state")
         if stale_main:
@@ -416,11 +488,13 @@ class DiscordCallbacks:
         trigger: TriggerInfo,
         state: MainTaskState,
     ) -> None:
+        if state.platform_data.get("terminal_status"):
+            return
         seq = trigger.inbound_seq
         pd = trigger.platform_data
         dot_state = self._get_or_create_dot_state(seq)
 
-        if trigger.is_dm:
+        if trigger.is_dm and not pd.get("background"):
             # 私聊：status_msg 显示全部进度（stream preview + 工具 + 日志）
             status_msg = pd.get("status_msg")
             ch_id = status_msg.channel.id if status_msg else 0
@@ -435,7 +509,7 @@ class DiscordCallbacks:
                 except Exception as e:
                     logger.error("update_progress DM edit FAILED: %s", e)
         else:
-            # 群聊：日志频道 log_msg + 触发频道 status_msg 分开更新
+            # 群聊及后台任务：日志频道 log_msg + 可选触发频道 status_msg
             # 1) 日志频道：stream preview + 计时器 + handoff 日志
             log_ch_id = self.rt.agent_log_channel_id or 0
             if log_ch_id and self._should_edit(f"log:{seq}", channel_id=log_ch_id):
@@ -446,11 +520,20 @@ class DiscordCallbacks:
                     try:
                         log_msg = state.platform_data.get("log_msg")
                         log_ch = await self._get_log_channel()
+                        if state.platform_data.get("terminal_status"):
+                            return
                         if log_ch:
                             if log_msg:
                                 await log_msg.edit(content=log_display)
                             else:
-                                state.platform_data["log_msg"] = await log_ch.send(log_display)
+                                log_msg = await log_ch.send(log_display)
+                                register_transient_msg(self.rt, log_msg)
+                                state.platform_data["log_msg"] = log_msg
+                            terminal = state.platform_data.get("terminal_status")
+                            if terminal:
+                                # A sweep may finish sending/editing after terminal cleanup.
+                                await self._settle_log_msg(state, terminal)
+                                return
                     except Exception as e:
                         logger.error("update_progress log edit FAILED: %s", e)
             # 2) 触发频道：工具摘要 + free prose
@@ -501,6 +584,7 @@ class DiscordCallbacks:
         display = _format_progress_log(state.prefix, state.lines, dot_state=child_dot)
         try:
             sent = await log_ch.send(display)
+            register_transient_msg(self.rt, sent)
             state.platform_data["msg"] = sent
             self._mark_edited(task_key)
         except Exception as e:
@@ -606,6 +690,7 @@ class DiscordCallbacks:
             # importing agent.py and creating a circular dependency.
             view = self.rt.approval_view_factory(approval_id) if self.rt.approval_view_factory else None
             msg = await ch.send(desc, view=view)
+            register_transient_msg(self.rt, msg)
             # [AutoC 2026-05-31] 保存消息引用给 ApprovalView.on_timeout 编辑用
             if view and hasattr(view, '_msg'):
                 view._msg = msg
@@ -678,6 +763,8 @@ class DiscordCallbacks:
 
         for t in cleaned_triggers:
             pd = t.platform_data
+            if pd.get("background"):
+                continue  # SDK already called finalize_main_progress for this trigger.
             status_msg = pd.get("status_msg")
             if status_msg:
                 try:

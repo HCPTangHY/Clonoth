@@ -115,7 +115,7 @@ User
    - 真正发送给模型前，会转换为 base64 data URL。
 7. **注入工具定义**
    - 注入节点允许的真实工具。
-   - 注入伪工具：`finish`、`ask`、`intermediate_reply`、`switch_node`、`compact_context`、`preempt_task`，以及每个 `delegate_targets` 目标对应的 `dispatch_to_{target}` 工具。
+   - 注入伪工具：`finish`、`ask`、`intermediate_reply`、`switch_node`、`compact_context`、`manage_workers`，以及每个 `delegate_targets` 目标对应的 `dispatch_to_{target}` 工具。
 8. **可选的压缩与重试**
    - 消息过长时，会先做上下文压缩。
    - LLM 返回 429 或 5xx 等临时错误时，会自动重试。
@@ -264,7 +264,7 @@ POST /v1/sessions/{session_id}/cancel
 
 ### 5.2 用户发新消息隐式取消
 
-用户在旧任务执行期间发新消息时，Supervisor 会创建新的入口 task。入口节点的 AI 看到新旧消息的上下文后，会自行决定是否取消旧任务（通过 `cancel_active_tasks` 工具）。
+用户在旧任务执行期间发新消息时，Supervisor 会创建新的入口 task。入口节点的 AI 看到新旧消息的上下文后，会自行决定是否取消旧任务（通过 `manage_workers(action="cancel")` 工具）。
 
 Adapter 不需要做任何额外处理。
 

@@ -8,6 +8,7 @@ reading or mutating module-level globals.
 from __future__ import annotations
 
 import datetime
+from collections import deque
 import re
 from pathlib import Path
 from typing import Any
@@ -50,10 +51,32 @@ def _get_display_name(member: discord.Member | discord.User) -> str:
     return _sanitize_name(getattr(member, "display_name", str(member)))
 
 
-def _get_role_names(member: discord.Member | discord.User) -> list[str]:
-    if not hasattr(member, "roles"):
+def _get_role_names(
+    member: discord.Member | discord.User, key_roles: set[str] | None = None,
+) -> list[str]:
+    if not key_roles:
         return []
-    return [_sanitize_name(r.name, 24) for r in member.roles if r.name != "@everyone"]
+    return [
+        _sanitize_name(r.name, 24) for r in getattr(member, "roles", [])
+        if r.name != "@everyone" and r.name in key_roles
+    ]
+
+
+def _format_identity(
+    member: discord.Member | discord.User,
+    key_roles: set[str] | None = None,
+    is_admin: bool = False,
+) -> str:
+    """统一历史、引用与指令身份，仅保留不同的用户名及特定身份组。"""
+    display_name = _get_display_name(member)
+    username = getattr(member, "name", "") or ""
+    identity = display_name if not username or display_name.lower() == username.lower() else f"{display_name}[{_sanitize_name(username)}]"
+    roles = _get_role_names(member, key_roles)
+    if roles:
+        identity += f"({','.join(roles)})"
+    if is_admin:
+        identity += " ✓ADMIN"
+    return identity
 
 
 async def _resolve_mention(match: re.Match[str], guild: discord.Guild | None) -> str:
@@ -146,14 +169,13 @@ def _format_member_entry(
     text: str,
     msg_time: datetime.datetime | None = None,
     reply_author: str = "",
+    key_roles: set[str] | None = None,
 ) -> str:
-    """构造带身份组标注的历史条目。"""
+    """构造带精简身份、时间与回复关系的历史条目。"""
     time_prefix = _format_time_prefix(msg_time)
-    display_name = _get_display_name(member)
-    roles = _get_role_names(member)
-    role_tag = f"({','.join(roles)})" if roles else ""
+    identity = _format_identity(member, key_roles)
     reply_tag = f" ↩ {reply_author}" if reply_author else ""
-    return f"{time_prefix}{display_name}[{member.name}]{role_tag}{reply_tag}: {text}"
+    return f"{time_prefix}{identity}{reply_tag}: {text}"
 
 
 def _build_context_text(
@@ -164,6 +186,7 @@ def _build_context_text(
     *,
     reply_context: str = "",
     exclude_last: bool = False,
+    min_seq_override: int | None = None,
 ) -> str:
     """组装发送给 Clonoth 的完整文本。"""
     q = _ensure_channel(rt, channel_id)
@@ -171,9 +194,12 @@ def _build_context_text(
         history_entries = q[:-1]
     else:
         history_entries = list(q)
-    # [2026-05-14 refactor note] The high watermark still lives in
-    # SessionState; runtime ownership only changes where the object is stored.
-    wm = rt.session_state.get_high_watermark(channel_id) if rt.session_state else -1
+    # Only successfully delivered replies consume channel context. Concurrent
+    # branches must still see questions whose replies have not landed yet.
+    # A preempt consumes only its own branch's context, not a sibling's watermark.
+    wm = min_seq_override
+    if wm is None:
+        wm = rt.session_state.get_high_watermark(channel_id) if rt.session_state else -1
     history_entries = [e for e in history_entries if e.get("seq", -1) > wm]
     # 排除 Bot 自己的消息，避免群聊上下文中出现 Bot 回复
     history_entries = [e for e in history_entries if not e.get("is_bot")]
@@ -192,10 +218,8 @@ def _build_context_text(
     else:
         history_block = ""
 
-    display_name = _get_display_name(member)
-    roles = _get_role_names(member)
-    role_str = f"（身份组: {', '.join(roles)}）" if roles else ""
-    now_str = datetime.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
+    identity = _format_identity(member, rt.key_roles, is_admin=member.id in rt.superusers)
+    now_str = datetime.datetime.now(_CST).strftime("%m-%d %H:%M CST")
 
     parts = []
     if history_block:
@@ -205,17 +229,37 @@ def _build_context_text(
     parts.append(f"当前时间: {now_str}")
     # [2026-05-14 refactor note] The administrator marker now reads the
     # superuser set from DiscordRuntime rather than a module-level global.
-    admin_tag = " ✓ADMIN" if member.id in rt.superusers else ""
     parts.append(
-        f"【当前用户指令】\n{display_name}[{member.name}]{role_str}{admin_tag}: {user_input}\n\n"
+        f"【当前用户指令】\n{identity}: {user_input}\n\n"
         f"请根据以上上下文，执行当前用户的指令并给出回复。"
     )
     return "\n".join(parts)
 
 
+def register_transient_msg(rt: Any, msg: Any) -> None:
+    """Exclude status, progress and approval cards from quoted context by ID."""
+    msg_id = getattr(msg, "id", None)
+    if not isinstance(msg_id, int):
+        return
+    # Embedders may supply the original duck-typed runtime rather than DiscordRuntime.
+    if not hasattr(rt, "transient_msg_ids"):
+        rt.transient_msg_ids = deque(maxlen=1000)
+    if msg_id not in rt.transient_msg_ids:
+        rt.transient_msg_ids.append(msg_id)
+
+
+def unregister_transient_msg(rt: Any, msg: Any) -> None:
+    """Make a status card quotable after it successfully becomes a partial reply."""
+    msg_id = getattr(msg, "id", None)
+    if isinstance(msg_id, int) and msg_id in getattr(rt, "transient_msg_ids", ()):
+        rt.transient_msg_ids.remove(msg_id)
+
+
 async def _build_reply_context(rt: Any, message: discord.Message) -> str:
     """提取被引用消息的作者、身份组、时间和正文。"""
     if not message.reference:
+        return ""
+    if message.reference.message_id in getattr(rt, "transient_msg_ids", ()):
         return ""
     ref: discord.Message | None = None
     if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
@@ -231,13 +275,11 @@ async def _build_reply_context(rt: Any, message: discord.Message) -> str:
             ref = await message.channel.fetch_message(message.reference.message_id)
         except Exception:
             pass
-    if not ref:
+    if not ref or ref.id in getattr(rt, "transient_msg_ids", ()):
         return ""
 
     author = ref.author
-    display_name = _get_display_name(author)
-    roles = _get_role_names(author) if hasattr(author, "roles") else []
-    role_tag = f"({','.join(roles)})" if roles else ""
+    identity = _format_identity(author, rt.key_roles)
     time_prefix = _format_time_prefix(ref.created_at)
     text = ""
     guild = message.guild
@@ -304,7 +346,7 @@ async def _build_reply_context(rt: Any, message: discord.Message) -> str:
         text = "[media]"
     if len(text) > 500:
         text = text[:497] + "..."
-    return f"{time_prefix}{display_name}[{author.name}]{role_tag}: {text}"
+    return f"{time_prefix}{identity}: {text}"
 
 
 def record_reaction_add(rt: Any, payload: discord.RawReactionActionEvent) -> None:

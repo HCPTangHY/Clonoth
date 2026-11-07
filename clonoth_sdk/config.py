@@ -21,6 +21,9 @@ class BotConfig:
         conversation_key_prefix: 会话键前缀，如 "discord" 使生成的 key 为 "discord:{channel_id}"
         poll_interval: 事件轮询间隔（秒）
         max_history: 频道历史队列最大长度
+        workspace_root: Clonoth 工作区根目录。可选，留空时可在启动阶段通过
+            ClonothClient.get_health() 动态获取
+        extra_roots: 信任的外部根路径列表（用于审批路径分类）
         auto_approve_internal: 工作区内操作自动放行，基于 supervisor trust_level
     """
     base_url: str
@@ -29,4 +32,14 @@ class BotConfig:
     conversation_key_prefix: str = ""
     poll_interval: float = 0.8
     max_history: int = 50
+    # Phase 3 (2026-04-17): EventRouter 审批处理需要此字段。
+    # 提取自 bot_adapter.py _process_approval_event 中 _is_external_operation 后的分支逻辑。
+    # False（默认）：所有审批请求都交给适配器展示审批 UI，由人工决定。安全默认值。
+    # True：工作区内部操作自动放行，仅外部操作需人工审批（bot_adapter.py 的现有行为）。
+    # Bot 侧根据安全需求显式开启。
     auto_approve_internal: bool = False
+    # 下面两个字段必须保留在 auto_approve_internal 之后：
+    # 旧代码可能按位置传入第 7 个参数（审批布尔值），提前插入会把它误解释为
+    # workspace_root。追加在尾部才能保持旧构造调用不变。
+    workspace_root: Path | None = None
+    extra_roots: list[Path] = field(default_factory=list)

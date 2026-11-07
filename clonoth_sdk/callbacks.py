@@ -35,8 +35,9 @@ class AdapterCallbacks(Protocol):
     trigger 匹配、状态管理等协议细节。
 
     异常处理约定：
-      所有回调中的异常由适配器自行 try/except 并记录日志，
-      不应向 SDK 抛出，以免阻断事件处理循环。
+      进度展示等尽力完成的操作可由适配器记录失败。
+      send_to_channel 投递失败必须抛出异常，由 SDK 捕获并标记发送失败；
+      不得将未成功投递当作正常返回。SDK 不因此自动重投。
     """
 
     # ================================================================
@@ -80,6 +81,20 @@ class AdapterCallbacks(Protocol):
             main_state: 被移除的主任务状态。包含 progress_records（进度记录列表）、
                         platform_data（log_msg 等平台引用）。
                         为 None 表示该 trigger 没有关联的任务状态记录。
+        """
+        ...
+
+    async def send_response_notice(
+        self,
+        trigger: TriggerInfo | None,
+        conversation_key: str,
+        response_info: dict[str, Any],
+    ) -> None:
+        """Optional user-only annotation after a delivered response.
+
+        Older adapters may omit this method. Render separately (e.g. an embed),
+        and do not add the notice to model-visible channel history or reply text.
+        The SDK does not interpret plugin-specific notice codes or details.
         """
         ...
 
@@ -148,7 +163,10 @@ class AdapterCallbacks(Protocol):
         *,
         node_id: str = "",
     ) -> None:
-        """消息需要发送到频道，但没有匹配的 trigger（fallback 路径）。
+        """发送后台或无匹配 trigger 的消息；投递失败必须抛出异常。
+
+        频道不可用、网络错误及部分分段发送失败均应报告失败。正常返回表示
+        投递操作已成功完成；SDK 捕获异常，不自动重投已消费的输出。
 
         触发时机：
           - outbound_message 事件，source_inbound_seq 不在 triggers 中
@@ -165,12 +183,16 @@ class AdapterCallbacks(Protocol):
           - 从 conversation_key 解析平台频道标识（如 "discord:123" → channel 123）
           - 非入口节点的消息可加节点显示名前缀以区分来源
           - 发送文本和附件到对应频道
+          - 无法解析目标或发送失败时抛出异常；正常返回表示发送成功。
+            SDK负责记录失败与进度结算，不会据此自动重投。
 
         Args:
             conversation_key: 目标会话键（如 "discord:123456789"）。
             text: 清理过 SDK 协议标记后的文本。仍含 Bot 自定义标记。
             attachments: 附件列表。
-            node_id: 发送方节点 ID。空字符串表示未知。
+            node_id: 对外回复所属节点 ID。outbound_message 优先使用
+                     reply_node_id，旧事件和 intermediate_reply 使用 node_id。
+                     空字符串表示未知；执行节点仍可从原始事件 node_id 读取。
                      适配器可据此为非入口节点消息添加来源标识前缀。
         """
         ...
@@ -269,6 +291,23 @@ class AdapterCallbacks(Protocol):
         Args:
             trigger: 关联的触发信息。
             state: 当前主任务状态（progress_records 已是最新）。
+        """
+        ...
+
+    async def finalize_main_progress(
+        self,
+        trigger: TriggerInfo,
+        state: MainTaskState | None,
+        status: str,
+    ) -> None:
+        """Optional terminal notification for a background entry task.
+
+        The SDK has removed this trigger and its main state. No platform user
+        message is available for background triggers. Settle progress UI and
+        release adapter-owned animation/throttling state using inbound_seq.
+        This callback does not send the answer; send_to_channel does that.
+        Older adapters may omit it. status describes completion, delivery
+        failure, cancellation, preemption or expiry, not model output.
         """
         ...
 
@@ -391,7 +430,7 @@ class AdapterCallbacks(Protocol):
     ) -> None:
         """外部操作需要人工审批，通知适配器展示审批 UI。
 
-        触发时机：approval_requested 事件，经 trust_level 判定为
+        触发时机：approval_requested 事件，经 is_external_operation 判定为
                   外部操作（操作目标在工作区外部）。
         对应 bot_adapter.py L993-1006 _process_approval_event 中的外部操作分支。
 
