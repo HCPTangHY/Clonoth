@@ -94,6 +94,17 @@ def _extract_usage(data: Any) -> dict[str, int] | None:
 
 
 
+def _extract_reasoning_text(message: dict[str, Any], reasoning_field: str = "") -> str | None:
+    """Read the configured field first, then passive display aliases."""
+    if not isinstance(message, dict):
+        return None
+    for field in dict.fromkeys((reasoning_field, "reasoning_content", "reasoning", "thinking")):
+        value = message.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 class OpenAIProvider(BaseProvider):
     """OpenAI-compatible provider implemented with raw HTTP (no SDK).
 
@@ -107,6 +118,11 @@ class OpenAIProvider(BaseProvider):
     # 原因：engine 不再硬编码 OpenAIProvider 分支；做法：类声明 provider_name；
     # 目的：registry 能把配置里的 "openai" 映射回这个类。
     provider_name = "openai"
+    # Empty by default: passive reasoning display does not enable API replay.
+    default_reasoning_field = ""
+    default_reasoning_effort: str | None = None
+    default_max_tokens: int | None = None
+    default_max_completion_tokens: int | None = None
 
     # ------------------------------------------------------------------
     #  L3 Provider 层：消息预处理
@@ -117,12 +133,14 @@ class OpenAIProvider(BaseProvider):
     # message_type, created_at 等)。只保留 API 规范内的字段。
     _MSG_ALLOWED_KEYS = frozenset({
         "role", "content", "name", "tool_calls", "tool_call_id",
-        "reasoning_content",  # DeepSeek / 部分兼容端点
         "refusal",            # OpenAI native
     })
 
     @staticmethod
-    def _prepare_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _prepare_messages(
+        messages: list[dict[str, Any]], *, reasoning_field: str = "",
+        always_backfill_reasoning: bool = False,
+    ) -> list[dict[str, Any]]:
         """L3: 将 L2 输出转换为 OpenAI API 最终格式。
 
         【三层管道 L3 实现】三项职责：
@@ -143,6 +161,11 @@ class OpenAIProvider(BaseProvider):
             clean["role"] = msg.get("role", "user")
             if "content" not in clean:
                 clean["content"] = msg.get("content", "")
+            # Chat Completions does not accept input image blocks in assistant
+            # turns. User images remain available to vision-capable endpoints.
+            if clean["role"] == "assistant" and isinstance(clean["content"], list):
+                content = [part for part in clean["content"] if not isinstance(part, dict) or part.get("type") != "image_url"]
+                clean["content"] = content or "[image attachment]"
             # [AutoC 2026-07-28] 出口清洗：历史 JSONL 中可能存有含冒号的
             # tool_call id（如 "grep:9"），在发送前统一替换为合规字符。
             if "tool_calls" in clean and isinstance(clean["tool_calls"], list):
@@ -151,6 +174,12 @@ class OpenAIProvider(BaseProvider):
                         _tc["id"] = sanitize_tool_call_id(_tc["id"])
             if "tool_call_id" in clean and isinstance(clean["tool_call_id"], str):
                 clean["tool_call_id"] = sanitize_tool_call_id(clean["tool_call_id"])
+            if reasoning_field and clean["role"] == "assistant":
+                value = msg.get(reasoning_field)
+                if isinstance(value, str):
+                    clean[reasoning_field] = value
+                elif clean.get("tool_calls") or always_backfill_reasoning:
+                    clean[reasoning_field] = ""
             result.append(clean)
         # Prefill Guard：最后一条是 assistant 时追加 user 占位消息，
         # 防止某些 API 端点拒绝以 assistant 结尾的消息列表。
@@ -165,6 +194,11 @@ class OpenAIProvider(BaseProvider):
         api_key: str,
         base_url: str | None,
         model: str,
+        reasoning_field: str | None = None,
+        reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
+        provider_options: dict[str, Any] | None = None,
     ) -> None:
         # [provider-registry 2026-05-03] 实例 name 复用 provider_name。
         # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
@@ -173,17 +207,102 @@ class OpenAIProvider(BaseProvider):
 
         k = (api_key or "").strip()
         if not k:
-            raise RuntimeError("openai api_key is empty")
+            raise RuntimeError(f"{self.provider_name} api_key is empty")
 
         self._http = http
         self._api_key = k
         self._base_url = _normalize_base_url(base_url)
+        options = provider_options if isinstance(provider_options, dict) else {}
+        field = reasoning_field if reasoning_field is not None else options.get("reasoning_field")
+        if field is None:
+            field = self.default_reasoning_field
+        self._reasoning_field = str(field or "").strip()
+        if self._reasoning_field and (
+            not self._reasoning_field.isidentifier()
+            or self._reasoning_field.startswith("_")
+            or self._reasoning_field in self._MSG_ALLOWED_KEYS | {"meta", "metadata", "provider", "provider_meta", "thinking_enabled"}
+        ):
+            raise ValueError("reasoning_field must be a non-reserved API field name")
+        effort = reasoning_effort if reasoning_effort is not None else options.get("reasoning_effort")
+        if effort is None:
+            effort = self.default_reasoning_effort
+        self._reasoning_effort = str(effort or "").strip() or None
+        self._always_backfill_reasoning = False
+        for name, explicit in (("max_tokens", max_tokens), ("max_completion_tokens", max_completion_tokens)):
+            value = explicit if explicit is not None else options.get(name)
+            if value is None:
+                value = getattr(self, "default_" + name)
+            try:
+                limit = int(value) if value is not None and not isinstance(value, bool) else 0
+            except (TypeError, ValueError, OverflowError):
+                limit = 0
+            setattr(self, "_" + name, limit if limit > 0 else None)
+
+    def _build_provider_meta(self) -> dict[str, Any]:
+        """Extra provider-owned metadata, shared by both response paths."""
+        return {}
+
+    def prepare_history(
+        self, messages: list[dict[str, Any]], *, tool_mode: str = "native",
+    ) -> list[dict[str, Any]]:
+        from .tool_format import build_llm_messages, create_tool_formatter
+
+        formatter = create_tool_formatter(tool_mode)
+        history = build_llm_messages(messages, formatter, preserve_metadata=True)
+        field = self._reasoning_field
+        for message in history:
+            legacy_value = message.get(field) if field else None
+            for key in {field, "reasoning_content", "reasoning", "thinking"} - {""}:
+                message.pop(key, None)
+            if not field or message.get("role") != "assistant" or formatter.mode != "native":
+                continue
+            meta = message.get("_meta")
+            meta = meta if isinstance(meta, dict) else {}
+            metadata = meta.get("metadata")
+            saved = metadata.get(self.provider_name) if isinstance(metadata, dict) else None
+            saved = saved if isinstance(saved, dict) else {}
+            # Only the selected native field is replayable, never display aliases.
+            if field in saved:
+                value = saved[field]
+            elif not meta.get("provider") or meta.get("provider") == self.provider_name:
+                value = legacy_value  # Explicit API input or an old same-provider snapshot.
+            else:
+                value = None
+            if isinstance(value, str):
+                message[field] = value
+        return history
+
+    def build_payload(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+        *, tool_mode: str = "native", stream: bool = False,
+    ) -> dict[str, Any]:
+        from .tool_format import create_tool_formatter
+
+        native = create_tool_formatter(tool_mode).mode == "native"
+        prepared = self._prepare_messages(
+            self.prepare_history(messages, tool_mode=tool_mode),
+            reasoning_field=self._reasoning_field if native else "",
+            always_backfill_reasoning=self._always_backfill_reasoning,
+        )
+        payload: dict[str, Any] = {"model": self.model, "messages": prepared}
+        if stream:
+            payload.update(stream=True, stream_options={"include_usage": True})
+        if tools:
+            payload.update(tools=tools, tool_choice="auto")
+        if self._reasoning_effort:
+            payload["reasoning_effort"] = self._reasoning_effort
+        if self._max_tokens is not None:
+            payload["max_tokens"] = self._max_tokens
+        if self._max_completion_tokens is not None:
+            payload["max_completion_tokens"] = self._max_completion_tokens
+        return payload
 
     async def chat_stream(
         self,
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
         on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -192,18 +311,7 @@ class OpenAIProvider(BaseProvider):
 
         url = f"{self._base_url}/chat/completions"
 
-        # L3: 在发送前对消息做 Provider 层预处理（剥离内部字段 + Prefill Guard）
-        prepared = self._prepare_messages(messages)
-
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": prepared,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        payload = self.build_payload(messages, tools, tool_mode=tool_mode, stream=True)
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -230,6 +338,9 @@ class OpenAIProvider(BaseProvider):
                 # [refactor 2026-04-18] thinking_parts → reasoning_parts，
                 # 变量名与 ProviderResponse.reasoning 对齐
                 reasoning_parts: list[str] = []
+                native_reasoning_parts: dict[str, list[str]] = {
+                    key: [] for key in {"reasoning_content", self._reasoning_field} - {""}
+                }
                 # index -> {id, name, arguments_parts}
                 tc_map: dict[int, dict[str, Any]] = {}
 
@@ -278,7 +389,10 @@ class OpenAIProvider(BaseProvider):
 
                     # 思维链 (reasoning_content / thinking)
                     # 注意：delta 字段名是 API 定义的，不改；只改内部变量名
-                    reasoning = delta.get("reasoning_content") or delta.get("thinking")
+                    for key, parts in native_reasoning_parts.items():
+                        if isinstance(delta.get(key), str):
+                            parts.append(delta[key])
+                    reasoning = _extract_reasoning_text(delta, self._reasoning_field)
                     if isinstance(reasoning, str) and reasoning:
                         reasoning_parts.append(reasoning)
                         # on_thinking 回调签名暂不改名（engine 接口，后续再统一）
@@ -377,12 +491,13 @@ class OpenAIProvider(BaseProvider):
                         error=f"Upstream error (finish_reason={_stream_finish_reason})",
                     )
 
-                # [refactor 2026-04-18] thinking= → reasoning=，新增 inline_data / provider_meta
-                import sys as _ds; _ds.stderr.write(f"[DIAG-PROVIDER] stream end: text={repr((text or '')[:120])} fr={_stream_finish_reason} err={_stream_error} tc={len(tool_calls)}\n"); _ds.stderr.flush()
+                provider_meta = self._build_provider_meta()
+                if reasoning_text is not None or any(native_reasoning_parts.values()):
+                    provider_meta.update({key: "".join(parts) if parts else None for key, parts in native_reasoning_parts.items()})
                 return ProviderResponse(
                     ok=True, text=text, tool_calls=tool_calls,
                     reasoning=reasoning_text, status_code=status, usage=stream_usage,
-                    inline_data=[], provider_meta={},
+                    inline_data=[], provider_meta=provider_meta,
                 )
 
         except Exception as e:
@@ -394,20 +509,12 @@ class OpenAIProvider(BaseProvider):
         self,
         *,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
     ) -> ProviderResponse:
         url = f"{self._base_url}/chat/completions"
 
-        # L3: 在发送前对消息做 Provider 层预处理（剥离内部字段 + Prefill Guard）
-        prepared = self._prepare_messages(messages)
-
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": prepared,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        payload = self.build_payload(messages, tools, tool_mode=tool_mode)
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -465,6 +572,11 @@ class OpenAIProvider(BaseProvider):
 
             content = msg.get("content")
             text = content if isinstance(content, str) else None
+            reasoning_text = _extract_reasoning_text(msg, self._reasoning_field)
+            native_reasoning = {
+                key: msg.get(key) if isinstance(msg.get(key), str) else None
+                for key in {"reasoning_content", self._reasoning_field} - {""}
+            }
 
             tool_calls: list[ToolCall] = []
             raw_tcs = msg.get("tool_calls")
@@ -527,8 +639,13 @@ class OpenAIProvider(BaseProvider):
                     error=f"Upstream error (finish_reason={_finish_reason})",
                 )
 
-            # [refactor 2026-04-18] 非流式也补齐 inline_data / provider_meta（OpenAI 目前不用）
-            return ProviderResponse(ok=True, text=text, tool_calls=tool_calls, status_code=status, usage=usage, inline_data=[], provider_meta={})
+            provider_meta = self._build_provider_meta()
+            if reasoning_text is not None or any(value is not None for value in native_reasoning.values()):
+                provider_meta.update(native_reasoning)
+            return ProviderResponse(
+                ok=True, text=text, tool_calls=tool_calls, reasoning=reasoning_text,
+                status_code=status, usage=usage, raw=data, inline_data=[], provider_meta=provider_meta,
+            )
 
         except Exception as e:
             return ProviderResponse(ok=False, error=f"failed to parse response: {e}", status_code=status, raw=data, inline_data=[], provider_meta={})

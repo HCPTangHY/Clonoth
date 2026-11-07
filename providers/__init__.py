@@ -17,12 +17,13 @@ class ProviderRegistry:
         # 原因：runner 需要通过配置字符串找到 provider；做法：集中到 registry；
         # 目的：新增 provider 时只需新增 providers/*.py，不再修改 engine if-elif 路由。
         self._registry: dict[str, type[BaseProvider]] = {}
+        self._registration_tokens: dict[str, object] = {}
 
     def register(self, name: str, cls: type[BaseProvider]) -> Callable[[], None]:
         """Register a provider class by its public provider name.
 
         Returns a disposer that removes only this exact registration; a later
-        same-name replacement is protected by the identity check.
+        same-name replacement is protected even when it reuses the same class.
         """
         provider_name = (name or "").strip().lower()
         if not provider_name:
@@ -33,17 +34,20 @@ class ProviderRegistry:
         # 原因：测试和热重载可能重新导入模块；做法：同名 key 覆盖为最新类；
         # 目的：保持注册操作幂等，避免重复发现导致启动失败。
         self._registry[provider_name] = cls
+        token = object()
+        self._registration_tokens[provider_name] = token
 
         def _dispose() -> None:
-            if self._registry.get(provider_name) is cls:
+            if self._registration_tokens.get(provider_name) is token:
                 self._registry.pop(provider_name, None)
+                self._registration_tokens.pop(provider_name, None)
 
         # Why: provider disposers join the shared per-plugin ledger like hooks
         # and tools. How: record when a ledger is attached and a loader
         # collecting block is active. Purpose: one unload undoes all surfaces.
         ledger = getattr(self, "_disposal_ledger", None)
         if ledger is not None:
-            ledger.record(_dispose)
+            ledger.record(_dispose, key=("provider", self, provider_name))
         return _dispose
 
     def set_disposal_ledger(self, ledger: Any) -> None:
@@ -74,7 +78,7 @@ def auto_discover() -> ProviderRegistry:
         # 目的：让新增 provider 文件可以自动进入注册表。
         module = importlib.import_module(f"{package_name}.{module_info.name}")
         for _, obj in inspect.getmembers(module, inspect.isclass):
-            if obj is BaseProvider or not issubclass(obj, BaseProvider):
+            if obj is BaseProvider or not issubclass(obj, BaseProvider) or inspect.isabstract(obj):
                 continue
             if obj.__module__ != module.__name__:
                 continue
@@ -94,7 +98,9 @@ auto_discover()
 # from providers. Discovery above does not depend on these imports; they only keep
 # the public package surface stable while routing moves to the registry.
 from .anthropic import AnthropicProvider  # noqa: E402
-from .gemini import GeminiProvider  # noqa: E402
+from .deepseek import DeepSeekProvider  # noqa: E402
+from .gemini_aistudio import GeminiAIStudioProvider  # noqa: E402
+from .gemini_vertex import GeminiVertexProvider  # noqa: E402
 from .openai import OpenAIProvider  # noqa: E402
 from .openai_responses import OpenAIResponsesProvider  # noqa: E402
 
@@ -106,7 +112,9 @@ __all__ = [
     "registry",
     "auto_discover",
     "OpenAIProvider",
+    "DeepSeekProvider",
     "AnthropicProvider",
-    "GeminiProvider",
+    "GeminiAIStudioProvider",
+    "GeminiVertexProvider",
     "OpenAIResponsesProvider",
 ]

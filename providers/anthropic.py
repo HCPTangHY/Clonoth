@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Any, Callable, Awaitable
 
 import httpx
@@ -139,13 +139,36 @@ def _convert_tools(tools: list[dict] | None) -> list[dict]:
     return result
 
 
-def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
+def _is_thinking_signature_error(error: str | None) -> bool:
+    """Match signature/block-order errors, not unrelated HTTP 400 responses."""
+    text = (error or "").lower()
+    return any(marker in text for marker in (
+        "invalid signature", "thinking.signature", "thinking block",
+        "redacted_thinking", "thinking or redacted_thinking",
+    ))
+
+
+def _without_thinking_blocks(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build one retry request without changing saved history or signed blocks."""
+    retry = deepcopy(payload)
+    for message in retry.get("messages", []):
+        if message.get("role") == "assistant":
+            message["content"] = [
+                block for block in message["content"]
+                if block.get("type") not in {"thinking", "redacted_thinking"}
+            ] or [{"type": "text", "text": "(empty)"}]
+    return retry
+
+
+def _convert_messages(
+    messages: list[dict], *, current_model: str = "",
+) -> tuple[str, list[dict]]:
     """Convert OpenAI-format messages to Anthropic format.
 
     Returns (system_text, converted_messages).
 
     Key transformations:
-    1. system messages -> extracted into a single system string
+    1. leading system/developer messages -> a single system string; later ones stay in history
     2. tool result messages (role=tool) -> grouped into user messages with tool_result blocks
     3. assistant messages with tool_calls -> content blocks with tool_use entries
     4. Consecutive same-role messages are merged (Anthropic requires strict alternation)
@@ -153,20 +176,24 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
     system_parts: list[str] = []
     converted: list[dict] = []
 
+    seen_non_system = False
     i = 0
     while i < len(messages):
         msg = messages[i]
         role = msg.get("role", "")
         content = msg.get("content")
 
-        if role == "system":
-            # Extract system messages into a single string
-            if content:
-                text = content if isinstance(content, str) else str(content)
-                system_parts.append(text)
-            i += 1
-            continue
+        if role in ("system", "developer"):
+            if not seen_non_system:
+                if content:
+                    text = content if isinstance(content, str) else str(content)
+                    system_parts.append(text)
+                i += 1
+                continue
+            # Do not move per-turn instructions ahead of already cached history.
+            role = "user"
 
+        seen_non_system = True
         if role == "tool":
             # Collect consecutive tool result messages into one user message
             # Anthropic represents tool results as user messages with tool_result content blocks
@@ -197,26 +224,26 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
             # 要求每个 assistant 消息的 thinking blocks 必须原样回传。
             _meta = msg.get("_meta")
             if isinstance(_meta, dict):
-                _anth_meta = _meta.get("metadata", {}).get("anthropic", {})
-                _saved_blocks = _anth_meta.get("thinking_blocks", [])
-                for tb in _saved_blocks:
-                    tb_type = tb.get("type", "")
-                    if tb_type == "thinking":
-                        blocks.append({
-                            "type": "thinking",
-                            "thinking": tb.get("thinking", ""),
-                            "signature": tb.get("signature", ""),
-                        })
-                    elif tb_type == "redacted_thinking":
-                        blocks.append({
-                            "type": "redacted_thinking",
-                            "data": tb.get("data", ""),
-                        })
+                namespaces = _meta.get("metadata")
+                saved = namespaces.get("anthropic") if isinstance(namespaces, dict) else None
+                saved = saved if isinstance(saved, dict) else {}
+                response_info = _meta.get("response_info")
+                response_info = response_info if isinstance(response_info, dict) else {}
+                saved_model = str(saved.get("model") or response_info.get("model") or "")
+                # Model changes invalidate replay eligibility, not the saved data.
+                model_matches = not (current_model and saved_model and saved_model != current_model)
+                saved_blocks = saved.get("thinking_blocks") if model_matches else None
+                if isinstance(saved_blocks, list):
+                    for block in saved_blocks:
+                        if isinstance(block, dict) and block.get("type") in {"thinking", "redacted_thinking"}:
+                            blocks.append(deepcopy(block))
 
             # Add text content if present
             if content:
+                # Assistant image blocks are not accepted by this API. Keep this
+                # restriction here rather than applying it to every provider.
                 text_blocks = _content_to_blocks(content)
-                blocks.extend(text_blocks)
+                blocks.extend(block for block in text_blocks if block.get("type") != "image")
             # Convert tool_calls to tool_use blocks
             tool_calls = msg.get("tool_calls") or []
             for tc in tool_calls:
@@ -253,11 +280,8 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
         converted.append({"role": "user", "content": blocks})
         i += 1
 
-    # Merge consecutive same-role messages (Anthropic requires strict user/assistant alternation)
-    # IMPORTANT: tool_result blocks and text blocks MUST NOT be mixed in the
-    # same user message — Anthropic rejects any user message containing both.
-    # When a user-role tool_result group is followed by a user-role text message
-    # (or vice versa), we insert a synthetic assistant separator instead of merging.
+    # Tool results may precede text in one user message. Preserve that order;
+    # never merge a later signed thinking block behind an earlier assistant text.
     merged: list[dict] = []
     for msg in converted:
         if merged and merged[-1]["role"] == msg["role"]:
@@ -265,18 +289,21 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
             curr_content = msg["content"]
             prev_blocks = prev_content if isinstance(prev_content, list) else _content_to_blocks(prev_content)
             curr_blocks = curr_content if isinstance(curr_content, list) else _content_to_blocks(curr_content)
+            if msg["role"] == "assistant" and any(
+                block.get("type") in {"thinking", "redacted_thinking"} for block in curr_blocks
+            ):
+                # Keep each signed turn intact instead of discarding its blocks
+                # or moving them in front of a different assistant response.
+                merged.append({"role": "user", "content": [{"type": "text", "text": "(continued)"}]})
+                merged.append(msg)
+                continue
             prev_has_tr = any(b.get("type") == "tool_result" for b in prev_blocks)
+            prev_has_text = any(b.get("type") != "tool_result" for b in prev_blocks)
             curr_has_tr = any(b.get("type") == "tool_result" for b in curr_blocks)
-            # Both have tool_result, or neither has — safe to merge
-            if prev_has_tr == curr_has_tr:
-                if isinstance(prev_content, list) and isinstance(curr_content, list):
-                    prev_content.extend(curr_content)
-                elif isinstance(prev_content, list):
-                    prev_content.extend(_content_to_blocks(curr_content))
-                else:
-                    merged[-1]["content"] = _content_to_blocks(prev_content) + _content_to_blocks(curr_content)
+            if not curr_has_tr or (prev_has_tr and not prev_has_text):
+                merged[-1]["content"] = prev_blocks + curr_blocks
             else:
-                # Mixing tool_result with text — insert assistant separator
+                # Prevent [text, tool_result] and [tool_result, text, tool_result].
                 merged.append({"role": "assistant", "content": [{"type": "text", "text": "(continued)"}]})
                 merged.append(msg)
         else:
@@ -316,16 +343,18 @@ def _parse_response_content(content_blocks: list[dict]) -> tuple[str, str, list[
     thinking_blocks: list[dict] = []
 
     for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
         btype = block.get("type", "")
         if btype == "thinking":
             thinking_text = block.get("thinking", "")
-            if thinking_text:
+            if isinstance(thinking_text, str) and thinking_text:
                 reasoning_parts.append(thinking_text)
-            # 保留整个 block（含 signature）用于 round-trip
-            thinking_blocks.append(block)
+            # Preserve all original fields independently of the display string.
+            thinking_blocks.append(deepcopy(block))
         elif btype == "redacted_thinking":
             # redacted_thinking 是不透明的加密块，必须原样回传
-            thinking_blocks.append(block)
+            thinking_blocks.append(deepcopy(block))
         elif btype == "text":
             t = block.get("text", "")
             if t:
@@ -350,20 +379,22 @@ def _parse_usage(data: dict) -> dict:
     cache_creation_input_tokens（缓存写入）归一化为
     cached_prompt_tokens 和 cache_write_prompt_tokens。
     """
-    usage = data.get("usage", {})
-    inp = usage.get("input_tokens", 0)
-    out = usage.get("output_tokens", 0)
-    result = {
-        "prompt_tokens": inp,
-        "completion_tokens": out,
-        "total_tokens": inp + out,
+    usage = data.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    counts = {
+        key: value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+        for key, value in ((key, usage.get(key)) for key in (
+            "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+        ))
     }
-    cache_read = usage.get("cache_read_input_tokens")
-    if isinstance(cache_read, int) and cache_read > 0:
-        result["cached_prompt_tokens"] = cache_read
-    cache_write = usage.get("cache_creation_input_tokens")
-    if isinstance(cache_write, int) and cache_write > 0:
-        result["cache_write_prompt_tokens"] = cache_write
+    # input_tokens excludes tokens read from or written to the prompt cache.
+    inp = counts["input_tokens"] + counts["cache_read_input_tokens"] + counts["cache_creation_input_tokens"]
+    out = counts["output_tokens"]
+    result = {"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out}
+    if counts["cache_read_input_tokens"]:
+        result["cached_prompt_tokens"] = counts["cache_read_input_tokens"]
+    if counts["cache_creation_input_tokens"]:
+        result["cache_write_prompt_tokens"] = counts["cache_creation_input_tokens"]
     return result
 
 
@@ -384,6 +415,9 @@ class AnthropicProvider(BaseProvider):
     # 原因：engine 不再硬编码 AnthropicProvider 分支；做法：类声明 provider_name；
     # 目的：registry 能把配置里的 "anthropic" 映射回这个类。
     provider_name = "anthropic"
+    default_max_tokens: int = 64000
+    default_reasoning_effort: str | None = None
+    default_thought_summary: bool = True
 
     def __init__(
         self,
@@ -402,7 +436,7 @@ class AnthropicProvider(BaseProvider):
         self._api_key = api_key
         # Default to official Anthropic API; strip trailing slash
         self._base_url = (base_url or "https://api.anthropic.com").rstrip("/")
-        self._options = provider_options or {}
+        self._options = deepcopy(provider_options) if isinstance(provider_options, dict) else {}
 
     # -- Auth headers --
 
@@ -425,6 +459,23 @@ class AnthropicProvider(BaseProvider):
     def _endpoint(self) -> str:
         return f"{self._base_url}/v1/messages"
 
+    def prepare_history(
+        self, messages: list[dict[str, Any]], *, tool_mode: str = "native",
+    ) -> list[dict[str, Any]]:
+        from .tool_format import build_llm_messages, create_tool_formatter
+
+        formatter = create_tool_formatter(tool_mode)
+        return build_llm_messages(
+            messages, formatter, preserve_metadata=(formatter.mode == "native"),
+        )
+
+    def build_payload(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+        *, tool_mode: str = "native", stream: bool = False,
+    ) -> dict[str, Any]:
+        prepared = self.prepare_history(messages, tool_mode=tool_mode)
+        return self._build_payload(prepared, tools=tools, stream=stream)
+
     # -- Build request payload --
 
     def _build_payload(
@@ -432,18 +483,28 @@ class AnthropicProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict] | None = None,
         temperature: float | None = None,
-        max_tokens: int = 64000,
+        max_tokens: int | None = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> dict:
         """Build the Anthropic API request payload from OpenAI-format inputs."""
-        system_text, converted = _convert_messages(messages)
+        system_text, converted = _convert_messages(messages, current_model=self.model)
         converted_tools = _convert_tools(tools)
+        token_limit = self._options.get("max_tokens")
+        if token_limit is None:
+            token_limit = self._options.get("max_completion_tokens")
+        default_limit = max_tokens if max_tokens is not None else self.default_max_tokens
+        try:
+            token_limit = int(token_limit)
+            if token_limit <= 0:
+                token_limit = default_limit
+        except (TypeError, ValueError, OverflowError):
+            token_limit = default_limit
 
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": converted,
-            "max_tokens": max_tokens,
+            "max_tokens": token_limit,
         }
         if system_text:
             payload["system"] = system_text
@@ -453,11 +514,54 @@ class AnthropicProvider(BaseProvider):
             payload["temperature"] = temperature
         if stream:
             payload["stream"] = True
-        # 注入 thinking 参数（如 {"type": "adaptive"} 或 {"type": "enabled", "budget_tokens": N}）
-        _thinking = self._options.get("thinking")
-        if _thinking and isinstance(_thinking, dict):
-            payload["thinking"] = _thinking
-        self._last_payload = payload
+        raw_thinking = self._options.get("thinking")
+        thinking = deepcopy(raw_thinking) if isinstance(raw_thinking, dict) else {}
+        output_config = self._options.get("output_config")
+        if isinstance(output_config, dict):
+            payload["output_config"] = deepcopy(output_config)
+        effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
+        effort = str(effort).strip().lower() if effort is not None else ""
+        if effort == "none":
+            thinking = {"type": "disabled"}
+            if "output_config" in payload:
+                payload["output_config"].pop("effort", None)
+        elif effort:
+            thinking.setdefault("type", "adaptive")
+            payload.setdefault("output_config", {})["effort"] = effort
+
+        show_summary = self._options.get("thought_summary", self.default_thought_summary)
+        if isinstance(show_summary, str):
+            show_summary = show_summary.strip().lower() not in ("false", "0", "no", "off", "none", "omitted")
+        if thinking.get("type") == "disabled":
+            thinking.pop("display", None)
+        else:
+            thinking.setdefault("type", "adaptive")
+            if thinking["type"] in {"adaptive", "enabled"}:
+                thinking["display"] = "summarized" if show_summary else "omitted"
+                payload.pop("temperature", None)
+        # Explicit enabled-mode budgets remain necessary for older models;
+        # adaptive thinking, unlike enabled thinking, does not accept a budget.
+        if thinking.get("type") == "adaptive":
+            thinking.pop("budget_tokens", None)
+        payload["thinking"] = thinking
+
+        cache_option = self._options.get("cache_control", {"type": "ephemeral", "ttl": "1h"})
+        cache_control = None
+        if isinstance(cache_option, dict) and cache_option:
+            cache_control = deepcopy(cache_option)
+        elif isinstance(cache_option, str) and cache_option.strip():
+            cache_control = {"type": "ephemeral"}
+            if cache_option.strip() in ("1h", "5m"):
+                cache_control["ttl"] = cache_option.strip()
+        if cache_control is not None:
+            payload["cache_control"] = cache_control
+            if system_text:
+                # The fixed prefix needs its own breakpoint, with the same TTL
+                # as automatic caching. Keep both request objects independent.
+                payload["system"] = [{
+                    "type": "text", "text": system_text,
+                    "cache_control": deepcopy(cache_control),
+                }]
         return payload
 
     # ===================================================================
@@ -468,29 +572,40 @@ class AnthropicProvider(BaseProvider):
         self,
         *,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
     ) -> ProviderResponse:
         """Non-streaming request to Anthropic Messages API."""
-        payload = self._build_payload(messages, tools=tools, stream=False)
+        payload = self.build_payload(messages, tools, tool_mode=tool_mode)
+
+        for attempt in range(2):
+            try:
+                resp = await self._http.post(
+                    self._endpoint,
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=300.0,
+                )
+            except Exception as exc:
+                log.error("Anthropic request failed: %s", exc)
+                return ProviderResponse(ok=False, error=str(exc), status_code=0)
+            if resp.status_code == 200:
+                break
+            error = self._error_response(resp, payload=payload)
+            if attempt or error.status_code != 400 or not _is_thinking_signature_error(error.error):
+                return error
+            log.warning("Anthropic signature error; retrying once without thinking blocks")
+            payload = _without_thinking_blocks(payload)
 
         try:
-            resp = await self._http.post(
-                self._endpoint,
-                headers=self._headers(),
-                json=payload,
-                timeout=300.0,
-            )
-        except Exception as exc:
-            log.error("Anthropic request failed: %s", exc)
-            return ProviderResponse(ok=False, error=str(exc), status_code=0)
-
-        if resp.status_code != 200:
-            return self._error_response(resp)
-
-        data = resp.json()
-        content_blocks = data.get("content", [])
-        text, reasoning, tool_calls, thinking_blocks = _parse_response_content(content_blocks)
-        usage = _parse_usage(data)
+            data = resp.json()
+            content_blocks = data.get("content", [])
+            if not isinstance(content_blocks, list) or not all(isinstance(block, dict) for block in content_blocks):
+                raise ValueError("content must be an array of content blocks")
+            text, reasoning, tool_calls, thinking_blocks = _parse_response_content(content_blocks)
+            usage = _parse_usage(data)
+        except (ValueError, TypeError, AttributeError) as exc:
+            return ProviderResponse(ok=False, error=f"Invalid Anthropic response: {exc}", status_code=resp.status_code)
 
         # [2026-05-01] 将含 signature 的原始 thinking blocks 存入 provider_meta，
         # engine 会自动持久化到消息 _meta.metadata.anthropic，
@@ -498,6 +613,7 @@ class AnthropicProvider(BaseProvider):
         provider_meta: dict[str, Any] = {}
         if thinking_blocks:
             provider_meta["thinking_blocks"] = thinking_blocks
+            provider_meta["model"] = self.model
 
         return ProviderResponse(
             ok=True,
@@ -518,6 +634,7 @@ class AnthropicProvider(BaseProvider):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
         on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -532,8 +649,24 @@ class AnthropicProvider(BaseProvider):
         - message_delta: stop_reason and final usage
         - message_stop: end of message
         """
-        payload = self._build_payload(messages, tools=tools, stream=True)
+        payload = self.build_payload(messages, tools, tool_mode=tool_mode, stream=True)
+        for attempt in range(2):
+            result = await self._chat_stream_once(
+                payload, on_text=on_text, on_thinking=on_thinking, on_tool_delta=on_tool_delta,
+            )
+            if result.ok or attempt or result.status_code != 400 or not _is_thinking_signature_error(result.error):
+                return result
+            log.warning("Anthropic stream signature error; retrying once without thinking blocks")
+            payload = _without_thinking_blocks(payload)
+        raise AssertionError("unreachable signature retry state")
 
+    async def _chat_stream_once(
+        self, payload: dict[str, Any], *,
+        on_text: Callable[[str], Awaitable[None]] | None,
+        on_thinking: Callable[[str], Awaitable[None]] | None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> ProviderResponse:
+        """Read one HTTP stream; all buffers and retry state are request-local."""
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         # Track active tool_use blocks by index
@@ -547,6 +680,7 @@ class AnthropicProvider(BaseProvider):
         # thinking_blocks: 已完成的原始 thinking blocks（含 signature）
         active_thinking: dict[int, dict] = {}
         thinking_blocks: list[dict] = []
+        completed = False
 
         try:
             async with self._http.stream(
@@ -559,7 +693,7 @@ class AnthropicProvider(BaseProvider):
                 if resp.status_code != 200:
                     # Read error body
                     body = await resp.aread()
-                    return self._error_from_body(resp.status_code, body)
+                    return self._error_from_body(resp.status_code, body, payload=payload)
 
                 # Parse SSE lines
                 # Anthropic sends: "event: <type>\ndata: <json>\n\n"
@@ -576,6 +710,7 @@ class AnthropicProvider(BaseProvider):
 
                     raw_data = line[6:]
                     if raw_data == "[DONE]":
+                        completed = True
                         break
 
                     try:
@@ -617,11 +752,20 @@ class AnthropicProvider(BaseProvider):
                         elif block.get("type") == "thinking":
                             # [2026-05-01] 开始追踪 thinking block，
                             # 累积文本，最终在 content_block_stop 时组装含 signature 的完整 block
-                            active_thinking[idx] = {"type": "thinking", "thinking_parts": []}
+                            initial_text = block.get("thinking", "")
+                            initial_text = initial_text if isinstance(initial_text, str) else ""
+                            active_thinking[idx] = {
+                                "block": deepcopy(block), "thinking_parts": [initial_text],
+                                "signature_parts": [block["signature"]] if isinstance(block.get("signature"), str) else [],
+                            }
+                            if initial_text:
+                                reasoning_parts.append(initial_text)
+                                if on_thinking:
+                                    await on_thinking(initial_text)
                         elif block.get("type") == "redacted_thinking":
                             # [2026-05-01] redacted_thinking 是不透明加密块，
                             # content_block_start 时就包含完整 data，直接收集
-                            thinking_blocks.append({"type": "redacted_thinking", "data": block.get("data", "")})
+                            thinking_blocks.append(deepcopy(block))
 
                     elif evt == "content_block_delta":
                         delta = data.get("delta", {})
@@ -651,8 +795,8 @@ class AnthropicProvider(BaseProvider):
                             # 出现在该 block 最后一个 thinking_delta 之后、
                             # content_block_stop 之前
                             sig = delta.get("signature", "")
-                            if sig and idx in active_thinking:
-                                active_thinking[idx]["signature"] = sig
+                            if isinstance(sig, str) and sig and idx in active_thinking:
+                                active_thinking[idx]["signature_parts"].append(sig)
 
                         elif dtype == "input_json_delta":
                             # Accumulate tool arguments JSON string
@@ -675,11 +819,11 @@ class AnthropicProvider(BaseProvider):
                         # [2026-05-01] 完成 thinking block：组装含 signature 的完整 block
                         if idx in active_thinking:
                             info = active_thinking.pop(idx)
-                            full_thinking = "".join(info.get("thinking_parts", []))
-                            tb: dict[str, Any] = {"type": "thinking", "thinking": full_thinking}
-                            if "signature" in info:
-                                tb["signature"] = info["signature"]
-                            thinking_blocks.append(tb)
+                            block = info["block"]
+                            block["thinking"] = "".join(info["thinking_parts"])
+                            if info["signature_parts"]:
+                                block["signature"] = "".join(info["signature_parts"])
+                            thinking_blocks.append(block)
                         elif idx in active_tools:
                             # [tool-stream 2026-05-19] content_block_stop 是 Anthropic 的明确结束信号。
                             # 原因：工具参数流结束后，前端需要知道该 index 不再追加 delta。
@@ -707,6 +851,10 @@ class AnthropicProvider(BaseProvider):
                         if du:
                             usage = du
 
+                    elif evt == "message_stop":
+                        completed = True
+                        break
+
                     elif evt == "error":
                         err = data.get("error", {})
                         err_msg = err.get("message", str(data))
@@ -719,14 +867,19 @@ class AnthropicProvider(BaseProvider):
             log.error("Anthropic stream failed: %s", exc)
             return ProviderResponse(ok=False, error=str(exc), status_code=0)
 
+        if not completed or active_thinking or active_tools:
+            return ProviderResponse(
+                ok=False, error="Anthropic stream ended before completing all content blocks",
+                status_code=resp.status_code, text="".join(text_parts) or None,
+                reasoning="".join(reasoning_parts) or None,
+            )
+
         # Build final usage combining message_start and message_delta
-        inp_tokens = input_usage.get("input_tokens", 0)
-        out_tokens = usage.get("output_tokens", 0)
-        final_usage = {
-            "prompt_tokens": inp_tokens,
-            "completion_tokens": out_tokens,
-            "total_tokens": inp_tokens + out_tokens,
-        }
+        merged_usage = dict(input_usage)
+        for key, value in usage.items():
+            if value or key not in merged_usage:
+                merged_usage[key] = value
+        final_usage = _parse_usage({"usage": merged_usage})
 
         text = "".join(text_parts)
         reasoning = "".join(reasoning_parts)
@@ -735,6 +888,7 @@ class AnthropicProvider(BaseProvider):
         provider_meta: dict[str, Any] = {}
         if thinking_blocks:
             provider_meta["thinking_blocks"] = thinking_blocks
+            provider_meta["model"] = self.model
 
         return ProviderResponse(
             ok=True,
@@ -747,7 +901,7 @@ class AnthropicProvider(BaseProvider):
 
     # -- Error handling helpers --
 
-    def _error_response(self, resp: httpx.Response) -> ProviderResponse:
+    def _error_response(self, resp: httpx.Response, *, payload: dict | None = None) -> ProviderResponse:
         """Parse a non-200 response into a ProviderResponse."""
         try:
             body = resp.json()
@@ -758,10 +912,10 @@ class AnthropicProvider(BaseProvider):
         except Exception:
             msg = resp.text[:500]
         log.error("Anthropic API error %d: %s", resp.status_code, msg)
-        self._dump_error_payload(resp.status_code, msg)
+        self._dump_error_payload(resp.status_code, msg, payload)
         return ProviderResponse(ok=False, error=msg, status_code=resp.status_code)
 
-    def _error_from_body(self, status_code: int, body: bytes) -> ProviderResponse:
+    def _error_from_body(self, status_code: int, body: bytes, *, payload: dict | None = None) -> ProviderResponse:
         """Parse an error from raw response body bytes."""
         try:
             data = json.loads(body)
@@ -772,12 +926,11 @@ class AnthropicProvider(BaseProvider):
         except Exception:
             msg = body.decode("utf-8", errors="replace")[:500]
         log.error("Anthropic API error %d: %s", status_code, msg)
-        self._dump_error_payload(status_code, msg)
+        self._dump_error_payload(status_code, msg, payload)
         return ProviderResponse(ok=False, error=msg, status_code=status_code)
 
-    def _dump_error_payload(self, status_code: int, error_msg: str) -> None:
-        """Dump the last request payload on error for forensic analysis."""
-        payload = getattr(self, '_last_payload', None)
+    def _dump_error_payload(self, status_code: int, error_msg: str, payload: dict | None = None) -> None:
+        """Dump this request's payload, not a concurrent request's instance state."""
         if not payload:
             return
         try:
@@ -785,7 +938,7 @@ class AnthropicProvider(BaseProvider):
             from datetime import datetime, timezone
             snap_dir = Path('data/llm_error_snapshots')
             snap_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+            ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
             filename = f'{ts}_anthropic_actual_payload.json'
             snap = {
                 'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -805,5 +958,3 @@ class AnthropicProvider(BaseProvider):
             log.info('dumped error payload: %s (%d messages)', filename, snap['message_count'])
         except Exception as exc:
             log.warning('failed to dump error payload: %s', exc)
-        finally:
-            self._last_payload = None

@@ -1,5 +1,5 @@
 """
-Google Gemini native API provider.
+Shared Gemini native API implementation for explicit backend providers.
 
 Implements the BaseProvider interface for Gemini's generateContent /
 streamGenerateContent endpoints. Converts OpenAI-format messages and tools
@@ -12,6 +12,7 @@ Reason: Complete the provider trio (Anthropic, OpenAI, Gemini) so the engine
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
 from typing import Any, Awaitable, Callable
@@ -24,12 +25,14 @@ log = logging.getLogger(__name__)
 
 
 class GeminiProvider(BaseProvider):
-    """Provider for Google Gemini (generativelanguage.googleapis.com)."""
+    """Shared transport; select GeminiVertexProvider or GeminiAIStudioProvider."""
 
-    # [provider-registry 2026-05-03] 这是自动发现注册使用的 key。
-    # 原因：engine 不再硬编码 GeminiProvider 分支；做法：类声明 provider_name；
-    # 目的：registry 能把配置里的 "gemini" 映射回这个类。
-    provider_name = "gemini"
+    # An empty registry key keeps this implementation out of channel selection.
+    provider_name = ""
+    default_base_url = ""
+    is_vertex = False
+    default_max_tokens = 65535
+    default_thought_summary = True
 
     def __init__(
         self,
@@ -43,10 +46,15 @@ class GeminiProvider(BaseProvider):
         # [provider-registry 2026-05-03] 实例 name 复用 provider_name。
         # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
         # 目的：注册 key、实例名和配置 provider 字段保持一致。
+        if not self.provider_name:
+            raise TypeError("Select gemini-vertex or gemini-aistudio; GeminiProvider is a shared implementation")
+        resolved_base_url = (base_url or "").strip() or self.default_base_url
+        if not resolved_base_url:
+            raise ValueError(f"{self.provider_name} requires an explicit base_url")
         super().__init__(model=model, name=self.provider_name)
         self._http = http
         self._api_key = api_key
-        self._base_url = (base_url or "https://generativelanguage.googleapis.com").rstrip("/")
+        self._base_url = resolved_base_url.rstrip("/")
         self._options = provider_options or {}
 
     # ── URL helpers ──────────────────────────────────────────────────
@@ -71,16 +79,19 @@ class GeminiProvider(BaseProvider):
 
     # ── Message conversion ───────────────────────────────────────────
 
-    @staticmethod
+    @classmethod
     def _convert_messages(
+        cls,
         messages: list[dict[str, Any]],
+        *,
+        strip_thoughts: bool = False,
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert OpenAI-format messages → Gemini contents + system instruction.
 
         Returns (system_text_or_None, gemini_contents_list).
 
         Conversion rules:
-        - role=system  → extracted and merged into a single systemInstruction
+        - leading system/developer → systemInstruction; later ones stay as user contents
         - role=user    → role="user", text/image parts
         - role=assistant → role="model", text + optional functionCall parts
         - role=tool     → role="function", functionResponse parts
@@ -93,16 +104,20 @@ class GeminiProvider(BaseProvider):
         # when processing role=tool messages (which only carry tool_call_id).
         tc_id_to_name: dict[str, str] = {}
 
+        seen_non_system = False
         for msg in messages:
             role = msg.get("role", "")
 
-            # ── system ──
-            if role == "system":
-                txt = _extract_text(msg)
-                if txt:
-                    system_parts.append(txt)
-                continue
+            # Keep only the leading static instructions in the cache prefix.
+            if role in ("system", "developer"):
+                if not seen_non_system:
+                    txt = _extract_text(msg)
+                    if txt:
+                        system_parts.append(txt)
+                    continue
+                role = "user"
 
+            seen_non_system = True
             # ── user ──
             if role == "user":
                 contents.append({"role": "user", "parts": _user_parts(msg)})
@@ -116,21 +131,33 @@ class GeminiProvider(BaseProvider):
                 # 优先使用 provider_meta 中保存的原始 parts。
                 _meta = msg.get("_meta")
                 _raw_parts = None
+                _gem_meta: dict[str, Any] = {}
                 if isinstance(_meta, dict):
-                    _gem_meta = _meta.get("metadata", {}).get("gemini", {})
-                    _raw_parts = _gem_meta.get("raw_parts")
+                    metadata = _meta.get("metadata")
+                    if isinstance(metadata, dict):
+                        # Replay only this explicit backend's parts, never the retired
+                        # "gemini" namespace or another backend's thought signatures.
+                        saved = metadata.get(cls.provider_name)
+                        if isinstance(saved, dict):
+                            _gem_meta = saved
+                            _raw_parts = saved.get("raw_parts")
 
                 if _raw_parts and isinstance(_raw_parts, list):
-                    # 有原始 parts：直接用，保留所有 thoughtSignature
-                    # 同时从 functionCall parts 中提取 tc_id_to_name 映射
-                    # 使用独立计数器避免多轮 ID 冲突
-                    _fc_idx = 0
-                    for rp in _raw_parts:
-                        fc = rp.get("functionCall")
-                        if fc:
-                            _fc_idx += 1
-                            tc_id_to_name[f"call_{_fc_idx}"] = fc.get("name", "")
-                    contents.append({"role": "model", "parts": _raw_parts})
+                    # Complete responses remain exact. Only known stream frame
+                    # boundaries permit coalescing in this request-local copy.
+                    parts = _coalesce_stream_parts(_raw_parts, _gem_meta.get("stream_part_counts"))
+                    if strip_thoughts:
+                        parts = _strip_thought_signatures(parts)
+                    for index, part in enumerate(p for p in parts if "functionCall" in p):
+                        tc_id_to_name[f"call_{index + 1}"] = part["functionCall"].get("name", "")
+                    for tc in msg.get("tool_calls") or []:
+                        fn = tc.get("function") or {}
+                        if tc.get("id"):
+                            tc_id_to_name[tc["id"]] = fn.get("name") or tc.get("name", "")
+                    if parts:
+                        contents.append({"role": "model", "parts": parts})
+                    elif _extract_text(msg):
+                        contents.append({"role": "model", "parts": [{"text": _extract_text(msg)}]})
                 else:
                     # 无原始 parts（旧消息或非 Gemini provider 产生的历史）：从 OpenAI 格式重建
                     parts: list[dict[str, Any]] = []
@@ -153,6 +180,9 @@ class GeminiProvider(BaseProvider):
                                 raw_args = {}
                         parts.append({"functionCall": {"name": name, "args": raw_args}})
                     if parts:
+                        # Synthesized calls have no original signatures. The
+                        # documented compatibility marker is not a borrowed signature.
+                        _ensure_fc_thought_signature(parts)
                         contents.append({"role": "model", "parts": parts})
                 continue
 
@@ -225,23 +255,189 @@ class GeminiProvider(BaseProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
+        *,
+        strip_thoughts: bool = False,
+        strip_system_role: bool = False,
     ) -> dict[str, Any]:
-        system_text, contents = self._convert_messages(messages)
+        system_text, contents = self._convert_messages(messages, strip_thoughts=strip_thoughts)
+        # Request-only channel compatibility tails, not recorded execution results.
+        # This matches the selected upstream policy, not a general Google API guarantee.
+        if not contents:
+            contents = [{"role": "user", "parts": [{"thought": True, "text": " "}]}]
+        elif contents[-1].get("role") == "model":
+            contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
+        elif self.is_vertex and not strip_system_role:
+            contents.append({"role": "system", "parts": [{"text": " "}]})
+        elif not self.is_vertex:
+            contents.append({
+                "role": "model",
+                "parts": [{"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": " "}}],
+            })
+            contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
         body: dict[str, Any] = {"contents": contents}
         if system_text:
             body["systemInstruction"] = {"parts": [{"text": system_text}]}
         gem_tools = self._convert_tools(tools)
         if gem_tools:
             body["tools"] = gem_tools
-        # generationConfig: let model defaults govern most settings;
-        # only set maxOutputTokens as a reasonable ceiling.
-        gen_config: dict[str, Any] = {"maxOutputTokens": 65536}
-        # 注入 thinkingConfig（如 {"thinkingBudget": 8192, "includeThoughts": true}）
-        _thinking = self._options.get("thinking_config")
-        if _thinking and isinstance(_thinking, dict):
-            gen_config["thinkingConfig"] = _thinking
+
+        custom_safety = self._options.get("safety_settings")
+        if isinstance(custom_safety, list):
+            body["safetySettings"] = deepcopy(custom_safety)
+        else:
+            model_lower = self.model.lower()
+            threshold = "OFF" if any(name in model_lower for name in ("gemini-2", "gemini-3", "gemini-4", "image")) else "BLOCK_NONE"
+            categories = [
+                "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "HARM_CATEGORY_CIVIC_INTEGRITY", "HARM_CATEGORY_JAILBREAK",
+            ]
+            if self.is_vertex:
+                categories.extend([
+                    "HARM_CATEGORY_IMAGE_HATE", "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT",
+                    "HARM_CATEGORY_IMAGE_HARASSMENT", "HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT",
+                ])
+            body["safetySettings"] = [{"category": category, "threshold": threshold} for category in categories]
+
+        raw_max_tokens = self._options.get("max_tokens")
+        if raw_max_tokens is None:
+            raw_max_tokens = self._options.get("max_output_tokens")
+        try:
+            max_tokens = int(raw_max_tokens) if raw_max_tokens is not None else self.default_max_tokens
+        except (TypeError, ValueError, OverflowError):
+            max_tokens = self.default_max_tokens
+        gen_config: dict[str, Any] = {"maxOutputTokens": max_tokens if max_tokens > 0 else self.default_max_tokens}
+        for option, field in (("temperature", "temperature"), ("top_p", "topP"), ("top_k", "topK")):
+            if self._options.get(option) is not None:
+                gen_config[field] = self._options[option]
+
+        # Preserve production precedence: effort/summary aliases override the
+        # low-level thinking config; budget-based thinking is no longer emitted.
+        raw_thinking = self._options.get("thinking_config")
+        thinking = deepcopy(raw_thinking) if isinstance(raw_thinking, dict) else {}
+        thinking.pop("thinkingBudget", None)
+        effort = self._options.get("reasoning_effort")
+        if effort is not None or "thinkingLevel" in thinking:
+            level = str(effort if effort is not None else thinking.get("thinkingLevel") or "").strip().upper()
+            if level and level != "NONE":
+                thinking["thinkingLevel"] = level
+            else:
+                thinking.pop("thinkingLevel", None)
+        summary = self._options.get("thought_summary", self.default_thought_summary)
+        enabled = summary.strip().lower() not in ("false", "0", "no", "off", "none") if isinstance(summary, str) else bool(summary)
+        if enabled:
+            thinking["includeThoughts"] = True
+        elif "thought_summary" in self._options:
+            thinking.pop("includeThoughts", None)
+        if thinking:
+            gen_config["thinkingConfig"] = thinking
         body["generationConfig"] = gen_config
         return body
+
+    def prepare_history(
+        self, messages: list[dict[str, Any]], *, tool_mode: str = "native",
+    ) -> list[dict[str, Any]]:
+        from .tool_format import (
+            FakeNativeToolFormatter, _assistant_tool_calls,
+            build_llm_messages, create_tool_formatter, prepare_raw_history,
+        )
+
+        formatter = create_tool_formatter(tool_mode)
+        if formatter.mode == "json":
+            return build_llm_messages(messages, formatter)
+
+        history = prepare_raw_history(messages)
+        text_formatter = FakeNativeToolFormatter()
+        text_result_ids: set[str] = set()
+        for index, message in enumerate(history):
+            if message.get("role") == "tool":
+                if message.get("tool_call_id") in text_result_ids:
+                    history[index] = text_formatter.message_to_llm(message)
+                continue
+            text_result_ids.clear()
+            if message.get("role") != "assistant":
+                continue
+            meta = message.get("_meta")
+            metadata = meta.get("metadata") if isinstance(meta, dict) else None
+            saved = metadata.get(self.provider_name) if isinstance(metadata, dict) else None
+            parts = saved.get("raw_parts") if isinstance(saved, dict) else None
+            if not isinstance(parts, list) or not parts:
+                continue
+
+            calls = _assistant_tool_calls(message)
+            raw_calls = [part["functionCall"] for part in parts if isinstance(part, dict) and "functionCall" in part]
+            valid_parts = all(isinstance(part, dict) for part in parts)
+            valid_calls = all(isinstance(call, dict) for call in raw_calls)
+            same_call_ids = meta.get("tool_call_ids", []) == [call["id"] for call in calls]
+            # JSON comparison distinguishes booleans from numbers, unlike Python equality.
+            if valid_parts and valid_calls and same_call_ids and json.dumps([
+                (call.get("name", ""), call.get("args") or {}) for call in raw_calls
+            ], sort_keys=True) == json.dumps([
+                (call["name"], call["arguments"]) for call in calls
+            ], sort_keys=True):
+                continue
+
+            # ponytail: incomplete signed turns are retained as text; native replay
+            # requires complete matching calls. Never move or invent a signature:
+            # parallel calls may share a signature attached only to the first part.
+            text_result_ids.update(call["id"] for call in calls)
+            history[index] = text_formatter.message_to_llm({
+                "role": "assistant", "content": _extract_text(message), "tool_calls": calls,
+            })
+        return history
+
+    def build_payload(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+        *, tool_mode: str = "native", stream: bool = False,
+        strip_thoughts: bool = False, strip_system_role: bool = False,
+    ) -> dict[str, Any]:
+        return self._build_body(
+            self.prepare_history(messages, tool_mode=tool_mode), tools,
+            strip_thoughts=strip_thoughts, strip_system_role=strip_system_role,
+        )
+
+    async def _request(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        *, tool_mode: str, stream: bool,
+    ) -> httpx.Response | ProviderResponse:
+        """Send one request and at most one request-local compatibility retry."""
+        strip_thoughts = False
+        strip_system_role = False
+        for attempt in range(2):
+            body = self.build_payload(
+                messages, tools, tool_mode=tool_mode, stream=stream,
+                strip_thoughts=strip_thoughts, strip_system_role=strip_system_role,
+            )
+            try:
+                if stream:
+                    request = self._http.build_request(
+                        "POST", self._endpoint(stream=True), headers=self._headers(), json=body, timeout=300,
+                    )
+                    response = await self._http.send(request, stream=True)
+                else:
+                    response = await self._http.post(
+                        self._endpoint(), headers=self._headers(), json=body, timeout=300,
+                    )
+            except Exception as exc:
+                return ProviderResponse(ok=False, error=f"Gemini request failed: {exc}")
+            if response.status_code == 200:
+                return response
+            if stream:
+                error = ProviderResponse(
+                    ok=False, error=await _read_stream_error(response), status_code=response.status_code,
+                )
+            else:
+                error = _error_from_response(response)
+                await response.aclose()
+            strip_thoughts = _is_thought_signature_error(error.error)
+            strip_system_role = self.is_vertex and _is_system_role_error(error.error)
+            if attempt or response.status_code != 400 or not (strip_thoughts or strip_system_role):
+                return error
+            log.warning(
+                "Gemini 400 (%s); retrying once with strip_thoughts=%s, strip_system_role=%s",
+                error.error, strip_thoughts, strip_system_role,
+            )
+        raise AssertionError("bounded Gemini request loop exhausted")
 
     # ── Non-streaming chat ───────────────────────────────────────────
 
@@ -250,29 +446,27 @@ class GeminiProvider(BaseProvider):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
     ) -> ProviderResponse:
-        body = self._build_body(messages, tools)
+        response = await self._request(messages, tools, tool_mode=tool_mode, stream=False)
+        if isinstance(response, ProviderResponse):
+            return response
         try:
-            resp = await self._http.post(
-                self._endpoint(stream=False),
-                headers=self._headers(),
-                json=body,
-                timeout=300,
-            )
-        except Exception as exc:
-            return ProviderResponse(ok=False, error=f"Gemini request failed: {exc}")
+            result = _parse_response(response.json())
+            if result.ok:
+                result.usage = self._usage((result.raw or {}).get("usageMetadata") or {})
+            return result
+        except (ValueError, TypeError, AttributeError) as exc:
+            return ProviderResponse(ok=False, error=f"Gemini returned an invalid response: {exc}", status_code=response.status_code)
+        finally:
+            await response.aclose()
 
-        if resp.status_code != 200:
-            return _error_from_response(resp)
-
-        try:
-            data = resp.json()
-        except Exception:
-            return ProviderResponse(
-                ok=False, error="Gemini returned non-JSON response", status_code=resp.status_code,
-            )
-
-        return _parse_response(data)
+    def _usage(self, metadata: dict[str, Any]) -> dict[str, int]:
+        # ponytail: the duplicate prompt-counter workaround is specific to the
+        # observed Vertex argon gateway; other models retain additive accounting.
+        return _parse_usage(
+            metadata, deduplicate_tool_prompt=self.is_vertex and "gemini-4-argon" in self.model.lower(),
+        )
 
     # ── Streaming chat ───────────────────────────────────────────────
 
@@ -281,208 +475,196 @@ class GeminiProvider(BaseProvider):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
         on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> ProviderResponse:
-        body = self._build_body(messages, tools)
-        try:
-            req = self._http.build_request(
-                "POST",
-                self._endpoint(stream=True),
-                headers=self._headers(),
-                json=body,
-                timeout=300,
-            )
-            resp = await self._http.send(req, stream=True)
-        except Exception as exc:
-            return ProviderResponse(ok=False, error=f"Gemini stream request failed: {exc}")
+        response = await self._request(messages, tools, tool_mode=tool_mode, stream=True)
+        if isinstance(response, ProviderResponse):
+            return response
 
-        if resp.status_code != 200:
-            # Need to read the body for error details
-            try:
-                raw_body = await resp.aread()
-                error_text = raw_body.decode("utf-8", errors="replace")
-                try:
-                    err_data = json.loads(error_text)
-                    err_info = err_data.get("error", {})
-                    msg = err_info.get("message", error_text[:500])
-                except (json.JSONDecodeError, TypeError):
-                    msg = error_text[:500]
-            except Exception:
-                msg = f"HTTP {resp.status_code}"
-            finally:
-                await resp.aclose()
-            return ProviderResponse(ok=False, error=msg, status_code=resp.status_code)
-
-        # Accumulate streaming chunks
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        usage: dict[str, int] = {}
-        inline_data_list: list[dict[str, Any]] = []
-        tc_counter = 0  # for generating synthetic tool_call ids
-        # [2026-05-01] 收集所有原始 parts，Gemini 3 要求整个 response 原样回传
-        all_raw_parts: list[dict[str, Any]] = []
-        # [2026-08-18] 保留原始响应文本，用于非 SSE 格式（如 Vertex AI JSON 数组）的回退解析
-        _raw_chunks: list[str] = []
+        raw_usage: dict[str, Any] = {}
+        inline_data: list[dict[str, Any]] = []
+        raw_parts: list[dict[str, Any]] = []
+        part_counts: list[int] = []
+        stream_error: str | None = None
+        error_status = response.status_code
+
+        async def consume(chunk: Any) -> None:
+            nonlocal error_status
+            if not isinstance(chunk, dict):
+                raise ValueError("Gemini stream chunk is not an object")
+            if "error" in chunk:
+                error = chunk["error"]
+                if isinstance(error, dict):
+                    error_status = error.get("code") or response.status_code
+                    raise ValueError(str(error.get("message") or error))
+                raise ValueError(str(error))
+            feedback = chunk.get("promptFeedback") or {}
+            if feedback.get("blockReason"):
+                raise ValueError(f"Blocked by safety filter: {feedback['blockReason']}")
+            usage = chunk.get("usageMetadata")
+            if isinstance(usage, dict):
+                raw_usage.update(usage)
+            candidates = chunk.get("candidates") or []
+            parts = (candidates[0].get("content") or {}).get("parts") or [] if candidates else []
+            if not isinstance(parts, list) or not all(isinstance(part, dict) for part in parts):
+                raise ValueError("Gemini stream contains invalid parts")
+            part_counts.append(len(parts))
+            raw_parts.extend(deepcopy(parts))
+            for part in parts:
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    if part.get("thought"):
+                        thinking_parts.append(text)
+                        if on_thinking:
+                            await on_thinking(text)
+                    else:
+                        text_parts.append(text)
+                        if on_text:
+                            await on_text(text)
+                if "functionCall" in part:
+                    call = part["functionCall"]
+                    if not isinstance(call, dict):
+                        raise ValueError("Gemini stream contains an invalid functionCall")
+                    index = len(tool_calls)
+                    arguments = call.get("args") or {}
+                    if not isinstance(arguments, dict):
+                        arguments = {"_raw": arguments}
+                    parsed = ToolCall(id=f"call_{index + 1}", name=call.get("name", ""), arguments=arguments)
+                    tool_calls.append(parsed)
+                    if on_tool_delta:
+                        await on_tool_delta({"event": "tool_call_start", "index": index, "id": parsed.id, "name": parsed.name})
+                        await on_tool_delta({"event": "tool_call_args_delta", "index": index, "delta": json.dumps(arguments, ensure_ascii=False)})
+                        await on_tool_delta({"event": "tool_call_done", "index": index})
+                if isinstance(part.get("inlineData"), dict):
+                    inline_data.append(part["inlineData"])
 
         try:
-            # Gemini SSE: each line is "data: {json}\n\n"
-            buf = ""
-            async for raw_chunk in resp.aiter_text():
-                buf += raw_chunk
-                _raw_chunks.append(raw_chunk)
-                # Process complete SSE events in buffer
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    line = line.rstrip("\r")
-                    if not line.startswith("data: "):
-                        continue
-                    json_str = line[6:]  # strip "data: " prefix
-                    if not json_str.strip():
-                        continue
-                    try:
-                        chunk_data = json.loads(json_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    # Extract parts from the first candidate
-                    candidates = chunk_data.get("candidates") or []
-                    if candidates:
-                        parts = (candidates[0].get("content") or {}).get("parts") or []
-                        for part in parts:
-                            # 收集所有原始 parts 用于 round-trip
-                            all_raw_parts.append(part)
-                            # Thinking / reasoning parts
-                            if part.get("thought"):
-                                t = part.get("text", "")
-                                if t:
-                                    thinking_parts.append(t)
-                                    if on_thinking:
-                                        await on_thinking(t)
-                            # Regular text
-                            elif "text" in part:
-                                t = part["text"]
-                                text_parts.append(t)
-                                if on_text:
-                                    await on_text(t)
-                            # Function calls
-                            elif "functionCall" in part:
-                                fc = part["functionCall"]
-                                tc_counter += 1
-                                tc_id = f"call_{tc_counter}"
-                                tc_index = tc_counter - 1
-                                tc_name = fc.get("name", "")
-                                tc_args_raw = fc.get("args") or {}
-                                tc_args = tc_args_raw if isinstance(tc_args_raw, dict) else {"_raw": tc_args_raw}
-                                # [tool-stream 2026-05-19] Gemini 当前返回完整 functionCall part，而非逐字符参数流。
-                                # 原因：没有真实 args delta 时仍要接入统一实时管道。
-                                # 做法：收到完整 functionCall 后合成 start、完整 args_delta、done 三个事件。
-                                # 目的：前端和 supervisor 不需要为 Gemini 维护另一套非流式工具调用逻辑。
-                                if on_tool_delta:
-                                    await on_tool_delta({
-                                        "event": "tool_call_start",
-                                        "index": tc_index,
-                                        "id": tc_id,
-                                        "name": tc_name,
-                                    })
-                                    await on_tool_delta({
-                                        "event": "tool_call_args_delta",
-                                        "index": tc_index,
-                                        "delta": json.dumps(tc_args, ensure_ascii=False),
-                                    })
-                                    await on_tool_delta({"event": "tool_call_done", "index": tc_index})
-                                tool_calls.append(ToolCall(
-                                    id=tc_id,
-                                    name=tc_name,
-                                    arguments=tc_args,
-                                ))
-                            # Inline data (images etc generated by model)
-                            elif "inlineData" in part:
-                                inline_data_list.append(part["inlineData"])
-
-                    # Usage metadata (typically present in the last chunk)
-                    um = chunk_data.get("usageMetadata")
-                    if um:
-                        usage = _parse_usage(um)
+            saw_sse = False
+            json_lines: list[str] = []
+            # aiter_lines handles CRLF, split UTF-8 and the final unterminated line.
+            async for line in response.aiter_lines():
+                if line.startswith("data:"):
+                    saw_sse = True
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    if data:
+                        await consume(json.loads(data))
+                elif not saw_sse and line and not line.startswith((":", "event:", "id:", "retry:")):
+                    json_lines.append(line)
+            if not saw_sse:
+                document = json.loads("\n".join(json_lines))
+                chunks = document if isinstance(document, list) else [document]
+                for chunk in chunks:
+                    await consume(chunk)
+            if not raw_parts:
+                stream_error = "Gemini stream returned no candidate parts"
         except Exception as exc:
-            # Partial result is still better than nothing; log and continue
-            log.warning("Gemini stream read error: %s", exc)
+            stream_error = f"Gemini stream failed: {exc}"
+            log.warning("%s", stream_error)
         finally:
-            await resp.aclose()
+            await response.aclose()
 
-        # [2026-08-18] Vertex AI / 非 SSE 回退：如果 SSE 解析一无所获，
-        # 尝试将原始响应当作 JSON 数组解析（Vertex streamGenerateContent
-        # 在不带 alt=sse 时返回 JSON 数组而非 SSE 事件流）。
-        if not all_raw_parts and not text_parts and not thinking_parts and not tool_calls and _raw_chunks:
-            _raw_body = "".join(_raw_chunks).strip()
-            if _raw_body:
-                try:
-                    _fb = json.loads(_raw_body)
-                    if isinstance(_fb, dict):
-                        _fb = [_fb]
-                    if isinstance(_fb, list):
-                        log.info("Gemini SSE empty; JSON-array fallback (%d chunks)", len(_fb))
-                        for _fd in _fb:
-                            _cands = _fd.get("candidates") or []
-                            if not _cands:
-                                continue
-                            for _p in (_cands[0].get("content") or {}).get("parts") or []:
-                                all_raw_parts.append(_p)
-                                if _p.get("thought"):
-                                    _t = _p.get("text", "")
-                                    if _t:
-                                        thinking_parts.append(_t)
-                                        if on_thinking:
-                                            await on_thinking(_t)
-                                elif "text" in _p:
-                                    _t = _p["text"]
-                                    text_parts.append(_t)
-                                    if on_text:
-                                        await on_text(_t)
-                                elif "functionCall" in _p:
-                                    _fc = _p["functionCall"]
-                                    tc_counter += 1
-                                    _tc_id = f"call_{tc_counter}"
-                                    _tc_idx = tc_counter - 1
-                                    _tc_name = _fc.get("name", "")
-                                    _tc_args_raw = _fc.get("args") or {}
-                                    _tc_args = _tc_args_raw if isinstance(_tc_args_raw, dict) else {"_raw": _tc_args_raw}
-                                    if on_tool_delta:
-                                        await on_tool_delta({"event": "tool_call_start", "index": _tc_idx, "id": _tc_id, "name": _tc_name})
-                                        await on_tool_delta({"event": "tool_call_args_delta", "index": _tc_idx, "delta": json.dumps(_tc_args, ensure_ascii=False)})
-                                        await on_tool_delta({"event": "tool_call_done", "index": _tc_idx})
-                                    tool_calls.append(ToolCall(id=_tc_id, name=_tc_name, arguments=_tc_args))
-                                elif "inlineData" in _p:
-                                    inline_data_list.append(_p["inlineData"])
-                            _um = _fd.get("usageMetadata")
-                            if _um:
-                                usage = _parse_usage(_um)
-                except (json.JSONDecodeError, TypeError, KeyError):
-                    pass
-
-        full_text = "".join(text_parts) or None
-        reasoning = "".join(thinking_parts) or None
-
-        # [2026-05-01] 存储所有原始 parts，Gemini 3 要求整个 response 原样回传
-        provider_meta: dict[str, Any] = {}
-        if all_raw_parts:
-            provider_meta["raw_parts"] = all_raw_parts
-
+        # Raw fragments remain intact. Their frame sizes allow request-local
+        # assembly without treating a complete response as a sequence of deltas.
+        provider_meta = {"raw_parts": raw_parts, "stream_part_counts": part_counts} if raw_parts else {}
         return ProviderResponse(
-            ok=True,
-            text=full_text,
-            tool_calls=tool_calls,
-            reasoning=reasoning,
-            usage=usage or None,
-            inline_data=inline_data_list,
-            raw=None,
-            provider_meta=provider_meta,
+            ok=stream_error is None, error=stream_error,
+            status_code=error_status, text="".join(text_parts) or None,
+            reasoning="".join(thinking_parts) or None,
+            tool_calls=tool_calls if stream_error is None else [],
+            usage=self._usage(raw_usage) if raw_usage else None,
+            inline_data=inline_data, provider_meta=provider_meta,
         )
 
 
 # ── Module-level helpers ─────────────────────────────────────────────
+
+
+def _coalesce_stream_parts(parts: list[dict[str, Any]], counts: Any) -> list[dict[str, Any]]:
+    """Assemble text deltas only across unambiguous single-part stream frames.
+
+    Complete responses and legacy records without frame boundaries are copied
+    unchanged. Every signed part, multi-part frame or unknown frame breaks a
+    run. A signed part is never merged with an unsigned part, even in a stream.
+    """
+    copied = deepcopy(parts)
+    if not isinstance(counts, list) or not counts or any(type(count) is not int or count < 0 for count in counts):
+        return copied
+    if sum(counts) != len(parts):
+        return copied
+    assembled: list[dict[str, Any]] = []
+    position = 0
+    previous_delta = False
+    for count in counts:
+        frame = copied[position:position + count]
+        position += count
+        part = frame[0] if count == 1 else {}
+        # ponytail: without explicit boundaries, only consecutive single-part
+        # text frames are deltas. Preserve every ambiguous frame rather than
+        # borrowing or reattaching a signature from another part.
+        delta = (
+            count == 1 and set(part) <= {"text", "thought"}
+            and (isinstance(part.get("text"), str) or part.get("thought") is True)
+        )
+        if delta and previous_delta and bool(assembled[-1].get("thought")) == bool(part.get("thought")):
+            assembled[-1]["text"] = assembled[-1].get("text", "") + part.get("text", "")
+        else:
+            assembled.extend(frame)
+        previous_delta = delta
+    return assembled
+
+
+_SKIP_THOUGHT_SIG = "skip_thought_signature_validator"
+
+
+def _ensure_fc_thought_signature(parts: list[dict[str, Any]]) -> None:
+    """Add the API's compatibility marker only when no signature is available."""
+    if not any("thoughtSignature" in part for part in parts):
+        for part in parts:
+            if "functionCall" in part:
+                part["thoughtSignature"] = _SKIP_THOUGHT_SIG
+                return
+
+
+def _strip_thought_signatures(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Make the bounded signature-retry projection, without changing raw data."""
+    cleaned = []
+    for part in parts:
+        if part.get("thought"):
+            continue
+        copied = {key: deepcopy(value) for key, value in part.items() if key != "thoughtSignature"}
+        if copied:
+            cleaned.append(copied)
+    _ensure_fc_thought_signature(cleaned)
+    return cleaned
+
+
+def _is_thought_signature_error(message: str | None) -> bool:
+    lower = (message or "").lower()
+    return any(marker in lower for marker in ("thought signature", "thoughtsignature", "thought_signature"))
+
+
+def _is_system_role_error(message: str | None) -> bool:
+    lower = (message or "").lower()
+    return "role 'system' is not supported" in lower or 'role "system" is not supported' in lower
+
+
+async def _read_stream_error(response: httpx.Response) -> str:
+    """Read an HTTP error and always close the first stream before any retry."""
+    try:
+        await response.aread()
+        return _error_from_response(response).error or f"HTTP {response.status_code}"
+    except Exception:
+        return f"HTTP {response.status_code}"
+    finally:
+        await response.aclose()
 
 
 def _extract_text(msg: dict[str, Any]) -> str | None:
@@ -512,7 +694,7 @@ def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
     """
     content = msg.get("content", "")
     if isinstance(content, str):
-        return [{"text": content}] if content else [{"text": ""}]
+        return [{"text": content}] if content else [{"text": " "}]
     if isinstance(content, list):
         parts: list[dict[str, Any]] = []
         for item in content:
@@ -531,7 +713,7 @@ def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
                     # for http(s) URLs, we'd need to download. For now, pass
                     # as text fallback since Gemini doesn't accept arbitrary URLs.
                     parts.append({"text": f"[Image: {url}]"})
-        return parts or [{"text": ""}]
+        return parts or [{"text": " "}]
     return [{"text": str(content)}]
 
 
@@ -545,6 +727,23 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
       exclusive bound to inclusive, keep the tighter value when both exist).
     - Recursively clean nested 'properties', 'items', and composition arrays.
     """
+    raw_type = schema.get("type")
+    if isinstance(raw_type, list):
+        types = list(dict.fromkeys(kind for kind in raw_type if isinstance(kind, str)))
+        non_null = [kind for kind in types if kind != "null"]
+        schema = dict(schema)
+        if not non_null:
+            schema["type"] = "null" if "null" in types else "string"
+        elif len(non_null) == 1:
+            schema["type"] = non_null[0]
+            if "null" in types:
+                schema["nullable"] = True
+        else:
+            schema.pop("type")
+            # Each alternative retains all existing constraints, including an
+            # existing anyOf, instead of silently selecting the first type.
+            return {"anyOf": [_clean_schema(dict(schema, type=kind)) for kind in types]}
+
     # Keywords Gemini's OpenAPI-3.0 subset does not accept at all
     DROP = {"additionalProperties", "default", "$schema", "$id", "$ref",
             "$defs", "definitions", "multipleOf", "uniqueItems",
@@ -561,6 +760,13 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
             cleaned[k] = {pk: _clean_schema(pv) if isinstance(pv, dict) else pv for pk, pv in v.items()}
         elif k == "items" and isinstance(v, dict):
             cleaned[k] = _clean_schema(v)
+        elif k == "items" and isinstance(v, list):
+            # ponytail: Gemini's native schema cannot express positional tuple
+            # constraints. Keep every item alternative; exact tuple semantics
+            # require the parametersJsonSchema transport in a future change.
+            alternatives = [_clean_schema(item) for item in v if isinstance(item, dict)]
+            cleaned[k] = {"anyOf": alternatives} if alternatives else {}
+            log.warning("Gemini tuple schema uses an item union; positional constraints are not supported")
         elif k in ("anyOf",) and isinstance(v, list):
             cleaned[k] = [_clean_schema(item) if isinstance(item, dict) else item for item in v]
         elif k == "enum" and isinstance(v, list):
@@ -594,32 +800,42 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def _parse_usage(um: dict[str, Any]) -> dict[str, int]:
-    """Convert Gemini usageMetadata to the standard usage dict.
+def _parse_usage(um: dict[str, Any], *, deduplicate_tool_prompt: bool = False) -> dict[str, int]:
+    """Include tool-use prompts and thinking tokens in normalized usage."""
+    def count(key: str) -> int:
+        try:
+            return max(0, int(um.get(key) or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
-    [AutoC 2026-08-24] 缓存命中统一为 Clonoth 内部字段 cached_prompt_tokens。
-    Gemini 的 cachedContentTokenCount 归一化到该字段。
-    """
+    prompt = count("promptTokenCount")
+    tool_prompt = count("toolUsePromptTokenCount")
+    cached = count("cachedContentTokenCount")
+    if deduplicate_tool_prompt and min(prompt, tool_prompt) > 50_000 and min(prompt, tool_prompt) >= 0.5 * max(prompt, tool_prompt):
+        prompt = max(prompt, tool_prompt, cached)
+    else:
+        prompt += tool_prompt
+    completion = count("candidatesTokenCount") + count("thoughtsTokenCount")
     result = {
-        "prompt_tokens": um.get("promptTokenCount", 0),
-        "completion_tokens": um.get("candidatesTokenCount", 0),
-        "total_tokens": um.get("totalTokenCount", 0),
+        "prompt_tokens": prompt, "completion_tokens": completion,
+        "total_tokens": count("totalTokenCount") or prompt + completion,
     }
-    cached = um.get("cachedContentTokenCount")
-    if isinstance(cached, int) and cached > 0:
+    if cached:
         result["cached_prompt_tokens"] = cached
     return result
 
 
 def _parse_response(data: dict[str, Any]) -> ProviderResponse:
     """Parse a non-streaming Gemini generateContent response into ProviderResponse."""
+    if not isinstance(data, dict):
+        return ProviderResponse(ok=False, error="Gemini returned a non-object response")
     # Check for API-level errors
     if "error" in data:
         err = data["error"]
         return ProviderResponse(
             ok=False,
-            error=err.get("message", str(err)),
-            status_code=err.get("code"),
+            error=str(err.get("message") or err) if isinstance(err, dict) else str(err),
+            status_code=err.get("code") if isinstance(err, dict) else None,
         )
 
     candidates = data.get("candidates") or []
@@ -632,6 +848,8 @@ def _parse_response(data: dict[str, Any]) -> ProviderResponse:
 
     candidate = candidates[0]
     parts = (candidate.get("content") or {}).get("parts") or []
+    if not isinstance(parts, list) or not all(isinstance(part, dict) for part in parts):
+        return ProviderResponse(ok=False, error="Gemini returned invalid parts")
 
     text_parts: list[str] = []
     thinking_parts: list[str] = []
@@ -666,7 +884,7 @@ def _parse_response(data: dict[str, Any]) -> ProviderResponse:
     # 任何 part 都可能带 thoughtSignature，不能只存 thought parts
     provider_meta: dict[str, Any] = {}
     if parts:
-        provider_meta["raw_parts"] = parts
+        provider_meta["raw_parts"] = deepcopy(parts)
 
     return ProviderResponse(
         ok=True,
@@ -684,8 +902,10 @@ def _error_from_response(resp: httpx.Response) -> ProviderResponse:
     """Build an error ProviderResponse from a failed httpx.Response."""
     try:
         data = resp.json()
-        err = data.get("error", {})
-        msg = err.get("message", resp.text[:500])
+        if isinstance(data, list) and data:
+            data = data[0]
+        err = data.get("error", {}) if isinstance(data, dict) else {}
+        msg = str(err.get("message") or resp.text[:500]) if isinstance(err, dict) else str(err)
     except Exception:
         msg = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
     return ProviderResponse(ok=False, error=msg, status_code=resp.status_code)

@@ -47,7 +47,6 @@ _ENGINE_TOOL_RESULT_RE = re.compile(
 _LEGACY_TOOL_RECORD_RE = re.compile(
     r'^\[Tool call history record: (?P<name>.+?) was executed with args: (?P<arguments>\{.*\})\]$'
 )
-_SYNTHETIC_TOOL_OUTPUT = "[No tool result was recorded by the engine.]"
 
 
 def _strip_encrypted_content(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -118,6 +117,9 @@ class OpenAIResponsesProvider(BaseProvider):
     # 原因：engine 不再硬编码 OpenAIResponsesProvider 分支；做法：类声明 provider_name；
     # 目的：registry 能把配置里的 "openai-responses" 映射回这个类。
     provider_name = "openai-responses"
+    default_max_tokens: int | None = None
+    default_reasoning_effort: str | None = None
+    default_thought_summary: bool = False
 
     def __init__(
         self,
@@ -134,7 +136,7 @@ class OpenAIResponsesProvider(BaseProvider):
         super().__init__(model=model, name=self.provider_name)
         self._http = http
         self._api_key = api_key
-        # _normalize_base_url ensures the URL ends with /v1
+        # Preserve the configured base path; append /responses in _endpoint.
         self._base_url = _normalize_base_url(base_url)
         self._options = provider_options or {}
 
@@ -174,11 +176,26 @@ class OpenAIResponsesProvider(BaseProvider):
         items: list[dict[str, Any]] = []
         pending_calls: list[dict[str, str]] = []
         synthetic_call_index = 0
+        reserved_ids: set[str] = set()
+        for message in messages:
+            if message.get("tool_call_id"):
+                reserved_ids.add(str(message["tool_call_id"]))
+            reserved_ids.update(str(call.get("id")) for call in message.get("tool_calls") or [] if isinstance(call, dict) and call.get("id"))
+            meta = message.get("_meta")
+            metadata = meta.get("metadata") if isinstance(meta, dict) else None
+            saved = metadata.get("openai-responses") if isinstance(metadata, dict) else None
+            raw = saved.get("raw_output") if isinstance(saved, dict) else None
+            if isinstance(raw, list):
+                reserved_ids.update(str(item["call_id"]) for item in raw if isinstance(item, dict) and item.get("call_id"))
 
         def _next_call_id() -> str:
             nonlocal synthetic_call_index
-            synthetic_call_index += 1
-            return f"call_{synthetic_call_index}"
+            while True:
+                synthetic_call_index += 1
+                call_id = f"call_{synthetic_call_index}"
+                if call_id not in reserved_ids:
+                    reserved_ids.add(call_id)
+                    return call_id
 
         def _append_function_call(call: dict[str, str]) -> None:
             call_id = call.get("call_id") or _next_call_id()
@@ -194,7 +211,7 @@ class OpenAIResponsesProvider(BaseProvider):
         for msg in messages:
             role = msg.get("role", "")
 
-            if role == "system":
+            if role in {"system", "developer"}:
                 # System messages are extracted into the top-level instructions field.
                 instructions_parts.append(_extract_text(msg))
                 continue
@@ -232,10 +249,8 @@ class OpenAIResponsesProvider(BaseProvider):
                         _append_function_call(legacy_call)
                     continue
 
-                # Normal user message → {type: message, role: user, content: [...]}.
-                # If a previous terminal pseudo tool did not record a tool result,
-                # synthesize one before the real user input so Responses receives
-                # valid function_call/function_call_output pairing.
+                # A missing result is kept as a text record, not invented as a
+                # function_call_output when the next user message arrives.
                 _flush_unpaired_function_calls(pending_calls, items)
                 items.append({
                     "type": "message",
@@ -252,8 +267,9 @@ class OpenAIResponsesProvider(BaseProvider):
                 _meta = msg.get("_meta")
                 _raw_output = None
                 if isinstance(_meta, dict):
-                    _resp_meta = _meta.get("metadata", {}).get("openai-responses", {})
-                    _raw_output = _resp_meta.get("raw_output")
+                    metadata = _meta.get("metadata")
+                    saved = metadata.get("openai-responses") if isinstance(metadata, dict) else None
+                    _raw_output = saved.get("raw_output") if isinstance(saved, dict) else None
 
                 if _raw_output and isinstance(_raw_output, list):
                     for _raw_item in _raw_output:
@@ -291,10 +307,14 @@ class OpenAIResponsesProvider(BaseProvider):
                 # when present; otherwise fall back to the pending-call queue.
                 call_id = str(msg.get("tool_call_id") or "")
                 if call_id:
+                    if not any(p.get("call_id") == call_id for p in pending_calls):
+                        continue
                     pending_calls[:] = [p for p in pending_calls if p.get("call_id") != call_id]
                 else:
                     pending = _pop_pending_call(pending_calls, "")
-                    call_id = pending["call_id"] if pending else ""
+                    if pending is None:
+                        continue
+                    call_id = pending["call_id"]
                 items.append({
                     "type": "function_call_output",
                     "call_id": call_id,
@@ -303,6 +323,73 @@ class OpenAIResponsesProvider(BaseProvider):
 
         _flush_unpaired_function_calls(pending_calls, items)
         return "\n\n".join(instructions_parts), items
+
+    def prepare_history(
+        self, messages: list[dict[str, Any]], *, tool_mode: str = "native",
+    ) -> list[dict[str, Any]]:
+        from .tool_format import (
+            FakeNativeToolFormatter, build_llm_messages,
+            create_tool_formatter, prepare_raw_history,
+        )
+
+        formatter = create_tool_formatter(tool_mode)
+        if formatter.mode == "json":
+            return build_llm_messages(messages, formatter)
+
+        history = prepare_raw_history(messages)
+        text_formatter = FakeNativeToolFormatter()
+        text_result_ids: set[str] = set()
+        for index, message in enumerate(history):
+            if message.get("role") == "tool":
+                if message.get("tool_call_id") in text_result_ids:
+                    history[index] = text_formatter.message_to_llm(message)
+                continue
+            text_result_ids.clear()
+            if message.get("role") != "assistant":
+                continue
+            calls = message.get("tool_calls") or []
+            meta = message.get("_meta")
+            metadata = meta.get("metadata") if isinstance(meta, dict) else None
+            saved = metadata.get(self.provider_name) if isinstance(metadata, dict) else None
+            has_cache = isinstance(saved, dict) and "raw_output" in saved
+            raw_output = saved.get("raw_output") if has_cache else None
+            try:
+                normalized = [_normalize_tool_call(call) for call in calls]
+                signature = [_call_signature(call) for call in normalized]
+                ids = [call[0] for call in signature]
+                valid = len(ids) == len(set(ids))
+                if has_cache:
+                    valid = valid and isinstance(raw_output, list) and all(isinstance(item, dict) for item in raw_output)
+                    if valid:
+                        raw_signature = [_call_signature(item) for item in raw_output if item.get("type") == "function_call"]
+                        original_ids = meta.get("tool_call_ids", ids)
+                        valid = original_ids == ids and signature == raw_signature
+            except (TypeError, ValueError):
+                valid = False
+            if valid:
+                continue
+
+            # ponytail: a damaged native turn is replayed as text. Recovering
+            # a partial signed/encrypted turn needs an explicit protocol rule.
+            text_result_ids.update(str(call.get("id") or "") for call in calls if isinstance(call, dict))
+            rendered = text_formatter.message_to_llm({
+                "role": "assistant", "content": _extract_text(message), "tool_calls": calls,
+            })
+            # Keep assistant role so the legacy user-text parser cannot turn
+            # these descriptions back into live function_call items.
+            rendered["role"] = "assistant"
+            history[index] = rendered
+        return history
+
+    def build_payload(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+        *, tool_mode: str = "native", stream: bool = False,
+    ) -> dict[str, Any]:
+        prepared = self.prepare_history(messages, tool_mode=tool_mode)
+        instructions, input_items = self._convert_messages(prepared)
+        return self._build_payload(
+            input_items=input_items, instructions=instructions, tools=tools, stream=stream,
+        )
 
     # ------------------------------------------------------------------
     # Non-streaming chat
@@ -313,14 +400,9 @@ class OpenAIResponsesProvider(BaseProvider):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
     ) -> ProviderResponse:
-        instructions, input_items = self._convert_messages(messages)
-        payload = self._build_payload(
-            input_items=input_items,
-            instructions=instructions,
-            tools=tools,
-            stream=False,
-        )
+        payload = self.build_payload(messages, tools, tool_mode=tool_mode)
 
         try:
             resp = await self._http.post(
@@ -357,10 +439,13 @@ class OpenAIResponsesProvider(BaseProvider):
             else:
                 return ProviderResponse(ok=False, error=err_msg, status_code=resp.status_code)
 
-        body = resp.json()
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            return ProviderResponse(ok=False, error=f"Invalid Responses JSON: {exc}", status_code=resp.status_code)
         result = self._parse_response(body)
         # [2026-05-01] 存储原始 output items（含 reasoning encrypted_content）到 provider_meta
-        raw_output = body.get("output")
+        raw_output = body.get("output") if isinstance(body, dict) else None
         if raw_output and isinstance(raw_output, list):
             result.provider_meta["raw_output"] = raw_output
         return result
@@ -374,17 +459,12 @@ class OpenAIResponsesProvider(BaseProvider):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
         on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> ProviderResponse:
-        instructions, input_items = self._convert_messages(messages)
-        payload = self._build_payload(
-            input_items=input_items,
-            instructions=instructions,
-            tools=tools,
-            stream=True,
-        )
+        payload = self.build_payload(messages, tools, tool_mode=tool_mode, stream=True)
 
         # [2026-05-06] Why: stream retries must reopen the whole SSE request
         # because a failed connection cannot be resumed. How: run at most two
@@ -394,6 +474,10 @@ class OpenAIResponsesProvider(BaseProvider):
             # -- Accumulators for the full response ----------------------
             text_parts: list[str] = []
             thinking_parts: list[str] = []
+            reasoning_deltas: dict[str, list[str]] = {"reasoning_text": [], "summary_text": []}
+            emitted = False
+            completed = False
+            finished_items: dict[int, dict[str, Any]] = {}
             # tool_calls keyed by output index so we can accumulate arguments
             pending_calls: dict[int, dict[str, str]] = {}  # idx → {name, call_id, arguments}
             # [tool-stream 2026-05-19] 记录已发送 done 的 output index。
@@ -442,6 +526,7 @@ class OpenAIResponsesProvider(BaseProvider):
                             continue
                         raw = line[6:]
                         if raw.strip() == "[DONE]":
+                            completed = True
                             break
                         try:
                             event = json.loads(raw)
@@ -453,9 +538,10 @@ class OpenAIResponsesProvider(BaseProvider):
                         # --- text deltas ---
                         if etype == "response.output_text.delta":
                             delta = event.get("delta", "")
-                            if delta:
+                            if isinstance(delta, str) and delta:
                                 text_parts.append(delta)
                                 if on_text:
+                                    emitted = True
                                     await on_text(delta)
 
                         # --- reasoning / thinking deltas ---
@@ -464,9 +550,12 @@ class OpenAIResponsesProvider(BaseProvider):
                             "response.reasoning_summary_text.delta",
                         ):
                             delta = event.get("delta", "")
-                            if delta:
+                            if isinstance(delta, str) and delta:
                                 thinking_parts.append(delta)
+                                kind = "summary_text" if etype == "response.reasoning_summary_text.delta" else "reasoning_text"
+                                reasoning_deltas[kind].append(delta)
                                 if on_thinking:
+                                    emitted = True
                                     await on_thinking(delta)
 
                         # --- new function_call item added ---
@@ -484,6 +573,7 @@ class OpenAIResponsesProvider(BaseProvider):
                                 # 做法：登记 pending_calls 后发送统一 tool_call_start。
                                 # 目的：Responses provider 与 Chat Completions provider 暴露相同事件格式。
                                 if on_tool_delta:
+                                    emitted = True
                                     await on_tool_delta({
                                         "event": "tool_call_start",
                                         "index": idx,
@@ -502,6 +592,7 @@ class OpenAIResponsesProvider(BaseProvider):
                                 # 做法：保留原有字符串累积，同时把 delta 透传给 on_tool_delta。
                                 # 目的：不改变最终 JSON 解析，又支持工具参数实时显示。
                                 if delta and on_tool_delta:
+                                    emitted = True
                                     await on_tool_delta({
                                         "event": "tool_call_args_delta",
                                         "index": idx,
@@ -521,13 +612,17 @@ class OpenAIResponsesProvider(BaseProvider):
                             if idx in pending_calls and idx not in done_indices:
                                 done_indices.add(idx)
                                 if on_tool_delta:
+                                    emitted = True
                                     await on_tool_delta({"event": "tool_call_done", "index": idx})
 
                         # --- function_call output item done ---
                         elif etype == "response.output_item.done":
                             item = event.get("item", {})
                             idx = int(event.get("output_index", 0) or 0)
-                            if item.get("type") == "function_call" and idx in pending_calls:
+                            if isinstance(item, dict):
+                                finished_items[idx] = item
+                            if item.get("type") == "function_call":
+                                pending_calls.setdefault(idx, {"name": "", "call_id": "", "arguments": ""})
                                 if item.get("name"):
                                     pending_calls[idx]["name"] = item.get("name", "")
                                 if item.get("call_id"):
@@ -541,10 +636,12 @@ class OpenAIResponsesProvider(BaseProvider):
                                 if idx not in done_indices:
                                     done_indices.add(idx)
                                     if on_tool_delta:
+                                        emitted = True
                                         await on_tool_delta({"event": "tool_call_done", "index": idx})
 
                         # --- response completed: extract usage + raw output ---
                         elif etype in ("response.completed", "response.done"):
+                            completed = True
                             resp_obj = event.get("response", {})
                             u = resp_obj.get("usage", {})
                             if u:
@@ -558,7 +655,7 @@ class OpenAIResponsesProvider(BaseProvider):
                         elif etype == "response.failed":
                             err = event.get("response", {}).get("error", {})
                             err_msg = err.get("message", str(err))
-                            if attempt == 0 and _is_encrypted_content_error(err_msg):
+                            if attempt == 0 and not emitted and _is_encrypted_content_error(err_msg):
                                 # [2026-05-06] Why: OpenAI may report encrypted
                                 # reasoning failure as response.failed after the
                                 # SSE connection opens. How: close this stream,
@@ -571,19 +668,71 @@ class OpenAIResponsesProvider(BaseProvider):
                                 payload["input"] = _strip_encrypted_content(payload["input"])
                                 retry_without_encrypted = True
                                 break
-                            return ProviderResponse(ok=False, error=f"API failed: {err_msg}")
+                            return ProviderResponse(
+                                ok=False, error=f"API failed: {err_msg}",
+                                text="".join(text_parts) or None, reasoning="".join(thinking_parts) or None,
+                            )
+                        elif etype == "response.incomplete":
+                            details = event.get("response", {}).get("incomplete_details", {})
+                            return ProviderResponse(
+                                ok=False, error=f"Incomplete response: {details}",
+                                text="".join(text_parts) or None, reasoning="".join(thinking_parts) or None,
+                            )
                         elif etype == "error":
                             err_msg = event.get("message", str(event))
-                            return ProviderResponse(ok=False, error=f"Stream error: {err_msg}")
+                            return ProviderResponse(
+                                ok=False, error=f"Stream error: {err_msg}",
+                                text="".join(text_parts) or None, reasoning="".join(thinking_parts) or None,
+                            )
 
             except Exception as exc:
-                return ProviderResponse(ok=False, error=str(exc))
+                return ProviderResponse(
+                    ok=False, error=str(exc) or type(exc).__name__,
+                    text="".join(text_parts) or None, reasoning="".join(thinking_parts) or None,
+                )
 
             if retry_without_encrypted:
                 continue
 
+            if not completed:
+                return ProviderResponse(
+                    ok=False, error="Responses stream ended before completion",
+                    text="".join(text_parts) or None, reasoning="".join(thinking_parts) or None,
+                )
+            if not raw_output_items and finished_items:
+                raw_output_items = [item for _, item in sorted(finished_items.items())]
+            final = self._parse_response({"output": raw_output_items, "usage": usage})
+            # Some gateways provide only the completion object. Keep observed
+            # delta order; append only missing tails, never regroup emitted text.
+            if not thinking_parts:
+                missing_reasoning = final.reasoning or ""
+            else:
+                full_reasoning: dict[str, list[str]] = {"reasoning_text": [], "summary_text": []}
+                for item in raw_output_items:
+                    if not isinstance(item, dict) or item.get("type") != "reasoning":
+                        continue
+                    for field, kind in (("content", "reasoning_text"), ("summary", "summary_text")):
+                        for block in item.get(field) or []:
+                            if isinstance(block, dict) and block.get("type") == kind and isinstance(block.get("text"), str):
+                                full_reasoning[kind].append(block["text"])
+                missing_reasoning = "".join(
+                    full[len(seen):] for kind, parts in full_reasoning.items()
+                    for full, seen in [("".join(parts), "".join(reasoning_deltas[kind]))]
+                    if full.startswith(seen)
+                )
+            if missing_reasoning:
+                thinking_parts.append(missing_reasoning)
+                if on_thinking:
+                    await on_thinking(missing_reasoning)
+            seen_text = "".join(text_parts)
+            full_text = final.text or ""
+            missing_text = full_text[len(seen_text):] if full_text.startswith(seen_text) else ""
+            if missing_text:
+                text_parts.append(missing_text)
+                if on_text:
+                    await on_text(missing_text)
+
             # -- Build final ProviderResponse ----------------------------
-            # raw_output_items 在 response.completed 事件中捕获
             provider_meta: dict[str, Any] = {}
             if raw_output_items:
                 provider_meta["raw_output"] = raw_output_items
@@ -596,8 +745,8 @@ class OpenAIResponsesProvider(BaseProvider):
                     arguments=_safe_json_loads(pc["arguments"]),
                 ))
 
-            inp = usage.get("input_tokens", 0)
-            out = usage.get("output_tokens", 0)
+            if raw_output_items:
+                tool_calls = final.tool_calls
             return ProviderResponse(
                 ok=True,
                 text="".join(text_parts) or None,
@@ -647,10 +796,34 @@ class OpenAIResponsesProvider(BaseProvider):
                 else:
                     resp_tools.append(t)
             payload["tools"] = resp_tools
-        # 注入 reasoning 参数（如 {"effort": "medium", "summary": "auto"}）
-        _reasoning = self._options.get("reasoning")
-        if _reasoning and isinstance(_reasoning, dict):
-            payload["reasoning"] = _reasoning
+        # Match production option aliases without modifying the caller's dict.
+        max_tokens = self._options.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = self._options.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = self.default_max_tokens
+        try:
+            if max_tokens is not None and int(max_tokens) > 0:
+                payload["max_output_tokens"] = int(max_tokens)
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+        configured = self._options.get("reasoning")
+        reasoning = dict(configured) if isinstance(configured, dict) else {}
+        effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
+        if effort is not None and str(effort).strip():
+            reasoning["effort"] = str(effort).strip().lower()
+        summary = self._options.get("thought_summary", self.default_thought_summary)
+        if summary is True or (isinstance(summary, str) and summary.strip().lower() in {"true", "1", "yes", "auto"}):
+            reasoning["summary"] = "auto"
+        elif isinstance(summary, str) and summary.strip().lower() in {"concise", "detailed"}:
+            reasoning["summary"] = summary.strip().lower()
+        elif "thought_summary" in self._options:
+            reasoning.pop("summary", None)
+        if str(reasoning.get("effort", "")).lower() == "none":
+            reasoning.pop("summary", None)
+        if reasoning:
+            payload["reasoning"] = reasoning
         return payload
 
     # ------------------------------------------------------------------
@@ -660,23 +833,40 @@ class OpenAIResponsesProvider(BaseProvider):
     @staticmethod
     def _parse_response(body: dict[str, Any]) -> ProviderResponse:
         """Parse a non-streaming Responses API JSON body into ProviderResponse."""
+        if not isinstance(body, dict):
+            return ProviderResponse(ok=False, error="Invalid Responses object")
+        if body.get("status") in {"failed", "incomplete"} or body.get("error"):
+            error = body.get("error") or body.get("incomplete_details") or body.get("status")
+            return ProviderResponse(ok=False, error=f"Responses API failed: {error}")
+        output = body.get("output") or []
+        if not isinstance(output, list):
+            return ProviderResponse(ok=False, error="Invalid Responses output")
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         tool_calls: list[ToolCall] = []
 
-        for item in body.get("output", []):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
             itype = item.get("type", "")
 
             if itype == "message":
-                for block in item.get("content", []):
-                    if block.get("type") == "output_text":
-                        text_parts.append(block.get("text", ""))
+                for block in item.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "output_text" and isinstance(block.get("text"), str):
+                        text_parts.append(block["text"])
 
             elif itype == "reasoning":
-                # Reasoning summary blocks
-                for block in item.get("summary", []):
-                    if block.get("type") == "summary_text":
-                        thinking_parts.append(block.get("text", ""))
+                # Both forms contribute to the same display field. The intact
+                # output item is independently retained in provider_meta.
+                for blocks, block_type in (
+                    (item.get("content") or [], "reasoning_text"),
+                    (item.get("summary") or [], "summary_text"),
+                ):
+                    for block in blocks:
+                        if isinstance(block, dict) and block.get("type") == block_type:
+                            text = block.get("text")
+                            if isinstance(text, str):
+                                thinking_parts.append(text)
 
             elif itype == "function_call":
                 tool_calls.append(ToolCall(
@@ -685,14 +875,14 @@ class OpenAIResponsesProvider(BaseProvider):
                     arguments=_safe_json_loads(item.get("arguments", "{}")),
                 ))
 
-        usage = body.get("usage", {})
+        usage = body.get("usage")
 
         return ProviderResponse(
             ok=True,
             text="".join(text_parts) or None,
             tool_calls=tool_calls,
             reasoning="".join(thinking_parts) or None,
-            usage=_normalize_usage(usage),
+            usage=_normalize_usage(usage if isinstance(usage, dict) else {}),
         )
 
 
@@ -787,6 +977,22 @@ def _normalize_tool_call(tc: Any) -> dict[str, str] | None:
     return {"call_id": call_id, "name": name, "arguments": _arguments_to_json_string(raw_args)}
 
 
+def _call_signature(call: Any) -> tuple[str, str, str]:
+    """Compare call_id, name and JSON values, never the output item's own id."""
+    if not isinstance(call, dict):
+        raise ValueError("invalid function call")
+    call_id, name = call.get("call_id"), call.get("name")
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        raise ValueError("missing function call identity")
+    arguments = call.get("arguments", "{}")
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
+    if not isinstance(arguments, dict):
+        raise ValueError("function arguments must be an object")
+    # Canonical JSON distinguishes False from 0 and True from 1.
+    return call_id, name, json.dumps(arguments, sort_keys=True, allow_nan=False)
+
+
 def _parse_native_tool_result(text: str) -> dict[str, str] | None:
     """Parse NativeToolFormatter's textual tool-result storage shape.
 
@@ -862,21 +1068,22 @@ def _flush_unpaired_function_calls(
     pending_calls: list[dict[str, str]],
     items: list[dict[str, Any]],
 ) -> None:
-    """Emit synthetic outputs for pending calls that have no stored result.
-
-    [2026-05-01] Terminal pseudo tools such as switch_node, and some historical
-    compact paths, can leave an assistant function_call without a following
-    stored result.  Responses requires every function_call to be paired with a
-    function_call_output before later messages, so this keeps the request valid
-    while making the missing result explicit to the model.
-    """
-    while pending_calls:
-        pending = pending_calls.pop(0)
-        items.append({
-            "type": "function_call_output",
-            "call_id": pending.get("call_id", ""),
-            "output": _SYNTHETIC_TOOL_OUTPUT,
-        })
+    """Keep unmatched legacy calls as text instead of fabricating results."""
+    unmatched = {call["call_id"] for call in pending_calls}
+    # Only the latest pending occurrence belongs to this turn. Earlier complete
+    # turns may legitimately have reused the same API call ID.
+    for index in range(len(items) - 1, -1, -1):
+        if not unmatched:
+            break
+        item = items[index]
+        if item.get("type") == "function_call" and item.get("call_id") in unmatched:
+            unmatched.remove(item["call_id"])
+            text = f"[Tool call: {item.get('name', '')}, arguments: {item.get('arguments', '{}')}]"
+            items[index] = {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+    pending_calls.clear()
 
 
 def _safe_json_loads(s: str | dict) -> dict:

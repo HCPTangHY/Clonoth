@@ -43,7 +43,8 @@ class ProviderResponse:
     ok: bool
     text: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
-    # [refactor 2026-04-18] thinking → reasoning：统一命名，保留思维链内容
+    # Unified display text: API reasoning or a summary. Replay data belongs to
+    # provider_meta; the engine must not turn this text into request fields.
     reasoning: str | None = None
     error: str | None = None
     status_code: int | None = None
@@ -67,8 +68,31 @@ class BaseProvider(ABC):
         self.model = model
         self.name = name or self.provider_name
 
+    def prepare_history(
+        self, messages: list[dict[str, Any]], *, tool_mode: str = "native",
+    ) -> list[dict[str, Any]]:
+        """Choose a request-local history representation inside the provider.
+
+        Inputs are internal messages, including provider metadata. Implementations
+        may override this method; the engine never selects a provider's history
+        representation. The default uses the configured text/native tool protocol.
+        """
+        from .tool_format import build_llm_messages, create_tool_formatter
+
+        return build_llm_messages(messages, create_tool_formatter(tool_mode))
+
+    def build_payload(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+        *, tool_mode: str = "native", stream: bool = False,
+    ) -> dict[str, Any]:
+        """Build an API payload from internal history, also usable by diagnostics."""
+        raise NotImplementedError
+
     @abstractmethod
-    async def chat(self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> ProviderResponse:
+    async def chat(
+        self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
+    ) -> ProviderResponse:
         raise NotImplementedError
 
     @abstractmethod
@@ -77,6 +101,7 @@ class BaseProvider(ABC):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_mode: str = "native",
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
         on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
