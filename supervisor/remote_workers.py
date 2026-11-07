@@ -713,7 +713,6 @@ class RemoteWorkerManager:
         return ""
 
     async def wait_call_result(self, call_id: str, wait_sec: float) -> dict[str, Any] | None:
-        await self.reap_stale_workers()
         async with self._condition:
             call = self.calls.get(call_id)
             if call is None:

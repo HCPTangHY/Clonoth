@@ -160,13 +160,18 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.get("/nodes")
     def list_nodes() -> list[dict[str, Any]]:
-        # 系统节点目录分离：扫描 engine/system_nodes/ 和 config/nodes/ 两个目录，
-        # engine 内建目录优先，同 id 节点只保留首次出现的。
-        # [AutoC 2026-08-30] 插件声明节点优先级最高（Paradox 式覆盖），
+        # 扫描 config/nodes/ 目录，插件声明节点优先级最高（Paradox 式覆盖），
         # source 标记为 "plugin"（附带声明者插件名，便于 UI 区分）。
         from engine.faces.nodes import iter_declared_nodes
+        # [2026-09-13] Why: _worker 节点从插件声明改为 config/nodes 物理文件，
+        # 设置页需要它总是可见可编辑。How: 列出前确保默认文件已落盘。
+        # Purpose: 前端可直接修改临时子节点的 provider/model。
+        try:
+            from engine.builtin.agent_manage import ensure_worker_node_yaml
+            ensure_worker_node_yaml(workspace_root)
+        except Exception:
+            pass
         dirs = [
-            (workspace_root / "engine" / "system_nodes", "system"),
             (workspace_root / "config" / "nodes", "user"),
         ]
         res = []
@@ -196,9 +201,9 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
         [AutoC 2026-09-02] Plugin-declared nodes resolve to their declaration
         file inside the plugin package (e.g. engine/builtin/nodes/*.yaml);
-        then fall back to system_nodes and config/nodes. Why first: after the
-        system-node migration, plugin declarations are the authoritative
-        source and the only place whose edit takes effect (on plugin reload).
+        otherwise fall back to config/nodes. Why first: plugin declarations are
+        the authoritative source and the only place whose edit takes effect
+        (on plugin reload).
         """
         from engine.faces.nodes import declared_node_path
         plugin_path = declared_node_path(node_id)
@@ -206,9 +211,6 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             pp = Path(plugin_path)
             if pp.is_file():
                 return pp
-        sys_path = _safe_path(workspace_root / "engine" / "system_nodes", node_id, ".yaml")
-        if sys_path.exists():
-            return sys_path
         return _safe_path(workspace_root / "config" / "nodes", node_id, ".yaml")
 
     @router.get("/nodes/{node_id}/raw")
@@ -349,8 +351,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     def all_tool_names() -> list[str]:
         from toolbox.builtins import RESERVED_TOOL_NAMES
         builtin = set(RESERVED_TOOL_NAMES)
-        # Also include tools registered but not in _RESERVED (like cancel_active_tasks)
-        extra_builtins = {'cancel_active_tasks'}
+        # Also include tools registered but not in _RESERVED
+        extra_builtins: set[str] = set()
         names = builtin | extra_builtins
         # Scan external tools
         tools_dir = workspace_root / "tools"

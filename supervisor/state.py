@@ -73,6 +73,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._inbound_leases: dict[int, _InboundLease] = {}
 
         self._cancelled_sessions: set[str] = set()
+        self._skip_merge_sessions: set[str] = set()
         self._tools_reload_seq: int = 0
         self.session_entry_overrides: dict[str, str] = {}  # session_id -> node_id (AI switch)
         self.session_last_entry_node: dict[str, str] = {}  # session_id -> last used entry node
@@ -750,6 +751,19 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         elif session_id and not target:
             self.session_entry_overrides.pop(session_id, None)
 
+    def _is_switchable_entry_node(self, node_id: str) -> bool:
+        """Use node metadata rather than deployment-specific node ID lists."""
+        from engine.node import load_node
+
+        if node_id.startswith("system."):
+            return False
+        node = load_node(self.workspace_root, node_id)
+        if node is None:
+            return True
+        ctl = getattr(node, "control_tools", "all")
+        can_switch_back = ctl in (None, "all") or (isinstance(ctl, (list, set, tuple)) and "switch_node" in ctl)
+        return (node.extra.get("switchable", True) is not False) and can_switch_back
+
     def switch_session_node(self, session_id: str, target_node_id: str) -> dict[str, Any]:
         """设置或清除 session 级入口节点覆盖。"""
         sid = (session_id or "").strip()
@@ -766,11 +780,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if route_sid not in self.sessions:
                 return {"ok": False, "error": "session not found"}
             default_node = self._default_entry_node()
+            if target and not self._is_switchable_entry_node(target):
+                return {"ok": False, "error": f"node '{target}' is an internal/child node and cannot be used as session entry"}
             if target and target != default_node:
                 self.session_entry_overrides[route_sid] = target
+                self.session_last_entry_node[route_sid] = target
                 persisted_entry_node = target
             else:
                 self.session_entry_overrides.pop(route_sid, None)
+                self.session_last_entry_node[route_sid] = default_node
                 target = ""  # 清除覆盖
                 persisted_entry_node = ""
             info = self.sessions.get(route_sid)
@@ -1002,13 +1020,51 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                             context_key = context_key or mapped_key
                             break
 
+                # [2026-09-14] Why: accumulate 复用与嵌套派发的新任务运行在子会话的
+                # 入口分支（branch_*）上，旧行为只按 session_id/child_session_id 归属任务，
+                # 分支上的任务对不上任何行——worker 自身任务已终结而分支任务仍在跑时，
+                # /children、manage_workers、前端子节点面板全部漏看（实测 96edb136 会话
+                # 两个分支任务 20+ 分钟不可见）。How: 把子会话的活跃入口分支并入任务归属
+                # （与 running_tasks 端点同源的解析视图）。Purpose: 子会话行状态反映其
+                # 分支上的真实任务，工具与面板不再漏看嵌套/复用派发。
+                _child_branch_ids = self._entry_branch_ids_for_parent_locked(child_sid)
                 related_tasks = [
                     task for task in self.tasks.values()
                     if str(task.input.get("child_session_id") or "").strip() == child_sid
                     or task.session_id == child_sid
+                    or task.session_id in _child_branch_ids
                 ]
                 latest_task = max(related_tasks, key=_task_sort_key) if related_tasks else None
-                task_status = latest_task.status.value if latest_task is not None else "running"
+                if latest_task is not None:
+                    task_status = latest_task.status.value
+                else:
+                    # [2026-09-14] Why: 内存任务表会定期裁剪（scheduler 只保留最近
+                    # 200 个终态任务）且重启后仅回放 5000 条事件，子会话关联任务
+                    # 消失后旧行为无条件报 "running"，早已结束的子会话在前端常驻
+                    # 为运行中幽灵（实测挂 20+ 小时）。How: 无任务时回退 registry：
+                    # terminal_status 存在（终态写回）直接采用；否则按
+                    # last_active_at/created_at 距今是否超过宽限期（15 分钟）判定，
+                    # 超过则报 completed。Purpose: 任务被裁剪或重启丢失后，子会话
+                    # 状态立即收敛到真实终态，前端浮动面板自动隐藏。
+                    _reg_status = str(raw.get("terminal_status") or "").strip()
+                    if _reg_status in {"completed", "failed", "cancelled"}:
+                        task_status = _reg_status
+                    else:
+                        task_status = "running"
+                        _ref_str = str(
+                            raw.get("last_active_at")
+                            or raw.get("updated_at")
+                            or raw.get("created_at")
+                            or ""
+                        )
+                        try:
+                            _ref_dt = datetime.fromisoformat(_ref_str)
+                            if _ref_dt.tzinfo is None:
+                                _ref_dt = _ref_dt.replace(tzinfo=timezone.utc)
+                            if (_now() - _ref_dt) >= timedelta(minutes=15):
+                                task_status = "completed"
+                        except Exception:
+                            pass
                 started_at = latest_task.created_at.isoformat() if latest_task and latest_task.created_at else str(raw.get("created_at") or "")
                 updated_at = latest_task.updated_at.isoformat() if latest_task and latest_task.updated_at else str(raw.get("last_active_at") or raw.get("created_at") or "")
                 terminal = task_status in {"completed", "failed", "cancelled"}
@@ -1029,6 +1085,41 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
             rows.sort(key=lambda item: str(item.get("started_at") or ""))
             return rows
+
+    def _mark_child_session_terminal(self, task: Task) -> None:
+        """任务终态时把终态写回关联子会话 registry。
+
+        [2026-09-14] Why: dispatch/spawn_worker 子会话创建后 last_active_at 从不
+        更新（update_last_active 仅在 accumulate 复用时被调用，其文档串声称的
+        "子 task 创建/完成时调用" 接线从未存在），24h TTL 只能按创建时间算；
+        且 scheduler 会把终态任务裁剪出内存、重启后只回放 5000 条事件，
+        session_children() 找不到任务时无从得知终态。How: 在 complete_task 与
+        超时回收处调用，把 last_active_at / completed_at / terminal_status 写入
+        task.session_id 及 task.input.child_session_id 对应的 is_child registry
+        条目。Purpose: TTL 按真实活动时间计算；任务从内存消失后子会话仍能报出
+        准确终态。
+        """
+        candidates: list[str] = []
+        _sid = str(getattr(task, "session_id", "") or "").strip()
+        if _sid:
+            candidates.append(_sid)
+        if isinstance(task.input, dict):
+            _alt = str(task.input.get("child_session_id") or "").strip()
+            if _alt and _alt not in candidates:
+                candidates.append(_alt)
+        touched = False
+        _now_iso = _now().isoformat()
+        _status = str(getattr(getattr(task, "status", None), "value", "") or "")
+        for cid in candidates:
+            entry = self._session_store._registry.get(cid)
+            if isinstance(entry, dict) and entry.get("is_child"):
+                entry["last_active_at"] = _now_iso
+                entry["completed_at"] = _now_iso
+                if _status:
+                    entry["terminal_status"] = _status
+                touched = True
+        if touched:
+            self._session_store._flush()
 
     def get_or_create_child_session(
         self,
@@ -1142,10 +1233,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         Child Session 隔离（Phase A）：删除 JSONL 文件、从映射表移除、物理删除 registry 条目。
         """
-        # 1. 删除 JSONL 文件
-        conv_path = self.workspace_root / "data" / "conversations" / f"{child_session_id}.jsonl"
-        if conv_path.exists():
-            conv_path.unlink()
+        # 1. 删除 JSONL 文件与缓存
+        self._delete_conversation_session_locked(child_session_id)
 
         # 2. 从映射表移除
         key_to_remove = None
@@ -1170,73 +1259,131 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         logger.info("child session expired: %s", child_session_id)
 
+    def _task_referenced_session_ids_locked(self) -> set[str]:
+        """收集仍被非终态 task 引用的 session id（须持 self._lock）。
+
+        [2026-11-02] 审计修复：Why: TTL sweep 曾只看 task.session_id，而 dispatch
+        task 把 child_session_id / parent_session_id / branch_session_id 存在 input 里，
+        sweep 会把这些仍在被使用的会话连同 JSONL 一起删掉，Worker 后续写入落到已删
+        除的历史上。How: 遍历所有非终态 task，收集 session_id 与上述四类引用，并把
+        它们的入口分支一并纳入。Purpose: 清理永不触碰活跃关系。
+        """
+        protected: set[str] = set()
+        for task in list(self.tasks.values()):
+            if self._task_terminal(task):
+                continue
+            data = task.input if isinstance(getattr(task, "input", None), dict) else {}
+            origin = data.get("_dispatch_origin")
+            origin = origin if isinstance(origin, dict) else {}
+            chain_origin = getattr(task, "output_chain_source_dispatch_origin", None)
+            chain_origin = chain_origin if isinstance(chain_origin, dict) else {}
+            for value in (
+                str(getattr(task, "session_id", "") or ""),
+                str(data.get("parent_session_id") or ""),
+                str(data.get("child_session_id") or ""),
+                str(data.get("branch_session_id") or ""),
+                str(data.get("_route_session_id") or ""),
+                str(origin.get("parent_session_id") or ""),
+                str(getattr(task, "output_chain_source_session_id", "") or ""),
+                str(chain_origin.get("parent_session_id") or ""),
+            ):
+                sid = value.strip()
+                if sid:
+                    protected.add(sid)
+        # A still-running descendant may return after its caller has finished.
+        # Preserve the caller's session chain until that callback can be delivered.
+        pending = list(protected)
+        while pending:
+            sid = pending.pop()
+            info = self._session_store._registry.get(sid)
+            parent = str(info.get("parent_session_id") or "").strip() if isinstance(info, dict) else ""
+            if parent and parent not in protected:
+                protected.add(parent)
+                pending.append(parent)
+        branches_for_parent = getattr(self, "_entry_branch_ids_for_parent_locked", None)
+        if callable(branches_for_parent):
+            for pid in list(protected):
+                protected.update(branches_for_parent(pid))
+        return protected
+
     def _cleanup_stale_sessions_locked(self) -> None:
         """清理 sessions.json 中已无用的 branch 和 child session 记录。
 
-        [AutoC 2026-05-30] Why: 历史上 branch/child session 只标记 reset 不删除，
-        导致 sessions.json 无限膨胀。
-        How: 遍历 registry，删除所有 reset=true 的条目，以及超过 24h 无活动的
-        非 accumulate child session。
-        Purpose: 定期清理积累的历史记录。
+        [2026-11-02] 审计修复：Why: 旧 sweep 只按 task.session_id 判断活跃，且删除
+        registry 时只删 conversations JSONL，留下 transcripts、cache、conversation_map
+        与 child 映射的悬挂引用。How: 先算「非终态 task 引用集合」作为硬保护，再
+        对 reset / 孤儿 branch / 过期 fresh-fork child 统一走
+        _delete_conversation_session_locked + 映射收缩。Purpose: 完成/历史对话在 TTL
+        内可回看（与历史 UI 一致），过期后磁盘与索引一起干净回收。
         """
-        from datetime import timedelta
-
         now = datetime.now(timezone.utc)
         stale_threshold = now - timedelta(hours=24)
+        protected = self._task_referenced_session_ids_locked()
         to_remove: list[str] = []
 
         for sid, info in list(self._session_store._registry.items()):
-            if not isinstance(info, dict):
+            sid = str(sid or "").strip()
+            if not sid or not isinstance(info, dict):
                 continue
-            # [AutoC 2026-05-30] Why: reset=true 条目已经不会参与活跃会话恢复。
-            # How: 后台 sweep 统一物理删除历史 reset 行。Purpose: 修复旧版本遗留
-            # reset 标记长期占用 sessions.json 的问题。
+            # 活跃关系硬保护：仍被非终态 task（含 dispatch child/branch）引用就不删。
+            if sid in protected:
+                continue
+            # [AutoC 2026-05-30] reset=true 条目已经不会参与活跃会话恢复。
             if info.get("reset"):
                 to_remove.append(sid)
                 continue
-            # [AutoC 2026-05-30] Why: branch session 是入口执行副本，不应长期
-            # 持久化。How: 只要没有非终态 task 仍运行在该 branch，就删除 registry。
-            # Purpose: 清理历史孤儿 branch，同时避免误删仍在执行的 branch。
-            if sid.startswith("branch_"):
-                if not any(t.session_id == sid and not self._task_terminal(t) for t in self.tasks.values()):
-                    to_remove.append(sid)
+            # 孤儿入口分支：只要没有非终态 task 跑在它上面就回收。
+            if (
+                sid.startswith("branch_")
+                or str(info.get("node_id") or "") == "__entry_branch__"
+                or sid in self.entry_branch_parents
+            ):
+                to_remove.append(sid)
                 continue
-            # [AutoC 2026-05-30] Why: fresh/fork child session 只用于一次性或
-            # 隔离上下文，24h 无活动后应释放；accumulate 是长期上下文，必须保留。
-            # How: 读取 context_mode 和 last_active_at，超过阈值才加入删除列表。
-            # Purpose: 同时满足 TTL 清理和 accumulate 永久保留规则。
-            if info.get("is_child"):
-                ctx_mode = str(info.get("context_mode") or "").strip()
-                # [AutoC 2026-05-30] 条件从 in ("fresh", "fork") 改为 != "accumulate"，
-                # 因为历史系统节点（turn_summarizer/compactor）创建的 child session
-                # 没有 context_mode 字段（空字符串），旧条件无法匹配，导致堆积。
-                if ctx_mode == "accumulate":
-                    continue
-                # [AutoC 2026-05-30] Why: 没有 context_mode 的历史 child session
-                # 是旧代码遗留，运行时清理对它们无效（旧 task 已消失）。
-                # How: 无 context_mode 的直接清理，不等 24h TTL。
-                # Purpose: 一次性清除历史堆积。
-                if not ctx_mode:
+            # child-like 记录：is_child / 有 parent / agent:* 派发会话（含老数据形状）。
+            conv_key = str(info.get("conversation_key") or "")
+            is_child = (
+                bool(info.get("is_child"))
+                or bool(info.get("parent_session_id"))
+                or conv_key.startswith("agent:")
+            )
+            if not is_child:
+                continue
+            ctx_mode = str(info.get("context_mode") or "").strip()
+            # accumulate 是长期上下文，永久保留。
+            if ctx_mode == "accumulate":
+                continue
+            # 无 context_mode 的历史 child session 直接清理，不等 TTL。
+            if not ctx_mode:
+                to_remove.append(sid)
+                continue
+            updated_str = str(
+                info.get("last_active_at")
+                or info.get("updated_at")
+                or info.get("created_at")
+                or ""
+            )
+            try:
+                updated_at = datetime.fromisoformat(updated_str)
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+                if updated_at < stale_threshold:
                     to_remove.append(sid)
-                    continue
-                # fresh/fork: 正常 TTL 检查
-                updated_str = str(
-                    info.get("last_active_at")
-                    or info.get("updated_at")
-                    or info.get("created_at")
-                    or ""
-                )
-                try:
-                    updated_at = datetime.fromisoformat(updated_str)
-                    if updated_at.tzinfo is None:
-                        updated_at = updated_at.replace(tzinfo=timezone.utc)
-                    if updated_at < stale_threshold:
-                        to_remove.append(sid)
-                except Exception:
-                    pass
+            except Exception:
+                # 时间不可解析时保守保留，避免误删。
+                pass
 
         if to_remove:
             for sid in to_remove:
+                if sid in protected:
+                    continue
+                # [2026-11-02] 统一清理：conversation JSONL + transcripts + cache
+                # 走同一个 helper；registry / conversation_map / child 映射 / 分支索引
+                # 在同一处收缩，不留孤儿文件与悬挂映射。
+                self._delete_conversation_session_locked(sid)
+                for _ck, _mapped in list(self.conversation_map.items()):
+                    if _mapped == sid:
+                        self.conversation_map.pop(_ck, None)
                 self._session_store._registry.pop(sid, None)
                 self.sessions.pop(sid, None)
                 self.session_generations.pop(sid, None)

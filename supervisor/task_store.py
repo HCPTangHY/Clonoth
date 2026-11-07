@@ -62,17 +62,16 @@ class TaskStoreMixin:
         """Build a task snapshot payload safe for long-term event storage."""
         payload = task.model_dump(mode="json")
         result = payload.get("result")
-        if isinstance(result, dict) and "dispatch_input" in result:
-            # Why: dispatch_input can contain a full child prompt or compacted
-            # conversation text, and the same stale result used to be repeated in
-            # task_started/task_suspended snapshots. How: copy the serialized
-            # result and remove only dispatch_input from the event payload while
-            # leaving the live Task object untouched. Purpose: reduce future
-            # events.jsonl growth and replay memory without changing routing,
-            # which reads task.result before or outside event serialization.
+        if isinstance(result, dict) and ("dispatch_input" in result or "_runtime_state" in result):
+            # Why: dispatch_input and _runtime_state (tool_call_log) can contain large
+            # prompts or multi-step logs, and repeating them in every task_* snapshot
+            # bloats EventLog memory and events.jsonl. How: strip them from the event
+            # copy while leaving the live Task object untouched.
             slim_result = dict(result)
-            slim_result.pop("dispatch_input", None)
-            slim_result["dispatch_input_omitted"] = True
+            if "dispatch_input" in slim_result:
+                slim_result.pop("dispatch_input", None)
+                slim_result["dispatch_input_omitted"] = True
+            slim_result.pop("_runtime_state", None)
             payload["result"] = slim_result
         return payload
 
@@ -259,6 +258,15 @@ class TaskStoreMixin:
         # the global runtime default. Purpose: callbacks keep the node binding
         # selected when the session was first routed or switched.
         session_recorded = (session_info.entry_node_id if session_info else "").strip() if session_info else ""
+        if (
+            session_info
+            and session_recorded
+            and not str(session_info.conversation_key or "").startswith("agent:")
+            and not self._is_switchable_entry_node(session_recorded)
+        ):
+            session_recorded = ""
+            session_info.entry_node_id = default_node
+            self._session_store.update_entry_node(session_id, default_node)
         payload_entry = str(payload.get("entry_node_id") or "").strip()
         # [2026-05-28] dispatch 场景下跳过 session_override，用 payload 指定的 entry_node。
         # 为什么：dispatch inbound 的 entry_node_id 由调用方精确指定，不应被
@@ -274,7 +282,12 @@ class TaskStoreMixin:
                 or session_recorded
                 or default_node
             )
-        if session_info and not session_info.entry_node_id:
+        if (
+            session_info
+            and not session_info.entry_node_id
+            and not payload.get("dispatch_origin")
+            and self._is_switchable_entry_node(entry_node)
+        ):
             # Why: newly-created sessions may not yet know their frontend-selected
             # entry node. How: once an inbound is actually routed, copy the node
             # into memory and sessions.json. Purpose: later restarts can reproduce
@@ -446,6 +459,9 @@ class TaskStoreMixin:
                 },
                 "dispatch_context_mode": _dispatch_context_mode,
                 "_dispatch_origin": _dispatch_origin,
+                # [2026-09-13] dispatch 回调承接标记：origin task 终态后 fork 的入口
+                # task 携带派发者 task_id，后续同源回调据此找到它并 preempt 注入。
+                "_dispatch_owner_root_task_id": str(payload.get("_dispatch_owner_root_task_id") or ""),
                 **inbound_metadata,
             },
             continuation={},
@@ -483,6 +499,8 @@ class TaskStoreMixin:
             if task.session_id not in session_ids:
                 continue
             if self._task_terminal(task):
+                continue
+            if task.input.get("_system_task"):
                 continue
             result.append({
                 "task_id": task.task_id,
@@ -534,6 +552,8 @@ class TaskStoreMixin:
                 session_ids.update(self._entry_branch_ids_for_parent_locked(_child_sid))
             for task in self.tasks.values():
                 if task.session_id not in session_ids or self._task_terminal(task) or task.task_id in keep_ids:
+                    continue
+                if not _filter_node and task.input.get("_system_task") and task.node_id == "system.memory_extractor":
                     continue
                 # node_id 过滤：仅当指定了 node_id 且不匹配时跳过
                 if _filter_node and task.node_id != _filter_node:
@@ -694,16 +714,28 @@ class TaskStoreMixin:
         """标记单个 task 为 preempt_requested。不影响 session 状态。"""
         with self._lock:
             task = self.tasks.get(task_id)
-            if task is None or task.status not in (TaskStatus.running, TaskStatus.pending):
+            if task is None:
+                return False
+            _can_preempt = (
+                task.status in (TaskStatus.running, TaskStatus.pending)
+                or (task.status == TaskStatus.suspended and bool(task.waiting_for_task_id))
+            )
+            if not _can_preempt:
                 return False
             task.preempt_requested = True
-            task.preempt_message = message
-            # [AutoC 2026-06-17] Why: a second preempt without files must not keep a
-            # previous unconsumed file list, and malformed API input must not become
-            # iterable garbage when consumed. How: always replace with a shallow list
-            # only when the provided value is actually a list. Purpose: preempt
-            # attachments stay scoped to exactly one injected message.
-            task.preempt_attachments = list(attachments) if isinstance(attachments, list) else []
+            # [2026-09-13] preempt 语义统一改为追加。Why: 引擎消费前多条消息并发
+            # 到达（异步工具结果、子任务回调、连发 preempt）时，覆盖式赋值会丢弃
+            # 先到的消息。How: 文本以空行拼接，attachments 仅在传入为 list 时追加
+            # 拼接。Purpose: consume_preempt_message 一次取走全部未消费内容。
+            if message:
+                task.preempt_message = (
+                    f"{task.preempt_message}\n\n{message}"
+                    if task.preempt_message else message
+                )
+            task.preempt_attachments = [
+                *task.preempt_attachments,
+                *(list(attachments) if isinstance(attachments, list) else []),
+            ]
             # [Fork/Merge 2026-05-17] Why: a task can be running inside a
             # temporary entry branch, but session event consumers watch the
             # durable parent session. How: use the task route helper when the
@@ -728,18 +760,58 @@ class TaskStoreMixin:
             )
             return True
 
-    def consume_preempt_message(self, task_id: str) -> dict:
-        """消费 preempt message，返回 {message, attachments} 并清空。同时重置 preempt_requested。"""
+    def consume_preempt_message(self, task_id: str, consumed_message: str | None = None, consumed_attachment_count: int = 0) -> dict:
+        """消费 preempt message，返回 {message, attachments} 并清空。同时重置 preempt_requested。
+
+        [2026-09-13] 前缀切除语义。Why: engine 的消费流程是 GET /preempted 读文本
+        →注入+持久化（耗时）→ POST 本方法；旧实现无条件全清，若读与清之间又有
+        消息追加到达（异步工具结果、子任务回调并发），后到的消息会被一并清掉
+        永久丢失。How: 携带 engine 实际消费的文本，完全匹配则全清；只是前缀则
+        切除前缀保留追加部分（flag 维持 True 供下轮轮询）；纯打断确认（空文本
+        哨兵 ""）但期间来了新消息时保留消息与 flag。None 表示旧式无参调用，
+        维持无条件全清保持兼容。Purpose: 追加语义下消费不丢失并发到达的消息。
+        """
         with self._lock:
             task = self.tasks.get(task_id)
             if task is None:
                 return {"message": "", "attachments": []}
             msg = task.preempt_message
             atts = list(task.preempt_attachments)
-            task.preempt_message = ""
-            task.preempt_attachments = []
-            task.preempt_requested = False
-            return {"message": msg, "attachments": atts}
+            if consumed_message is None:
+                # 旧式无参调用：无条件全清。
+                task.preempt_message = ""
+                task.preempt_attachments = []
+                task.preempt_requested = False
+                return {"message": msg, "attachments": atts}
+            consumed = str(consumed_message)
+            # [2026-11-02] 审计修复：严格 ACK 参数（只消费已观察前缀）。
+            # Why: 旧实现把非法值 int() 宽容成 0，且不校验上限，count=100 会
+            # atts[100:] 把整张附件列表清空；负数/字符串/布尔也被静默接受。
+            # How: 只接受真 int（排除 bool）且 0 <= count <= len(atts)，否则原样
+            # 保留消息与附件并返回 kept=True。Purpose: 坏参数不清队列，引擎下次
+            # 轮询仍能拿到未消费的回调。
+            count = consumed_attachment_count
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or not 0 <= count <= len(atts)
+            ):
+                return {"message": "", "attachments": [], "kept": True}
+            consumed = str(consumed_message)
+            if msg == consumed:
+                remaining = ""
+            elif consumed and msg.startswith(consumed + "\n\n"):
+                remaining = msg[len(consumed) + 2:]
+            elif not consumed:
+                remaining = msg
+            else:
+                return {"message": "", "attachments": [], "kept": True}
+            remaining_atts = atts[count:]
+            task.preempt_message = remaining
+            task.preempt_attachments = remaining_atts
+            task.preempt_requested = bool(remaining or remaining_atts)
+            # 返回值只描述本次已消费的前缀（与 engine 观察到的内容一致）。
+            return {"message": consumed_message, "attachments": atts[:count], "kept": task.preempt_requested}
 
     def is_task_preempted(self, task_id: str) -> dict:
         """查询 task 的 preempt 状态，包含 message。"""
@@ -795,6 +867,8 @@ class TaskStoreMixin:
                     task.status = TaskStatus.cancelled
                     task.updated_at = now
                     task.lease_expires_at = None
+                    self._finalize_branch_task_locked(task, merge=True)
+                    self._cleanup_tool_result_artifacts_for_task(task.task_id)
                     self._event_task_snapshot("task_cancelled", task)
                     continue
 
@@ -828,6 +902,9 @@ class TaskStoreMixin:
             if task is None:
                 return None
             if self._task_terminal(task):
+                branch_sid = str(task.input.get("branch_session_id") or "").strip() if isinstance(task.input, dict) else ""
+                if branch_sid:
+                    self._cleanup_branch_locked(branch_sid)
                 return task
             if task.worker_id and task.worker_id != wid and task.lease_expires_at and task.lease_expires_at > _now():
                 return None
@@ -845,6 +922,7 @@ class TaskStoreMixin:
                 # 做法：在写 task_cancelled 事件前调用分支 finalize，执行 merge 与 cleanup。
                 # 目的：finish/fail/cancel 三类终态都能把分支历史回写主 session。
                 self._finalize_branch_task_locked(task, merge=True)
+                self._mark_child_session_terminal(task)
                 self._event_task_snapshot("task_cancelled", task, component="engine")
                 return task
 
@@ -861,6 +939,9 @@ class TaskStoreMixin:
                 task.status = TaskStatus.completed
 
             self._cleanup_tool_result_artifacts_for_task(task.task_id)
+            # [2026-09-14] 任务终态写回子会话 registry，供 TTL 与 session_children
+            # 在任务被裁剪/重启丢失后仍能报终态。见 SupervisorState._mark_child_session_terminal。
+            self._mark_child_session_terminal(task)
             self._event_task_snapshot("task_completed", task, component="engine")
             self._route_completed_task_locked(task)
             return task

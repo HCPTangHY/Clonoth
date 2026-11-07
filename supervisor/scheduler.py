@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -20,6 +22,7 @@ from typing import Any, TYPE_CHECKING
 import yaml
 
 from engine.context_store import cleanup_old_contexts
+from toolbox._common import safe_subprocess_env
 
 
 if TYPE_CHECKING:
@@ -122,8 +125,10 @@ class SchedulerThread:
         self._state = state
         self._workspace_root = workspace_root
         self._last_fired: dict[str, str] = {}  # schedule_id -> "YYYY-MM-DD HH:MM"
+        self._last_tick_minute: datetime | None = None
         self._thread: threading.Thread | None = None
         self._running_scripts: set[str] = set()  # 防重入
+        self._scripts_lock = threading.Lock()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
@@ -141,44 +146,79 @@ class SchedulerThread:
             # 每 30 分钟清理一次旧上下文快照（30 ticks × 60s = 30min）
             if tick_count % 30 == 0:
                 self._cleanup()
-            time.sleep(60)
+            # Align sleep to the next minute boundary (+0.2s) to prevent cumulative drift
+            sleep_sec = max(1.0, 60.0 - (time.time() % 60.0) + 0.2)
+            time.sleep(sleep_sec)
 
     def _tick(self) -> None:
         now = datetime.now(timezone.utc)
-        now_key = now.strftime("%Y-%m-%d %H:%M")
+        cur_min = now.replace(second=0, microsecond=0)
+        last_min = self._last_tick_minute
+        if last_min is not None:
+            gap_sec = (cur_min - last_min).total_seconds()
+            if 0 < gap_sec <= 300:
+                steps = int(gap_sec // 60)
+                minutes_to_check = [last_min + timedelta(minutes=i) for i in range(1, steps + 1)]
+            elif gap_sec <= 0:
+                minutes_to_check = [cur_min]
+            else:
+                minutes_to_check = [cur_min]
+        else:
+            minutes_to_check = [cur_min]
+        self._last_tick_minute = cur_min
 
         schedules = load_schedules(self._workspace_root)
 
-        for s in schedules:
-            sid = str(s.get("id") or "").strip()
-            if not sid:
-                continue
-            if not s.get("enabled", True):
-                continue
+        # [2026-11-02] 审计修复：catchup 快照内 once 只能触发一次。
+        # Why: _tick 为了补上休眠期间的分钟，会用同一份 schedules 快照循环多个
+        # check_dt；once 的 _remove_schedule 只改磁盘，不改已加载的 snapshot，于是
+        # "* * * * *" 的 once 任务在 5 分钟 catchup 里被注入 5 次。
+        # How: 在本轮快照内用 fired_once 记录已触发的 once schedule id，命中即跳过。
+        # Purpose: 一次任务不论补几个分钟都只执行一次。
+        fired_once: set[str] = set()
 
-            cron_expr = str(s.get("cron") or "").strip()
-            if not cron_expr:
-                continue
+        for check_dt in minutes_to_check:
+            dt_key = check_dt.strftime("%Y-%m-%d %H:%M")
+            for s in schedules:
+                sid = str(s.get("id") or "").strip()
+                if not sid:
+                    continue
+                if sid in fired_once:
+                    continue
+                if not s.get("enabled", True):
+                    continue
 
-            # 防止同一分钟重复触发
-            if self._last_fired.get(sid) == now_key:
-                continue
+                cron_expr = str(s.get("cron") or "").strip()
+                if not cron_expr:
+                    continue
 
-            if not cron_match(cron_expr, now):
-                continue
+                # 防止同一分钟重复触发
+                if self._last_fired.get(sid) == dt_key:
+                    continue
 
-            # 匹配成功
-            self._last_fired[sid] = now_key
-            once = bool(s.get("once", False))
-            stype = str(s.get("type") or "message").strip()
+                if not cron_match(cron_expr, check_dt):
+                    continue
 
-            if stype == "script":
-                self._fire_script(s, sid)
-            else:
-                self._fire_message(s, sid)
+                # 匹配成功
+                self._last_fired[sid] = dt_key
+                once = bool(s.get("once", False))
+                stype = str(s.get("type") or "message").strip()
 
-            if once:
-                self._remove_schedule(sid)
+                if stype == "script":
+                    threading.Thread(
+                        target=self._fire_script,
+                        args=(dict(s), sid),
+                        daemon=True,
+                        name=f"sched-script-{sid}",
+                    ).start()
+                else:
+                    self._fire_message(s, sid)
+
+                if once:
+                    fired_once.add(sid)
+                    self._remove_schedule(sid)
+
+        now_key = cur_min.strftime("%Y-%m-%d %H:%M")
 
         # Why: system-level scheduled features now live in engine.builtin
         # supervisor hook handlers. How: emit a dream schedule tick with a
@@ -246,26 +286,50 @@ class SchedulerThread:
         if not command:
             log.error(f"[scheduler] script {sid}: missing 'command' field")
             return
-        if sid in self._running_scripts:
-            log.warning(f"[scheduler] script {sid}: still running, skipping")
-            return
-        self._running_scripts.add(sid)
+        with self._scripts_lock:
+            if sid in self._running_scripts:
+                log.warning(f"[scheduler] script {sid}: still running, skipping")
+                return
+            self._running_scripts.add(sid)
+        proc: subprocess.Popen[str] | None = None
         try:
             timeout = int(s.get("timeout") or 30)
             silent = bool(s.get("silent", True))
             text_prefix = str(s.get("text") or "").strip()
             conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
             entry_node_id = str(s.get("entry_node_id") or "").strip()
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                timeout=timeout, cwd=str(self._workspace_root),
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(self._workspace_root),
+                env=safe_subprocess_env(),
+                start_new_session=True,
             )
-            if result.stderr and result.stderr.strip():
-                log.warning(f"[scheduler] script {sid} stderr: {result.stderr.strip()[:500]}")
-            if result.returncode != 0:
-                log.error(f"[scheduler] script {sid} exited with rc={result.returncode}")
+            try:
+                stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.communicate(timeout=3)
+                except Exception:
+                    pass
+                log.error(f"[scheduler] script {sid}: timed out after {timeout}s")
                 return
-            stdout = (result.stdout or "").strip()
+            if stderr_raw and stderr_raw.strip():
+                log.warning(f"[scheduler] script {sid} stderr: {stderr_raw.strip()[:500]}")
+            if proc.returncode != 0:
+                log.error(f"[scheduler] script {sid} exited with rc={proc.returncode}")
+                return
+            stdout = (stdout_raw or "").strip()
             if not stdout:
                 if silent:
                     log.debug(f"[scheduler] script {sid}: empty stdout, silent skip")
@@ -288,12 +352,11 @@ class SchedulerThread:
                 body_text = text_prefix + "\n" + body_text
             attachments = data.get("attachments") or None
             self._inject_inbound(sid, body_text, conv_key, entry_node_id, attachments)
-        except subprocess.TimeoutExpired:
-            log.error(f"[scheduler] script {sid}: timed out after {s.get('timeout', 30)}s")
         except Exception as e:
             log.error(f"[scheduler] script {sid}: unexpected error: {e}")
         finally:
-            self._running_scripts.discard(sid)
+            with self._scripts_lock:
+                self._running_scripts.discard(sid)
 
     def _remove_schedule(self, sid: str) -> None:
         try:
@@ -335,21 +398,55 @@ class SchedulerThread:
             if count > 0:
                 log.info(f"[scheduler] cleaned up {count} old context snapshots")
 
-            # 在锁内清理内存中已终结的旧 task（保留最近 200 个）
+            # 在锁内清理内存中已终结的旧 task（保留最近 80 个）并瘦身历史入站与事件缓冲
             with self._state._lock:
                 terminal = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
+                for _t in self._state.tasks.values():
+                    if _t.status in terminal and isinstance(_t.result, dict):
+                        _t.result.pop("_runtime_state", None)
                 finished_ids = [
                     tid for tid in self._state._task_order
                     if tid in self._state.tasks and self._state.tasks[tid].status in terminal
                 ]
-                if len(finished_ids) > 200:
-                    to_remove = finished_ids[:-200]
+                if len(finished_ids) > 80:
+                    to_remove = finished_ids[:-80]
                     for tid in to_remove:
                         self._state.tasks.pop(tid, None)
                     self._state._task_order = [
                         tid for tid in self._state._task_order if tid in self._state.tasks
                     ]
                     log.info(f"[scheduler] pruned {len(to_remove)} old tasks from memory")
+
+                # 清理已处理的入站消息 payload 并裁剪过老的入站序号（保留最近 500 个及所有活跃 task 关联序号）
+                active_seqs = {
+                    t.source_inbound_seq for t in self._state.tasks.values()
+                    if t.source_inbound_seq is not None
+                }
+                for _seq, _ievt in list(self._state._inbound_events.items()):
+                    if (_seq in self._state._inbound_processed or _seq in self._state._inbound_routed) and isinstance(_ievt, dict) and "payload" in _ievt:
+                        self._state._inbound_events[_seq] = {"session_id": str(_ievt.get("session_id") or "")}
+                if self._state._inbound_cursor > 500:
+                    cut = self._state._inbound_cursor - 500
+                    evict_seqs = [
+                        s for s in self._state._inbound_order[:cut]
+                        if s not in active_seqs
+                    ]
+                    if evict_seqs:
+                        evict_set = set(evict_seqs)
+                        for s in evict_seqs:
+                            self._state._inbound_events.pop(s, None)
+                            self._state._inbound_processed.discard(s)
+                            self._state._inbound_routed.pop(s, None)
+                            self._state._inbound_leases.pop(s, None)
+                        self._state._inbound_order = [
+                            s for s in self._state._inbound_order if s not in evict_set
+                        ]
+                        self._state._inbound_cursor = max(0, self._state._inbound_cursor - len(evict_seqs))
+
+                if hasattr(self._state, "eventlog") and hasattr(self._state.eventlog, "_events"):
+                    with self._state.eventlog._lock:
+                        if len(self._state.eventlog._events) > 1000:
+                            self._state.eventlog._events = self._state.eventlog._events[-1000:]
 
                 # 回收超时的 running 状态 task（安全网，防止 worker 崩溃后 task 永久孤立）
                 _now_ts = datetime.now(timezone.utc)
@@ -368,13 +465,22 @@ class SchedulerThread:
                     task.result = {
                         "action": "fail",
                         "node_id": task.node_id or "",
-                        "error": f"任务运行超时（{_stale_min} 分钟无响应，疑似 worker 崩溃）",
+                        "error": f"Task timed out (no response for {_stale_min} minutes, worker likely crashed)",
                     }
                     task.updated_at = _now_ts
                     task.lease_expires_at = None
+                    # [2026-09-14] 超时回收也是终态，写回子会话 registry，避免
+                    # supervisor 重启/裁剪后这类子会话在面板上变回 running 幽灵。
+                    self._state._mark_child_session_terminal(task)
                     self._state._event_task_snapshot("task_completed", task, component="supervisor")
                     self._state._route_completed_task_locked(task)
                     log.warning(f"[scheduler] reaped stale running task {tid} (node={task.node_id}, stale {_stale_min}min)")
         except Exception as e:
             log.warning(f"[scheduler] cleanup error: {e}")
+        try:
+            import ctypes, gc
+            gc.collect()
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 

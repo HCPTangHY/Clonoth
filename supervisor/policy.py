@@ -58,6 +58,7 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "data/policy.yaml", "decision": "deny", "reason": "policy is high-risk (human-only)"},
                 {"pattern": "data/events.jsonl", "decision": "deny", "reason": "event log is append-only; never modify"},
                 {"pattern": "data/schedules.yaml", "decision": "approval_required", "reason": "schedule changes require approval"},
+                {"pattern": "data/mcp_clients.yaml", "decision": "approval_required", "reason": "MCP client changes require approval"},
                 {"pattern": "engine/**", "decision": "approval_required", "reason": "engine source changes require approval"},
                 {"pattern": "supervisor/**", "decision": "approval_required", "reason": "supervisor source changes require approval"},
                 {"pattern": "toolbox/**", "decision": "approval_required", "reason": "toolbox source changes require approval"},
@@ -106,13 +107,26 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"name": "list_dir", "decision": "auto", "reason": "只读目录"},
                 {"name": "search_in_files", "decision": "auto", "reason": "只读搜索"},
                 {"name": "create_schedule", "decision": "auto", "reason": "内部 write_file 审批 data/schedules.yaml"},
+                {"name": "list_schedules", "decision": "auto", "reason": "只读定时任务列表"},
                 {"name": "delete_schedule", "decision": "auto", "reason": "内部 write_file 审批 data/schedules.yaml"},
+                {"name": "manage_schedule", "decision": "auto", "reason": "list只读，upsert/delete内部 write_file 审批 data/schedules.yaml"},
                 {"name": "delete_skill", "decision": "auto", "reason": "内部 write_file 审批 skills/**"},
+                {"name": "manage_memory", "decision": "auto", "reason": "记忆读写是高频操作，dream/extractor 无人值守"},
                 {"name": "save_memory", "decision": "auto", "reason": "记忆读写是高频操作，dream/extractor 无人值守"},
                 {"name": "delete_memory", "decision": "auto", "reason": "记忆读写是高频操作，dream/extractor 无人值守"},
                 {"name": "list_memories", "decision": "auto", "reason": "只读记忆列表"},
                 {"name": "list_skills", "decision": "auto", "reason": "只读技能列表"},
                 {"name": "create_or_update_skill", "decision": "auto", "reason": "内部 write_file 审批 skills/**"},
+                {"name": "manage_skill", "decision": "auto", "reason": "list只读，upsert/delete内部 write_file 审批 skills/**"},
+                {"name": "list_mcp_clients", "decision": "auto", "reason": "只读 MCP 客户端列表"},
+                {"name": "create_or_update_mcp_client", "decision": "auto", "reason": "内部 write_file 审批 data/mcp_clients.yaml"},
+                {"name": "delete_mcp_client", "decision": "auto", "reason": "内部 write_file 审批 data/mcp_clients.yaml"},
+                {"name": "manage_mcp_client", "decision": "auto", "reason": "list只读，upsert/delete内部 write_file 审批 data/mcp_clients.yaml"},
+                {"name": "manage_tool", "decision": "auto", "reason": "reload只读，upsert内部 write_file 审批 tools/**"},
+                {"name": "read_media", "decision": "auto", "reason": "只读媒体分析"},
+                {"name": "read_image", "decision": "auto", "reason": "只读图像分析"},
+                {"name": "read_video", "decision": "auto", "reason": "只读视频分析"},
+                {"name": "create_agent", "decision": "auto", "reason": "内部 write_file 审批 config/nodes/**"},
             ],
         },
     }
@@ -146,12 +160,6 @@ class PolicyEngine:
 
         self._extra_roots: list[Path] = []
 
-    @property
-    def extra_roots(self) -> list[Path]:
-        """Public read access for attachment trust resolution."""
-        self._reload_if_needed()
-        return list(self._extra_roots)
-
         self._read_default: SafetyLevel = SafetyLevel.auto
         self._write_default: SafetyLevel = SafetyLevel.auto
         self._restart_default: SafetyLevel = SafetyLevel.approval_required
@@ -164,8 +172,22 @@ class PolicyEngine:
         self._approval_command_patterns: list[re.Pattern[str]] = [re.compile(_GIT_REMOTE_PUSH_PATTERN, re.IGNORECASE)]
         self._deny_command_patterns: list[re.Pattern[str]] = []
 
+        # [AutoC 2026-09-12] 先编译内置安全默认，再碰文件系统。Why: 属性里提前
+        # return 的写法曾让整段初始化成为死代码，_read_default 等从未赋值，任何
+        # evaluate_* 都直接 AttributeError；即便侥幸跳过，未编译的规则集在配置
+        # 文件缺失/不可读时会 fail open。How: 构造期无条件 _compile() 一次，随后
+        # 才尝试创建/读取 policy.yaml。Purpose: 配置不存在、不可读或损坏时，
+        # .env / data/policy.yaml 等敏感读写仍被内置默认拒绝。
+        self._compile()
+
         self._ensure_policy_file_exists()
         self._reload_if_needed(force=True)
+
+    @property
+    def extra_roots(self) -> list[Path]:
+        """Public read access for attachment trust resolution."""
+        self._reload_if_needed()
+        return list(self._extra_roots)
 
     def _ensure_policy_file_exists(self) -> None:
         if self._policy_path.exists():
@@ -198,7 +220,13 @@ class PolicyEngine:
             # 顶层键，每节内部仍以文件为准。Purpose: 内置默认新增节（如
             # tools）对存量部署自动生效。
             merged = _default_policy_dict()
-            merged.update(data)
+            for key, value in data.items():
+                # [AutoC 2026-09-12] 顶层节类型损坏（如 read_file: "oops"）不能被
+                # 当成"回退到 auto"：没有 rules 的 auto 节会让 .env 变成可读。
+                # 保留内置安全节，只让合法映射覆盖它。
+                if key in merged and isinstance(merged[key], dict) and not isinstance(value, dict):
+                    continue
+                merged[key] = value
             data = merged
 
         self._cfg = data
@@ -290,6 +318,43 @@ class PolicyEngine:
                 return PolicyDecision(dec, reason or f"matched rule: {pat}")
         return PolicyDecision(default, "default policy")
 
+    _SEVERITY = {SafetyLevel.auto: 0, SafetyLevel.approval_required: 1, SafetyLevel.deny: 2}
+
+    def _install_root_rel(self, resolved: Path) -> str | None:
+        """Path relative to the installation root, or None when it is outside."""
+        try:
+            return resolved.relative_to(self._root.resolve()).as_posix()
+        except (ValueError, OSError):
+            return None
+
+    def _with_install_root_rules(
+        self,
+        decision: PolicyDecision,
+        resolved: Path,
+        rel: str,
+        rules: list[tuple[str, SafetyLevel, str]],
+    ) -> PolicyDecision:
+        """Re-apply the rules against the installation-root-relative path.
+
+        [AutoC 2026-09-12] Why: classify_path reports the active workspace first,
+        so when the workspace is set to an install subdirectory (``data/``,
+        ``engine/``) or to an ancestor of the install root, ``data/policy.yaml``
+        and ``engine/**`` are reported as ``policy.yaml`` / ``runner.py`` and
+        every install-root rule silently misses. How: for paths that really sit
+        inside the install root, policy derives that root-relative path itself
+        and matches the same rule list again. Purpose: fixed install-root
+        protection applies no matter which workspace is active, and a stricter
+        deny/approval can never be widened by a looser workspace match.
+        """
+        root_rel = self._install_root_rel(resolved)
+        if root_rel is None or root_rel == rel:
+            return decision
+        # default=auto here means "no opinion": only an actual rule may escalate.
+        guarded = self._match_rules(root_rel, rules, SafetyLevel.auto)
+        if self._SEVERITY[guarded.safety_level] > self._SEVERITY[decision.safety_level]:
+            return PolicyDecision(guarded.safety_level, guarded.reason, decision.trust_level)
+        return decision
+
     def evaluate_read_file(self, *, path: str, workspace: Path | None = None) -> PolicyDecision:
         self._reload_if_needed()
         resolved, rel, trust_level = self._resolve_relpath(path, workspace=workspace)
@@ -299,6 +364,7 @@ class PolicyEngine:
         if trust_level == "external":
             default = SafetyLevel.approval_required
         decision = self._match_rules(rel, self._read_rules, default)
+        decision = self._with_install_root_rules(decision, resolved, rel, self._read_rules)
         decision.trust_level = trust_level
         return decision
 
@@ -311,6 +377,7 @@ class PolicyEngine:
         if trust_level == "external":
             default = SafetyLevel.approval_required
         decision = self._match_rules(rel, self._write_rules, default)
+        decision = self._with_install_root_rules(decision, resolved, rel, self._write_rules)
         decision.trust_level = trust_level
         return decision
 

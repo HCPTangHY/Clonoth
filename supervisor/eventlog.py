@@ -11,8 +11,8 @@ from typing import Any
 
 
 SYSTEM_SESSION_ID = "__system__"
-_MAX_MEMORY_EVENTS = 5000
-_MAX_MEMORY_EVENT_BYTES = 64 * 1024 * 1024
+_MAX_MEMORY_EVENTS = 1000
+_MAX_MEMORY_EVENT_BYTES = 16 * 1024 * 1024
 _TAIL_READ_BLOCK_BYTES = 1024 * 1024
 
 
@@ -163,7 +163,7 @@ class EventLog:
 
             self._events.append(evt)
             # Trim with hysteresis to prevent unbounded memory growth
-            if len(self._events) > _MAX_MEMORY_EVENTS + 500:
+            if len(self._events) > _MAX_MEMORY_EVENTS + 100:
                 self._events = self._events[-_MAX_MEMORY_EVENTS:]
             # [WS events 2026-05-17] Why: broadcasting while holding the threading
             # lock would make subscriber callbacks part of the critical section.

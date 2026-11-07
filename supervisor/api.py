@@ -66,6 +66,7 @@ from .types import (
     TaskKind,
     TaskStatus,
 )
+from .panel_auth import PanelAuth
 from .admin_api import create_admin_router
 from .admin_api import get_admin_token, get_web_auth, init_web_auth, verify_admin_token
 from engine.model import resolve_provider
@@ -311,6 +312,7 @@ def create_app(
     # [AutoC 2026-08-20] 插件路由面用 public=True 写入此集合；中间件闭包持有
     # 同一对象引用，运行期新增的公开路径立即生效，无需重建中间件。
     app.state.auth_exempt_paths = _AUTH_EXEMPT_PATHS
+    app.state.panel_auth = PanelAuth(app)
 
     @app.middleware("http")
     async def _auth_middleware(request: Request, call_next):
@@ -328,6 +330,8 @@ def create_app(
             try:
                 verify_admin_token(request)
             except HTTPException:
+                if app.state.panel_auth.permits(request):
+                    return await call_next(request)
                 return Response(
                     content=json.dumps({"detail": "Unauthorized"}),
                     status_code=401,
@@ -486,14 +490,29 @@ def create_app(
         save_path.write_bytes(content)
 
         rel_path = str(save_path.relative_to(st.workspace_root))
-        mime_type = file.content_type or "application/octet-stream"
-        return {
+        from engine.attachments import inspect_raster_image_bytes, _is_claimed_raster_image, _guess_mime
+        real_img_mime, img_err = inspect_raster_image_bytes(content)
+        if real_img_mime:
+            return {
+                "path": rel_path,
+                "name": file.filename or unique_name,
+                "size": len(content),
+                "mime_type": real_img_mime,
+                "type": "image",
+            }
+        raw_mime = file.content_type or _guess_mime(ext) or "application/octet-stream"
+        claimed_img = _is_claimed_raster_image(ext, raw_mime, "")
+        out_att: dict[str, Any] = {
             "path": rel_path,
             "name": file.filename or unique_name,
             "size": len(content),
-            "mime_type": mime_type,
-            "type": "image" if mime_type.startswith("image/") else "file",
+            "mime_type": raw_mime if not raw_mime.startswith("image/") or ext.lower() == ".svg" else "application/octet-stream",
+            "type": "file",
         }
+        if claimed_img:
+            out_att["invalid_image"] = True
+            out_att["invalid_image_reason"] = img_err
+        return out_att
 
     @app.get("/v1/sessions/{session_id}/file")
     async def session_file(
@@ -609,11 +628,35 @@ def create_app(
                     if isinstance(_reg, dict):
                         _reg.setdefault("is_child", True)
                         _reg["parent_session_id"] = _resolved_parent
+                        # [2026-09-14] Why: 该条目由 get_or_create_session 创建，
+                        # 不走 on_child_session_created，可能缺 last_active_at，
+                        # 导致 24h TTL 与 session_children 的宽限判定只能退回
+                        # created_at。How: 缺失时补当前时间，后续由终态写回刷新。
+                        # Purpose: registry 字段与正常子会话保持一致。
+                        _reg.setdefault("last_active_at", datetime.now(timezone.utc).isoformat())
                         if _entry_node:
                             _reg["node_id"] = _entry_node
                         if _ctx_mode:
                             _reg["context_mode"] = _ctx_mode
                         st._session_store._flush()
+
+                    # [AutoC 2026-09-13] Inherit parent workspace for dispatch children.
+                    # Why: spawn_worker and dispatch create child sessions via /v1/inbound
+                    # but never copy the parent's workspace binding, so children fall back
+                    # to the engine install directory and operate on production files.
+                    # How: when the child session has no workspace and the resolved parent
+                    # does, copy it before any task is created. Purpose: child agents work
+                    # in the same workspace as their parent without a race window.
+                    _parent_info = st.sessions.get(_resolved_parent)
+                    _child_info = st.sessions.get(session_id)
+                    if (
+                        _parent_info is not None
+                        and _child_info is not None
+                        and getattr(_parent_info, "workspace", None)
+                        and not getattr(_child_info, "workspace", None)
+                    ):
+                        _child_info.workspace = dict(_parent_info.workspace)
+                        st._session_store.update_workspace(session_id, _child_info.workspace)
 
         # [2026-05-28] 异步 dispatch 统一走 inbound：透传新增的 dispatch 字段到 payload。
         # 为什么：model_dump() 已包含这些字段，但 record_inbound_message_event 依赖
@@ -708,10 +751,50 @@ def create_app(
         return st.is_task_preempted(task_id)
 
     @app.post("/v1/tasks/{task_id}/preempt_consumed")
-    async def task_preempt_consumed(task_id: str) -> dict[str, Any]:
-        """Engine 读取完 preempt message 后调用，清空 message 防止重复注入。"""
+    async def task_preempt_consumed(task_id: str, request: Request) -> dict[str, Any]:
+        """Engine 读取完 preempt message 后调用，清空 message 防止重复注入。
+
+        [2026-09-13] 可选 body 携带实际消费内容。Why: 无条件全清会丢失消费期间
+        并发追加的消息（异步工具结果/子任务回调）。How: engine 传 consumed_message
+        与 consumed_attachment_count，旧调用不带 body 时退化为全清保持兼容。
+        """
+        body: dict[str, Any] = {}
+        _has_body = False
+        try:
+            body = await request.json()
+            _has_body = isinstance(body, dict)
+        except Exception:
+            pass
+        # [2026-11-02] 审计修复：严格校验 ACK 参数。
+        # Why: 旧实现用 int() 宽容解析，-1 / "1" / true 被静默折算成 0 或 1，
+        # 前端或引擎的错参会被当成「消费成功」；越界 count 还会清掉未观察的附件。
+        # How: 只接受真 int（排除 bool）且 0 <= count <= 当前已观察附件数，
+        # consumed_message 必须是字符串或缺失；任一不满足返回 422 且不改动队列。
+        # Purpose: 坏参数不清队列，消费只覆盖引擎实际观察到的前缀。
+        consumed_message: str | None = None
+        if _has_body and "consumed_message" in body:
+            raw_message = body.get("consumed_message")
+            if raw_message is not None and not isinstance(raw_message, str):
+                raise HTTPException(status_code=422, detail="consumed_message must be a string")
+            consumed_message = raw_message
+        raw_count = body.get("consumed_attachment_count", 0) if _has_body else 0
+        if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="consumed_attachment_count must be a non-negative integer",
+            )
         st: SupervisorState = app.state.state
-        result = st.consume_preempt_message(task_id)
+        observed_attachments = st.is_task_preempted(task_id).get("attachments") or []
+        if raw_count > len(observed_attachments):
+            raise HTTPException(
+                status_code=422,
+                detail="consumed_attachment_count exceeds observed attachments",
+            )
+        result = st.consume_preempt_message(
+            task_id,
+            consumed_message=consumed_message,
+            consumed_attachment_count=raw_count,
+        )
         return {"ok": True, **result}
 
     @app.post("/v1/sessions/{session_id}/async_tool_result")
@@ -761,7 +844,11 @@ def create_app(
             for task in st.tasks.values():
                 if task.session_id not in session_ids:
                     continue
-                if task.status not in (TaskStatus.running, TaskStatus.pending):
+                _is_active_suspended = (
+                    task.status == TaskStatus.suspended
+                    and bool(task.waiting_for_task_id)
+                )
+                if task.status not in (TaskStatus.running, TaskStatus.pending) and not _is_active_suspended:
                     continue
                 # 收割僵尸：running + lease 过期超过 grace period
                 # 但如果 session 有 pending approval，跳过回收（等审批是合法阻塞）
@@ -1579,7 +1666,13 @@ def create_app(
         conv_key = str(body.get("conversation_key") or "").strip()
         if not conv_key:
             raise HTTPException(status_code=400, detail="conversation_key required")
-        result = st.reset_conversation(conversation_key=conv_key)
+        exclude_session_id = str(body.get("exclude_session_id") or "").strip()
+        exclude_task_id = str(body.get("exclude_task_id") or "").strip()
+        result = st.reset_conversation(
+            conversation_key=conv_key,
+            exclude_session_id=exclude_session_id,
+            exclude_task_id=exclude_task_id,
+        )
         if not result.get("ok"):
             raise HTTPException(status_code=404, detail=result.get("error", "not found"))
         # emit context_reset 事件，通知 bot 侧重置高水位

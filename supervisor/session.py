@@ -35,12 +35,25 @@ def _build_multimodal_content(
         if not path or not path.replace("\\", "/").lstrip("/").startswith(_ALLOWED_ATT_PREFIX):
             continue
         att_type = str(att.get("type") or "").strip()
-        if att_type == "file":
-            # Text file: metadata-only reference
+        mime = str(att.get("mime_type") or "").strip()
+        is_svg = path.lower().endswith(".svg") or mime.lower() == "image/svg+xml"
+        if att.get("invalid_image"):
             from pathlib import Path as _Path
             name = att.get("name") or _Path(path).name
-            mime = att.get("mime_type") or "text/plain"
-            parts.append({"type": "text", "text": f"[Attached file: {name} | type: {mime} | path: {path}]"})
+            reason = str(att.get("invalid_image_reason") or "invalid or corrupted image")
+            parts.append({
+                "type": "text",
+                "text": (
+                    f"[Invalid image attachment: {name} | path: {path} | "
+                    f"reason: {reason}. You can inspect or fix this file at '{path}' using tools.]"
+                ),
+            })
+        elif att_type == "file" or is_svg or (not att_type and not path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"))):
+            # Text / non-raster file: metadata-only reference
+            from pathlib import Path as _Path
+            name = att.get("name") or _Path(path).name
+            mime_val = mime or ("image/svg+xml" if is_svg else "text/plain")
+            parts.append({"type": "text", "text": f"[Attached file: {name} | type: {mime_val} | path: {path}]"})
         else:
             # Image: file:// reference
             parts.append({"type": "image_url", "image_url": {"url": f"file://{path}"}})
@@ -150,15 +163,20 @@ class SessionMixin:
                     self.parent_children.pop(parent_sid, None)
 
     def _delete_conversation_session_locked(self, session_id: str) -> None:
-        """Delete a ConversationStore JSONL file and invalidate its cache."""
+        """Delete a ConversationStore JSONL file (and its transcript JSONL) and invalidate its cache."""
         from engine.conversation_store import ConversationStore
 
         # [Fork/Merge 2026-05-12] 分支生命周期由 supervisor 管理。
         # 原因：入口分支只是一次 inbound 的执行副本，merge 后继续保留会污染后续查询。
-        # 做法：通过 ConversationStore.delete 删除 JSONL 和缓存。目的：确保已合并分支
-        # 不再作为可恢复会话被误用。
+        # 做法：通过 ConversationStore.delete 删除 JSONL 和缓存，并同步删除 transcripts 下的临时分支记录。
         store = ConversationStore(self.workspace_root / "data" / "conversations")
         store.delete(session_id)
+        tr_path = self.workspace_root / "data" / "transcripts" / f"{session_id}.jsonl"
+        if tr_path.exists():
+            try:
+                tr_path.unlink()
+            except Exception:
+                pass
 
     def _create_entry_branch_locked(self, parent_session_id: str, inbound_seq: int) -> tuple[str, dict[str, Any]]:
         """Create a branch session for one inbound and fork parent history into it."""
@@ -244,9 +262,17 @@ class SessionMixin:
         )
         return branch_session_id, fork_meta
 
-    def _merge_branch_locked(self, parent_session_id: str, branch_session_id: str, base_count: int) -> int:
+    def _merge_branch_locked(
+        self,
+        parent_session_id: str,
+        branch_session_id: str,
+        base_count: int,
+        base_last_id: str = "",
+        orig_base_last_id: str = "",
+    ) -> int:
         """Merge a completed entry branch back into its parent ConversationStore."""
         from engine.conversation_store import ConversationStore
+        from engine.compact import strip_anthropic_thinking_signatures
 
         parent = str(parent_session_id or "").strip()
         branch = str(branch_session_id or "").strip()
@@ -254,17 +280,53 @@ class SessionMixin:
             return 0
         store = ConversationStore(self.workspace_root / "data" / "conversations")
         count = 0
+        stripped_sigs = 0
         try:
             merge_fn = getattr(store, "merge", None)
             if callable(merge_fn):
                 count = int(merge_fn(parent, branch, base_count=int(base_count or 0)) or 0)
             else:
-                # [Fork/Merge 2026-05-12] 兼容旧 ConversationStore 无 merge 方法的情况。
-                # 原因：本次任务只允许改 supervisor 层，目标树里的 engine store 可能仍是旧版。
-                # 做法：读取 branch 中 fork 基准之后的消息并批量追加到 parent。
-                # 目的：保持新 supervisor 在旧 store 上也能完成分支回写。
+                parent_messages = list(store.load(parent))
+                b_count = int(base_count or 0)
+                b_last_id = str(base_last_id or "").strip()
+                orig_last_id = str(orig_base_last_id or "").strip()
+                prefix_unchanged = (
+                    len(parent_messages) == b_count
+                    and (b_count == 0 or not b_last_id or getattr(parent_messages[-1], "id", "") == b_last_id)
+                )
                 branch_messages = list(store.load(branch))
-                tail = branch_messages[int(base_count or 0):]
+                split_idx = b_count
+                if b_last_id or orig_last_id:
+                    anchor_ok = (
+                        0 < b_count <= len(branch_messages)
+                        and getattr(branch_messages[b_count - 1], "id", "") == b_last_id
+                    )
+                    if not anchor_ok:
+                        candidate_ids = [aid for aid in (b_last_id, orig_last_id) if aid]
+                        for _i in range(len(branch_messages) - 1, -1, -1):
+                            if getattr(branch_messages[_i], "id", "") in candidate_ids:
+                                split_idx = _i + 1
+                                break
+                raw_tail = branch_messages[split_idx:]
+                if not prefix_unchanged and raw_tail:
+                    stripped_sigs = strip_anthropic_thinking_signatures(raw_tail)
+                tail = []
+                for m in raw_tail:
+                    m_type = str(getattr(m, "message_type", "") or (m.meta.get("message_type") if isinstance(getattr(m, "meta", None), dict) else "") or "")
+                    if m_type == "output_rejected":
+                        # Preserve both the rejected assistant draft and the output_rejected feedback with explicit flags
+                        if tail and getattr(tail[-1], "role", "") == "assistant":
+                            if not isinstance(tail[-1].meta, dict):
+                                tail[-1].meta = {}
+                            tail[-1].meta.setdefault("rejected_draft", True)
+                            tail[-1].meta.setdefault("rejection_source", getattr(m, "source_node_id", "") or "output_gate")
+                            tail[-1].meta.setdefault("rejection_code", "output_rejected")
+                        if not isinstance(getattr(m, "meta", None), dict):
+                            m.meta = {}
+                        m.meta.setdefault("is_rejection", True)
+                        m.meta.setdefault("rejection_source", getattr(m, "source_node_id", "") or "output_gate")
+                        m.meta.setdefault("rejection_code", "output_rejected")
+                    tail.append(m)
                 if tail:
                     store.append_batch(parent, tail)
                 count = len(tail)
@@ -297,7 +359,96 @@ class SessionMixin:
         )
         return count
 
-    def _cleanup_branch_locked(self, branch_session_id: str) -> None:
+    def _strip_rejected_drafts_in_place_locked(self, session_id: str) -> int:
+        """Ensure intermediate output_rejected messages and their preceding drafts carry rejection flags in place.
+
+        Preserves all rejected drafts and rejection feedback in the session JSONL so the model
+        can learn from previous rejections in subsequent turns.
+        """
+        from engine.conversation_store import ConversationStore
+
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        conv_dir = self.workspace_root / "data" / "conversations"
+        path = conv_dir / f"{sid}.jsonl"
+        store = ConversationStore(conv_dir)
+        try:
+            if not path.exists():
+                return 0
+            raw_msgs = list(store.load(sid))
+            if not raw_msgs:
+                return 0
+            updated = False
+            for idx, m in enumerate(raw_msgs):
+                m_type = str(
+                    getattr(m, "message_type", "")
+                    or (m.meta.get("message_type") if isinstance(getattr(m, "meta", None), dict) else "")
+                    or ""
+                )
+                if m_type == "output_rejected":
+                    if not isinstance(getattr(m, "meta", None), dict):
+                        m.meta = {}
+                    if not m.meta.get("is_rejection"):
+                        m.meta["is_rejection"] = True
+                        m.meta.setdefault("rejection_source", getattr(m, "source_node_id", "") or "output_gate")
+                        m.meta.setdefault("rejection_code", "output_rejected")
+                        updated = True
+                    if idx > 0 and getattr(raw_msgs[idx - 1], "role", "") == "assistant":
+                        prev = raw_msgs[idx - 1]
+                        if not isinstance(getattr(prev, "meta", None), dict):
+                            prev.meta = {}
+                        if not prev.meta.get("rejected_draft"):
+                            prev.meta["rejected_draft"] = True
+                            prev.meta.setdefault("rejection_source", getattr(m, "source_node_id", "") or "output_gate")
+                            prev.meta.setdefault("rejection_code", "output_rejected")
+                            updated = True
+            if updated:
+                store.replace_all(sid, raw_msgs)
+            return 0
+        except Exception:
+            return 0
+
+    def _cancel_task_for_reset_locked(self, task: Any, now: datetime) -> bool:
+        """Cancel a non-terminal task during branch cleanup or conversation reset."""
+        if task is None or self._task_terminal(task):
+            return False
+        if isinstance(getattr(task, "input", None), dict):
+            task.input["_branch_skipped_merge"] = True
+        if task.status in (TaskStatus.pending, TaskStatus.suspended):
+            if isinstance(getattr(task, "input", None), dict):
+                task.input["_branch_finalized"] = True
+            task.cancel_requested = True
+            task.status = TaskStatus.cancelled
+            task.waiting_for_task_id = None
+            task.updated_at = now
+            task.lease_expires_at = None
+            self._cleanup_tool_result_artifacts_for_task(task.task_id)
+            self._event_task_snapshot("task_cancelled", task)
+            return True
+        if task.status == TaskStatus.running:
+            was_requested = bool(task.cancel_requested)
+            task.cancel_requested = True
+            task.updated_at = now
+            if not task.lease_expires_at or task.lease_expires_at < now:
+                if isinstance(getattr(task, "input", None), dict):
+                    task.input["_branch_finalized"] = True
+                task.status = TaskStatus.cancelled
+                task.lease_expires_at = None
+                self._cleanup_tool_result_artifacts_for_task(task.task_id)
+                self._event_task_snapshot("task_cancelled", task)
+                return True
+            if not was_requested:
+                self._event_task_snapshot("task_cancel_requested", task)
+                return True
+        return False
+
+    def _cleanup_branch_locked(
+        self,
+        branch_session_id: str,
+        *,
+        exclude_task_id: str = "",
+    ) -> None:
         """Delete one entry branch session and its derived child sessions."""
         self._ensure_entry_branch_indexes_locked()
         branch = str(branch_session_id or "").strip()
@@ -312,6 +463,7 @@ class SessionMixin:
         # 原因：入口分支运行过程中仍可 dispatch 子节点，这些子节点的 parent_session_id
         # 是 branch。做法：删除 parent_children[branch] 下的所有 JSONL、映射和 registry 标记。
         # 目的：merge 后不会留下只能由已删除 branch 访问的悬挂上下文。
+        sids_to_remove = {branch}
         derived_children = list(self.parent_children.pop(branch, set()))
         for child_sid in derived_children:
             if self._is_entry_branch_session_locked(child_sid, parent_session_id=branch):
@@ -326,24 +478,22 @@ class SessionMixin:
             # [AutoC 2026-05-30] Why: branch 派生 child session 在 branch merge 后
             # 不应继续留在 sessions.json。How: 物理删除 registry 条目而不是标记 reset。
             # Purpose: 防止临时 child 记录随 branch 清理后继续堆积。
-            self._session_store.remove_session(child_sid)
+            sids_to_remove.add(child_sid)
 
         # [Fork/Merge 2026-05-12] 删除 branch 前取消仍挂在该运行 session 下的派生任务。
         # 原因：异步 dispatch 可能让 root entry 已结束但 branch 下仍有 pending/running 子任务。
         # 做法：把这些任务标记为 cancelled 并写快照，不递归 finalize。目的：避免任务继续
         # 写入已清理的 branch session。
         now = _now()
+        _exclude_task = str(exclude_task_id or "").strip()
+        _branch_sids = {branch, *(c for c in derived_children if not self._is_entry_branch_session_locked(c, parent_session_id=branch))}
         for task in self.tasks.values():
-            if task.session_id != branch or self._task_terminal(task):
+            if _exclude_task and task.task_id == _exclude_task:
                 continue
-            task.cancel_requested = True
-            task.status = TaskStatus.cancelled
-            task.updated_at = now
-            task.lease_expires_at = None
-            if task.waiting_for_task_id:
-                task.waiting_for_task_id = None
-            self._cleanup_tool_result_artifacts_for_task(task.task_id)
-            self._event_task_snapshot("task_cancelled", task)
+            _t_csid = str(task.input.get("child_session_id") or "").strip() if isinstance(task.input, dict) else ""
+            if (task.session_id not in _branch_sids and _t_csid not in _branch_sids) or self._task_terminal(task):
+                continue
+            self._cancel_task_for_reset_locked(task, now)
 
         self._delete_conversation_session_locked(branch)
         self.sessions.pop(branch, None)
@@ -369,8 +519,8 @@ class SessionMixin:
                 children.discard(branch)
         # [AutoC 2026-05-30] Why: branch merge 完成后应立即从 sessions.json 物理删除，
         # 而不是仅标记 reset，否则注册记录无限堆积。
-        # How: 用 remove_session 代替 on_session_reset。
-        self._session_store.remove_session(branch)
+        # How: 汇总 branch 与派生 child 的记录并单次落盘。
+        self._session_store.remove_sessions(sids_to_remove)
         self.eventlog.append(
             session_id=parent or branch,
             component="supervisor",
@@ -699,7 +849,15 @@ class SessionMixin:
         action_type: str | None = None,
         llm_request_id: str | None = None,
         task_id: str | None = None,
+        response_info: dict[str, Any] | None = None,
+        reply_node_id: str | None = None,
     ) -> dict[str, Any]:
+        """Emit a reply with separate display ownership and execution metadata.
+
+        reply_node_id is the outward-facing node (output-chain entry); node_id,
+        task_id and llm_request_id continue to identify the final executor.
+        Legacy producers can omit reply_node_id; clients then use node_id.
+        """
         text_clean = str(text or "").strip()
         # [Fix] 当 source_inbound_seq 存在时，允许空文本通过。
         # 空 outbound_message 事件用于触发 Bot 侧 trigger/status_msg 的清理收尾。
@@ -732,12 +890,16 @@ class SessionMixin:
                     return {"ok": True, "deduped": True, "route": existing}
 
             payload: dict[str, Any] = {"text": text_clean}
+            if response_info:
+                payload["response_info"] = dict(response_info)
             if attachments:
                 payload["attachments"] = list(attachments)
             if src_seq is not None:
                 payload["source_inbound_seq"] = src_seq
             if node_id:
                 payload["node_id"] = node_id
+            if reply_node_id:
+                payload["reply_node_id"] = reply_node_id
             if llm_request_id:
                 # [AutoC 2026-06-04] Why: outbound_message is emitted after the task
                 # has already finished, but it must finalize the card for one LLM
@@ -777,7 +939,13 @@ class SessionMixin:
 
             return {"ok": True, "deduped": False, "event_seq": int(evt.get("seq", 0) or 0)}
 
-    def reset_conversation(self, *, conversation_key: str) -> dict[str, Any]:
+    def reset_conversation(
+        self,
+        *,
+        conversation_key: str,
+        exclude_session_id: str = "",
+        exclude_task_id: str = "",
+    ) -> dict[str, Any]:
         """Reset a conversation by removing the conversation_map entry.
 
         Next inbound message with this conversation_key will create a fresh session.
@@ -793,28 +961,80 @@ class SessionMixin:
 
             # 方案 A: 标记 session 为已重置
             self._session_store.on_session_reset(old_session_id)
+            self._purge_context_usage_for_session(old_session_id)
 
             # Child Session 隔离（Phase C）：级联清理所有关联的 child session
             cleared_children = 0
             conv_dir = self.workspace_root / "data" / "conversations"
 
-            # 删除主 session 的 JSONL
-            main_jsonl = conv_dir / f"{old_session_id}.jsonl"
-            if main_jsonl.exists():
-                try:
-                    main_jsonl.unlink()
-                except Exception:
-                    pass
+            # 删除主 session 的 JSONL 与缓存
+            self._delete_conversation_session_locked(old_session_id)
 
             # [Fork/Merge 2026-05-12] reset 时必须先收集未合并入口分支。
             # 原因：branch session 可能已从内存索引丢失，但仍存在于 parent_children 或
-            # sessions.json。做法：把 parent_children 和 entry_branch 索引合并后逐个判断。
-            # 目的：清理对话时不会留下未 merge 的 branch JSONL 和派生 child session。
-            child_ids = set(self.parent_children.pop(old_session_id, set()))
-            child_ids.update(self._entry_branch_ids_for_parent_locked(old_session_id))
+            # sessions.json。做法：先调 _entry_branch_ids_for_parent_locked，再 pop(parent_children)，
+            # 并扫描持久化注册表兜底。
+            child_ids = set(self._entry_branch_ids_for_parent_locked(old_session_id))
+            child_ids.update(self.parent_children.pop(old_session_id, set()))
+            for registered_id, entry in self._session_store._registry.items():
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("node_id") == "__entry_branch__"
+                    and entry.get("parent_session_id") == old_session_id
+                ):
+                    child_ids.add(registered_id)
+
+            _exclude_sid = str(exclude_session_id or "").strip()
+            _exclude_tid = str(exclude_task_id or "").strip()
+
+            # [2026-11-02] 审计修复：把调用链保护提前到所有删除/取消之前。
+            # Why: 旧顺序是「先删 child / dispatch ssesion，再算 keep_task_ids」，
+            # clear_context 调用者自己（及其上游）正在跑的 branch / dispatch 历史会被
+            # 先删掉，工具后续 merge 到已删除会话、或子会话历史凭空消失。
+            # How: 先收集 keep_task_ids（exclude_task_id 及其 caller 链），再把它
+            # 所属的 session_id / child_session_id 全部标为 protected_sids。
+            # Purpose: reset 对用户是干净清理，对调用链是无损的。
+            keep_task_ids: set[str] = set()
+            _cur_tid = _exclude_tid
+            while _cur_tid and _cur_tid not in keep_task_ids:
+                keep_task_ids.add(_cur_tid)
+                _t_obj = self.tasks.get(_cur_tid)
+                _cur_tid = str(getattr(_t_obj, "caller_task_id", "") or "").strip() if _t_obj else ""
+
+            protected_sids: set[str] = set()
+            if _exclude_sid:
+                protected_sids.add(_exclude_sid)
+            for _ktid in keep_task_ids:
+                _kt = self.tasks.get(_ktid)
+                if _kt is None:
+                    continue
+                _kt_input = _kt.input if isinstance(getattr(_kt, "input", None), dict) else {}
+                for _cand in (
+                    str(getattr(_kt, "session_id", "") or "").strip(),
+                    str(_kt_input.get("child_session_id") or "").strip(),
+                    str(_kt_input.get("branch_session_id") or "").strip(),
+                ):
+                    if _cand:
+                        protected_sids.add(_cand)
+            # 主会话本身是 reset 目标，历史必须清掉（请求任务通常就跑在它上面）。
+            protected_sids.discard(old_session_id)
+
+            # 被保留的分支在终态也不得 merge 回已重置的父会话，否则旧历史复活。
+            # task_router._finalize_branch_task_locked 会消费并 discard 这些登记。
+            if not hasattr(self, "_skip_merge_sessions"):
+                self._skip_merge_sessions = set()
+            for _psid in protected_sids:
+                if _psid and self._is_entry_branch_session_locked(_psid):
+                    self._skip_merge_sessions.add(_psid)
+
             for child_sid in list(child_ids):
+                if child_sid in protected_sids:
+                    # 调用链正在使用的 branch/child：保留历史，只跳过 merge。
+                    continue
+                if _exclude_sid and child_sid == _exclude_sid:
+                    continue
                 if self._is_entry_branch_session_locked(child_sid, parent_session_id=old_session_id):
-                    self._cleanup_branch_locked(child_sid)
+                    self._cleanup_branch_locked(child_sid, exclude_task_id=_exclude_tid)
                     cleared_children += 1
                     continue
                 child_jsonl = conv_dir / f"{child_sid}.jsonl"
@@ -854,30 +1074,126 @@ class SessionMixin:
                 elif ck.startswith("agent:") and _dispatch_prefix + ":" in ck:
                     # 匹配 fresh/fork 模式的 agent:{node}:{parent_conv}:{uuid}
                     _dispatch_keys_to_remove.append(ck)
+            reset_session_ids: set[str] = set()
+            if not _exclude_sid or old_session_id != _exclude_sid:
+                reset_session_ids.add(old_session_id)
+            for _csid in child_ids:
+                if _csid in protected_sids:
+                    continue
+                if _exclude_sid and _csid == _exclude_sid:
+                    continue
+                reset_session_ids.add(_csid)
+
             for ck in _dispatch_keys_to_remove:
                 _dsid = self.conversation_map.pop(ck, None)
-                if _dsid:
-                    # 清理 dispatch session 的 JSONL 和内存状态
-                    _d_jsonl = conv_dir / f"{_dsid}.jsonl"
-                    if _d_jsonl.exists():
-                        try:
-                            _d_jsonl.unlink()
-                        except Exception:
-                            pass
-                    self.sessions.pop(_dsid, None)
-                    self.session_generations.pop(_dsid, None)
-                    self._cancelled_sessions.discard(_dsid)
-                    self._purge_context_usage_for_session(_dsid)
-                    # [AutoC 2026-05-30] Why: dispatch session 是由父会话派生的临时
-                    # child/fork 会话，重置父会话时不需要保留其 registry 行。
-                    # How: 物理删除 sessions.json 条目。
-                    # Purpose: 避免 agent:* 派生 session 在主会话 reset 后继续堆积。
-                    self._session_store.remove_session(_dsid)
-                    cleared_children += 1
+                if not _dsid or _dsid in protected_sids:
+                    continue
+                reset_session_ids.add(_dsid)
+                _d_sub_ids = set(self._entry_branch_ids_for_parent_locked(_dsid))
+                _d_sub_ids.update(self.parent_children.pop(_dsid, set()))
+                for _reg_id, _reg_entry in list(self._session_store._registry.items()):
+                    if isinstance(_reg_entry, dict) and _reg_entry.get("parent_session_id") == _dsid:
+                        _d_sub_ids.add(_reg_id)
+                for _sub_sid in _d_sub_ids:
+                    if _sub_sid in protected_sids:
+                        continue
+                    if _exclude_sid and _sub_sid == _exclude_sid:
+                        continue
+                    reset_session_ids.add(_sub_sid)
+                    if self._is_entry_branch_session_locked(_sub_sid, parent_session_id=_dsid):
+                        self._cleanup_branch_locked(_sub_sid, exclude_task_id=_exclude_tid)
+                    else:
+                        _sub_jsonl = conv_dir / f"{_sub_sid}.jsonl"
+                        if _sub_jsonl.exists():
+                            try:
+                                _sub_jsonl.unlink()
+                            except Exception:
+                                pass
+                        self._remove_child_mapping_for_session_locked(_sub_sid)
+                        self.sessions.pop(_sub_sid, None)
+                        self.session_generations.pop(_sub_sid, None)
+                        self._cancelled_sessions.discard(_sub_sid)
+                        self._purge_context_usage_for_session(_sub_sid)
+                        self._session_store.remove_session(_sub_sid)
+                # 清理 dispatch session 的 JSONL 和内存状态
+                _d_jsonl = conv_dir / f"{_dsid}.jsonl"
+                if _d_jsonl.exists():
+                    try:
+                        _d_jsonl.unlink()
+                    except Exception:
+                        pass
+                self.sessions.pop(_dsid, None)
+                self.session_generations.pop(_dsid, None)
+                self._cancelled_sessions.discard(_dsid)
+                self._purge_context_usage_for_session(_dsid)
+                self._session_store.remove_session(_dsid)
+                cleared_children += 1
+
+            # 收集所有属于被重置会话（含主会话、child_sid、agent:* 派生会话及二级分支）的非终态任务
+            now = _now()
+            tasks_to_cancel: set[str] = set()
+            for _t in self.tasks.values():
+                if _t.task_id in keep_task_ids or self._task_terminal(_t):
+                    continue
+                if _t.session_id in protected_sids:
+                    # 调用链自己的运行会话：即使属于被重置会话也不得取消。
+                    continue
+                _t_psid = str(_t.input.get("parent_session_id") or "").strip() if isinstance(_t.input, dict) else ""
+                _t_csid = str(_t.input.get("child_session_id") or "").strip() if isinstance(_t.input, dict) else ""
+                if (
+                    _t.session_id in reset_session_ids
+                    or _t_csid in reset_session_ids
+                    or (_t_psid in reset_session_ids and _t.session_id not in protected_sids)
+                ):
+                    tasks_to_cancel.add(_t.task_id)
+
+            # BFS 级联纳入所有 caller_task_id 后代子任务
+            _bfs = list(tasks_to_cancel)
+            while _bfs:
+                _ptid = _bfs.pop(0)
+                for _t in self.tasks.values():
+                    if (
+                        _t.caller_task_id == _ptid
+                        and _t.task_id not in tasks_to_cancel
+                        and _t.task_id not in keep_task_ids
+                        and not self._task_terminal(_t)
+                    ):
+                        tasks_to_cancel.add(_t.task_id)
+                        _bfs.append(_t.task_id)
+
+            cancelled_tasks = 0
+            for _ctid in tasks_to_cancel:
+                if self._cancel_task_for_reset_locked(self.tasks.get(_ctid), now):
+                    cancelled_tasks += 1
+
+            # 拒绝所有挂在被重置会话或被取消任务上的 pending 审批单，防止 Worker 卡死在 wait_for_approval
+            for _appr in list(self.approvals.values()):
+                if _appr.status != ApprovalStatus.pending:
+                    continue
+                if _appr.task_id and _appr.task_id in keep_task_ids:
+                    continue
+                if _appr.session_id in reset_session_ids or (_appr.task_id and _appr.task_id in tasks_to_cancel):
+                    self.decide_approval(
+                        approval_id=_appr.approval_id,
+                        decision="deny",
+                        comment="conversation reset",
+                    )
+
+            # 取消所有挂在被重置会话或被取消任务上的 running 异步工具
+            for _aid, _aentry in list(getattr(self, "_async_tools", {}).items()):
+                if _aentry.get("status") != "running":
+                    continue
+                _atid = str(_aentry.get("task_id") or "").strip()
+                _asid = str(_aentry.get("session_id") or "").strip()
+                if _atid and _atid in keep_task_ids:
+                    continue
+                if _asid in reset_session_ids or (_atid and _atid in tasks_to_cancel):
+                    self.cancel_async_tool(_aid)
 
             return {"ok": True, "old_session_id": old_session_id,
                     "conversation_key": conversation_key,
-                    "cleared_children": cleared_children}
+                    "cleared_children": cleared_children,
+                    "cancelled_tasks": cancelled_tasks}
 
     def session_messages(self, *, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
         """Read session messages from ConversationStore (persistent JSONL).
@@ -887,7 +1203,7 @@ class SessionMixin:
         truth. EventLog is only used for real-time event streaming and audit.
         """
         from pathlib import Path
-        from engine.conversation_store import ConversationStore
+        from engine.conversation_store import ConversationStore, is_dynamic_context
 
         try:
             store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
@@ -914,6 +1230,8 @@ class SessionMixin:
         # expected by callers (engine _fetch_history, hook ctx, /messages API)
         msgs: list[dict[str, Any]] = []
         for m in stored_msgs:
+            if is_dynamic_context(m):
+                continue
             if m.role in ("user", "assistant", "system"):
                 content = m.content
                 if isinstance(content, str) and content.strip():
@@ -936,7 +1254,8 @@ class SessionMixin:
         If task_id is provided, only messages whose source_task_id matches are returned.
         """
         from pathlib import Path
-        from engine.conversation_store import ConversationStore
+        from engine.conversation_store import ConversationStore, is_dynamic_context
+        from engine.inference.message_model import get_reasoning_text
 
         store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
         messages = list(store.load(session_id))
@@ -966,6 +1285,10 @@ class SessionMixin:
         # prior tasks in the same long-lived session.
         if task_id:
             messages = [m for m in messages if getattr(m, 'source_task_id', '') == task_id]
+
+        # Filter presentation only: persisted dynamic rows still belong to replay
+        # and compaction, but must not consume user-history pagination slots.
+        messages = [m for m in messages if not is_dynamic_context(m)]
 
         # [2026-06-07] Structural compatibility for older mixed terminal-tool
         # rejection rows. Why: old rows predate MessageMeta.tool_rejection_code,
@@ -1082,12 +1405,14 @@ class SessionMixin:
                     pass
             # Extract thinking/reasoning from meta
             if isinstance(msg.meta, dict):
-                reasoning = str(
-                    msg.meta.get("reasoning")
-                    or msg.meta.get("thinking_text")
-                    or msg.meta.get("thinking")
-                    or ""
-                )
+                # [2026-11-02] 审计修复：恢复 get_reasoning_text 统一读取。
+                # Why: 生产覆盖后这里退回内联 `or` 链，正文与摘要只取先命中者，丢掉
+                # body+"\n\n"+summary 的合并语义，并把 thought_summary 额外塞进响应。
+                # How: 复用 MessageMeta 的同一套读取规则（新键优先，旧的 thinking_text /
+                # thinking 别名兼容，正文与摘要去重后合并）。
+                # Purpose: 历史回放与实时流式共用一条展示规则，响应只保留 thinking /
+                # thinking_text / thinking_blocks 与 response_info 外层字段。
+                reasoning = get_reasoning_text(msg.meta)
                 _llm_req_id = str(msg.meta.get("llm_request_id") or "").strip()
                 if _llm_req_id:
                     entry["llm_request_id"] = _llm_req_id
@@ -1172,6 +1497,8 @@ class SessionMixin:
                     # refreshed inbound messages render the same image/file cards as
                     # realtime WebSocket messages.
                     entry["attachments"] = list(_attachments)
+                if msg.response_info:
+                    entry["response_info"] = dict(msg.response_info)
                 _provider = str(msg.meta.get("provider") or "").strip()
                 if _provider:
                     entry["provider"] = _provider
@@ -1215,6 +1542,16 @@ class SessionMixin:
                 _rej_code = str(msg.meta.get("tool_rejection_code") or "").strip()
                 if _rej_code:
                     entry["tool_rejection_code"] = _rej_code
+                if msg.meta.get("rejected_draft"):
+                    entry["rejected_draft"] = True
+                if msg.meta.get("is_rejection"):
+                    entry["is_rejection"] = True
+                _rej_src = str(msg.meta.get("rejection_source") or "").strip()
+                if _rej_src:
+                    entry["rejection_source"] = _rej_src
+                _draft_rej_code = str(msg.meta.get("rejection_code") or "").strip()
+                if _draft_rej_code:
+                    entry["rejection_code"] = _draft_rej_code
                 _visibility = str(msg.meta.get("tool_result_visibility") or "").strip()
                 if _visibility:
                     entry["tool_result_visibility"] = _visibility
@@ -1293,24 +1630,25 @@ class SessionMixin:
         from engine.conversation_store import ConversationStore
 
         with self._lock:
-            usage: dict[str, Any] = {}
-            best_prompt = -1
+            si_obj = self.sessions.get(session_id)
+            entry_nid = str(getattr(si_obj, "entry_node_id", "") or "")
+            candidates: list[dict[str, Any]] = []
             for (sid, nid), entry in self._session_context_usage.items():
                 entry_node = str(entry.get("node_id") or nid or "")
-                if entry_node.startswith("system."):
+                if entry_node.startswith("system.") or (hasattr(self, "_is_switchable_entry_node") and not self._is_switchable_entry_node(entry_node)):
                     continue
-                if sid == session_id:
-                    pt = entry.get("prompt_tokens") or 0
-                    if pt > best_prompt:
-                        best_prompt = pt
-                        usage = dict(entry)
-                else:
-                    resolved = self._route_session_id_for_session_locked(sid)
-                    if resolved == session_id:
-                        pt = entry.get("prompt_tokens") or 0
-                        if pt > best_prompt:
-                            best_prompt = pt
-                            usage = dict(entry)
+                if sid == session_id or self._route_session_id_for_session_locked(sid) == session_id:
+                    if (entry.get("prompt_tokens") or 0) > 0:
+                        candidates.append(dict(entry))
+
+            # Prefer the session's entry_node_id, then pick the most recently updated entry (not historical max)
+            if candidates:
+                entry_matches = [c for c in candidates if entry_nid and c.get("node_id") == entry_nid]
+                pool = entry_matches if entry_matches else candidates
+                pool.sort(key=lambda c: str(c.get("updated_at") or ""), reverse=True)
+                usage = dict(pool[0])
+            else:
+                usage = {}
 
         # [2026-06-06] Read from ConversationStore (persistent JSONL), not EventLog.
         # Priority: 1) in-memory usage from context_usage WS event
@@ -1330,7 +1668,7 @@ class SessionMixin:
             for msg in reversed(stored_msgs):
                 if msg.role == "assistant" and isinstance(msg.meta, dict):
                     msg_usage = msg.meta.get("usage")
-                    if isinstance(msg_usage, dict) and msg_usage.get("prompt_tokens"):
+                    if isinstance(msg_usage, dict) and not msg_usage.get("_compacted_stale") and msg_usage.get("prompt_tokens"):
                         prompt_tokens = msg_usage["prompt_tokens"]
                         usage["completion_tokens"] = msg_usage.get("completion_tokens")
                         usage["total_tokens"] = msg_usage.get("total_tokens")

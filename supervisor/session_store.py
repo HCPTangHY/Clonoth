@@ -279,6 +279,17 @@ class SessionStore:
             self._registry.pop(session_id)
             self._flush()
 
+    def remove_sessions(self, session_ids: list[str] | set[str]) -> int:
+        """批量删除会话记录，仅在实际删除后落盘一次。"""
+        removed = 0
+        for session_id in session_ids:
+            if session_id in self._registry:
+                del self._registry[session_id]
+                removed += 1
+        if removed:
+            self._flush()
+        return removed
+
     def on_child_session_created(
         self,
         child_session_id: str,

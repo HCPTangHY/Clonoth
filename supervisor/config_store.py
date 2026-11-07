@@ -79,6 +79,9 @@ class ConfigStore:
         # AppConfigSecret Pydantic model. Without this, reload() would strip
         # any key not declared in the model.
         data = cfg.model_dump(mode="json")
+        if getattr(self, "_openai_extra_keys", None) and isinstance(data.get("openai"), dict):
+            for ek, ev in self._openai_extra_keys.items():
+                data["openai"].setdefault(ek, ev)
         if self._extra_keys:
             data.update(self._extra_keys)
         text = yaml.safe_dump(
@@ -96,9 +99,17 @@ class ConfigStore:
                 self._save_yaml(self._config)
                 return self._config.model_copy(deep=True)
 
-            # Capture top-level keys not in the Pydantic model
+            # Capture top-level keys not in the Pydantic model, plus extra keys inside openai block
             _known_keys = set(AppConfigSecret.model_fields.keys())
             self._extra_keys = {k: v for k, v in data.items() if k not in _known_keys}
+            _oai_raw = data.get("openai")
+            if isinstance(_oai_raw, dict):
+                self._openai_extra_keys = {
+                    k: v for k, v in _oai_raw.items()
+                    if k not in {"base_url", "api_key", "model"}
+                }
+            else:
+                self._openai_extra_keys = {}
             try:
                 self._config = AppConfigSecret.model_validate(data)
             except Exception:
