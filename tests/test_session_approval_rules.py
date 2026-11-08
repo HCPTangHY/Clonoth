@@ -67,7 +67,7 @@ def test_branch_child_live_inheritance_and_override(state):
     assert state.get_session_approval_rules("child")["source_session_id"] == "a"
     assert request(state, "child").safety_level == "auto"
     state.set_session_approval_rules("a", ASK_RULES)
-    assert request(state, "child", call="two").safety_level == "approval_required"
+    assert request(state, "child", call="two").safety_level == "deny"
     state.set_session_approval_rules("child", ALLOW)
     assert request(state, "child", call="three").safety_level == "auto"
     state.set_session_approval_rules("child", None)
@@ -91,9 +91,66 @@ def test_synchronous_child_task_uses_execution_session_rules(state):
     state.set_session_approval_rules("a", ALLOW)
     state.set_session_approval_rules("child", ASK_RULES)
     assert state.get_session_approval_rules("child")["effective_rules"] == ASK_RULES
-    assert request(state, "a", task_id="task").safety_level == "approval_required"
+    assert request(state, "a", task_id="task").safety_level == "deny"
     state.set_session_approval_rules("child", None)
     assert request(state, "a", call="two", task_id="task").safety_level == "auto"
+
+
+@pytest.mark.parametrize("mode", ["sync", "async", "nested", "child_branch", "tool"])
+def test_subagent_never_creates_new_pending(state, mode):
+    state._session_store.on_child_session_created("child", "a", "coder", "")
+    state._session_store.on_child_session_created("nested", "child", "reviewer", "")
+    state._session_store.on_child_session_created("child_branch", "child", "__entry_branch__", "")
+    execution_sid = {"nested": "nested", "child_branch": "child_branch"}.get(mode, "child")
+    state.tasks["child-task"] = SimpleNamespace(
+        session_id="a" if mode in ("sync", "tool") else execution_sid,
+        caller_task_id=None,
+        input={"child_session_id": "child"} if mode in ("sync", "tool") else {},
+    )
+    task_id = "child-task"
+    if mode == "tool":
+        state.tasks["tool-task"] = SimpleNamespace(session_id="a", caller_task_id="child-task", input={})
+        task_id = "tool-task"
+    result = request(state, "a", task_id=task_id)
+    assert result.safety_level == "deny"
+    assert result.approval_id is None
+    assert "do not repeat" in result.reason
+    assert not state.approvals
+    state.eventlog.append.assert_not_called()
+
+
+def test_main_entry_branch_and_its_tool_still_ask(state):
+    state._session_store.on_child_session_created("branch", "a", "__entry_branch__", "")
+    state.tasks["main"] = SimpleNamespace(session_id="branch", caller_task_id=None, input={})
+    state.tasks["tool"] = SimpleNamespace(session_id="branch", caller_task_id="main", input={})
+    assert request(state, task_id="main").safety_level == "approval_required"
+    assert request(state, call="two", task_id="tool").safety_level == "approval_required"
+
+
+def test_old_child_pending_is_preserved(state):
+    state._session_store.on_child_session_created("child", "a", "coder", "")
+    pending = state.create_approval(session_id="child", operation="tool_call",
+                                    details={"tool_name": "unlisted_tool"}, tool_call_id="one")
+    assert request(state, "child").approval_id == pending.approval_id
+    assert pending.status == "pending"
+    assert request(state, "child", call="new").safety_level == "deny"
+    assert len(state.approvals) == 1
+
+
+def test_child_auto_deny_and_system_exceptions_unchanged(state):
+    state._session_store.on_child_session_created("child", "a", "coder", "")
+    assert state.request_operation(session_id="child", op="tool_call", parameters={"tool_name": "list_dir"}).safety_level == "auto"
+    state.set_session_approval_rules("a", ALLOW)
+    assert request(state, "child").safety_level == "auto"
+    assert state.request_operation(session_id="child", op="read_file", parameters={"path": ".env"}).safety_level == "deny"
+    state.set_session_approval_rules("a", ASK_RULES)
+    assert request(state, "child", node_id="system.dream").safety_level == "auto"
+    state.tasks["scheduled"] = SimpleNamespace(session_id="child", caller_task_id=None, input={"schedule_id": "daily"})
+    assert request(state, "child", task_id="scheduled").safety_level == "auto"
+
+
+def test_unregistered_node_name_does_not_make_main_task_a_child(state):
+    assert request(state, node_id="child_coder").safety_level == "approval_required"
 
 
 def test_rule_order_and_inner_guard_tool_identity(state):

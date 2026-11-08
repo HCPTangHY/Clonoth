@@ -1557,6 +1557,33 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             )
             return a
 
+    def _is_subagent_operation_locked(self, session_id: str, task_id: str | None) -> bool:
+        """Identify delegated agents from stored ancestry, excluding entry branches.
+
+        Tool tasks may share the parent's routing session, so inspect their caller
+        chain too. A caller ID alone does not make a main agent's tool a subagent.
+        """
+        task = self.tasks.get(task_id) if task_id else None
+        seen_tasks: set[str] = set()
+        while True:
+            sid = str(task.input.get("child_session_id") or task.session_id) if task else session_id
+            seen_sessions: set[str] = set()
+            while sid and sid not in seen_sessions:
+                seen_sessions.add(sid)
+                entry = self._session_store._registry.get(sid, {})
+                parent = str(entry.get("parent_session_id") or self.entry_branch_parents.get(sid, ""))
+                is_branch = entry.get("node_id") == "__entry_branch__" or sid in self.entry_branch_parents
+                if entry.get("is_child") and not is_branch:
+                    return True
+                sid = parent
+            caller_id = task.caller_task_id if task else None
+            if not caller_id or caller_id in seen_tasks:
+                return False
+            seen_tasks.add(caller_id)
+            task = self.tasks.get(caller_id)
+            if task is None:
+                return False
+
     def request_operation(
         self,
         *,
@@ -1642,6 +1669,19 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if rules is not None and approval_action(rules, tool=name, operation=op, trust_level=_tl) == "allow":
                 return OpRequestOut(safety_level=SafetyLevel.auto,
                                     reason=f"auto-approved: session rules ({source})", trust_level=_tl)
+
+            # Delegated agents report missing authorization instead of waiting for
+            # a user who may never open their session. Existing pending stays above.
+            if self._is_subagent_operation_locked(session_id, task_id):
+                return OpRequestOut(
+                    safety_level=SafetyLevel.deny,
+                    reason=(
+                        "Subagent operation requires human authorization and was not executed. "
+                        "Subagents do not wait for approval. Use an already authorized alternative "
+                        "or report this limitation to the parent task; do not repeat the same request."
+                    ),
+                    trust_level=_tl,
+                )
 
             # Keep rule evaluation and creation atomic with a concurrent rule edit.
             approval = self.create_approval(
