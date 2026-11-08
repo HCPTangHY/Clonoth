@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _REJECT_MESSAGE_TEMPLATE = (
     "\u274c REJECTED: {tool}() cannot be called alongside other tools "
-    "(except intermediate_reply). Execute your other tools first, wait for their "
+    "in one response. Execute your other tools first, wait for their "
     "results, then call {tool}() alone in a separate turn."
 )
 
@@ -51,9 +51,27 @@ class FinishGuardHandler:
         already-filtered legacy pseudo/real call lists when present, and
         otherwise fall back to raw ctx.tool_calls for isolated tests.
         """
+        # Count raw calls before authorization filtering, once per model response.
+        # Reject the entire batch before any pseudo or real tool has side effects.
+        calls = ctx.tool_calls or ctx.extra.get("pseudo_calls") or []
+        response_count = sum(
+            _tool_name(call) in {"intermediate_reply", "finish", "ask"} for call in calls
+        )
+        if response_count > 1:
+            logger.warning("Rejected response tool burst (node=%s, step=%d, count=%d)",
+                           getattr(ctx.node, "id", ""), ctx.step, response_count)
+            return hook_result(
+                block=True,
+                reason="response_tools_colocated",
+                error_message=(
+                    "REJECTED: At most ONE call TOTAL to intermediate_reply, finish, or ask "
+                    "is allowed per model response. ALL tool calls in this response were "
+                    "rejected; none executed. Retry with at most one response tool. "
+                    "Combine any message parts into its text parameter."
+                ),
+            )
         terminal_tools = {"finish", "ask"}
         exclusive_tools = {"compact_context", "switch_node"}
-        reply_tools = {"intermediate_reply", "reply"}
         pseudo_calls = ctx.extra.get("pseudo_calls")
         real_tool_calls = ctx.extra.get("real_tool_calls")
 
@@ -85,7 +103,7 @@ class FinishGuardHandler:
             )
             has_terminal = bool(terminal_name)
             has_non_reply_others = bool(real_list) or (unauth_count > 0) or any(
-                _tool_name(call) not in (*terminal_tools, *reply_tools) for call in pseudo_list
+                _tool_name(call) not in terminal_tools for call in pseudo_list
             )
         else:
             calls = list(ctx.tool_calls or [])
@@ -112,7 +130,7 @@ class FinishGuardHandler:
             )
             has_terminal = bool(terminal_name)
             has_non_reply_others = any(
-                _tool_name(call) not in (*terminal_tools, *reply_tools) for call in calls
+                _tool_name(call) not in terminal_tools for call in calls
             )
 
         if not (has_terminal and has_non_reply_others):

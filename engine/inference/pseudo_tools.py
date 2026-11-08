@@ -324,6 +324,14 @@ def refresh_dispatch_to_spec(ls: Any) -> bool:
         return False
 
 
+_RESPONSE_TOOL_LIMIT = (
+    "Per model response, call intermediate_reply, finish, or ask at most ONCE IN TOTAL. "
+    "Multiple calls (including different tools from this group) reject ALL tool calls "
+    "in that response without executing any. Combine message parts into one text. "
+    "The limit resets on the next model response.\n\n"
+)
+
+
 def _finish_spec() -> dict:
     """Build the finish pseudo-tool spec."""
     return {
@@ -331,9 +339,9 @@ def _finish_spec() -> dict:
         "function": {
             "name": "finish",
             "description": (
-                "Submit the final result and terminate this node immediately.\n\n"
+                _RESPONSE_TOOL_LIMIT + "Submit the final result and terminate this node immediately.\n\n"
                 "CRITICAL: Once you call finish, the node exits. If you have other tools to call (like execute_command or manage_memory), you MUST wait for them to complete (`ok`) before calling finish.\n\n"
-                "⚠️ finish MUST be called ALONE — never in the same turn as other tools (except intermediate_reply). "
+                "⚠️ finish MUST be called ALONE — never in the same turn as other tools. "
                 "If you call finish alongside execute_command, manage_memory, a dispatch tool, or any other tool, ALL calls will be REJECTED and you must retry. "
                 "Always: execute tools first → wait for results → then call finish separately.\n\n"
                 "Do NOT send your final report via `intermediate_reply` while waiting for tools. Just call the tools silently, wait for the next turn, and put your ENTIRE final report in the `finish` tool's text.\n\n"
@@ -378,7 +386,7 @@ def _ask_spec() -> dict:
         "function": {
             "name": "ask",
             "description": (
-                "Ask the upstream (caller or user) for additional information or clarification. "
+                _RESPONSE_TOOL_LIMIT + "Ask the upstream (caller or user) for additional information or clarification. "
                 "This terminates the current task, similar to finish, but signals that you need "
                 "more input before you can complete your work."
             ),
@@ -403,7 +411,7 @@ def _reply_spec() -> dict:
         "function": {
             "name": "intermediate_reply",
             "description": (
-                "Send an interim message to the user WITHOUT terminating this node.\n\n"
+                _RESPONSE_TOOL_LIMIT + "Send an interim message to the user WITHOUT terminating this node.\n\n"
                 "The node keeps running after this call — you can continue calling tools "
                 "or do more work in subsequent turns.\n\n"
                 "The `text` parameter is the message content the user will read. "
