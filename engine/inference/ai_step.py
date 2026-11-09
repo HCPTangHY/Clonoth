@@ -80,7 +80,9 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
     使子节点的消息写入自己的 JSONL 而非父 session。
     """
     pending = getattr(ls, "_pending_shadow_writes", None)
-    if pending is not None and message_type == "tool_result":
+    # Results and their image rows must share the same ordered flush. Otherwise
+    # an image is persisted first and breaks native call/result pairing on reload.
+    if pending is not None and message_type in ("tool_result", "tool_result_attachment"):
         pending.append((msg_dict, message_type))
         return
     try:
@@ -595,7 +597,7 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
                     _collected_step_atts,
                     workspace_root=ls.rctx.workspace_root,
                 ),
-                "_meta": {"attachments": list(_collected_step_atts)},
+                "_meta": {"message_type": "tool_result_attachment", "attachments": list(_collected_step_atts)},
             }
             ls.messages.append(_tool_att_msg)
             _shadow_write(ls, _tool_att_msg, message_type="tool_result_attachment")
@@ -1138,7 +1140,7 @@ def _persist_tool_results(
                 "content": build_multimodal_content(
                     "The tool executions above produced the following image results:", tool_atts, workspace_root=ls.rctx.workspace_root,
                 ),
-                "_meta": {"attachments": list(tool_atts)},
+                "_meta": {"message_type": "tool_result_attachment", "attachments": list(tool_atts)},
             }
             ls.messages.append(_tool_att_msg)
             _shadow_write(ls, _tool_att_msg, message_type="tool_result_attachment")

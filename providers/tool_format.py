@@ -884,6 +884,47 @@ def _make_finish_tool_result(call: dict[str, Any], tool_mode: str) -> dict[str, 
     }
 
 
+def _restore_tool_attachment_order(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Recover the old shadow-write order in a request copy, never on disk.
+
+    Only move explicitly marked image-result rows within one adjacent, fully
+    identified call/result block. Never move ordinary user input or match across
+    another turn; incomplete and ambiguous blocks keep the existing repair path.
+    """
+    ordered = list(messages)
+    moved = 0
+    index = 0
+    while index < len(ordered):
+        message = ordered[index]
+        calls = _assistant_tool_calls(message) if isinstance(message, dict) else []
+        ids = [call["id"] for call in calls]
+        if not ids or not all(ids) or len(set(ids)) != len(ids):
+            index += 1
+            continue
+        end = index + 1
+        results, attachments = [], []
+        misplaced = False
+        while end < len(ordered):
+            row = ordered[end]
+            if not isinstance(row, dict):
+                break
+            kind = row.get("message_type") or _message_meta(row).get("message_type")
+            if row.get("role") == "user" and kind == "tool_result_attachment":
+                attachments.append(row)
+            elif _is_tool_result_message(row):
+                results.append(row)
+                misplaced = misplaced or bool(attachments)
+            else:
+                break
+            end += 1
+        result_ids = [_tool_result_call_id(row) for row in results]
+        if misplaced and len(result_ids) == len(ids) and set(result_ids) == set(ids):
+            ordered[index + 1:end] = results + attachments
+            moved += len(attachments)
+        index = end
+    return ordered, moved
+
+
 def repair_tool_result_pairing_with_stats(
     messages: list[dict[str, Any]],
     *,
@@ -899,7 +940,9 @@ def repair_tool_result_pairing_with_stats(
     and remove unpaired native result rows. Purpose: fix old orphan pollution
     without deleting valid finish or business-tool history.
     """
+    messages, reordered_attachments = _restore_tool_attachment_order(messages)
     stats = {
+        "reordered_tool_result_attachments": reordered_attachments,
         "removed_orphan_finish_results": 0,
         "removed_orphan_tool_results": 0,
         "inserted_missing_finish_results": 0,
