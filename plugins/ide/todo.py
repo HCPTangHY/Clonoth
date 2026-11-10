@@ -1,7 +1,7 @@
 """Session-owned work plans, not a task scheduler or a completion verifier.
 
 Supervisor is the single writer; tools and the panel use the same validation.
-No conversation-sized cache is retained. Workspace switches select another list.
+Each real session owns its list; workspace bindings never affect ownership.
 """
 from __future__ import annotations
 
@@ -41,9 +41,10 @@ def _fields(value: Any, allowed: set[str]) -> None:
 
 def apply_update(current: dict, patch: dict, actor: dict) -> dict:
     """Validate the entire batch before mutating anything; compare-and-swap once."""
-    _fields(patch, {"expected_revision", "changes", "remove_ids", "order", "workspace_path"})
-    if patch.get("workspace_path") != current["workspace"]["path"]:
-        raise HTTPException(409, "工作区已更换，请重新读取对应清单。")
+    _fields(patch, {"expected_revision", "expected_session_id", "changes", "remove_ids", "order"})
+    expected_sid = _text(patch.get("expected_session_id"), "expected_session_id", 200)
+    if expected_sid != current["session_id"]:
+        raise HTTPException(409, "待办所属会话不同，请重新读取当前会话清单。")
     revision = patch.get("expected_revision")
     if type(revision) is not int or revision < 0:
         raise HTTPException(422, "expected_revision must be a nonnegative integer")
@@ -106,8 +107,8 @@ def apply_update(current: dict, patch: dict, actor: dict) -> dict:
     return result
 
 
-def _owner(state: Any, session_id: str) -> tuple[str, dict]:
-    """Resolve entry branches only. Ordinary children never inherit write access."""
+def _owner(state: Any, session_id: str) -> str:
+    """Only temporary entry branches share a list; ordinary children own theirs."""
     sid = _text(session_id, "session_id", 200)
     records = state._session_store._registry
     seen = set()
@@ -119,41 +120,42 @@ def _owner(state: Any, session_id: str) -> tuple[str, dict]:
         if record.get("node_id") == "__entry_branch__":
             sid = record.get("parent_session_id", "")
             continue
-        if record.get("is_child") or record.get("parent_session_id"):
-            raise HTTPException(403, "普通子会话不自动继承主会话的待办；请由主节点汇总。")
-        ws = state.get_session_workspace(sid)
-        if not ws or not ws.get("path"):
-            raise HTTPException(400, "请先为会话设置工作区。")
-        path = Path(ws["path"]).resolve()
-        if not path.is_dir():
-            raise HTTPException(409, "工作区目录不可用。")
-        return sid, {"name": str(ws.get("name") or ""), "path": str(path)}
+        return sid
     raise HTTPException(409, "invalid session ancestry")
 
 
-def _path(root: Path, sid: str, workspace: dict) -> Path:
-    # Neither user paths nor session IDs become path components.
-    key = hashlib.sha256(json.dumps([sid, workspace["path"]], ensure_ascii=False).encode()).hexdigest()
-    return root / "data" / "ide" / "todos" / f"{key}.json"
+def _path(root: Path, sid: str) -> Path:
+    # Separate v2 files from the fixed legacy directory; never scan growing
+    # session lists when looking for an old workspace-scoped list.
+    key = hashlib.sha256(sid.encode()).hexdigest()
+    return root / "data" / "ide" / "todos" / "sessions" / f"{key}.json"
 
 
-def read_list(root: Path, sid: str, workspace: dict) -> dict:
-    path = _path(root, sid, workspace)
-    try:
-        with path.open("rb") as source:
-            raw = source.read(MAX_BYTES + 1)
-    except FileNotFoundError:
-        return {"schema_version": 1, "session_id": sid, "workspace": workspace,
-                "revision": 0, "items": [], "updated_at": None, "updated_by": None}
+def _read_json(path: Path) -> dict:
+    with path.open("rb") as source:
+        raw = source.read(MAX_BYTES + 1)
     try:
         if len(raw) > MAX_BYTES:
             raise ValueError("oversized data")
         data = json.loads(raw)
-        if (data["schema_version"] != 1 or data["session_id"] != sid
-                or data["workspace"]["path"] != workspace["path"]
+        if not isinstance(data, dict) or not isinstance(data.get("session_id"), str):
+            raise ValueError("invalid session metadata")
+        return data
+    except (ValueError, TypeError):
+        raise HTTPException(500, "待办数据格式损坏，未覆盖原文件。") from None
+
+
+def _validate_list(data: dict, sid: str, version: int) -> dict:
+    try:
+        if (type(data["schema_version"]) is not int or data["schema_version"] != version
+                or data["session_id"] != sid
                 or type(data["revision"]) is not int or data["revision"] < 0
                 or not isinstance(data["items"], list) or len(data["items"]) > MAX_ITEMS):
             raise ValueError("invalid list metadata")
+        if version == 1:
+            _text(data["workspace"]["path"], "workspace.path", MAX_BYTES)
+        elif "workspace" in data:
+            raise ValueError("workspace is not part of a session list")
         ids = set()
         for item in data["items"]:
             item_id = _text(item["id"], "id", 64)
@@ -161,16 +163,43 @@ def read_list(root: Path, sid: str, workspace: dict) -> dict:
                 raise ValueError("duplicate ID")
             ids.add(item_id)
             _text(item["title"], "title", 500)
-            _text(item["note"], "note", 2000, empty=True)
-            if item["status"] not in STATUSES:
-                raise ValueError("invalid status")
+            note = _text(item["note"], "note", 2000, empty=True)
+            if item["status"] not in STATUSES or (item["status"] in ("blocked", "cancelled") and not note):
+                raise ValueError("invalid status or missing reason")
     except (ValueError, TypeError, KeyError, HTTPException):
         raise HTTPException(500, "待办数据格式损坏，未覆盖原文件。") from None
-    return {**data, "workspace": workspace}
+    return data
+
+
+def read_list(root: Path, sid: str) -> dict:
+    """Read under the supervisor lock; lazily copy one unambiguous v1 list.
+
+    Legacy files remain unchanged as backups. Ambiguity or corruption fails
+    closed instead of guessing, merging, or returning an empty replacement.
+    """
+    path = _path(root, sid)
+    try:
+        return _validate_list(_read_json(path), sid, 2)
+    except FileNotFoundError:
+        pass
+    legacy = []
+    for old_path in sorted(path.parent.parent.glob("*.json")):
+        data = _read_json(old_path)
+        if data["session_id"] == sid:
+            legacy.append(_validate_list(data, sid, 1))
+    if len(legacy) > 1:
+        raise HTTPException(409, "同一会话存在多份旧待办，请明确整理后再迁移；原文件未修改。")
+    if not legacy:
+        return {"schema_version": 2, "session_id": sid, "revision": 0,
+                "items": [], "updated_at": None, "updated_by": None}
+    migrated = {**legacy[0], "schema_version": 2}
+    migrated.pop("workspace")
+    save_list(root, migrated)
+    return migrated
 
 
 def save_list(root: Path, data: dict) -> None:
-    path = _path(root, data["session_id"], data["workspace"])
+    path = _path(root, data["session_id"])
     raw = json.dumps(data, ensure_ascii=False, indent=2).encode()
     if len(raw) > MAX_BYTES:
         raise HTTPException(422, "待办清单总长度超限，请缩短说明。")
@@ -192,9 +221,11 @@ def save_list(root: Path, data: dict) -> None:
 
 
 def _can_use(node: Any, tool: str) -> bool:
+    from engine.inference.pseudo_tools import is_tool_action_allowed
+
     access = getattr(node, "tool_access", None)
-    return bool(access and ((access.mode == "all" and tool not in access.deny)
-                            or (access.mode == "allowlist" and tool in access.allow)))
+    return bool(access and (access.mode == "all" or (access.mode == "allowlist" and tool in access.allow))
+                and is_tool_action_allowed(node, tool, {}))
 
 
 def operate(state: Any, session_id: str, patch: dict | None = None, *,
@@ -202,7 +233,7 @@ def operate(state: Any, session_id: str, patch: dict | None = None, *,
     """Bounded, synchronous transaction under the host's existing session lock.
 
     Only reads host task/session records; does not call any private locked methods
-    or modify host state. The lock prevents workspace changes during a write.
+    or modify host state. The lock serializes ownership checks, migration and CAS.
     """
     with state._lock:
         actor = {"type": "user"}
@@ -216,18 +247,33 @@ def operate(state: Any, session_id: str, patch: dict | None = None, *,
             if (task.worker_id != worker_id or task.session_generation != generation
                     or task.status != "running" or task.cancel_requested):
                 raise HTTPException(409, "task is not active on this worker")
-            if (task.caller_task_id or inp.get("child_session_id") or inp.get("_dispatch_origin")
-                    or inp.get("_system_task") or inp.get("task_context", {}).get("is_system_task")):
-                raise HTTPException(403, "only the main task may access its work plan")
+            if inp.get("_system_task") or inp.get("task_context", {}).get("is_system_task"):
+                raise HTTPException(403, "system tasks cannot access work plans")
             node = load_node(state.workspace_root, task.node_id)
             if not _can_use(node, TOOL_UPDATE if patch is not None else TOOL_READ):
                 raise HTTPException(403, "node cannot access todo tools")
-            session_id = task.session_id
+            # Synchronous children retain their parent's task.session_id, while
+            # async children run in their own session (possibly an entry branch).
+            session_id = inp.get("child_session_id") or task.session_id
+            sid = _owner(state, session_id)
+            task_sid = _owner(state, task.session_id)
+            if task.caller_task_id and not inp.get("child_session_id"):
+                caller = state.tasks.get(task.caller_task_id)
+                if caller is None or sid == _owner(state, caller.input.get("child_session_id") or caller.session_id):
+                    raise HTTPException(403, "child task has no independent todo session")
+            origin = inp.get("_dispatch_origin")
+            if origin and not inp.get("child_session_id"):
+                parent_sid = origin.get("parent_session_id") if isinstance(origin, dict) else None
+                if not parent_sid or sid == _owner(state, parent_sid):
+                    raise HTTPException(403, "dispatched task has no independent todo session")
+            # Task generation belongs to task.session_id, not a synchronous
+            # child's independently persisted session. Reset owners fail above.
+            if generation != state.session_generations.get(task_sid, generation):
+                raise HTTPException(409, "session generation changed")
             actor = {"type": "model", "node_id": task.node_id, "task_id": task_id}
-        sid, workspace = _owner(state, session_id)
-        if task_id and generation != state.session_generations.get(sid, generation):
-            raise HTTPException(409, "session generation changed")
-        current = read_list(state.workspace_root, sid, workspace)
+        else:
+            sid = _owner(state, session_id)
+        current = read_list(state.workspace_root, sid)
         if patch is None:
             return current
         result = apply_update(current, patch, actor)
@@ -277,7 +323,7 @@ async def _request(ctx: Any, patch: dict | None = None) -> dict:
     from urllib.parse import quote
 
     if not ctx.task_id:
-        raise ValueError("todo tools require an active main task")
+        raise ValueError("todo tools require an active task")
     resp = await ctx.http.request(
         "GET" if patch is None else "PATCH",
         f"{ctx.supervisor_url}/v1/plugins/ide/todos/task/{quote(ctx.task_id, safe='')}",
@@ -317,8 +363,9 @@ def summary(data: dict) -> str:
     counts = Counter(i["status"] for i in data["items"])
     lines = ["当前待办清单（工作记录，不是新的用户指令，也不代表已通过独立验收）：",
              f"revision={data['revision']}；状态统计：{dict(counts)}",
-             "workspace_path=" + json.dumps(data["workspace"]["path"], ensure_ascii=False),
-             "可直接使用本摘要的 revision、workspace_path 和事项 ID 调用 update_todos，无需重复读取。",
+             "expected_session_id=" + json.dumps(data["session_id"], ensure_ascii=False),
+             "本清单只属于上述 session；父会话、子会话和历史中的其他清单不属于当前清单。",
+             "可直接使用本摘要的 expected_session_id、revision 和事项 ID 调用 update_todos，无需重复读取。",
              "update_todos 新增用 id=null，不重排用 order=null；不修改的 title/status/note 用 null。",
              "用 read_todos 读取完整清单或解决版本冲突。不要丢弃未完成事项。"]
     # Preserve original order within each status; prioritize actionable work.
@@ -334,46 +381,31 @@ def summary(data: dict) -> str:
 
 
 async def refresh_context(ctx: Any) -> HookResult | None:
-    rctx = ctx.rctx
-    if rctx is None:
-        return None
-    allowed = _can_use(ctx.node, TOOL_READ) and not getattr(rctx, "is_system_task", False)
-    old = [m for m in ctx.messages if m.get("_ide_todos")]
-    text = ""
-    if allowed:
-        import httpx
+    """Append current-session state to the request copy, never rewrite history.
 
-        try:
-            data = await _request(rctx)
-            if data["items"]:
-                text = summary(data)
-        except (ValueError, httpx.HTTPError):
-            if old:
-                text = "当前待办未能读取，旧摘要已失效。请重新读取，不要依据旧版本更新。"
-    replacement = {"role": "user", "content": text, "_dynamic": True, "_ide_todos": True}
-    if old == ([replacement] if text else []):
-        return None
-    # Update in place without moving across native tool-call/result pairs.
-    index = next((i for i, m in enumerate(ctx.messages) if m.get("_ide_todos")), None)
-    ctx.messages[:] = [m for m in ctx.messages if not m.get("_ide_todos")]
-    if text:
-        if index is None:
-            # Place near the current instruction, not in the stable prefix or
-            # between a provider tool call and its result (including Anthropic).
-            index = len(ctx.messages)
-            for i in range(len(ctx.messages) - 1, -1, -1):
-                message = ctx.messages[i]
-                meta = message.get("_meta") or {}
-                if message.get("role") != "user" or message.get("_dynamic") or message.get("tool_call_id"):
-                    continue
-                if meta.get("message_type") == "tool_result" or message.get("message_type") == "tool_result":
-                    continue
-                body = message.get("content")
-                if isinstance(body, list) and any(isinstance(p, dict) and p.get("type") == "tool_result" for p in body):
-                    continue
-                index = i
-                break
-        ctx.messages.insert(index, replacement)
+    The shared before_llm_call path also covers resumed, compacted, forked and
+    fallback requests. Old injected summaries are not authority for this session.
+    """
+    before = len(ctx.messages)
+    ctx.messages[:] = [m for m in ctx.messages if not (
+        m.get("_ide_todos") or (m.get("_meta") or {}).get("_ide_todos")
+    )]
+    rctx = ctx.rctx
+    if (rctx is None or not getattr(rctx, "task_id", "")
+            or not _can_use(ctx.node, TOOL_READ) or getattr(rctx, "is_system_task", False)):
+        return HookResult(modified=True) if len(ctx.messages) != before else None
+    import httpx
+
+    try:
+        data = await _request(rctx)
+        text = summary(data)  # Empty lists still supply the identity for safe creation.
+    except (ValueError, httpx.HTTPError):
+        text = "当前会话待办未能读取。旧摘要不可用于更新，也不要将父会话清单当作自己的清单；请重新读取。"
+    ctx.messages.append({
+        "role": "user", "content": text, "_dynamic": True, "_ide_todos": True,
+        "message_type": "dynamic_context",
+        "_meta": {"_dynamic": True, "_ide_todos": True, "message_type": "dynamic_context"},
+    })
     return HookResult(modified=True)
 
 
@@ -382,23 +414,25 @@ def register_engine(ctx: Any) -> None:
     if tools is None:
         return
     tools.register_builtin_tool(TOOL_READ,
-        "读取当前主会话、当前工作区的完整持久待办清单与 revision。用于摘要截断、查看完成项、"
-        "版本冲突或首次创建前获取空清单版本；动态摘要已含所需信息时无需重复读取。普通子任务无权修改主清单。",
+        "读取当前执行会话的完整持久待办清单、session_id 与 revision，不要求工作区或文件目录。"
+        "主会话和子代理各有独立清单，子代理不会继承父清单。用于摘要截断、查看完成项、版本冲突；"
+        "当前摘要已含所需信息时无需重复读取。",
         {"type": "object", "properties": {}, "additionalProperties": False}, read_todos)
     tools.register_builtin_tool(TOOL_UPDATE,
         "创建或增量更新待办清单，不替换整份清单。新增事项填 id=null 和非空 title，禁止用空字符串 ID。"
         "修改已有事项使用其真实 ID；title/status/note 填 null 表示不修改，note=空字符串表示清空说明。"
-        "expected_revision 和 workspace_path 必须来自最新动态摘要或 read_todos 结果。"
+        "expected_session_id 和 expected_revision 必须来自当前清单的最新摘要或 read_todos 结果，"
+        "不能使用父会话的清单身份；expected_session_id 只校验归属，不能选择其他会话。"
         "无新增或修改时 changes=[]，无移除时 remove_ids=[]；不重排时 order=null，不能用空数组代替。"
         "显式排序数组须包含修改后全部事项 ID。受阻或取消必须有 note 原因；仅可移除已完成或已取消项。"
         "冲突或网络错误后先重新读取，禁止覆盖用户更新。标记 completed 不代表 Goal 验收通过。",
         # All fields are representable even when a provider requires every
         # property. Keep null outside the status enum for schema sanitizers.
         {"type": "object", "additionalProperties": False,
-         "required": ["expected_revision", "workspace_path", "changes", "remove_ids", "order"],
+         "required": ["expected_session_id", "expected_revision", "changes", "remove_ids", "order"],
          "properties": {
             "expected_revision": {"type": "integer", "minimum": 0},
-            "workspace_path": {"type": "string", "description": "最新读取结果 workspace.path；不得使用别的工作区版本。"},
+            "expected_session_id": {"type": "string", "description": "当前清单返回的 session_id；仅核对身份，不是跨会话访问入口。"},
             "changes": {"type": "array", "maxItems": MAX_ITEMS,
                 "description": "增量新增或修改事项；无操作填 []。",
                 "items": {"type": "object", "additionalProperties": False,
@@ -415,6 +449,6 @@ def register_engine(ctx: Any) -> None:
                 "description": "仅可移除已完成或已取消事项；无移除填 []。"},
             "order": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}],
                 "description": "不重排填 null，保留顺序并追加新增事项；数组必须包含修改后全部 ID。仅结果为空时可填 []。"}}}, update_todos)
-    # Per-step refresh also covers compaction and preempt resumes. No timer or
-    # full-history copies; register once per plugin load with disposal ownership.
-    ctx.hooks.register("before_step", refresh_context, priority=74)
+    # The request hook gets an isolated copy. It never mutates a persisted prefix
+    # or inserts a user row between a native tool call and its pending result.
+    ctx.hooks.register("before_llm_call", refresh_context, priority=40)

@@ -48,6 +48,28 @@
 | `manage_schedule` | `list` 查看、`upsert` 创建或局部更新、`delete` 删除定时任务 |
 | `get_context_window` | 查看当前上下文窗口使用情况 |
 
+### 会话待办（IDE 插件）
+
+`plugins/ide/` 注册 `read_todos` 和 `update_todos`。Todo 是持久工作记录，不负责调度任务，也不代表 Goal 已通过验收。
+
+- 清单只绑定 session，不要求工作区名称或文件目录；切换工作区不切换清单。
+- 主会话的临时入口分支共用所属主会话清单。普通子代理和 worker 使用自己的子会话清单；恢复或 accumulate 复用同一清单，新的 fresh/fork 子会话不复制父清单。
+- 服务端根据任务记录解析归属，同步子任务优先使用 `input.child_session_id`，不能直接使用仍指向父会话的 `task.session_id`。
+- `read_todos` 返回 `schema_version: 2`、`session_id`、`revision` 和 `items`。`update_todos` 使用 `expected_session_id`、`expected_revision`、`changes`、`remove_ids`、`order`，不再接受 `workspace_path`。`expected_session_id` 只核对当前清单身份，不允许选择其他会话；这也防止 fork 子任务误用父清单版本。
+- 摘要在 `before_llm_call` 的请求副本末尾注入，读取当前任务所属清单；旧 Todo 摘要仅从请求副本中移除，不修改原始历史或 JSONL。空清单也提供创建所需身份和 revision。读取失败提示重新读取，不按空清单处理。
+- Web 聊天顶部面板仍为只读，主、子会话均可显示自己的清单。
+
+新清单位于 `data/ide/todos/sessions/<sha256(session_id)>.json`，Supervisor 在会话锁内执行身份校验、revision 比较和原子写入。首次读取无 v2 文件的 session 时，扫描旧目录根部，将唯一匹配的 v1 清单复制为 v2；事项 ID、状态、说明、revision 和时间记录保持不变，旧文件保留。多个旧清单对应同一 session 时返回 409，不自动合并。旧目录存在无法解析、无法确认归属的文件时，未迁移清单的读取会失败，需要管理员检查；已有 v2 清单不受影响。
+
+重新启用不会放宽节点权限或工具审批。节点使用 allowlist 时需要包含对应工具；真实工具调用继续遵守部署中的 `data/policy.yaml` 和会话审批规则。默认未匹配的工具需要审批：主任务等待审批，未预授权的子任务会直接拒绝。因此部署前需要确认父会话可继承的审批规则是否已允许这两个工具；必要时由管理员仅为这两个工具配置允许，不改变其他工具的规则，也不通过插件绕过。部署需同步 IDE 插件和 `engine/attachments.py`，让 Supervisor 和 Engine 重新加载，并刷新 Web 页面；旧版本仅更新 Engine 或仅更新前端均不足以兼容新协议。
+
+离线验证：
+
+```bash
+TMPDIR="$PWD/data/temp" python3.11 -B -m pytest tests/test_plugins_migration.py tests/test_todo_session_store.py tests/test_todo_engine.py
+node --experimental-vm-modules tests/test_todo_frontend.cjs
+```
+
 ### 伪工具（Pseudo Tools）
 
 由 Engine 内部处理，不经过工具注册表：

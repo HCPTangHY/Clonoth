@@ -20,7 +20,7 @@ from typing import Any
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.16.5",
+    "version": "0.17.0",
     "description": "Web IDE：文件管理、编辑器、Git、搜索、@文件引用和会话待办清单",
     "author": "clonoth",
     # supervisor：静态面板与 API；engine：文件引用、待办工具与进度摘要。
@@ -265,8 +265,10 @@ def register(ctx) -> None:
     """双进程入口：Supervisor 注册 API，Engine 注册引用和待办能力。"""
     routes = getattr(ctx.contributions, "get", lambda _name: None)("routes")
     if routes is None:
-        # [2026-10-27] 停用 Engine 侧 read_todos / update_todos 工具与每步 before_step 轮询钩子
-        # engine 进程：仅注册 before_llm_call @path 引用展开处理。
+        # Todos belong to the executing session, including child sessions, and
+        # require no filesystem workspace. Request-only summaries keep history intact.
+        from .todo import register_engine
+        register_engine(ctx)
         dispose = ctx.hooks.register("before_llm_call", _expand_file_mentions, priority=50)
         return [dispose]
 

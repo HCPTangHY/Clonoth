@@ -49,9 +49,9 @@ export default {
     this.disposed = false;
     this.seq = 0;
     this.sessionId = '';
-    this.isChild = false;
     this.data = null;
     this.controller = null;
+    this.requestTimeout = null;
     this.style = element('style', '', CSS);
     this.root = element('section', 'ide-todo-progress');
     this.root.setAttribute('aria-label', '当前会话待办');
@@ -106,42 +106,40 @@ export default {
   update(ctx) {
     this.ctx = ctx;
     const sid = String(ctx.data?.sessionId || '');
-    const child = Boolean(ctx.data?.isChildSession);
-    if (sid === this.sessionId && child === this.isChild) return;
+    if (sid === this.sessionId) return;
     this.sessionId = sid;
-    this.isChild = child;
     ++this.seq;
     this.controller?.abort();
     this.controller = null;
+    window.clearTimeout(this.requestTimeout);
+    this.requestTimeout = null;
     this.data = null;
     this.root.hidden = true;
     this.body.replaceChildren();
-    if (ctx.state.sessionId !== sid || child) {
+    if (ctx.state.sessionId !== sid) {
       ctx.state.sessionId = sid;
-      ctx.state.workspacePath = '';
       ctx.state.expanded = false;
     }
-    if (sid && !child) void this.load();
+    if (sid) void this.load();
   },
 
   async load() {
-    if (this.disposed || !this.sessionId || this.isChild || this.controller) return;
+    if (this.disposed || !this.sessionId || this.controller) return;
     const seq = ++this.seq;
     const controller = new AbortController();
     this.controller = controller;
     const timeout = window.setTimeout(() => controller.abort(), 8000);
+    this.requestTimeout = timeout;
     try {
       const data = await this.ctx.api.request('/plugins/ide/todos?session_id=' + encodeURIComponent(this.sessionId), {
         signal: controller.signal,
       });
       if (this.disposed || seq !== this.seq) return;
-      if (!data || !Array.isArray(data.items) || typeof data.workspace?.path !== 'string') {
+      if (!data || data.schema_version !== 2 || data.session_id !== this.sessionId
+        || !Number.isSafeInteger(data.revision) || data.revision < 0 || !Array.isArray(data.items)) {
         throw new Error('待办响应格式无效');
       }
-      const unchanged = this.data?.revision === data.revision
-        && this.data?.workspace.path === data.workspace.path;
-      if (this.ctx.state.workspacePath !== data.workspace.path) this.ctx.state.expanded = false;
-      this.ctx.state.workspacePath = data.workspace.path;
+      const unchanged = this.data?.session_id === data.session_id && this.data?.revision === data.revision;
       this.data = data;
       if (!unchanged) this.render();
     } catch {
@@ -163,7 +161,10 @@ export default {
       this.toggle.setAttribute('aria-label', '待办读取失败，点击重试');
     } finally {
       window.clearTimeout(timeout);
-      if (this.controller === controller) this.controller = null;
+      if (this.controller === controller) {
+        this.controller = null;
+        this.requestTimeout = null;
+      }
     }
   },
 
@@ -226,6 +227,9 @@ export default {
     ++this.seq;
     window.clearInterval(this.timer);
     this.controller?.abort();
+    this.controller = null;
+    window.clearTimeout(this.requestTimeout);
+    this.requestTimeout = null;
     document.removeEventListener('visibilitychange', this.onVisibility);
     document.removeEventListener('pointerdown', this.onPointerDown);
     this.data = null;

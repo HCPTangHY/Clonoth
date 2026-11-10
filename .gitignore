@@ -125,6 +125,7 @@ tools/
 !/tests/test_engine_rw_memory.py
 !/tests/test_plugins_migration.py
 !/tests/test_plugins_frontend.cjs
+!/tests/test_todo_frontend.cjs
 
 # Include source regression tests added by subsequent migrations.
 !/tests/test_*.py

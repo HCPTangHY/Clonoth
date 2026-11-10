@@ -59,13 +59,13 @@ def item(**kw) -> dict:
     return base
 
 
-def todo_list(items=(), revision=0, path="/ws") -> dict:
-    return {"schema_version": 1, "session_id": "s1", "workspace": {"name": "w", "path": path},
+def todo_list(items=(), revision=0, session_id="s1") -> dict:
+    return {"schema_version": 2, "session_id": session_id,
             "revision": revision, "items": list(items), "updated_at": None, "updated_by": None}
 
 
-def patch(ws="/ws", **kw) -> dict:
-    base = {"expected_revision": 0, "workspace_path": str(ws), "changes": [],
+def patch(session_id="s1", **kw) -> dict:
+    base = {"expected_revision": 0, "expected_session_id": session_id, "changes": [],
             "remove_ids": [], "order": None}
     base.update(kw)
     return base
@@ -220,7 +220,7 @@ class MentionExpansionTests(unittest.TestCase):
 
 
 class EngineRegistrationTests(unittest.TestCase):
-    def test_registers_only_before_llm_call(self) -> None:
+    def test_registers_reference_and_todo_engine_capabilities(self) -> None:
         hooks, tools, called = Hooks(), Tools(), []
         ctx = SimpleNamespace(contributions=contrib(tools=tools), hooks=hooks)
         with mock.patch.object(ide_todo, "register_engine", lambda c: called.append(c)):
@@ -228,7 +228,8 @@ class EngineRegistrationTests(unittest.TestCase):
         self.assertEqual([call[0] for call in hooks.calls], ["before_llm_call"])  # no before_step
         self.assertIs(hooks.calls[0][1], ide._expand_file_mentions)
         self.assertEqual(hooks.calls[0][2], 50)
-        self.assertEqual((tools.names, called), ([], []))  # no todos tools, no todo.register_engine
+        self.assertEqual(tools.names, [])  # registration is mocked above
+        self.assertEqual(called, [ctx])
         self.assertEqual(len(disposers), 1)
         self.assertTrue(callable(disposers[0]))
 
@@ -287,9 +288,9 @@ class ApplyUpdateTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["updated_by"], ACTOR)
         self.assertEqual(current["items"], [])  # input stays pristine
 
-    def test_revision_conflict_and_workspace_mismatch(self) -> None:
+    def test_revision_conflict_and_session_mismatch(self) -> None:
         expect(self, 409, apply_update, todo_list(revision=3), patch(), ACTOR)
-        expect(self, 409, apply_update, todo_list(), patch(ws="/elsewhere"), ACTOR)
+        expect(self, 409, apply_update, todo_list(), patch(session_id="other"), ACTOR)
 
     def test_failed_batch_leaves_input_untouched(self) -> None:
         current = todo_list([item()], revision=2)
@@ -374,27 +375,28 @@ class OperateTests(unittest.TestCase):
     def test_read_write_and_session_isolation(self) -> None:
         state = self.state()
         self.assertEqual(operate(state, "s1")["revision"], 0)
-        self.assertEqual(operate(state, "s1", patch(self.ws, changes=[{"id": None, "title": "A"}]))["revision"], 1)
+        self.assertEqual(operate(state, "s1", patch(changes=[{"id": None, "title": "A"}]))["revision"], 1)
         self.assertEqual(operate(state, "s1")["items"][0]["title"], "A")
         self.assertEqual(operate(state, "s2")["items"], [])  # sibling session: own list
-        self.assertEqual(len(list((self.tmp / "data" / "ide" / "todos").glob("*.json"))), 1)
+        self.assertEqual(len(list((self.tmp / "data" / "ide" / "todos" / "sessions").glob("*.json"))), 1)
 
-    def test_workspace_switch_is_a_different_list(self) -> None:
-        state = self.state({"s1": {"name": "o", "path": str(self.other)}})
-        self.assertEqual(operate(state, "s1")["items"], [])  # does not read the ws/ list
-        expect(self, 409, operate, state, "s1", patch(self.ws, changes=[{"id": None, "title": "stale"}]))
-        self.assertEqual(operate(state, "s1", patch(self.other, changes=[{"id": None, "title": "B"}]))
-                         ["workspace"]["path"], str(self.other.resolve()))
-        expect(self, 409, operate, state, "s1", patch(self.ws))
-
-    def test_access_denials_and_workspace_requirement(self) -> None:
+    def test_workspace_switch_preserves_the_session_list(self) -> None:
         state = self.state()
-        expect(self, 403, operate, state, "child")  # child sessions never inherit
+        original = operate(state, "s1", patch(changes=[{"title": "A"}]))
+        state.sessions["s1"].workspace = {"name": "other", "path": str(self.other)}
+        self.assertEqual(operate(state, "s1"), original)
+        state.sessions["s1"].workspace = {}
+        self.assertEqual(operate(state, "s1"), original)
+        self.assertNotIn("workspace", original)
+
+    def test_session_access_does_not_require_a_workspace(self) -> None:
+        state = self.state()
+        self.assertEqual(operate(state, "child")["session_id"], "child")
         expect(self, 404, operate, state, "reset")
         expect(self, 404, operate, state, "missing")
-        expect(self, 400, operate, state, "bare")  # no workspace bound
+        self.assertEqual(operate(state, "bare")["items"], [])
         missing = self.state({"s1": {"name": "w", "path": str(self.tmp / "nope")}})
-        expect(self, 409, operate, missing, "s1")  # directory gone
+        self.assertEqual(operate(missing, "s1")["items"], [])
 
     def test_entry_branch_redirects_to_parent(self) -> None:
         state = self.state()
@@ -404,36 +406,31 @@ class OperateTests(unittest.TestCase):
         self.assertEqual(operate(state, "branch"), operate(state, "s1"))
 
     def test_save_read_roundtrip(self) -> None:
-        space = {"name": "w", "path": str(self.ws.resolve())}
-        self.assertEqual(ide_todo.read_list(self.tmp, "s1", space)["items"], [])
-        data = {**todo_list([item(status="completed")], revision=3), "workspace": space}
+        self.assertEqual(ide_todo.read_list(self.tmp, "s1")["items"], [])
+        data = todo_list([item(status="completed")], revision=3)
         ide_todo.save_list(self.tmp, data)
-        loaded = ide_todo.read_list(self.tmp, "s1", space)
+        loaded = ide_todo.read_list(self.tmp, "s1")
         self.assertEqual((loaded["revision"], loaded["items"]), (3, data["items"]))
-        self.assertEqual(loaded["workspace"], space)
+        self.assertNotIn("workspace", loaded)
 
     def test_corrupt_file_is_never_overwritten(self) -> None:
-        space = {"name": "w", "path": str(self.ws.resolve())}
-        path = ide_todo._path(self.tmp, "s1", space)
+        path = ide_todo._path(self.tmp, "s1")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"{not json")
-        expect(self, 500, ide_todo.read_list, self.tmp, "s1", space)
-        expect(self, 500, operate, self.state(), "s1", patch(self.ws, changes=[{"id": None, "title": "A"}]))
+        expect(self, 500, ide_todo.read_list, self.tmp, "s1")
+        expect(self, 500, operate, self.state(), "s1", patch(changes=[{"id": None, "title": "A"}]))
         self.assertEqual(path.read_bytes(), b"{not json")  # write path never clobbered it
-        path.write_bytes(b'{"schema_version": 1, "session_id": "other", "workspace": {"name": "w", '
-                         b'"path": "' + str(self.ws.resolve()).encode() + b'"}, "revision": 0, "items": []}')
-        expect(self, 500, ide_todo.read_list, self.tmp, "s1", space)  # foreign session id
+        path.write_bytes(b'{"schema_version": 2, "session_id": "other", "revision": 0, "items": []}')
+        expect(self, 500, ide_todo.read_list, self.tmp, "s1")  # foreign session id
 
     def test_oversized_data_is_rejected(self) -> None:
-        space = {"name": "w", "path": str(self.ws.resolve())}
-        data = {**todo_list(revision=1), "workspace": space,
-                "items": [item(note="n" * 2000, title="t" * 500)] * 200}
+        data = {**todo_list(revision=1), "items": [item(note="n" * 2000, title="t" * 500)] * 200}
         expect(self, 422, ide_todo.save_list, self.tmp, data)
-        self.assertFalse(ide_todo._path(self.tmp, "s1", space).exists())
-        path = ide_todo._path(self.tmp, "s1", space)
+        self.assertFalse(ide_todo._path(self.tmp, "s1").exists())
+        path = ide_todo._path(self.tmp, "s1")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"{" + b" " * ide_todo.MAX_BYTES)
-        expect(self, 500, ide_todo.read_list, self.tmp, "s1", space)
+        expect(self, 500, ide_todo.read_list, self.tmp, "s1")
 
 
 if __name__ == "__main__":

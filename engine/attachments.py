@@ -344,10 +344,11 @@ def prepare_messages_for_llm(
         # [2026-05-01] Keep _meta until the provider layer runs. Native
         # providers, especially OpenAI Responses, need provider metadata to
         # round-trip raw output/reasoning items and rebuild native tool history.
-        # Other transient internal flags are still removed here; providers are
-        # responsible for never copying _meta into the final API payload.
-        if any(k.startswith("_") and k != "_meta" for k in msg):
-            msg = {k: v for k, v in msg.items() if not k.startswith("_") or k == "_meta"}
+        # Keep the legacy Todo marker until its request hook removes the old
+        # summary; older snapshots stored it only at the top level. Providers
+        # must never copy internal fields into the final API payload.
+        if any(k.startswith("_") and k not in ("_meta", "_ide_todos") for k in msg):
+            msg = {k: v for k, v in msg.items() if not k.startswith("_") or k in ("_meta", "_ide_todos")}
 
         content = msg.get("content")
 
