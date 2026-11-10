@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from copy import deepcopy
 import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, NamedTuple
 
 from clonoth_runtime import get_float, load_runtime_config
 
@@ -16,6 +17,22 @@ from ._common import safe_subprocess_env as _safe_subprocess_env
 
 
 ToolFunc = Callable[[dict[str, Any], Any], Awaitable[dict[str, Any]]]
+
+
+class _ToolApproval(NamedTuple):
+    registry: Any
+    name: str
+    func: ToolFunc
+    spec: dict[str, Any]
+    identity: str
+    call_id: str
+    complete: bool = False
+
+
+def _approval_identity(spec: dict[str, Any], arguments: dict[str, Any]) -> str:
+    # JSON identity, not Python equality: 1, 1.0 and True must remain distinct.
+    # Do not stringify unsupported values or admit NaN/Infinity into an approval.
+    return json.dumps([spec, arguments], sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _json_text(value: Any) -> str:
@@ -702,6 +719,35 @@ class ToolRegistry:
         """按名称获取单个工具的 spec，不存在返回 None。"""
         return self._tool_specs.get(name)
 
+    @staticmethod
+    def _clear_tool_approval(ctx: Any) -> None:
+        # request_guard fingerprints are also per invocation, not per context life.
+        for attr in ("_registry_approval", "_approved_guard_fps"):
+            if hasattr(ctx, attr):
+                delattr(ctx, attr)
+
+    def _check_tool_approval(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any] | None:
+        """An approval belongs to one implementation, specification and argument set."""
+        func = self._tool_funcs.get(name)
+        grant = getattr(ctx, "_registry_approval", None)
+        if func is None:
+            reason = "tool unavailable after approval" if grant is not None else "tool not found"
+            return _error_tool_response(f"{reason}: {name}", rejection_code="tool_unavailable", denied=False)
+        try:
+            identity = _approval_identity(self._tool_specs.get(name) or {}, arguments) if grant is not None else None
+        except (TypeError, ValueError, RecursionError):
+            identity = None  # Invalid JSON after approval is also a changed call.
+        if grant is not None and (
+            grant.registry is not self or grant.name != name or grant.func is not func
+            or grant.identity != identity
+            or grant.call_id != str(getattr(ctx, "tool_call_id", "") or "")
+        ):
+            return _error_tool_response(
+                f"tool changed during approval; execution cancelled: {name}",
+                rejection_code="tool_changed", denied=False,
+            )
+        return None
+
     async def authorize(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any] | None:
         """Run the policy + approval gate without executing the tool.
 
@@ -717,37 +763,67 @@ class ToolRegistry:
 
         Returns None when the call may proceed, else the error-shaped result.
         """
-        if name not in self._tool_funcs:
-            return _error_tool_response(f"tool not found: {name}")
-        # The per-call context also carries this identity into inner file guards.
-        ctx.tool_name = name
-        from ._common import request_guard
-        _op, _err = await request_guard(
-            ctx, "tool_call",
-            {"tool_name": name, "arguments": arguments},
-        )
-        if _err is not None:
-            return _approval_failure_response(_err)
-        # [2026-09-06] Pre-flight the tool's own internal guard when declared.
-        # Why: execute_command's command-level approval used to wait inside the
-        # scheduler's timed execution task, so a pending approval tripped the
-        # 60s async-upgrade threshold before the command ever ran. How: run the
-        # declared guard here; request_guard records the approved fingerprint
-        # on ctx, making the in-tool repeat a no-op for this exact operation.
-        # Purpose: approval latency is excluded from execution timing on both
-        # the adaptive and the direct paths.
-        _spec = self._tool_specs.get(name) or {}
-        _guard_op = str(_spec.get("guard_op") or "").strip()
-        if _guard_op:
-            _guard_params = {
-                k: arguments[k]
-                for k in (_spec.get("guard_params") or [])
-                if isinstance(k, str) and k in (arguments or {})
-            }
-            _op2, _err2 = await request_guard(ctx, _guard_op, _guard_params)
-            if _err2 is not None:
-                return _approval_failure_response(_err2)
-        return None
+        complete = False
+        try:
+            func = self._tool_funcs.get(name)
+            if func is None:
+                return _error_tool_response(f"tool not found: {name}", rejection_code="tool_unavailable", denied=False)
+            call_id = str(getattr(ctx, "tool_call_id", "") or "")
+            grant = getattr(ctx, "_registry_approval", None)
+            if grant is not None and grant.call_id != call_id:
+                self._clear_tool_approval(ctx)
+                grant = None
+            if grant is not None:
+                changed = self._check_tool_approval(name=name, arguments=arguments, ctx=ctx)
+                if changed is not None:
+                    return changed
+                if grant.complete:
+                    complete = True
+                    return None
+                return _error_tool_response(f"tool authorization incomplete: {name}", rejection_code="tool_not_authorized", denied=False)
+            # Only this invocation may reuse the preflight via execute(). The
+            # canonical JSON snapshot also catches in-place edits and type changes.
+            spec = self._tool_specs.get(name) or {}
+            try:
+                identity = _approval_identity(spec, arguments)
+            except (TypeError, ValueError, RecursionError):
+                return _error_tool_response(
+                    f"tool definition or arguments are not valid JSON: {name}",
+                    rejection_code="tool_invalid_json", denied=False,
+                )
+            grant = _ToolApproval(self, name, func, deepcopy(spec), identity, call_id)
+            ctx._registry_approval = grant
+            ctx.tool_name = name
+            from ._common import request_guard
+            _op, _err = await request_guard(ctx, "tool_call", {"tool_name": name, "arguments": arguments})
+            if _err is not None:
+                return _approval_failure_response(_err)
+            changed = self._check_tool_approval(name=name, arguments=arguments, ctx=ctx)
+            if changed is not None:
+                return changed
+            # Preserve the preflight's declared internal guard, not a replacement.
+            _spec = grant.spec
+            _guard_op = str(_spec.get("guard_op") or "").strip()
+            if _guard_op:
+                _guard_params = {
+                    k: arguments[k]
+                    for k in (_spec.get("guard_params") or [])
+                    if isinstance(k, str) and k in (arguments or {})
+                }
+                _op2, _err2 = await request_guard(ctx, _guard_op, _guard_params)
+                if _err2 is not None:
+                    return _approval_failure_response(_err2)
+            changed = self._check_tool_approval(name=name, arguments=arguments, ctx=ctx)
+            if changed is not None:
+                return changed
+            if getattr(ctx, "_registry_approval", None) is not grant:
+                return _error_tool_response(f"tool authorization invalidated: {name}", rejection_code="tool_not_authorized", denied=False)
+            ctx._registry_approval = grant._replace(complete=True)
+            complete = True
+            return None
+        finally:
+            if not complete:
+                self._clear_tool_approval(ctx)
 
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any, _authorized: bool = False) -> dict[str, Any]:
         # [AutoC 2026-08-10] 统一工具级审批：所有真实工具调用先过 supervisor policy。
@@ -756,16 +832,24 @@ class ToolRegistry:
         # 等）在 policy.yaml tools.rules 里配 auto，避免双重拦截；其余工具默认
         # approval_required，由前端/Discord 按 trust_level（空 = 无路径）+ 用户偏好
         # 自动批准或弹人工审批。_authorized=True 供调度器预授权后跳过二次审批。
-        if _authorized:
-            if name not in self._tool_funcs:
-                return _error_tool_response(f"tool not found: {name}")
-        else:
-            denied = await self.authorize(name=name, arguments=arguments, ctx=ctx)
-            if denied is not None:
-                return denied
-
-        func = self._tool_funcs[name]
-        return _ensure_tool_response_shape(await func(arguments, ctx))
+        try:
+            if not _authorized:
+                denied = await self.authorize(name=name, arguments=arguments, ctx=ctx)
+                if denied is not None:
+                    return denied
+            changed = self._check_tool_approval(name=name, arguments=arguments, ctx=ctx)
+            if changed is not None:
+                return changed
+            grant = getattr(ctx, "_registry_approval", None)
+            if grant is not None and not grant.complete:
+                return _error_tool_response(f"tool authorization incomplete: {name}", rejection_code="tool_not_authorized", denied=False)
+            # _authorized without a grant preserves the existing trusted internal
+            # caller contract. Real scheduler paths always carry a checked grant.
+            # No await between validation and invocation of the current callable.
+            func = self._tool_funcs.get(name)
+            return _ensure_tool_response_shape(await func(arguments, ctx))
+        finally:
+            self._clear_tool_approval(ctx)
 
     async def load_remote_tools(self, supervisor_url: str) -> int:
         """Load remote-worker tools from Supervisor and register wrappers."""

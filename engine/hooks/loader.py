@@ -162,7 +162,11 @@ def register_meta_handler(
             hook_registry.register(str(hook_point), method, priority=priority)
         teardown = getattr(instance, "teardown", None)
         if callable(teardown):
-            hook_registry.add_plugin_disposer(ledger_name, teardown)
+            # Only shared resources opt into replacement. Ordinary instances
+            # keep separate disposers so none of their private resources leak.
+            hook_registry.add_plugin_disposer(
+                ledger_name, teardown, key=getattr(instance, "teardown_key", None),
+            )
         register_declared_tools(module.__name__, meta, tool_registry)
         register_declared_nodes(module.__name__, meta, context, module)
     return instance

@@ -675,7 +675,6 @@ _SESSION_ATTEMPTS = 2
 _SESSION_CLOSED_MESSAGE = (
     "MCP session closed before the request completed; the call was not retried"
 )
-_TOOL_SCHEMA_CACHE: dict[tuple[int, str], tuple[str, list[dict[str, Any]]]] = {}
 
 
 def resolve_idle_ttl(spec: dict[str, Any] | None) -> float:
@@ -1008,69 +1007,70 @@ class _StdioSessionActor:
         await self.stop()
 
 
-_STDIO_ACTORS: dict[tuple[int, str], _StdioSessionActor] = {}
+def _runtime_state() -> dict[str, Any]:
+    """Return loop-owned state, including across a complete MCP package reload.
 
-# Why: bridge bookkeeping lives in the runtime module, not in the plugin
-# package. importlib.reload() re-executes engine/builtin/mcp/__init__.py and
-# drops every module global there while the watcher task and the stdio children
-# keep running, which is exactly the leak this dict prevents. How: the plugin
-# package reads and writes this one dict through shared_state(). Purpose: one
-# reload-safe home for the process-wide MCP state.
-_BRIDGE_STATE: dict[str, Any] = {
-    "task": None,
-    "generation": 0,
-    "registry": None,
-    "hooks": None,
-    "workspace_root": None,
-    "disposers": {},       # client_id -> [(registered tool name, disposer)]
-    "specs": {},           # client_id -> spec used for the live registrations
-    "failed_clients": set(),
-    "retry_pending": True,
-    "actors": {},          # read-only view of the current loop's actor pool
-}
+    load_single_builtin() removes this runtime module as well as the plugin.
+    Keeping state on the event loop lets both incarnations hand off the same
+    bridge, actor pool and cache while still loading new runtime code. No loop
+    means no writable runtime state; callers must not create a fallback pool.
+    """
+    loop = asyncio.get_running_loop()
+    state = getattr(loop, "_clonoth_mcp_state", None)
+    if state is None:
+        state = {
+            "bridge": {
+                "task": None,
+                "generation": 0,
+                "registry": None,
+                "hooks": None,
+                "workspace_root": None,
+                "disposers": {},  # client_id -> [(tool name, disposer)]
+                "specs": {},      # client_id -> live registration spec
+                "failed_clients": set(),
+                "retry_pending": True,
+                "actors": {},     # diagnostic view of the current actor pool
+            },
+            # Keep (loop_id, client_id) keys to preserve the existing pool API.
+            "stdio_actors": {},
+            "tool_schema_cache": {},
+        }
+        setattr(loop, "_clonoth_mcp_state", state)
+    return state
 
 
 def shared_state() -> dict[str, Any]:
-    """Return the live MCP bridge/session state (one dict per process).
-
-    Why: the plugin package is re-executed on reload, so its module globals
-    cannot be the only record of the running watcher and its registrations;
-    state that survives reload must live in this module. How: hand back the one
-    ``_BRIDGE_STATE`` dict and refresh its ``actors`` view from the pool of the
-    running event loop. Purpose: a reload can find, release and replace the
-    previous incarnation, and diagnostics/tests get one inspection surface
-    without duplicating bookkeeping.
-    """
-    try:
-        loop_id: int | None = id(asyncio.get_running_loop())
-    except RuntimeError:
-        loop_id = None
-    _BRIDGE_STATE["actors"] = {
+    """Return this loop's bridge state with a refreshed actor diagnostic view."""
+    runtime = _runtime_state()
+    state = runtime["bridge"]
+    loop_id = id(asyncio.get_running_loop())
+    state["actors"] = {
         client_id: actor
-        for (pool_loop, client_id), actor in list(_STDIO_ACTORS.items())
-        if loop_id is not None and pool_loop == loop_id
+        for (pool_loop, client_id), actor in list(runtime["stdio_actors"].items())
+        if pool_loop == loop_id
     }
-    return _BRIDGE_STATE
+    return state
 
 
 def _cache_get(client_id: str, spec_sig: str) -> list[dict[str, Any]] | None:
-    entry = _TOOL_SCHEMA_CACHE.get((id(asyncio.get_running_loop()), client_id))
+    entry = _runtime_state()["tool_schema_cache"].get((id(asyncio.get_running_loop()), client_id))
     if entry is None or entry[0] != spec_sig:
         return None
     return list(entry[1])
 
 
 def _cache_set(client_id: str, spec_sig: str, tools: list[dict[str, Any]]) -> None:
-    _TOOL_SCHEMA_CACHE[(id(asyncio.get_running_loop()), client_id)] = (spec_sig, tools)
+    _runtime_state()["tool_schema_cache"][(id(asyncio.get_running_loop()), client_id)] = (spec_sig, tools)
 
 
 def _cache_drop(client_id: str) -> None:
-    _TOOL_SCHEMA_CACHE.pop((id(asyncio.get_running_loop()), client_id), None)
+    _runtime_state()["tool_schema_cache"].pop((id(asyncio.get_running_loop()), client_id), None)
 
 
 def _cache_clear_loop(loop_id: int) -> None:
-    for key in [key for key in _TOOL_SCHEMA_CACHE if key[0] == loop_id]:
-        _TOOL_SCHEMA_CACHE.pop(key, None)
+    cache = _runtime_state()["tool_schema_cache"]
+    for key in [key for key in cache if key[0] == loop_id]:
+        cache.pop(key, None)
 
 
 def _stdio_spec_signature(spec: dict[str, Any]) -> str:
@@ -1098,10 +1098,11 @@ async def reconcile_stdio_actors(clients: list[dict[str, Any]]) -> bool:
         if spec.get("enabled", True) and spec.get("transport") == "stdio"
     }
     loop_id = id(asyncio.get_running_loop())
+    actors = _runtime_state()["stdio_actors"]
     retired: list[tuple[tuple[int, str], _StdioSessionActor]] = []
     complete = True
     async with _stdio_actor_lock():
-        for key, actor in list(_STDIO_ACTORS.items()):
+        for key, actor in list(actors.items()):
             if key[0] != loop_id:
                 continue
             cid = key[1]
@@ -1125,8 +1126,8 @@ async def reconcile_stdio_actors(clients: list[dict[str, Any]]) -> bool:
             logger.warning("MCP session cleanup failed: %s", key[1], exc_info=True)
             continue
         async with _stdio_actor_lock():
-            if _STDIO_ACTORS.get(key) is actor:
-                _STDIO_ACTORS.pop(key, None)
+            if actors.get(key) is actor:
+                actors.pop(key, None)
     return complete
 
 
@@ -1134,6 +1135,7 @@ async def _get_stdio_actor(workspace_root: Path, client_id: str) -> _StdioSessio
     _ensure_sdk()
     loop = asyncio.get_running_loop()
     key = (id(loop), client_id)
+    actors = _runtime_state()["stdio_actors"]
     while True:
         async with _stdio_actor_lock():
             # Read under the pool lock, including after awaiting old-session
@@ -1148,7 +1150,7 @@ async def _get_stdio_actor(workspace_root: Path, client_id: str) -> _StdioSessio
                 raise RuntimeError("stdio client missing command")
             sig = _stdio_spec_signature(spec)
             idle_ttl = resolve_idle_ttl(spec)
-            existing = _STDIO_ACTORS.get(key)
+            existing = actors.get(key)
             if existing is not None:
                 same_loop = getattr(existing, "_loop_ref", lambda: loop)() is loop
                 if same_loop and not existing.retired and existing.spec_sig == sig:
@@ -1157,7 +1159,7 @@ async def _get_stdio_actor(workspace_root: Path, client_id: str) -> _StdioSessio
                 existing.retired = True
                 _cache_drop(client_id)
                 if not same_loop:
-                    _STDIO_ACTORS.pop(key, None)
+                    actors.pop(key, None)
                     continue
             else:
                 args = [str(x) for x in (spec.get("args") or [])]
@@ -1172,13 +1174,13 @@ async def _get_stdio_actor(workspace_root: Path, client_id: str) -> _StdioSessio
                     actor._loop_ref = _wr.ref(loop)  # type: ignore[attr-defined]
                 except Exception:
                     pass
-                _STDIO_ACTORS[key] = actor
+                actors[key] = actor
                 return actor
         # Keep shutdown outside the shared lock so other clients remain usable.
         await existing.stop()
         async with _stdio_actor_lock():
-            if _STDIO_ACTORS.get(key) is existing:
-                _STDIO_ACTORS.pop(key, None)
+            if actors.get(key) is existing:
+                actors.pop(key, None)
 
 
 async def close_stdio_actor(client_id: str) -> bool:
@@ -1190,8 +1192,9 @@ async def close_stdio_actor(client_id: str) -> bool:
     cleanup cannot break another client's session.
     """
     key = (id(asyncio.get_running_loop()), client_id)
+    actors = _runtime_state()["stdio_actors"]
     async with _stdio_actor_lock():
-        actor = _STDIO_ACTORS.get(key)
+        actor = actors.get(key)
         if actor is None:
             return False
         actor.retired = True
@@ -1200,8 +1203,8 @@ async def close_stdio_actor(client_id: str) -> bool:
         await actor.stop()
     finally:
         async with _stdio_actor_lock():
-            if _STDIO_ACTORS.get(key) is actor:
-                _STDIO_ACTORS.pop(key, None)
+            if actors.get(key) is actor:
+                actors.pop(key, None)
     return True
 
 
@@ -1209,10 +1212,11 @@ async def close_stdio_actors() -> int:
     """Stop all active stdio actors in the current event loop and return count stopped."""
     loop_id = id(asyncio.get_running_loop())
     _cache_clear_loop(loop_id)
-    keys = [k for k in list(_STDIO_ACTORS.keys()) if k[0] == loop_id]
+    actors = _runtime_state()["stdio_actors"]
+    keys = [k for k in list(actors.keys()) if k[0] == loop_id]
     stopped = 0
     for k in keys:
-        actor = _STDIO_ACTORS.pop(k, None)
+        actor = actors.pop(k, None)
         if actor is not None:
             actor.retired = True
             try:

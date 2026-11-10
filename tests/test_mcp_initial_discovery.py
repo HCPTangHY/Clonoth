@@ -32,7 +32,9 @@ class InitialDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         for p in reversed(self.patches):
             p.stop()
 
-    def start(self):
+    def start(self, *, replace_registry=False):
+        if replace_registry:
+            self.registry = SimpleNamespace(workspace_root=Path("."))
         mcp._start_engine_bridge(self.registry, SimpleNamespace(hooks=None))
         self.tasks.append(self.state["task"])
 
@@ -60,6 +62,38 @@ class InitialDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             gate.set()
             self.assertTrue(await waiter)
             self.assertEqual(specs, ["mcp_probe_read"])
+
+    async def test_reentry_shares_initial_future_before_and_during_discovery(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def discover(*args, **kwargs):
+            entered.set()
+            await release.wait()
+        with patch.object(mcp, "refresh_mcp_tools", side_effect=discover) as refresh:
+            self.start()
+            task, initial = self.state["task"], self.state["initial_discovery"]
+            self.start()  # Before the scheduled task has ever run.
+            self.assertIs(self.state["task"], task)
+            self.assertIs(self.state["initial_discovery"], initial)
+            await entered.wait()
+            self.start()
+            self.assertIs(self.state["task"], task)
+            self.assertFalse(initial[2].done())
+            release.set()
+            self.assertTrue(await mcp.wait_mcp_initial_discovery(timeout=1))
+            self.start()  # Healthy idle watcher also survives node reentry.
+            self.assertIs(self.state["task"], task)
+            refresh.assert_awaited_once()
+
+    async def test_finished_watcher_is_restarted(self):
+        with patch.object(mcp, "refresh_mcp_tools", new=AsyncMock(return_value=0)):
+            self.start()
+            self.assertTrue(await mcp.wait_mcp_initial_discovery(timeout=1))
+            old_task = self.state["task"]
+            old_task.cancel()
+            await asyncio.gather(old_task, return_exceptions=True)
+            self.start()
+            self.assertIsNot(self.state["task"], old_task)
+            self.assertTrue(await mcp.wait_mcp_initial_discovery(timeout=1))
 
     async def test_failed_attempt_releases_waiters_for_normal_retry(self):
         with patch.object(mcp, "refresh_mcp_tools", new=AsyncMock(side_effect=ValueError("offline"))):
@@ -121,7 +155,7 @@ class InitialDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             self.start()
             await started.wait()
             old_ready = self.state["initial_discovery"][2]
-            self.start()
+            self.start(replace_registry=True)
             new_ready = self.state["initial_discovery"][2]
             self.assertFalse(old_ready.result())
             await asyncio.sleep(.03)
@@ -137,7 +171,7 @@ class InitialDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             waiter = asyncio.create_task(mcp.wait_mcp_initial_discovery(timeout=.03))
             for _ in range(5):
                 await asyncio.sleep(.01)
-                self.start()
+                self.start(replace_registry=True)
             self.assertTrue(waiter.done())
             self.assertFalse(await waiter)
 

@@ -24,6 +24,7 @@ bump reload-seq：其他 worker 的 MCP 工具经快照存活、经 mtime 监视
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
@@ -198,10 +199,8 @@ async def _refresh_and_notify(ctx: Any) -> int:
 #  动态工具发现（engine 进程后台桥）
 # ---------------------------------------------------------------------------
 
-# 桥状态跨重入、跨 reload 存活：每次进 AI 节点或 reload 插件包都会重跑
-# 本模块的模块级代码，而旧的后台任务/工具注册/子进程不能跟着丢。
-# 因此状态存在 mcp_runtime.shared_state()（不被 reload 重新执行）里，
-# 本模块只是它的一个读写者。
+# 桥状态由事件循环持有，普通节点重入复用；完整删除并重导入插件包后，
+# 新旧 runtime 仍通过 shared_state() 访问同一份状态，完成资源交接。
 _BRIDGE_TASK_NAME = "mcp-bridge"
 # After asking a watcher to stop cooperatively, how long to wait before
 # cancelling it; the watcher never blocks for more than one watch interval.
@@ -246,16 +245,12 @@ async def _stop_bridge_task(task: Any, stop_event: Any) -> None:
             pass
 
 
-def _start_engine_bridge(tools_face: Any, ctx: Any) -> None:
-    """Start the discovery watcher, releasing whatever the previous load owned.
+def _start_engine_bridge(tools_face: Any, ctx: Any) -> int | None:
+    """Reuse this worker's bridge on node entry; replace it only on real reload.
 
-    Why: this runs from McpPlugin.__init__, i.e. again on every plugin reload.
-    A previous incarnation's watcher task, tool registrations and stdio children
-    must be released first, otherwise a reload leaks an old loop plus a child
-    process per MCP client. How: bump the generation, create this load's stop
-    event, and hand the previous task/event to the new watcher, which releases
-    them before discovering. Purpose: exactly one bridge exists at any time,
-    old or new, never both.
+    Record ownership before scheduling discovery so concurrent node starts share
+    the same initial future. A new module implementation, registry, stopped or
+    failed watcher still takes the normal ownership hand-off path.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -265,22 +260,46 @@ def _start_engine_bridge(tools_face: Any, ctx: Any) -> None:
     state = _bridge_state()
     previous = state.get("task")
     previous_stop = state.get("stop")
+    initial = state.get("initial_discovery")
+    hooks = getattr(ctx, "hooks", None)
+    if (
+        previous is not None and _same_loop(previous)
+        and not previous.done() and not previous.cancelling()
+        and previous_stop is not None and not previous_stop.is_set()
+        and initial is not None and initial[1] is tools_face
+        and initial[0] == state.get("generation")
+        and state.get("owner_hooks") is hooks
+        and state.get("implementation") is _bridge_main
+    ):
+        return int(state["generation"])
     generation = int(state.get("generation") or 0) + 1
     state["generation"] = generation
-    initial = state.get("initial_discovery")
     if initial is not None and not initial[2].done():
         initial[2].set_result(False)
     state["initial_discovery"] = (generation, tools_face, loop.create_future())
+    state["owner_hooks"] = hooks
+    state["implementation"] = _bridge_main
     stop_event = asyncio.Event()
     state["stop"] = stop_event
     task = loop.create_task(
         _bridge_main(
-            tools_face, getattr(ctx, "hooks", None), previous, previous_stop,
+            tools_face, hooks, previous, previous_stop,
             generation, stop_event,
         ),
         name=_BRIDGE_TASK_NAME,
     )
     state["task"] = task
+    return generation
+
+
+def _bridge_lifecycle_lock() -> asyncio.Lock:
+    """Serialize asynchronous ownership release against a replacement bridge."""
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, "_clonoth_mcp_bridge_lifecycle_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(loop, "_clonoth_mcp_bridge_lifecycle_lock", lock)
+    return lock
 
 
 async def wait_mcp_initial_discovery(timeout: float = 15.0, *, registry: Any = None) -> bool:
@@ -324,15 +343,16 @@ async def _bridge_main(
     initial = _bridge_state().get("initial_discovery")
     try:
         await _stop_bridge_task(previous, previous_stop)
-        if _bridge_state().get("generation") != generation or stop_event.is_set():
-            return
-        await _drop_bridge_ownership()
-        state = _bridge_state()
-        if state.get("generation") != generation or stop_event.is_set():
-            return
-        state["registry"] = registry
-        state["hooks"] = hooks
-        state["workspace_root"] = Path(getattr(registry, "workspace_root"))
+        async with _bridge_lifecycle_lock():
+            if _bridge_state().get("generation") != generation or stop_event.is_set():
+                return
+            await _drop_bridge_ownership()
+            state = _bridge_state()
+            if state.get("generation") != generation or stop_event.is_set():
+                return
+            state["registry"] = registry
+            state["hooks"] = hooks
+            state["workspace_root"] = Path(getattr(registry, "workspace_root"))
         await _bridge_loop(registry, generation, stop_event)
     finally:
         if initial is not None and initial[0] == generation and not initial[2].done():
@@ -362,7 +382,7 @@ async def _drop_bridge_ownership(*, close_actors: bool = True) -> None:
             logger.warning("MCP session teardown failed", exc_info=True)
 
 
-async def shutdown_bridge() -> None:
+async def shutdown_bridge(*, expected_generation: int | None = None) -> None:
     """Stop the watcher, dispose every MCP tool and close the stdio actors.
 
     Public entry used by McpPlugin.teardown() and by tests: after it returns,
@@ -370,7 +390,10 @@ async def shutdown_bridge() -> None:
     plugin and no stdio child.
     """
     state = _bridge_state()
-    state["generation"] = int(state.get("generation") or 0) + 1
+    if expected_generation is not None and state.get("generation") != expected_generation:
+        return  # An old plugin instance must never shut down its replacement.
+    generation = int(state.get("generation") or 0) + 1
+    state["generation"] = generation
     initial = state.pop("initial_discovery", None)
     if initial is not None and not initial[2].done():
         initial[2].set_result(False)
@@ -379,7 +402,9 @@ async def shutdown_bridge() -> None:
     state["task"] = None
     state["stop"] = None
     await _stop_bridge_task(task, stop_event)
-    await _drop_bridge_ownership()
+    async with _bridge_lifecycle_lock():
+        if state.get("generation") == generation:
+            await _drop_bridge_ownership()
 
 
 async def _bridge_loop(registry: Any, generation: int, stop_event: asyncio.Event) -> None:
@@ -490,6 +515,7 @@ def _discard_client_tools(registry: Any, client_id: str) -> None:
             if isinstance(mapping, dict):
                 mapping.pop(name, None)
     state["specs"].pop(client_id, None)
+    state.get("registration_signatures", {}).pop(client_id, None)
 
 
 def _refresh_lock() -> asyncio.Lock:
@@ -530,7 +556,8 @@ async def refresh_mcp_tools(registry: Any, *, retry_only: bool = False) -> int:
     """Discover per client; retain unchanged registrations on transient failure.
 
     Deleted, disabled and reconfigured clients lose their old registrations
-    immediately. Other clients are replaced only after discovery succeeds.
+    immediately. Other clients are replaced only when discovered definitions or
+    the wrapper implementation change; unchanged wrappers retain their identity.
     Failed clients are retried by the existing ten-second watcher.
     """
     async with _refresh_lock():
@@ -590,9 +617,7 @@ async def refresh_mcp_tools(registry: Any, *, retry_only: bool = False) -> int:
                 if not isinstance(tools, list):
                     raise ValueError("MCP discovery returned no tool list")
 
-                _discard_client_tools(registry, cid)
-                replacing = True
-                state["disposers"][cid] = []
+                definitions = {}
                 for tool in tools:
                     if not isinstance(tool, dict):
                         continue
@@ -605,11 +630,32 @@ async def refresh_mcp_tools(registry: Any, *, retry_only: bool = False) -> int:
                     if not isinstance(schema, dict):
                         schema = {"type": "object", "properties": {}, "required": []}
                     _sanitize_schema_patterns(schema)
-                    pure = _tool_is_pure(tool)
+                    definitions[reg_name] = {
+                        "raw_name": raw_name,
+                        "description": f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
+                        "input_schema": schema,
+                        "pure": _tool_is_pure(tool),
+                    }
+                # JSON comparison distinguishes booleans/numbers in schemas and
+                # ignores object/tool listing order. Keep actual discovery, but
+                # do not invalidate unrelated calls waiting for approval.
+                signature = (registry, _make_mcp_tool, ws, json.dumps(
+                    [client, definitions], sort_keys=True, allow_nan=False,
+                ))
+                signatures = state.setdefault("registration_signatures", {})
+                if cid in state["disposers"] and signatures.get(cid) == signature:
+                    continue
+                _discard_client_tools(registry, cid)
+                replacing = True
+                state["disposers"][cid] = []
+                for reg_name, definition in definitions.items():
+                    raw_name = definition["raw_name"]
+                    schema = definition["input_schema"]
+                    pure = definition["pure"]
                     try:
                         dispose = registry.register_builtin_tool(
                             reg_name,
-                            f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
+                            definition["description"],
                             schema,
                             _make_mcp_tool(ws, cid, raw_name),
                             pure=pure,
@@ -617,7 +663,7 @@ async def refresh_mcp_tools(registry: Any, *, retry_only: bool = False) -> int:
                     except TypeError:
                         dispose = registry.register_builtin_tool(
                             reg_name,
-                            f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
+                            definition["description"],
                             schema,
                             _make_mcp_tool(ws, cid, raw_name),
                         )
@@ -633,6 +679,7 @@ async def refresh_mcp_tools(registry: Any, *, retry_only: bool = False) -> int:
                         except Exception:
                             pass
                 state["specs"][cid] = client
+                signatures[cid] = signature
             except Exception:
                 if state.get("generation") != generation:
                     return 0
@@ -756,8 +803,11 @@ class McpPlugin:
 
     name = "mcp"
     priority = 50
+    teardown_key = ("mcp", "bridge")
 
     def __init__(self, ctx: Any = None) -> None:
+        self._bridge_generation: int | None = None
+        self._bridge_loop: asyncio.AbstractEventLoop | None = None
         contributions = getattr(ctx, "contributions", None)
         get_face = getattr(contributions, "get", lambda _n: None)
         routes = get_face("routes")
@@ -765,7 +815,9 @@ class McpPlugin:
         if routes is not None:
             _register_admin_routes(routes)
         if tools is not None:
-            _start_engine_bridge(tools, ctx)
+            self._bridge_generation = _start_engine_bridge(tools, ctx)
+            if self._bridge_generation is not None:
+                self._bridge_loop = asyncio.get_running_loop()
 
     def teardown(self) -> Any:
         """Release this plugin's tools, watcher task and stdio children.
@@ -777,12 +829,26 @@ class McpPlugin:
         running loop and hand the task back. Purpose: unloading is complete
         when the returned task completes, and nothing survives the unload.
         """
+        generation = self._bridge_generation
+        if generation is None:
+            return None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No loop (process teardown path): nothing can be awaited here.
             return None
-        return loop.create_task(shutdown_bridge(), name="mcp-bridge-teardown")
+        if loop is not self._bridge_loop:
+            return None  # Generation numbers are local to their owning loop.
+        state = _bridge_state()
+        if state.get("generation") != generation:
+            return None
+        # Synchronous invalidation prevents a new load from reusing a bridge
+        # whose asynchronous teardown has been scheduled but not run yet.
+        stop = state.get("stop")
+        if stop is not None:
+            stop.set()
+        return loop.create_task(
+            shutdown_bridge(expected_generation=generation), name="mcp-bridge-teardown",
+        )
 
 PLUGIN_META = {
     "handler_class": "McpPlugin",

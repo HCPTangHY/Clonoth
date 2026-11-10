@@ -97,6 +97,8 @@ Responses 同样核对原始 `raw_output` 中的 `function_call.call_id`、名�
 
 Hook System 位于 `engine/hooks/`。它提供一个进程内的 `hook_registry` 单例，也允许测试或局部逻辑创建新的 `HookRegistry` 实例。
 
+加载器默认分别保留每个 handler 实例的 `teardown()`。只有管理同一共享资源的实例才应声明稳定、可哈希的 `teardown_key`，使新登记替换旧回调；例如 MCP 桥。每个实例持有独立资源的插件不应设置该属性，以免丢失旧实例的清理记录。
+
 Hook 的目标是把推理循环中的横切逻辑移出 `engine/inference/ai_step.py`，例如上下文压缩、取消检查、审批、附件收集和纯文本响应策略。
 
 ### HookRegistry 行为

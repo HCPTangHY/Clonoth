@@ -79,6 +79,10 @@
 
 MCP 客户端配置在 `data/mcp_clients.yaml`，支持 `stdio`、`sse`、`streamable_http` 三种传输。注册后工具名格式为 `mcp_{client_id}_{tool_name}`。
 
+同一 Worker 事件循环中的节点启动和恢复会复用已有 MCP 桥及首次发现任务，不会重新删除工具或关闭 stdio 会话。配置变化由现有监视器按客户端刷新；显式卸载、代码重载或失效的桥才进行资源交接。桥、stdio 会话池和 schema 缓存由事件循环持有，完整重新导入插件包后仍可完成旧资源清理。首次部署这一状态存储变更需重启 Worker，不能仅热重载旧版本。
+
+刷新仍执行工具发现；客户端配置、规范化工具定义及包装实现未变化时，保留原注册和函数身份，避免修改其他客户端导致待审批调用失效。实际定义或实现变化仍使旧审批失效。插件清理同时核对所属事件循环和 generation，不会因两个循环的 generation 相同而关闭另一个循环的桥。
+
 ## 审批机制
 
 工具操作通过 `request_guard` 向 Supervisor 请求策略判定：
@@ -103,6 +107,8 @@ MCP 客户端配置在 `data/mcp_clients.yaml`，支持 `stdio`、`sse`、`strea
 ### 统一工具级审批
 
 所有通过 `ToolRegistry.execute()` 执行的工具（内置、自定义、MCP）都会经过 Supervisor policy 的 `evaluate_tool` 检查。默认策略为 `approval_required`；已有内部文件或命令审批的工具可通过具体规则免除重复的工具级审批。可通过 `data/policy.yaml` 的 `tools` 配置覆盖。
+
+审批只对应当次调用的工具实现、定义和参数。等待期间工具被移除，返回 `tool_unavailable`；实现或定义被替换，返回 `tool_changed`。这类情况是工具执行错误，不是假定用户拒绝，也不会自动重试或调用已卸载的旧实现。同步与异步预授权共用这项检查，调用结束或授权失败后清理临时授权记录。定义与参数按规范化 JSON 比较，区分 `1`、`1.0`、`true`，忽略对象键顺序；不能序列化的值以及 NaN、Infinity 在授权前返回 `tool_invalid_json`，授权期间出现则按变更拒绝。
 
 ### 文件保护规则
 
