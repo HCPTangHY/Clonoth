@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Goal 详情</title>
+  <style>
+    html,body { margin:0; min-width:0; min-height:100%; background:var(--duties-bg); color:var(--duties-text); font-family:Inter,ui-sans-serif,system-ui,sans-serif; }
+    #loading { padding:16px; font-size:12px; color:var(--duties-secondary); }
+  </style>
+</head>
+<body>
+  <p id="loading" role="status">正在读取 Goal…</p>
+  <main id="goal-panel"></main>
+  <script type="module">
+    import definition from './goal_progress.js';
+    let plugin, context, initialSessionId;
+    function mount() {
+      const bridge = window.__CLONOTH_PANEL__;
+      if (!bridge || plugin) return;
+      document.getElementById('loading').remove();
+      plugin = Object.assign({}, definition);
+      initialSessionId = bridge.sessionId;
+      context = {
+        el: document.getElementById('goal-panel'), state: {},
+        data: { sessionId: bridge.sessionId, viewportWidth: () => bridge.viewportWidth },
+        api: { request: bridge.request, call: bridge.call },
+        composer: {
+          setMode: (...args) => bridge.call('setComposerMode', ...args),
+          getDraft: () => bridge.call('getComposerDraft', { sessionId: context.data.sessionId }),
+          setDraft: text => bridge.call('setComposerDraft', text, { sessionId: context.data.sessionId }),
+          submit: () => bridge.call('submitComposer', { sessionId: context.data.sessionId }),
+        },
+        close: bridge.close,
+      };
+      plugin.mount(context);
+      window.parent.postMessage({ type: 'clonoth:panel-ready' }, window.location.origin);
+    }
+    window.addEventListener('message', async event => {
+      if (event.origin !== window.location.origin || event.source !== window.parent
+          || event.data?.type !== 'clonoth:panel-intent' || !plugin) return;
+      if (event.data.intent?.resetEditor) {
+        plugin.editingGoal = false;
+        plugin.renderDraft();
+      }
+      if (initialSessionId !== 'no-session') return;
+      const sid = event.data.intent?.composerSessionId;
+      if (typeof sid !== 'string' || !sid || sid === 'no-session' || context.data.sessionId === sid) return;
+      // Do not relax empty-session authority: the current composer validates this identity.
+      try {
+        await window.__CLONOTH_PANEL__.call('getComposerDraft', { sessionId: sid });
+        context.data.sessionId = sid;
+        plugin.draftError = '';
+        plugin.draftWriteFailed = false;
+        ++plugin.draftVersion;
+        plugin.update(context);
+        await plugin.syncDraft();
+      } catch { /* A stale intent cannot switch this frame's composer identity. */ }
+    });
+    window.addEventListener('clonoth:panel-context', mount);
+    window.addEventListener('pagehide', () => { plugin?.destroy(); window.removeEventListener('clonoth:panel-context', mount); });
+    mount();
+  </script>
+</body>
+</html>

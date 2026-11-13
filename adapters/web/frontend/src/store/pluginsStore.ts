@@ -157,7 +157,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
         } else if (panel.slot === 'settings') {
           settingsPanels.push({ key, owner, panelId: panel.id, title, entry: panel.entry, icon: typeof panel.icon === 'string' && panel.icon ? panel.icon : 'extension', order: Number.isFinite(panel.order) ? Number(panel.order) : 100 });
         } else if (!panel.slot || panel.slot === 'right') {
-          manifestPanels.push({ key, owner, overlayId: key, title, priority, standalone: true, kind: 'iframe', entry: panel.entry });
+          manifestPanels.push({ key, owner, overlayId: key, title, priority, standalone: panel.standalone !== false, kind: 'iframe', entry: panel.entry });
         }
       }
       if (scriptsOn) {

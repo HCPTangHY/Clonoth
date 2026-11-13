@@ -81,6 +81,16 @@ import { SwapHorizW400 } from '@material-symbols-svg/react/icons/swap-horiz';
 import { TagW400 } from '@material-symbols-svg/react/icons/tag';
 import { TerminalW400 } from '@material-symbols-svg/react/icons/terminal';
 import { VisibilityW400 } from '@material-symbols-svg/react/icons/visibility';
+import { MovieW400 } from '@material-symbols-svg/react/icons/movie';
+import { PermMediaW400 } from '@material-symbols-svg/react/icons/perm-media';
+import { GroupsW400 } from '@material-symbols-svg/react/icons/groups';
+import { CallSplitW400 } from '@material-symbols-svg/react/icons/call-split';
+import { TravelExploreW400 } from '@material-symbols-svg/react/icons/travel-explore';
+import { ChecklistW400 } from '@material-symbols-svg/react/icons/checklist';
+import { EditNoteW400 } from '@material-symbols-svg/react/icons/edit-note';
+import { AudioFileW400 } from '@material-symbols-svg/react/icons/audio-file';
+import { PictureAsPdfW400 } from '@material-symbols-svg/react/icons/picture-as-pdf';
+import { FolderZipW400 } from '@material-symbols-svg/react/icons/folder-zip';
 
 // Composer action icons
 import { StopW400 } from '@material-symbols-svg/react/icons/stop';
@@ -171,6 +181,16 @@ const ICON_MAP: Record<string, SvgIcon> = {
   tag: TagW400,
   terminal: TerminalW400,
   visibility: VisibilityW400,
+  movie: MovieW400,
+  perm_media: PermMediaW400,
+  groups: GroupsW400,
+  call_split: CallSplitW400,
+  travel_explore: TravelExploreW400,
+  checklist: ChecklistW400,
+  edit_note: EditNoteW400,
+  audio_file: AudioFileW400,
+  picture_as_pdf: PictureAsPdfW400,
+  folder_zip: FolderZipW400,
 
   // Composer action icons
   stop: StopW400,
@@ -194,14 +214,8 @@ interface IconProps {
 }
 
 export const Icon = ({ name, size = 20, className = '' }: IconProps) => {
-  const SvgComponent = ICON_MAP[name];
-  if (!SvgComponent) {
-    // [2026-06-02] Preserve the previous text fallback for unknown icon names.
-    // Why: dynamic tool data can provide icon strings before ICON_MAP is updated.
-    // How: render readable text at the requested size instead of failing the component tree.
-    // Purpose: the interface degrades visibly and keeps the missing icon easy to diagnose.
-    return <span className={className} style={{ fontSize: size, lineHeight: 1, verticalAlign: 'middle' }}>{name}</span>;
-  }
+  // Dynamic plugin names may be unknown; never render internal identifiers as visible text.
+  const SvgComponent = ICON_MAP[name] || HelpW400;
 
   return <SvgComponent className={className} width={size} height={size} style={{ verticalAlign: 'middle' }} />;
 };

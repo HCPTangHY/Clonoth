@@ -12,6 +12,7 @@ adapters/discord/
 ├── callbacks.py     # EventRouter 回调实现（发送 Discord 消息、编辑、React）
 ├── context.py       # 群聊上下文构建（历史记录、成员信息、提及解析）
 ├── messaging.py     # 附件收集、图片/文件 MIME 识别、媒体文本生成
+├── extensions/      # 可选命令分发；ide_goal.py 为 IDE Goal 的独立 HTTP 桥
 └── __init__.py
 ```
 
@@ -102,6 +103,43 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+## 可选命令：IDE Goal
+
+发送 `!goal 目标正文`（无需 @Bot），Bot 会发送 **IDE 扩展 · 创建 Goal** 确认卡。
+所有非 Bot 用户均可发起；仅原命令发起者可以点击“确认创建并开始”或“取消”。
+确认固定 120 秒到期，他人点击不续期；修改原消息不改变卡内冻结的目标。
+只支持正文，带附件的命令会被拒绝；长正文会随确认卡提供完整 `goal.txt` 供核对。
+
+- 没有目标：确认后创建并开始；已完成目标：确认后替换，重置预算和 Goal 专属评审/证据记录，保留聊天历史和 Todo。
+- 其他状态（包括暂停、受阻）：拒绝覆盖；本命令不提供修改、暂停、恢复或清除。
+- 使用 IDE 的 `capabilities.create` 与 `action=create`，不改用 `submit`，也不先清除旧目标。未安装、未启用或旧版 IDE 会明确提示，不转普通聊天。
+- 确认期间目标 revision、会话身份变化会拒绝。按钮一次性锁定，创建请求用原频道/消息 ID 幂等；网络或服务故障不自动重试。提交后 5xx 明确提示目标可能已保存，需到 Web 核对，不要盲目重发。
+- 创建权限开放不等于批准工具执行；现有审批权限保持不变。服务返回暂停/受阻不会被显示成“已开始”。
+
+实现仅在 `extensions/ide_goal.py`，`app.py` 只在历史记录之前调用通用命令分发。
+原命令、提示与确认卡使用现有 transient ID 过滤，避免自动进入历史或被引用为模型上下文（沿用有界、进程内过滤，不保证跨 Bot 重启）。
+通过 SDK 的已鉴权 HTTP 客户端访问 Supervisor，不直接导入 IDE Python 模块，不改 SDK/Core。
+正文结果仍走现有 SDK 后台任务/频道发送路径，不新增结果投递流程。确认成功后，原 Embed 转为 **IDE 扩展 · Goal** 状态卡，移除确认按钮；显示整体状态、自动续轮数、暂停/受阻原因，以及当前轮的计时、工具与简短进度。只有 IDE 返回 completed 才显示目标完成，本轮正文发送完毕不代表验收通过。
+
+状态卡由 `extensions/ide_goal_status.py` 管理，只读轮询 Goal 状态（活动时 3 秒、暂停/受阻时 10 秒），使用公开 `goal_id` 与 `execution.source_inbound_seq/task_id` 精确选取本轮进度。进度取自通用 `DiscordCallbacks.subscribe_progress()` 的同步通知，或准确 task_id 的只读 child-progress/终态查询（有界保留最近 32 个已结束任务），复用原格式化逻辑的副本，不重复建立工具状态机。非默认入口的根任务结束不等于 output 链完成，卡片会明确显示仍在等待输出，不提前标为本轮结束。HTTP 确认前只缓存进度，不宣称创建成功；失败便解除监听。
+
+普通消息的原回复、附件、计时、取消按钮、工具/正文摘要与日志路径保持不变，Goal 卡不写入普通 trigger 的 status_msg 或 cancel_view。Goal 与普通消息同频道运行时仍按各自 source_inbound_seq 隔离。状态卡共享频道编辑限流，临时 Discord 编辑错误最多连续重试三次；每 60 秒检查卡片是否仍存在，即使暂停内容不变也能回收已删除卡。完成/清除/替换、插件不可用、多次读取或编辑失败时停止跟随，不补发新卡。暂停卡可继续显示后续明确恢复，但卡片绑定是进程内状态，Bot 重启后不自动恢复旧卡。
+
+确认前只做读取和无任务的 `get_or_create`，因此取消后可留下空会话，但不产生 Goal 或模型任务。
+新会话没有绑定/没有其他事件时，确认后按 `DISCORD_ENTRY_NODE` 初始化；取消后再次创建仍可初始化。
+已有节点绑定保持不变。`active_node` 和最多两条会话事件用于识别未使用会话，切换前再读一次，
+但现存 `switch_node` API 没有 CAS，**不保证跨 HTTP 的节点绑定原子性**；本扩展不为此新增 Core 接口。
+
+离线验证：
+
+```bash
+mkdir -p data/temp/goal-create-discord/discord
+TMPDIR="$PWD/data/temp/goal-create-discord/discord" python3.11 -B -m pytest \
+  tests/test_discord_goal.py -q --basetemp=data/temp/goal-create-discord/discord/pytest
+```
+
+包含真实 app 消息入口、确认按钮、HTTP 替身、SDK 路由，以及隔离的真实 Supervisor/GoalService ASGI 链路（不访问 Discord Gateway 或生产服务，不调用真实模型）。
 
 ## 架构说明
 

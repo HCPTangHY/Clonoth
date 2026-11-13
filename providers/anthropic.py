@@ -79,7 +79,10 @@ def _content_to_blocks(content: Any) -> list[dict]:
             ptype = part.get("type", "")
             if ptype == "text":
                 if part.get("text"):
-                    blocks.append({"type": "text", "text": part["text"]})
+                    block = {"type": "text", "text": part["text"]}
+                    if isinstance(part.get("cache_control"), dict):
+                        block["cache_control"] = deepcopy(part["cache_control"])
+                    blocks.append(block)
             elif ptype == "image_url":
                 blocks.append(_convert_image_part(part))
             else:

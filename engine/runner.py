@@ -31,6 +31,7 @@ from toolbox.registry import ToolRegistry
 from .inference import run_ai_node
 from .attachments import build_multimodal_content
 from .context import RunContext
+from .restart_recovery import current_context, cancelled_task_result, runtime_state, restore_runtime_state
 from .model import _current_sticky_sid_var, resolve_provider, wrap_http_with_sticky_session
 from .context_store import load_context_snapshot
 from providers.tool_format import sanitize_control_tool_history
@@ -776,11 +777,20 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
 
         # Follow production's bounded task cancellation; release diagnostics last.
         try:
-            if _active:
+            # Background tools must settle cancellation while the HTTP client still
+            # exists, not during asyncio.run's final teardown after it has closed.
+            from engine.inference.async_tools import _async_tool_tasks, mark_async_tool_cancelled
+            background = set()
+            for aid, entry in list(_async_tool_tasks.items()):
+                task = entry.get('_task') if isinstance(entry, dict) else None
+                if isinstance(task, asyncio.Task) and not task.done():
+                    background.add(task)
+                    mark_async_tool_cancelled(aid)
+            if _active or background:
                 print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)
                 for task in _active:
                     task.cancel()
-                await asyncio.wait(_active, timeout=15.0)
+                await asyncio.wait(_active | background, timeout=15.0)
         finally:
             metrics.close()
         print(f"[engine] worker {wid[:8]} stopped (generation {generation_id[:8]})", flush=True)
@@ -793,6 +803,7 @@ async def _heartbeat(
     worker_id: str,
     interval: float = 60.0,
     lease_sec: float = 120.0,
+    execution_id: str = "",
 ) -> None:
     """Periodically renew task lease to prevent zombie reaping."""
     try:
@@ -801,7 +812,8 @@ async def _heartbeat(
             try:
                 await http.post(
                     f"{sup_url}/v1/tasks/{task_id}/renew_lease",
-                    json={"worker_id": worker_id, "lease_sec": lease_sec},
+                    json={"worker_id": worker_id, "lease_sec": lease_sec,
+                          **({"execution_id": execution_id} if execution_id else {})},
                 )
             except Exception:
                 pass
@@ -819,16 +831,21 @@ async def _handle_task(
     worker_id: str,
 ) -> None:
     task_id = str(item.get("task_id") or "").strip()
+    execution_id = str(item.get("execution_id") or "")
     kind = str(item.get("kind") or "").strip()
     session_id = str(item.get("session_id") or "").strip()
     _hb: asyncio.Task | None = None
     sticky_token = _current_sticky_sid_var.set("")
+    restart_token = current_context.set(None)
     try:
         session_generation = int(item.get("session_generation") or 0)
-        _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id))
+        _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id, execution_id=execution_id))
         cfg_raw = await fetch_llm_secret(http, sup_url)
         api_key, base_url, default_model = normalize_llm_secret(cfg_raw)
-        if kind == "node":
+        if kind == "tool" and (item.get("input") or {}).get("_restart_cancelled_tool"):
+            result = {"action": "cancelled", "interruption_reason": "service_restart",
+                      "error": "Tool interrupted by service restart; external effects may already have occurred."}
+        elif kind == "node":
             result = await _run_node_task(
                 http=http, llm_http=llm_http, sup_url=sup_url, ws_root=ws_root,
                 registry=registry, task=item, worker_id=worker_id,
@@ -848,7 +865,7 @@ async def _handle_task(
     except asyncio.CancelledError:
         # Direction 1: engine graceful shutdown — write terminal state before exiting
         print(f"[engine] task {task_id} cancelled (engine shutdown)", flush=True)
-        result = {"action": "cancelled", "node_id": str(item.get("node_id") or ""), "error": "engine graceful shutdown"}
+        result = cancelled_task_result(current_context.get(), str(item.get("node_id") or ""))
     except Exception as exc:
         import traceback as _tb
         print(f"[engine] task {task_id} crashed: {exc}", flush=True)
@@ -856,6 +873,7 @@ async def _handle_task(
         result = {"action": "fail", "node_id": str(item.get("node_id") or ""), "error": f"引擎内部错误: {exc}"}
     finally:
         _current_sticky_sid_var.reset(sticky_token)
+        current_context.reset(restart_token)
 
     if _hb is not None:
         _hb.cancel()
@@ -866,7 +884,8 @@ async def _handle_task(
             try:
                 _cr = await http.post(
                     f"{sup_url}/v1/tasks/{task_id}/complete",
-                    json={"worker_id": worker_id, "result": result},
+                    json={"worker_id": worker_id, "result": result,
+                          **({"execution_id": execution_id} if execution_id else {})},
                 )
                 if _cr.status_code < 500:
                     break  # 成功或客户端错误（如 404），不再重试
@@ -883,7 +902,8 @@ async def _handle_task(
         try:
             await http.post(
                 f"{sup_url}/v1/tasks/{task_id}/complete",
-                json={"worker_id": worker_id, "result": result},
+                json={"worker_id": worker_id, "result": result,
+                      **({"execution_id": execution_id} if execution_id else {})},
             )
         except Exception:
             print(f"[engine] task {task_id} ORPHANED - shutdown interrupted complete POST", flush=True)
@@ -969,6 +989,25 @@ async def _run_node_task(
     node = load_node(ws_root, node_id)
     if node is None:
         return {"action": "fail", "node_id": node_id, "error": f"节点未找到：{node_id}"}
+    if node.type == "script" and (input_data.get("resume_data") or {}).get("type") == "restart_interrupted":
+        # A script has no inference checkpoint; never replay its external effects.
+        return {"action": "cancelled", "node_id": node_id, "interruption_reason": "service_restart",
+                "error": "Script interrupted by service restart; external effects may already have occurred."}
+    execution_options = input_data.get("_execution_options") or {}
+    if execution_options:
+        if not input_data.get("_system_task"):
+            return {"action": "fail", "error": "execution options require a system task"}
+        from dataclasses import replace
+        from .node import ToolAccess, SkillAccess, MemoryAccess
+        if not isinstance(execution_options, dict) or set(execution_options) - {"provider", "model", "max_steps"}:
+            return {"action": "fail", "error": "invalid system execution options"}
+        node = replace(
+            node, provider=str(execution_options.get("provider") or node.provider),
+            model=str(execution_options.get("model") or node.model),
+            tool_access=ToolAccess(mode="none"), skill_access=SkillAccess(mode="none"),
+            memory_access=MemoryAccess(mode="none"), control_tools="none", delegate_targets=[],
+            output_mode="hybrid", output="", persistent=False,
+        )
     # [AutoC 2026-08-01] api_key 检查移至 provider 构造之后。
     # 全局 key 为空不代表最终无 key：resolve_provider 会从
     # node.api_key / config.yaml provider section / 环境变量中取。
@@ -980,10 +1019,15 @@ async def _run_node_task(
         api_key=api_key, base_url=base_url, default_model=default_model,
         user_text=str(input_data.get("instruction") or "").strip(),
         task_id=task_id, session_generation=session_generation,
+        execution_id=str(task.get("execution_id") or ""),
         parent_session_id=parent_session_id,
         source_inbound_seq=int(source_inbound_seq) if source_inbound_seq is not None else None,
         task_context=_build_task_context(input_data),
     )
+    current_context.set(rctx)
+    rctx._resume_execution_id = str(task.get("completed_execution_id") or "")
+    if execution_options:
+        rctx.task_context["execution_max_steps"] = max(1, min(10, int(execution_options.get("max_steps", 1))))
     if task.get("caller_task_id"):
         rctx.task_context["caller_task_id"] = str(task["caller_task_id"])
     # [AutoC 2026-08-10] Why: apply the durable session workspace after RunContext
@@ -1010,7 +1054,17 @@ async def _run_node_task(
 
     history = []
     resume_data_raw = input_data.get("resume_data") if isinstance(input_data.get("resume_data"), dict) else None
+    if isinstance(resume_data_raw, dict) and resume_data_raw.get('type') == 'restart_interrupted':
+        initial_sid = str(input_data.get('child_session_id') or '') or session_id
+        has_initial_input = any(m.source_task_id == task_id and m.role == 'user'
+                                and m.message_type in ('', MessageType.USER_INPUT, 'dispatch_result', 'async_tool_result')
+                                and not m.meta.get('preempt') for m in _conv_store.load(initial_sid))
+        if not has_initial_input:
+            # A claim cancelled during provider/workspace setup has not admitted
+            # its input. Treat it as the original first run rather than dropping it.
+            resume_data_raw = None
     is_resume = bool(resume_data_raw)
+    rctx._restart_input_persisted = is_resume
 
     # [AutoC 2026-06-09] Why: resumed tasks get a fresh RunContext, losing
     # tool_call_log and total_usage from the previous execution fragment.
@@ -1019,10 +1073,7 @@ async def _run_node_task(
     if is_resume:
         _prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
         _prev_state = _prev_result.get("_runtime_state") if isinstance(_prev_result.get("_runtime_state"), dict) else {}
-        if isinstance(_prev_state.get("tool_call_log"), list):
-            rctx.tool_call_log = list(_prev_state["tool_call_log"])
-        if isinstance(_prev_state.get("total_usage"), dict):
-            rctx.total_usage = dict(_prev_state["total_usage"])
+        restore_runtime_state(rctx, _prev_state)
 
     # ====== Child Session 隔离（Phase B）：优先走 child session 路径 ======
     # child_session_id 由 supervisor 的 task_router 在 dispatch 时设置。
@@ -1294,6 +1345,12 @@ async def _run_node_task(
         # child result. Purpose: refreshed history can render callbacks without storing
         # the LLM-only English prefix or any backend-localized prose.
         _inbound_meta: dict[str, Any] = {}
+        delivery_ids = input_data.get("delivery_ids") or []
+        if not isinstance(delivery_ids, list) or any(not isinstance(i, str) or not i for i in delivery_ids):
+            raise ValueError("invalid callback delivery identities")
+        if delivery_ids:
+            _inbound_meta["delivery_ids"] = list(delivery_ids)
+            _inbound_meta["execution_id"] = rctx.execution_id
         if source_inbound_seq is not None:
             _inbound_meta["source_inbound_seq"] = int(source_inbound_seq)
         if _inbound_child_session_id:
@@ -1312,7 +1369,8 @@ async def _run_node_task(
             # a web session keeps the same inbound attachment cards as live events.
             _inbound_meta["attachments"] = list(input_attachments)
         _user_msg = Message(
-            id=str(uuid.uuid4()),
+            id=(str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([task_id, delivery_ids])))
+                if delivery_ids else str(uuid.uuid4())),
             role="user",
             content=_user_content,
             message_type=_inbound_message_type or MessageType.USER_INPUT,
@@ -1322,8 +1380,10 @@ async def _run_node_task(
             source_task_id=task_id,
         )
         _conv_store.append(_target_sid, _user_msg)
+        rctx._restart_input_persisted = True
         rctx.inbound_message_id = _user_msg.id
         rctx.inbound_message = _message_to_history_dict(_user_msg, current_task_id=task_id)
+        await rctx.admit_input(delivery_ids, _user_msg.id)
 
     if not is_resume and _inbound_message_type in ("dispatch_result", "async_tool_result"):
         # Label system-delivered results only after persisting the raw inbound.
@@ -1429,6 +1489,11 @@ async def _run_node_task(
         print(f"[engine] Failed to write task record: {_tr_err}", flush=True)
 
     _result = action.to_dict()
+    if rctx.response_info:
+        _result["_execution_model"] = {
+            "provider": str(rctx.response_info.get("provider") or ""),
+            "model": str(rctx.response_info.get("model") or ""),
+        }
     # Keep provenance outside result: output-chain model input receives only the answer.
     if rctx.response_info and action.action in ("finish", "ask"):
         _result["response_info"] = dict(rctx.response_info)
@@ -1438,10 +1503,7 @@ async def _run_node_task(
     # so the next claim can restore it. Purpose: plugins like
     # no_tool_finish_guard see the full task history, not just the
     # current claim's fragment.
-    _result["_runtime_state"] = {
-        "tool_call_log": list(rctx.tool_call_log),
-        "total_usage": dict(rctx.total_usage) if rctx.total_usage else {},
-    }
+    _result["_runtime_state"] = runtime_state(rctx)
     if getattr(rctx, "current_llm_request_id", "") and not _result.get("llm_request_id"):
         # [AutoC 2026-06-04] Why: some TaskAction producers are hooks rather than
         # pseudo handlers, but they still end the current provider request. How: fill

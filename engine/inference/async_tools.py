@@ -5,8 +5,8 @@
 工具在后台 asyncio.Task 中执行，完成后通过 supervisor 的
 /v1/sessions/{id}/async_tool_result 接口将结果注入回对话流。
 
-模块级字典 _async_tool_tasks 是异步工具状态的唯一存储，ai_step 与
-本模块共享同一引用（import 的是同一对象，直接原地修改）。
+模块级字典 _async_tool_tasks 保存执行侧状态；Supervisor 保存后台责任与投递确认。
+ai_step 与本模块共享同一引用（import 的是同一对象，直接原地修改）。
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 #  异步工具跟踪表（Async Tool Tracking）
 #  [2026-04-23] 从 commit 7d10197 恢复，在 864a333 大扫除中被误删。
-#  key = async_tool_id (8 位 hex), value = 状态字典
+#  key = async_tool_id (UUID hex), value = 状态字典
 #  用于关联异步工具的启动占位消息与 preempt 回传结果。
 #  done/failed 条目保留 5 分钟后自动清理，防止无限增长。
 # ---------------------------------------------------------------------------
@@ -58,7 +58,7 @@ def _cleanup_async_tracker() -> None:
     now = time.monotonic()
     expired = [
         k for k, v in _async_tool_tasks.items()
-        if v.get("status") in ("done", "failed")
+        if v.get("status") in ("done", "failed", "cancelled")
         and now - v.get("finished_at", now) > _ASYNC_TRACK_RETAIN_SEC
     ]
     for k in expired:
@@ -84,24 +84,43 @@ def get_async_tool_tasks() -> list[dict]:
 # ---------------------------------------------------------------------------
 #  Supervisor 生命周期上报（2026-09-02）
 #  Why: 异步工具状态过去只存在 engine 进程内存，supervisor/前端完全不可见。
-#  How: 启动时登记、完成/失败时上报，两个 POST 端点；上报失败不影响投递。
+#  How: 启动登记确认后才脱离主循环；计算结束与结果投递分别确认。
 #  Purpose: supervisor 持有影子清单，可查询、可在引擎重启时标记 lost。
 # ---------------------------------------------------------------------------
+
+async def _post_ack(http: Any, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Retry only the same idempotent payload; an HTTP response alone is not an ACK."""
+    import httpx
+
+    for attempt in range(3):
+        try:
+            response = await http.post(url, json=payload, timeout=5.0)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or data.get("ok") is not True:
+                raise ValueError(f"async lifecycle not acknowledged: {data!r}")
+            return data
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500 or attempt == 2:
+                raise
+        except (httpx.HTTPError, ValueError):
+            if attempt == 2:
+                raise
+        await asyncio.sleep(0.1 * (attempt + 1))
+    raise RuntimeError("async lifecycle acknowledgement exhausted")
+
 
 async def report_async_tool_lifecycle(
     http: Any,
     supervisor_url: str,
     path: str,
     payload: dict[str, Any],
-) -> None:
-    """向 supervisor 异步工具登记处上报一条生命周期事件（best-effort）。"""
-    try:
-        await http.post(f"{supervisor_url}/v1/async_tools{path}", json=payload, timeout=5.0)
-    except Exception as exc:
-        logger.debug("async tool lifecycle report failed: %s", exc)
+) -> dict[str, Any]:
+    """Confirm a lifecycle update; callers must retain unfinished delivery on failure."""
+    return await _post_ack(http, f"{supervisor_url.rstrip('/')}/v1/async_tools{path}", payload)
 
 
-def report_async_tool_started(
+async def report_async_tool_started(
     *,
     rctx: Any,
     node_id: str,
@@ -109,8 +128,8 @@ def report_async_tool_started(
     tool_name: str,
     tool_args: dict[str, Any],
     upgraded_from: str = "",
-) -> None:
-    """登记异步工具启动（fire-and-forget）。调度插件在两个创建点调用。"""
+) -> dict[str, Any]:
+    """Register before detaching work and return its immutable delivery identity."""
     payload = {
         "async_id": async_id,
         "tool_name": tool_name,
@@ -118,15 +137,49 @@ def report_async_tool_started(
         "task_id": getattr(rctx, "task_id", ""),
         "node_id": node_id,
         "worker_id": getattr(rctx, "worker_id", ""),
+        "execution_id": getattr(rctx, "execution_id", ""),
         "args_summary": _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200),
         "upgraded_from": upgraded_from,
     }
+    acknowledgement = await report_async_tool_lifecycle(rctx.http, rctx.supervisor_url, "", payload)
+    identity = {
+        "execution_id": payload["execution_id"],
+        "boot_id": acknowledgement.get("boot_id", ""),
+        "target_generation": acknowledgement.get("target_generation", 0),
+    }
+    if payload["execution_id"] and (
+        not isinstance(identity["boot_id"], str) or not identity["boot_id"]
+        or type(identity["target_generation"]) is not int or identity["target_generation"] < 1
+    ):
+        raise ValueError("async registration omitted boot or target generation identity")
+    return identity
+
+
+async def settle_inline_registration(
+    *, rctx: Any, node_id: str, async_id: str, tool_name: str,
+    tool_args: dict[str, Any], upgraded_from: str = "", status: str = "cancelled",
+    error: str = "", elapsed_sec: float = 0.0,
+) -> bool:
+    """Reconcile an uncertain start using its original id, without executing work again.
+
+    The result is returned by the original synchronous tool call. The supervisor
+    can close this receipt only when that source execution completes normally.
+    """
     try:
-        asyncio.get_running_loop().create_task(
-            report_async_tool_lifecycle(rctx.http, rctx.supervisor_url, "", payload)
+        identity = await report_async_tool_started(
+            rctx=rctx, node_id=node_id, async_id=async_id, tool_name=tool_name,
+            tool_args=tool_args, upgraded_from=upgraded_from,
         )
-    except RuntimeError:
-        pass
+        await report_async_tool_lifecycle(
+            rctx.http, rctx.supervisor_url, f"/{async_id}/finish",
+            {**identity, "status": status, "error": error[:500], "elapsed_sec": elapsed_sec,
+             "delivered_inline": True, "carrier_task_id": getattr(rctx, "task_id", "")},
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Uncertain async registration remains unresolved: %s: %s", async_id, exc)
+        return False
+
 
 _CANCELLED_ASYNC_IDS: set[str] = set()
 
@@ -253,14 +306,15 @@ async def _deliver_async_result(
     index: int = 0,
     tool_call_id: str = "",
     result: Any = None,
-    error: Exception | None = None,
+    error: BaseException | None = None,
+    registration: dict[str, Any] | None = None,
 ) -> None:
-    """Format, track, and deliver an async tool result through supervisor."""
-    # [AutoC 2026-06-27] Why: declared async tools and adaptive execute_command share
-    # the same callback protocol. How: move result shaping, truncation, tracker
-    # updates, attachment extraction, and async_tool_result POST into one delivery
-    # function. Purpose: adaptive upgrade can await an already-started process without
-    # copying the existing callback implementation.
+    """Compute outcome once, then confirm finish and delivery without conflating failures."""
+    identity = dict(registration or {})
+    elapsed = round(time.monotonic() - started_at, 1)
+    attachments: list[str] = []
+    status = "done"
+    failure = ""
     try:
         if error is not None:
             raise error
@@ -282,26 +336,16 @@ async def _deliver_async_result(
                 _ref = write_artifact(tool_ctx.workspace_root, task_id, step, index, tool_name, tool_call_id or async_tool_id, raw)
             raw, _was_truncated = truncate_tool_result(tool_name, raw, _limit, _ref, config=runtime_cfg)
 
-        _async_tool_tasks[async_tool_id] = {
-            "tool_name": tool_name,
-            "status": "done",
-            "task_id": task_id,
-            "started_at": started_at,
-            "finished_at": time.monotonic(),
-            "elapsed": round(_elapsed, 1),
-        }
-        await report_async_tool_lifecycle(
-            http, supervisor_url, f"/{async_tool_id}/finish",
-            {"status": "done", "elapsed_sec": round(_elapsed, 1)},
-        )
-
         preempt_text = (
             f'✅ Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
             f'\nResult:\n{raw}'
         )
 
-        attachments: list[str] = []
         if isinstance(result, dict):
+            if result.get("ok") is False or result.get("error"):
+                status = "failed"
+                failure = str(result.get("error") or "tool returned an unsuccessful result")
+                preempt_text = f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed:\n{raw}'
             data = result.get("data") if isinstance(result.get("data"), dict) else {}
             source_attachments = data.get("attachments") if isinstance(data.get("attachments"), list) else result.get("attachments")
             if isinstance(source_attachments, list):
@@ -311,51 +355,54 @@ async def _deliver_async_result(
                     elif isinstance(a, str):
                         attachments.append(a)
 
-        payload: dict = {"message": preempt_text, "task_id": task_id}
-        if attachments:
-            payload["attachment_paths"] = attachments
+    except (Exception, asyncio.CancelledError) as exc:
+        cancelled = is_async_tool_cancelled(async_tool_id) or isinstance(exc, asyncio.CancelledError)
+        status = "cancelled" if cancelled else "failed"
+        failure = "" if cancelled else str(exc)
+        attachments = []
+        preempt_text = (
+            f'⛔ Async tool "{tool_name}" (id: {async_tool_id}) was cancelled.'
+            if cancelled else f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed: {exc}'
+        )
 
-        await http.post(
-            f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-            json=payload,
-        )
-    except (Exception, asyncio.CancelledError) as e:
-        # [fix 2026-09-03] Why: since Python 3.8 asyncio.CancelledError is a
-        # BaseException, so `except Exception` never caught it — the isinstance
-        # check below was dead code and a hard-cancelled task died without any
-        # cancelled report, leaving the supervisor shadow entry stuck at running
-        # until an engine restart marked it lost. How: catch CancelledError
-        # explicitly alongside Exception. Purpose: real cancellations now flow
-        # through the cancelled-report path they were designed for.
-        _is_cancelled = is_async_tool_cancelled(async_tool_id) or isinstance(e, asyncio.CancelledError)
-        _async_tool_tasks[async_tool_id] = {
-            "tool_name": tool_name,
-            "status": "cancelled" if _is_cancelled else "failed",
-            "task_id": task_id,
-            "started_at": started_at,
-            "finished_at": time.monotonic(),
-            "elapsed": round(time.monotonic() - started_at, 1),
-            "error": "" if _is_cancelled else str(e),
-        }
-        await report_async_tool_lifecycle(
-            http, supervisor_url, f"/{async_tool_id}/finish",
-            {
-                "status": "cancelled" if _is_cancelled else "failed",
-                "elapsed_sec": round(time.monotonic() - started_at, 1),
-                "error": "" if _is_cancelled else str(e)[:500],
-            },
-        )
+    entry = _async_tool_tasks.setdefault(async_tool_id, {})
+    entry.update(tool_name=tool_name, status="result_pending_delivery", compute_status=status,
+                 task_id=task_id, started_at=started_at, elapsed=elapsed, error=failure)
+    # Cancellation during finish reporting gets one cancellation-only delivery attempt.
+    # A transport failure never generates another (incorrect) tool-failure result.
+    for cancellation_attempt in range(2):
         try:
-            await http.post(
-                f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-                json={"message": (
-                    f'⛔ Async tool "{tool_name}" (id: {async_tool_id}) was cancelled.'
-                    if _is_cancelled else
-                    f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'
-                ), "task_id": task_id},
+            if is_async_tool_cancelled(async_tool_id) and status != "cancelled":
+                raise asyncio.CancelledError()
+            await report_async_tool_lifecycle(
+                http, supervisor_url, f"/{async_tool_id}/finish",
+                {**identity, "status": status, "elapsed_sec": elapsed, "error": failure[:500]},
             )
-        except Exception:
-            pass
+            if is_async_tool_cancelled(async_tool_id) and status != "cancelled":
+                raise asyncio.CancelledError()
+            payload = {
+                **identity, "async_id": async_tool_id, "delivery_id": f"{async_tool_id}:result",
+                "message": preempt_text, "task_id": task_id,
+            }
+            if attachments:
+                payload["attachment_paths"] = attachments
+            await _post_ack(http, f"{supervisor_url.rstrip('/')}/v1/sessions/{session_id}/async_tool_result", payload)
+        except asyncio.CancelledError as exc:
+            if not cancellation_attempt:
+                status, failure, attachments = "cancelled", "", []
+                preempt_text = f'⛔ Async tool "{tool_name}" (id: {async_tool_id}) was cancelled.'
+                entry.update(compute_status=status, error="")
+                continue
+            entry.update(status="delivery_failed", delivery_error="delivery cancelled", finished_at=time.monotonic())
+            logger.warning("Async result delivery cancelled: %s", async_tool_id)
+            return
+        except Exception as exc:
+            entry.update(status="delivery_failed", delivery_error=str(exc), finished_at=time.monotonic())
+            logger.warning("Async result delivery unconfirmed: %s: %s", async_tool_id, exc)
+            return
+        else:
+            entry.update(status=status, delivery_status="queued", finished_at=time.monotonic())
+            return
 
 
 async def _deliver_started_async_task(
@@ -369,10 +416,13 @@ async def _deliver_started_async_task(
     # Purpose: the subprocess remains single-instance and execute_command's internal
     # timeout still owns the eventual kill behavior.
     async_tool_id = str(delivery_kwargs.get("async_tool_id") or "")
-    _CANCELLED_ASYNC_IDS.discard(async_tool_id)
     if isinstance(_async_tool_tasks.get(async_tool_id), dict):
         _async_tool_tasks[async_tool_id]["_task"] = asyncio.current_task()
     try:
+        if is_async_tool_cancelled(async_tool_id):
+            exec_task.cancel()
+            await asyncio.gather(exec_task, return_exceptions=True)
+            raise asyncio.CancelledError()
         result = await exec_task
     except asyncio.CancelledError as e:
         # [fix 2026-09-03] hard cancel from mark_async_tool_cancelled lands here;
@@ -398,6 +448,8 @@ async def _run_async_tool(
     step: int = 0,
     index: int = 0,
     tool_call_id: str = "",
+    registration: dict[str, Any] | None = None,
+    authorized: bool = False,
 ) -> None:
     """后台执行异步工具，完成后通过路由 session 的 API 注入结果。"""
     # [Fork/Merge 2026-05-12] session_id here is the event/user-facing route session.
@@ -406,70 +458,27 @@ async def _run_async_tool(
     # Purpose: branch-local ConversationStore writes remain isolated while async callbacks still
     # reach the SDK conversation_key mapping.
     _started = time.monotonic()
-    _CANCELLED_ASYNC_IDS.discard(async_tool_id)
     if isinstance(_async_tool_tasks.get(async_tool_id), dict):
         _async_tool_tasks[async_tool_id]["_task"] = asyncio.current_task()
     try:
+        if is_async_tool_cancelled(async_tool_id):
+            raise asyncio.CancelledError()
         result = await _execute_registry_tool_with_span(
             registry,
             tool_name,
             tool_args,
             tool_ctx,
             async_call=True,
+            authorized=authorized,
         )
-    except asyncio.CancelledError as e:
-        # [fix 2026-09-03] hard cancel from mark_async_tool_cancelled lands here;
-        # route it through the normal cancelled-report delivery instead of dying.
-        await _deliver_async_result(
-            registry=registry,
-            http=http,
-            supervisor_url=supervisor_url,
-            task_id=task_id,
-            session_id=session_id,
-            tool_name=tool_name,
-            tool_args=tool_args,
-            tool_ctx=tool_ctx,
-            async_tool_id=async_tool_id,
-            started_at=_started,
-            runtime_cfg=runtime_cfg,
-            step=step,
-            index=index,
-            tool_call_id=tool_call_id,
-            error=e,
-        )
-    except Exception as e:
-        await _deliver_async_result(
-            registry=registry,
-            http=http,
-            supervisor_url=supervisor_url,
-            task_id=task_id,
-            session_id=session_id,
-            tool_name=tool_name,
-            tool_args=tool_args,
-            tool_ctx=tool_ctx,
-            async_tool_id=async_tool_id,
-            started_at=_started,
-            runtime_cfg=runtime_cfg,
-            step=step,
-            index=index,
-            tool_call_id=tool_call_id,
-            error=e,
-        )
+    except (Exception, asyncio.CancelledError) as exc:
+        result, error = None, exc
     else:
-        await _deliver_async_result(
-            registry=registry,
-            http=http,
-            supervisor_url=supervisor_url,
-            task_id=task_id,
-            session_id=session_id,
-            tool_name=tool_name,
-            tool_args=tool_args,
-            tool_ctx=tool_ctx,
-            async_tool_id=async_tool_id,
-            started_at=_started,
-            runtime_cfg=runtime_cfg,
-            step=step,
-            index=index,
-            tool_call_id=tool_call_id,
-            result=result,
-        )
+        error = None
+    await _deliver_async_result(
+        registry=registry, http=http, supervisor_url=supervisor_url, task_id=task_id,
+        session_id=session_id, tool_name=tool_name, tool_args=tool_args, tool_ctx=tool_ctx,
+        async_tool_id=async_tool_id, started_at=_started, runtime_cfg=runtime_cfg,
+        step=step, index=index, tool_call_id=tool_call_id, registration=registration,
+        result=result, error=error,
+    )

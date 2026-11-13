@@ -441,6 +441,47 @@ def register(ctx) -> None:
 - `ctx.providers`（渠道型）：ProviderRegistry，模型后端注册。
 - `ctx.contributions`（声明型容器）：按名挂载 face，用 `get(name)` 取用。当前已挂载：`prompt_sections`（engine）、`routes`（supervisor）、`nodes`（engine + supervisor）。新增 face 不需要改框架，调用 `Contributions.mount(name, face)`。
 
+### Web 输入工具栏与提交扩展
+
+输入框附近的注册位置通过现有 `web.slots` 声明，不新增按钮注册系统：
+
+- `input_controls`：紧贴输入框外侧上边框的普通布局工具栏，适合 Goal 输入切换或未来的思考强度控件。没有贡献时不占位置。
+- `input_status`：保留原有输入框上方浮动状态插槽的位置和布局，不因 Goal 调整而改变其他插件行为；Goal 不再使用此插槽。
+- `input_above`：原有右侧浮动区，继续供技能挂载、文件补全等插件使用，不混作新工具栏。
+- `input_toolbar_left/right`：输入框内部底部工具栏，保持原有语义。
+
+输入区插件上下文可带 `ctx.composer`。这是当前输入框实例的能力，不通过 DOM 查询、拦截 Enter 或改写 React 受控控件实现。`registerMode({id, label, placeholder, command?, onSubmit})` 注册一种提交用途，返回 disposer；`setMode(id, text?, metadata?)` 切换用途或显式载入编辑正文，metadata 可保存编辑基准。`getState(id)` 返回当前会话草稿范围内的模式私有状态，用于保留未确认的请求身份；普通插件卸载不清除它，登出统一清理。`mode`、`busy` 提供当前输入状态。插件卸载时撤销注册，保留未提交草稿，不自动把目标发送为普通消息。
+
+宿主负责输入框、键盘与输入法行为、附件上传、会话准备和提交互斥；模式的 `onSubmit` 收到正文、已上传附件路径、固定 session/conversation 身份、requestId、AbortSignal 和模式私有 state。插件负责业务 API，不得重用普通聊天发送再触发一次业务提交。Goal 插件将附件路径加入文字：空目标或已完成目标使用 `action="create"` 新建并启动，未完成目标使用 `action="submit"` 修改并保留累计预算。已完成时新建需确认替换专属记录；操作类型与 revision 一同固定，冲突后不得自动换成新建。旧插件未声明 `capabilities.create` 时不回退到 submit。`/goal` 是前端提交前缀，不是后端命令解析协议。
+
+插件面板可声明 `standalone: false`，仅注册右侧面板而不自动增加 Header 按钮，适合由 `header_actions` 的动态状态入口调用 `openPanel` 打开。`header_actions` 接收当前 `sessionId` 与 `isChildSession`。此前为移动端增加的 `right_panel_actions`、Goal／系统导航以及相关标题栏覆盖已撤回。两端的输入区 Goal 按钮均打开原有右侧面板；桌面主输入框编写，只要 Goal 侧栏仍打开，提交成功后也保持 Goal 输入模式；关闭侧栏后才恢复普通输入。切换回旧会话时，若侧栏已关闭，只恢复正文而不恢复旧 Goal 模式；用户显式输入 `/goal` 仍按命令提交。移动端由 IDE 面板提供文本框和开始按钮；running/waiting/reviewing 时默认隐藏编辑区，显式点击“修改目标”后才显示，提交按钮标明“修改并重新开始”。关闭重开恢复状态展示，未提交草稿仍保留。顶部状态只在桌面显示。
+
+同源面板加载后，宿主在该 iframe 内设置 `window.__CLONOTH_PANEL__ = { sessionId, viewportWidth, request, call, close }` 并发送 `clonoth:panel-context` 事件。此对象只属于该 frame，卸载、会话或凭证变化后失效，在途请求取消；插件不能保留旧对象跨会话操作。`call('setComposerMode', id, text, {sessionId, ...metadata})` 由当前输入框处理：会话不符、子会话、提交中切换到非空模式或用户拒绝替换草稿时返回 false，成功为 true，不自动提交。空模式允许在提交中退出，不取消已发出的提交；`metadata.focus: false` 不聚焦主输入框。`close()` 撤销当前 frame 的通信对象并调用原有面板关闭回调，不改变其他面板的移动端侧栏开关或焦点行为。
+
+输入区 `data.panelId/rightPanelOpen` 只报告宿主右栏状态。IDE 插件据此在关闭按钮、遮罩或滑动收起后退出自己的输入模式并保留正文，不调用 Goal 暂停接口。需要收起 Goal 所在侧栏时，插件显式调用通用 `setRightPanelOpen(boolean)`，其他面板关闭行为不变。
+
+`composer.getDraft()/setDraft(text)` 以及对应宿主 action `getComposerDraft({sessionId})`、`setComposerDraft(text, {sessionId})` 读写同一份草稿，不通过 DOM 操作 React。`submitComposer({sessionId})` 只提交已选择的注册模式，和表单共用一次 `submitDraft` 流程，包括附件上传、会话创建、互斥及错误保留。欢迎页允许空身份或 `no-session`，但一旦准备出真实会话，旧空身份立即失效。IDE 输入插件通过已有 `openPanel` intent 传递准备出的身份；欢迎页面板校验消息来源并经 `getComposerDraft` 确认后跟随，不放宽空身份校验，首次提交失败后仍可编辑和重试。`viewportWidth` 是宿主只读宽度，不是 iframe 宽度。
+
+### execution face（supervisor 进程）
+
+`ctx.contributions.get("execution")` 提供通用执行事实与受限操作；Core 不解释 Goal 或其他插件业务状态。实现位于 `supervisor/execution_runtime.py`。
+
+- `session_info()` / `task_info()`：解析真实 session，校验执行身份；仅入口 branch 归父会话，普通子会话不合并。
+- `transaction()`：短操作与状态校验使用宿主锁。禁止在此锁中发模型请求；评审等工作通过 `create_system_task()` 使用既有 Engine 调度。
+- `subscribe()`：接收 ready、用户输入、工作区变化、会话移除、任务及最终候选通知；返回 disposer。
+- `register_input_handler(callback, matches=...)`：仅处理实时用户输入。`matches(text)` 是无副作用的匹配函数，不匹配的普通聊天不写命令状态文件。返回直接应答时不再进入模型，Core 为命令保存独立输入和回复，不借用正在执行任务的触发身份。
+- `submit_input()`：以稳定请求身份创建正常下一轮；`create_system_task()`：创建独立历史的插件系统任务，不自动恢复主 caller。
+- `watch()` / `snapshot()`：限定执行来源，观察后代任务、后台工作及投递记录。快照版本不随心跳、暂停或无关任务变化；计算结束不代表结果已经由模型处理。`outputs` 是按持久 `sequence` 排列的 reply/finish 原文，具有稳定 `id`、`task_id`、`node_id`、`kind`、`text` 和 `attachments`；独立于原始证据预算。`truncated_task_ids` 标记原始证据不完整，`output_truncated_task_ids` 标记输出超限、身份冲突或旧存储缺失。输出内容及精确缺失身份参与快照版本，调用者不得把未知当成空。
+- `set_paused()`：保留相关结果但不自动创建承接执行；不取消已经执行的任务。`forget()` 清除观察证据时保留必要的禁止自动承接记录。
+
+插件注册早于 SessionStore 恢复，不得在 `register()` 内直接扫描会话。注册后等待 ready；热加载检查运行时已就绪状态。订阅、线程与控制处理须通过现有 `add_plugin_disposer()` 或登记面归属插件；仅从 `register()` 返回 disposer 不会登记清理。卸载先撤销自动推进许可，再解除订阅。
+
+通用持久事实位于 `data/executions/runtime.json`。计划重启通过封存的调度记录恢复原任务与交付关系，运行中的后台工具返回取消；非计划退出后未完成后台工作明确记录 lost，不因内存清单为空而被认为完成。相关事实无法持久确认时停止自动判定，不将未知状态转为成功。详见[计划重启与任务恢复](planned-restart.md)。
+
+Task 的 `execution_id` 标识一次实际领取；完成提交和续租携带该身份，重复完成不得重复执行 output 路由。异步启动需取得 Supervisor 确认，投递携带稳定 `async_id/delivery_id`、来源执行、目标 generation 及 boot 身份。preempt 继续采用文本前缀消费，同时携带逐条 delivery ID；输入落库确认与承接任务完成是两个不同阶段。更新这组协议时需要同时更新 Supervisor 与 Engine，不能在运行中只替换一侧。
+
+Goal 的业务接口、预算、评审和续轮策略位于 IDE 插件；见 [会话 Goal](tools_and_evolution.md#会话-goalide-插件)。Discord 的 `!goal` 位于独立的 `adapters/discord/extensions/ide_goal.py`，仅经 HTTP 调用 IDE API，不导入插件实现。适配器主入口只负责通用扩展分发；确认卡先于普通历史处理，未确认命令不触发 Agent，IDE 缺失或停用也不回退为聊天。Web 事件仍使用已有全局 WebSocket；插件事件 payload 必须自带 session_id，因为插件总线不传外层事件对象。
+
 ### nodes face（engine + supervisor 进程）
 
 插件声明节点，Paradox 式覆盖语义：**插件声明 > engine/system_nodes/ > config/nodes/**。声明即生效，卸载插件自动回落到文件来源。

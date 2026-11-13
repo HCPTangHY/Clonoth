@@ -55,7 +55,7 @@ Clonoth 采用多进程模型。Supervisor、Engine 和 Bot Adapter 可以分别
 4. Engine 执行节点或工具任务后，通过 `/v1/tasks/{task_id}/complete` 回报结果。
 5. Bot Adapter 或 SDK 通过 `/v1/events` 按 `after_seq` 轮询新事件，并把输出呈现到平台。
 
-这种设计让调度状态集中在 Supervisor，推理和工具执行集中在 Engine，平台协议集中在 Adapter。任一层重启时，可以依靠事件日志、任务状态和会话信息恢复运行。
+这种设计让调度状态集中在 Supervisor，推理和工具执行集中在 Engine，平台协议集中在 Adapter。通过设置页或 `request_restart` 发起的计划重启，会保存并恢复原任务；非计划退出不自动获得任务恢复权限。具体边界见[计划重启与任务恢复](planned-restart.md)。
 
 ## 3. 事件流模型
 

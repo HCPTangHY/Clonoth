@@ -5,6 +5,7 @@ Run: python3.11 -B tests/test_responses_migration.py
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -75,6 +76,28 @@ def sse(events):
 
 
 class ResponsesPayloadTests(unittest.TestCase):
+    def test_cache_key_uses_sticky_identity_with_stable_length_boundary(self):
+        for raw in (None, "", " \n\t", " session-id ", "x" * 64, "x" * 65, "会话" * 40):
+            with self.subTest(raw=raw):
+                normalized = str(raw or "").strip()
+                expected = (hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+                            if len(normalized) > 64 else normalized)
+                options = {"_sticky_session_id": raw, "sticky_session": {"enabled": True}}
+                before = copy.deepcopy(options)
+                instance = provider(**options)
+                self.assertEqual(instance._cache_key(), expected)
+                self.assertEqual(provider(**options)._cache_key(), expected)
+                for stream in (False, True):
+                    payload = instance.build_payload([], stream=stream)
+                    self.assertEqual(payload.get("prompt_cache_key"), expected or None)
+                    self.assertNotIn("_sticky_session_id", payload)
+                    self.assertNotIn("sticky_session", payload)
+                self.assertEqual(options, before)
+                self.assertEqual(instance._options, before)
+        self.assertNotEqual(provider(_sticky_session_id="x" * 65)._cache_key(),
+                            provider(_sticky_session_id="x" * 64 + "y")._cache_key())
+        self.assertNotIn("prompt_cache_key", provider().build_payload([]))
+
     def test_legacy_ids_do_not_collide_with_complete_or_future_calls(self):
         messages = [
             {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "name": "complete", "arguments": {}}]},
@@ -272,6 +295,36 @@ class ResponsesPayloadTests(unittest.TestCase):
 
 
 class ResponsesTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cache_key_is_in_actual_json_for_both_transports_and_retries(self):
+        for stream in (False, True):
+            for failure in (None, "http", "stream") if stream else (None, "http"):
+                for raw in (None, "node:coder", "parent:bootstrap.coder:" + "context" * 10):
+                    with self.subTest(stream=stream, failure=failure, raw=raw):
+                        sent = []
+
+                        def handle(request):
+                            sent.append(json.loads(request.content))
+                            if failure and len(sent) == 1:
+                                error = {"message": "encrypted content could not be verified"}
+                                if failure == "http":
+                                    return httpx.Response(400, json={"error": error})
+                                return sse([{"type": "response.failed", "response": {"error": error}}])
+                            body = completion()
+                            return sse([{"type": "response.completed", "response": body}]) if stream else httpx.Response(200, json=body)
+
+                        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+                            instance = provider(http, _sticky_session_id=raw)
+                            response = await (instance.chat_stream if stream else instance.chat)(messages=native_history())
+                        self.assertTrue(response.ok, response.error)
+                        self.assertEqual(len(sent), 2 if failure else 1)
+                        expected = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32] if raw and len(raw) > 64 else raw
+                        for body in sent:
+                            self.assertEqual(body.get("prompt_cache_key"), expected)
+                            if not raw:
+                                self.assertNotIn("prompt_cache_key", body)
+                            self.assertEqual(body["stream"], stream)
+                            self.assertNotIn("_sticky_session_id", body)
+
     async def test_nonstream_unifies_body_and_summary_without_trimming_raw_output(self):
         body = completion()
         async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body))) as http:

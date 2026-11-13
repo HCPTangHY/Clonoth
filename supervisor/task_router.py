@@ -321,10 +321,19 @@ class TaskRouterMixin:
         # [AutoC 2026-05-30] Why: child session 清理曾散落在多个 return
         # 路径，新增路由分支时容易遗漏。How: 外层只负责 try/finally，原路由
         # 逻辑下沉到 inner。Purpose: 所有完成路径共享一个清理出口。
+        succeeded = False
         try:
             self._route_completed_task_inner_locked(task)
+            succeeded = True
         finally:
             self._cleanup_task_child_session_if_needed(task)
+            runtime = getattr(self, "execution_runtime", None)
+            if succeeded:
+                task.completion_state = "routed"
+                if runtime is not None:
+                    runtime.routed(task)
+            elif runtime is not None:
+                runtime.task_changed(task)
 
     def _route_completed_task_inner_locked(self, task: Task) -> None:
         """执行 task 完成后的实际路由逻辑。"""
@@ -414,6 +423,14 @@ class TaskRouterMixin:
             route_session_id = self._finalize_branch_task_locked(task, merge=True)
             self._route_fail_locked(task, action)
         elif act == "cancelled":
+            if task.cancel_reason == "service_restart" and task.caller_task_id:
+                resume = ({"type": "tool_results", "tool_results": [{
+                    "name": task.tool_name, "status": "cancelled", "cancelled": True,
+                    "raw_inline": "Tool cancelled by service restart; external effects may already have occurred. Check actual state before retrying.",
+                    "format": "text"}]}
+                    if task.kind == TaskKind.tool else {"type": "child_cancelled", "child_node_id": task.node_id})
+                self._resume_caller_or_output_locked(task, resume, {})
+                return
             # [Fork/Merge 2026-05-12] engine 主动返回 cancelled 时不输出，但仍收束分支。
             # 原因：cancel 是终态，不应遗留 branch session。做法：只 finalize，不调用输出路由。
             # 目的：符合 finish/cancel 时 merge 回主 session 的架构约束。
@@ -949,6 +966,9 @@ class TaskRouterMixin:
         if not source_task_id and self._try_resume_entry_with_unconsumed_preempt_locked(entry, result, delivery_task=task):
             self._complete_output_chain_waiters_locked(final_task=task, entry_task=entry)
             return
+        runtime = getattr(self, "execution_runtime", None)
+        if runtime is not None:
+            runtime.candidate(entry, result, task)
         self._complete_output_chain_waiters_locked(final_task=task, entry_task=entry)
         resume_data = self._output_chain_resume_data(task, result, action_type="finish")
         source_task_id = str(task.output_chain_source_task_id or entry.caller_task_id or "").strip()
@@ -1104,6 +1124,9 @@ class TaskRouterMixin:
         # Purpose: 普通 finish、异步 dispatch 回调和系统任务继续使用原路由。
         if self._try_resume_entry_with_unconsumed_preempt_locked(task, result):
             return
+        runtime = getattr(self, "execution_runtime", None)
+        if runtime is not None:
+            runtime.candidate(task, result)
         self._finalize_branch_task_locked(task, merge=True)
         self._resume_caller_or_output_locked(
             task,
@@ -1386,6 +1409,18 @@ class TaskRouterMixin:
         if route_session_id in self._cancelled_sessions:
             return
 
+        runtime = getattr(self, "execution_runtime", None)
+        origin_task_id = str(task.input.get("_execution_origin_task_id") or "")
+        if runtime is not None and origin_task_id:
+            runtime.queue_result(
+                delivery_id=f"dispatch:{task.task_id}:{task.execution_id}", work_id=task.task_id,
+                origin_task_id=origin_task_id, session_id=route_session_id,
+                text=result_text or "(no text result)", attachments=result_atts,
+                message_type="dispatch_result", target_generation=current_gen or 1,
+                metadata={"child_task_id": task.task_id, "child_node_id": task.node_id,
+                          "child_session_id": child_session_id, "caller_node_id": caller_node})
+            return
+
         # [Fork/Merge 2026-05-12] 异步 dispatch 结果不再自动 preempt 入口 task。
         # 原因：新架构规定 preempt 只能由 adapter 显式调用 preempt API 触发，普通 inbound
         # 或内部注入都应通过 fork 分支并发处理。做法：移除 running/suspended 入口任务的
@@ -1488,9 +1523,10 @@ class TaskRouterMixin:
             )
             return
 
-        # 检查 session generation 是否过期
+        # Compare the target's generation, never a child session's counter.
         current_gen = self._current_session_generation_locked(target_session_id)
-        if task.session_generation and current_gen and task.session_generation != current_gen:
+        target_gen = origin.get("target_generation", task.session_generation)
+        if target_gen and current_gen and target_gen != current_gen:
             return
         # 检查 session 是否已被 cancel
         if target_session_id in self._cancelled_sessions:
@@ -1507,6 +1543,17 @@ class TaskRouterMixin:
             if isinstance(fallback_result.get("attachments"), list)
             else None
         )
+
+        runtime = getattr(self, "execution_runtime", None)
+        if runtime is not None and origin_task_id:
+            runtime.queue_result(
+                delivery_id=f"dispatch:{task.task_id}:{task.execution_id}", work_id=task.task_id,
+                origin_task_id=origin_task_id, session_id=target_session_id,
+                text=result_text or "(no text result)", attachments=result_atts,
+                message_type="dispatch_result", target_generation=target_gen,
+                metadata={"child_task_id": task.task_id, "child_node_id": task.node_id,
+                          "child_session_id": child_session_id, "caller_node_id": caller_node})
+            return
 
         # [2026-09-13] 三级承接查找：优先 preempt "认识"派发记录的活跃 task
         # （origin task 本身，或带承接标记的 fork task），都不在时才 fork 新
@@ -1588,7 +1635,9 @@ class TaskRouterMixin:
                 and self._dispatch_carrier_route_matches_locked(t, target_session_id)
                 and (
                     t.status in (TaskStatus.running, TaskStatus.pending)
-                    or (t.status == TaskStatus.suspended and bool(t.waiting_for_task_id))
+                    or (t.status == TaskStatus.suspended and (
+                        bool(t.waiting_for_task_id) or t.completion_state == "interrupted"
+                    ))
                 )
             ):
                 return t
@@ -1603,7 +1652,9 @@ class TaskRouterMixin:
                 if str(task.input.get("_dispatch_owner_root_task_id") or "").strip() != origin_task_id:
                     continue
                 if task.status not in (TaskStatus.running, TaskStatus.pending) and not (
-                    task.status == TaskStatus.suspended and bool(task.waiting_for_task_id)
+                    task.status == TaskStatus.suspended and (
+                        bool(task.waiting_for_task_id) or task.completion_state == "interrupted"
+                    )
                 ):
                     continue
                 if best is None or task.created_at < best.created_at:
@@ -1748,6 +1799,26 @@ class TaskRouterMixin:
                 return {"ok": False, "error": "session not found"}
 
             result_atts = list(attachments or [])
+            runtime = getattr(self, "execution_runtime", None)
+            if runtime is not None:
+                tracked = runtime._related(runtime._watched | runtime._closed)
+                if source_task_id and source_task_id in tracked:
+                    return runtime.queue_result(
+                        delivery_id="legacy:" + str(uuid.uuid4()), work_id="",
+                        origin_task_id=source_task_id, session_id=session_id, text=text,
+                        attachments=[{"path": p} if isinstance(p, str) else p for p in result_atts],
+                        metadata={"identity_unverified": True})
+                roots = [tid for tid in runtime._watched
+                         if runtime._tasks.get(tid, {}).get("session_id") == session_id
+                         and not runtime._tasks[tid].get("is_system_task")]
+                if roots:
+                    # Legacy callbacks cannot establish which observed execution owns them.
+                    # Stop automatic review rather than borrowing an unrelated active task.
+                    for tid in roots:
+                        runtime._tasks[tid]["identity_unverified"] = True
+                    runtime._save()
+                    runtime.notify("task", session_id)
+                    return {"ok": False, "error": "callback requires stable source and delivery identities"}
 
             # ---- 策略 1 & 2：三级承接查找（优先原 task 本身 running/pending，其次同源已唤醒的承接 branch task，最后无 branch 模式入口 task） ----
             target_task: Task | None = self._find_dispatch_callback_carrier_locked(source_task_id, session_id)

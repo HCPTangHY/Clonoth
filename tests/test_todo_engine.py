@@ -378,7 +378,7 @@ async def test_model_tool_specs_and_loader_unload_reload_are_reversible(case, ac
     assert set(schema["required"]) == set(schema["properties"])
     assert "workspace_path" not in schema["properties"]
     assert "before_step" not in case.hooks.list_hooks()
-    assert len(case.hooks.list_hooks()["before_llm_call"]) == 2
+    assert len(case.hooks.list_hooks()["before_llm_call"]) == 4
     history = [{"role": "user", "content": "instruction"}]
     current_summary(await prepare(case, history), "main", 0)
     case.registry.reload()
@@ -394,6 +394,6 @@ async def test_model_tool_specs_and_loader_unload_reload_are_reversible(case, ac
     old_module = sys.modules[plugin_module_key("ide")]
     load_single_plugin(case.hooks, ROOT / "plugins", "ide", context=case.context, process="engine")
     assert sys.modules[plugin_module_key("ide")] is not old_module
-    assert len(case.hooks.list_hooks()["before_llm_call"]) == 2
+    assert set(case.hooks.list_hooks()["before_llm_call"]) == {"_expand_file_mentions", "refresh_goal_context", "review_cache_blocks", "refresh_context"}
     assert all(case.registry.get_spec(name) for name in TOOLS)
     current_summary(await prepare(case, history), "main", 0)

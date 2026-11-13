@@ -126,6 +126,10 @@ tools/
 !/tests/test_plugins_migration.py
 !/tests/test_plugins_frontend.cjs
 !/tests/test_todo_frontend.cjs
+!/tests/test_goal_frontend.cjs
+!/tests/test_goal_composer.cjs
+!/tests/test_goal_header.cjs
+!/tests/test_composer_temporary.cjs
 
 # Include source regression tests added by subsequent migrations.
 !/tests/test_*.py

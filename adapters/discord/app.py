@@ -38,6 +38,7 @@ from .context import (
     record_reaction_remove,
 )
 from .messaging import _current_message_media_text, _resolve_image_mime
+from .extensions import dispatch_command
 
 
 logging.basicConfig(level=logging.INFO)
@@ -324,6 +325,8 @@ def register_events(rt: DiscordRuntime) -> None:
 
         channel_id = message.channel.id
         raw_text = message.content.strip()
+        if await dispatch_command(rt, message, raw_text):
+            return
 
         guild = message.guild
         bot_id = rt.dc_client.user.id if rt.dc_client.user else None

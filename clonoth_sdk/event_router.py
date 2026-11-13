@@ -127,15 +127,11 @@ class EventRouter:
         self._entry_node_id = entry_node_id or config.entry_node_id
         self._after_seq = 0
         self._running = False
-        # [2026-05-29 restart detection fix] Why: request_restart(target=engine)
-        # actually triggers a FULL restart (supervisor+engine), wiping supervisor's
-        # in-memory _engine_generations dict. So engine_registered arrives with an
-        # EMPTY previous_generation_id, and the old `if not prev_gen: return` guard
-        # mistook every restart for a first boot — skipping on_engine_restarted and
-        # leaving stale progress logs open. How: the bot tracks the last generation
-        # it has seen itself, independent of supervisor's prev field. Purpose: detect
-        # restarts reliably by comparing the new generation against our own record.
-        self._last_seen_generation: str | None = None
+        # Workers register independently. Comparing one worker's generation with
+        # another's must not clear deliveries belonging to a planned restart.
+        self._worker_generations: dict[str, str] = {}
+        self._planned_restart_id = ""
+        self._planned_restart_phase = ""
 
         # [AutoC 2026-06-09] Why: output chain tasks should be displayed as
         # part of the main progress card, not as separate child entries.
@@ -232,6 +228,8 @@ class EventRouter:
 
     async def _sweep_once(self) -> None:
         """执行一次完整 sweep，用于 WS 定时器和后续共享调用。"""
+        if self._planned_restart_phase == "stopping":
+            return  # Retain delivery bindings; no typing or timeout during planned downtime.
         await self._cleanup_stale_triggers()
         await self._refresh_active_states()
 
@@ -1404,52 +1402,52 @@ class EventRouter:
     #  engine_registered — Engine 重启检测
     # ------------------------------------------------------------------
 
+    async def _notify_planned_restart(self, payload: dict, phase: str) -> bool:
+        """Handle explicit preservation only; legacy and crash events keep cleanup."""
+        restart_id = str(payload.get("restart_id") or "").strip()
+        if payload.get("preserve_tasks") is not True or not restart_id:
+            return False
+        if self._planned_restart_id == restart_id and (
+            self._planned_restart_phase == phase or self._planned_restart_phase == "restored"
+        ):
+            return True  # Duplicate worker registration or a late stopping event.
+        self._planned_restart_id = restart_id
+        self._planned_restart_phase = phase
+        for trigger in self._state.triggers.values():
+            trigger.refresh()
+        await self._cb.on_engine_restarted({**payload, "phase": phase})
+        return True
+
     async def _handle_engine_registered(self, event: Event) -> None:
-        """Handle engine_registered: notify adapter when engine restarts.
-
-        [2026-05-29 restart detection fix] The old logic trusted supervisor's
-        previous_generation_id, but a full restart (the only restart path now,
-        since target=engine is disabled in api.py) wipes supervisor's in-memory
-        generation map, so that field is empty and every restart looked like a
-        first boot. We now track the generation ourselves and compare.
-        """
+        """A planned registration resumes delivery; other generation changes clean up."""
         p = event.payload
-        cur_gen = (p.get("generation_id") or "").strip()
-        prev_gen = (p.get("previous_generation_id") or "").strip()
-
-        # Determine whether this is a real restart:
-        #  - supervisor reports a non-empty previous_generation_id (in-process
-        #    engine restart, generation map survived) → trust it; OR
-        #  - we've seen a different generation before (full restart wiped the
-        #    supervisor field, but our own record proves the generation changed).
-        is_restart = bool(prev_gen) or (
-            self._last_seen_generation is not None
-            and cur_gen != ""
-            and cur_gen != self._last_seen_generation
-        )
-
-        # Record current generation for the next comparison regardless of outcome.
+        worker_id = str(p.get("worker_id") or "")
+        cur_gen = str(p.get("generation_id") or "").strip()
+        prev_gen = str(p.get("previous_generation_id") or "").strip()
+        known_gen = self._worker_generations.get(worker_id)
         if cur_gen:
-            self._last_seen_generation = cur_gen
-
-        if not is_restart:
-            # Genuine first boot (we had no prior generation on record) — skip
-            # cleanup, just remember the generation above.
-            return
+            self._worker_generations[worker_id] = cur_gen
         try:
+            if await self._notify_planned_restart(p, "restored"):
+                return
+            # Repeated registrations of one worker are not additional restarts.
+            if cur_gen and cur_gen == known_gen:
+                return
+            if not prev_gen and not (known_gen and cur_gen and cur_gen != known_gen):
+                return
+            self._planned_restart_id = ""
+            self._planned_restart_phase = ""
             await self._cb.on_engine_restarted(p)
         except Exception as e:
             logger.error("on_engine_restarted callback error: %s", e)
 
     async def _handle_engine_restarting(self, event: Event) -> None:
-        """Handle engine_restarting: supervisor is about to restart, clean up now.
-
-        [2026-06-11] Why: full restart kills the supervisor process, WS drops
-        with 1012 and bot misses the post-restart engine_registered event.
-        How: supervisor emits engine_restarting while WS is still alive.
-        Purpose: bot cleans up typing/logs/status_msg before disconnect.
-        """
+        """Keep task bindings for planned downtime, otherwise use legacy cleanup."""
         try:
+            if await self._notify_planned_restart(event.payload, "stopping"):
+                return
+            self._planned_restart_id = ""
+            self._planned_restart_phase = ""
             await self._cb.on_engine_restarted(event.payload)
         except Exception as e:
             logger.error("on_engine_restarted (pre-restart) callback error: %s", e)

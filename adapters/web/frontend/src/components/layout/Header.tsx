@@ -201,7 +201,7 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
           ))}
 
           {/* Reserved slot: plugins may append small header widgets. */}
-          <PluginSlotHost slot="header_actions" />
+          <PluginSlotHost slot="header_actions" data={{ sessionId, isChildSession: Boolean(viewingChildNodeId) }} />
         </div>
       </div>
     </header>

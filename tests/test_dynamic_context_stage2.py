@@ -523,8 +523,11 @@ def test_compact_done_resume_reinjects_compacted_skill_while_normal_resume_does_
         run_id="t1",
         resume_data={"type": "child_result", "from_node": "worker", "result": {"text": "child output"}},
     ))
-    # No new dynamic_context row was appended to JSONL
-    assert [m.id for m in store.load(sid)] == ["u1", "d1", "a1"]
+    # The callback is durable for restart recovery, but dynamic context is not duplicated.
+    after_normal = store.load(sid)
+    assert [m.id for m in after_normal if m.message_type != "resume_input"] == ["u1", "d1", "a1"]
+    callbacks = [m for m in after_normal if m.message_type == "resume_input"]
+    assert len(callbacks) == 1 and "child output" in callbacks[0].content
 
     # Case B: compact_done resume where d1 was in an older segment that got compacted away!
     sid_compact = "sess_compact_resume"

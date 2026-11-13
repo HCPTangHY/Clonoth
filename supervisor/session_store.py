@@ -258,8 +258,13 @@ class SessionStore:
         """更新 session 的 workspace 并落盘。"""
         entry = self._registry.get(session_id)
         if entry is not None:
+            previous = entry.get("workspace")
             entry["workspace"] = dict(workspace or {})
-            self._flush()
+            try:
+                self._flush(raise_errors=True)
+            except Exception:
+                entry["workspace"] = previous
+                raise
 
     def update_entry_node(self, session_id: str, entry_node_id: str) -> None:
         """更新 session 的入口节点并落盘。"""
@@ -376,10 +381,11 @@ class SessionStore:
         即使写入过程中进程崩溃，也不会损坏已有文件。
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        (self._path.parent / "temp").mkdir(parents=True, exist_ok=True)
         tmp_path: str | None = None
         try:
             fd, tmp_path = tempfile.mkstemp(
-                dir=str(self._path.parent),
+                dir=str(self._path.parent / "temp"),
                 prefix=".sessions_",
                 suffix=".tmp",
             )

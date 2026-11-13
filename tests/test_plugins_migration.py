@@ -225,9 +225,13 @@ class EngineRegistrationTests(unittest.TestCase):
         ctx = SimpleNamespace(contributions=contrib(tools=tools), hooks=hooks)
         with mock.patch.object(ide_todo, "register_engine", lambda c: called.append(c)):
             disposers = ide.register(ctx)
-        self.assertEqual([call[0] for call in hooks.calls], ["before_llm_call"])  # no before_step
-        self.assertIs(hooks.calls[0][1], ide._expand_file_mentions)
-        self.assertEqual(hooks.calls[0][2], 50)
+        self.assertEqual([call[0] for call in hooks.calls], ["before_llm_call"] * 3)  # no before_step
+        by_name = {call[1].__name__: call for call in hooks.calls}
+        self.assertEqual(set(by_name), {"refresh_goal_context", "review_cache_blocks", "_expand_file_mentions"})
+        self.assertIs(by_name["_expand_file_mentions"][1], ide._expand_file_mentions)
+        self.assertEqual(by_name["_expand_file_mentions"][2], 50)
+        self.assertEqual(by_name["refresh_goal_context"][2], 41)
+        self.assertEqual(by_name["review_cache_blocks"][2], 42)
         self.assertEqual(tools.names, [])  # registration is mocked above
         self.assertEqual(called, [ctx])
         self.assertEqual(len(disposers), 1)

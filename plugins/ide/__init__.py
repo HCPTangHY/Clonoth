@@ -20,8 +20,9 @@ from typing import Any
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.17.0",
-    "description": "Web IDE：文件管理、编辑器、Git、搜索、@文件引用和会话待办清单",
+    "version": "0.18.0",
+    "description": "Web IDE：文件管理、编辑器、Git、搜索、文件引用、会话待办与 Goal 验收",
+    "nodes": [{"file": "nodes/ide.goal_reviewer.yaml"}],
     "author": "clonoth",
     # supervisor：静态面板与 API；engine：文件引用、待办工具与进度摘要。
     "processes": ["supervisor", "engine"],
@@ -34,9 +35,30 @@ PLUGIN_META = {
                 # 接管宿主内置 files overlay，不作为独立入口出现在 Header。
                 "replaces": "files",
                 "entry": "/v1/plugins/ide/web/index.html",
-            }
+            },
+            {
+                "id": "goal",
+                "slot": "right",
+                "title": "Goal",
+                "standalone": False,
+                "entry": "/v1/plugins/ide/web/goal.html",
+            },
         ],
         "slots": [
+            {
+                "slot_id": "ide.goal_progress",
+                "slot": "header_actions",
+                "priority": 60,
+                "mode": "append",
+                "script": {"file": "web/goal_header.js"},
+            },
+            {
+                "slot_id": "ide.goal_composer",
+                "slot": "input_controls",
+                "priority": 60,
+                "mode": "append",
+                "script": {"file": "web/goal_composer.js"},
+            },
             {
                 "slot_id": "ide.todo_progress",
                 "slot": "chat_top",
@@ -268,7 +290,9 @@ def register(ctx) -> None:
         # Todos belong to the executing session, including child sessions, and
         # require no filesystem workspace. Request-only summaries keep history intact.
         from .todo import register_engine
+        from .goal import register_engine as register_goal_engine
         register_engine(ctx)
+        register_goal_engine(ctx)
         dispose = ctx.hooks.register("before_llm_call", _expand_file_mentions, priority=50)
         return [dispose]
 
@@ -285,6 +309,9 @@ def register(ctx) -> None:
 
     api = APIRouter()
     add_routes(api)
+    from .goal import add_routes as add_goal_routes, register_supervisor
+    add_goal_routes(api)
+    register_supervisor(ctx)
 
     def _state(request: Request):
         st = getattr(request.app.state, "state", None)

@@ -44,6 +44,10 @@ class TaskStoreMixin:
         # finish, ask, failure, and direct cancellation do not leave task-scoped raw
         # outputs behind.
         try:
+            runtime = getattr(self, "execution_runtime", None)
+            task = self.tasks.get(task_id)
+            if runtime is not None and task is not None:
+                runtime.capture_evidence(task)
             cleanup_tool_result_artifacts(self.workspace_root, task_id)
         except Exception:
             pass
@@ -51,6 +55,17 @@ class TaskStoreMixin:
     # ---- 内部 task 创建 ----
 
     def _event_task_snapshot(self, event_type: str, task: Task, *, component: str = "supervisor") -> None:
+        resume = task.input.get("resume_data")
+        if event_type == "task_resumed" and isinstance(resume, dict) and resume and resume.get("type") != "restart_interrupted":
+            # Distinct callbacks may carry identical text; identity follows the
+            # scheduling transition and survives planned-restart wrappers.
+            resume.setdefault("resume_id", str(uuid.uuid4()))
+        recovery = getattr(self, "restart_recovery", None)
+        if recovery is not None:
+            recovery.task_changed(task)
+        runtime = getattr(self, "execution_runtime", None)
+        if runtime is not None:
+            runtime.task_changed(task, notify=event_type != "task_completed")
         self.eventlog.append(
             session_id=task.session_id,
             component=component,
@@ -433,6 +448,8 @@ class TaskStoreMixin:
             node_id=entry_node,
             input_data={
                 "instruction": text,
+                "delivery_ids": list(payload.get("delivery_ids") or []),
+                "_execution_origin_task_id": str(payload.get("_execution_origin_task_id") or ""),
                 "context_ref": last_ctx_ref,
                 "switched_from": default_node if session_override else "",
                 "resume_data": {},
@@ -760,7 +777,7 @@ class TaskStoreMixin:
             )
             return True
 
-    def consume_preempt_message(self, task_id: str, consumed_message: str | None = None, consumed_attachment_count: int = 0) -> dict:
+    def consume_preempt_message(self, task_id: str, consumed_message: str | None = None, consumed_attachment_count: int = 0, *, delivery_ids: list[str] | None = None, message_id: str = "", execution_id: str = "") -> dict:
         """消费 preempt message，返回 {message, attachments} 并清空。同时重置 preempt_requested。
 
         [2026-09-13] 前缀切除语义。Why: engine 的消费流程是 GET /preempted 读文本
@@ -806,6 +823,12 @@ class TaskStoreMixin:
                 remaining = msg
             else:
                 return {"message": "", "attachments": [], "kept": True}
+            if delivery_ids:
+                runtime = getattr(self, "execution_runtime", None)
+                if runtime is None or task.preempt_delivery_ids[:len(delivery_ids)] != delivery_ids:
+                    raise ValueError("receipt acknowledgement is not an observed prefix")
+                runtime.admit(task_id, delivery_ids, message_id, execution_id)
+                del task.preempt_delivery_ids[:len(delivery_ids)]
             remaining_atts = atts[count:]
             task.preempt_message = remaining
             task.preempt_attachments = remaining_atts
@@ -823,9 +846,10 @@ class TaskStoreMixin:
                 "preempted": task.preempt_requested,
                 "message": task.preempt_message,
                 "attachments": list(task.preempt_attachments),
+                **({"delivery_ids": list(task.preempt_delivery_ids)} if task.preempt_delivery_ids else {}),
             }
 
-    def renew_lease(self, task_id: str, worker_id: str, lease_sec: float = 120.0) -> bool:
+    def renew_lease(self, task_id: str, worker_id: str, lease_sec: float = 120.0, execution_id: str = "") -> bool:
         """续租 task 的 lease，延长 lease_expires_at。仅 status=running 且 worker_id 匹配时生效。"""
         tid = (task_id or "").strip()
         wid = (worker_id or "").strip()
@@ -835,7 +859,7 @@ class TaskStoreMixin:
             task = self.tasks.get(tid)
             if task is None or task.status != TaskStatus.running:
                 return False
-            if task.worker_id != wid:
+            if task.worker_id != wid or (task.execution_id and task.execution_id != execution_id):
                 return False
             lease_val = max(10.0, min(lease_sec, 600.0))
             task.lease_expires_at = _now() + timedelta(seconds=lease_val)
@@ -854,6 +878,8 @@ class TaskStoreMixin:
         if not wid:
             return None
         with self._lock:
+            if self.restart_recovery.preparing:
+                return None
             now = _now()
             lease_val = max(10.0, min(lease_sec, 600.0))
             for tid in self._task_order:
@@ -885,6 +911,8 @@ class TaskStoreMixin:
                     self._event_task_snapshot("task_requeued", task)
 
                 task.status = TaskStatus.running
+                task.execution_id = str(uuid.uuid4())
+                task.completion_state = ""
                 task.worker_id = wid
                 task.updated_at = now
                 task.lease_expires_at = now + timedelta(seconds=lease_val)
@@ -892,7 +920,7 @@ class TaskStoreMixin:
                 return task.model_dump(mode="json")
             return None
 
-    def complete_task(self, *, task_id: str, worker_id: str, result: dict[str, Any]) -> Task | None:
+    def complete_task(self, *, task_id: str, worker_id: str, result: dict[str, Any], execution_id: str = "") -> Task | None:
         tid = (task_id or "").strip()
         wid = (worker_id or "").strip()
         if not tid or not wid:
@@ -901,15 +929,43 @@ class TaskStoreMixin:
             task = self.tasks.get(tid)
             if task is None:
                 return None
+            if task.execution_id:
+                if not execution_id:
+                    raise ValueError("execution_id is required")
+                if execution_id == task.completed_execution_id:
+                    if task.input.get("_completed_worker_id") != wid:
+                        raise ValueError("completion worker mismatch")
+                    runtime = getattr(self, "execution_runtime", None)
+                    if runtime is not None:
+                        runtime.cleanup_closed_system(task)
+                    return task
+                if execution_id != task.execution_id or (task.worker_id != wid and task.completion_state != "routing"):
+                    raise ValueError("stale task completion")
+                if task.completion_state == "routing":
+                    # Never repeat a partially committed output chain. Preserve unknown
+                    # delivery as an explicit failure rather than acknowledging success.
+                    raise ValueError("previous completion routing is unresolved")
+                task.completion_state = "routing"
             if self._task_terminal(task):
                 branch_sid = str(task.input.get("branch_session_id") or "").strip() if isinstance(task.input, dict) else ""
                 if branch_sid:
                     self._cleanup_branch_locked(branch_sid)
+                runtime = getattr(self, "execution_runtime", None)
+                if runtime is not None:
+                    runtime.cleanup_closed_system(task)
+                task.completion_state = "routed"
+                task.completed_execution_id = execution_id
+                task.input["_completed_worker_id"] = wid
                 return task
             if task.worker_id and task.worker_id != wid and task.lease_expires_at and task.lease_expires_at > _now():
                 return None
 
             current_gen = self._current_session_generation_locked(task.session_id)
+            if self.restart_recovery.intercept_completion(task, result):
+                task.completed_execution_id = execution_id
+                task.input["_completed_worker_id"] = wid
+                self.restart_recovery.save()
+                return task
             if task.cancel_requested or (current_gen and task.session_generation != current_gen):
                 task.cancel_requested = True
                 task.status = TaskStatus.cancelled
@@ -923,6 +979,9 @@ class TaskStoreMixin:
                 # 目的：finish/fail/cancel 三类终态都能把分支历史回写主 session。
                 self._finalize_branch_task_locked(task, merge=True)
                 self._mark_child_session_terminal(task)
+                task.completion_state = "routed"
+                task.completed_execution_id = execution_id
+                task.input["_completed_worker_id"] = wid
                 self._event_task_snapshot("task_cancelled", task, component="engine")
                 return task
 
@@ -944,4 +1003,8 @@ class TaskStoreMixin:
             self._mark_child_session_terminal(task)
             self._event_task_snapshot("task_completed", task, component="engine")
             self._route_completed_task_locked(task)
+            task.completion_state = "routed"
+            task.completed_execution_id = execution_id
+            task.input["_completed_worker_id"] = wid
+            self.restart_recovery.save()
             return task

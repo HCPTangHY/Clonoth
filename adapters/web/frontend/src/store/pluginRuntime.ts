@@ -68,6 +68,14 @@ export function getPluginState(slotId: string): Record<string, unknown> {
   return state;
 }
 
+/** Clear private drafts and request bodies on logout, including retained references. */
+export function clearPluginStates(): void {
+  for (const state of pluginStates.values()) {
+    for (const key of Object.keys(state)) delete state[key];
+  }
+  pluginStates.clear();
+}
+
 /** Drop the state of a contribution that disappeared for good. */
 export function wipePluginState(slotId: string): void {
   pluginStates.delete(slotId);

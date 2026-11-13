@@ -130,11 +130,28 @@ export async function updateSessionApprovalRules(
   return resp.json();
 }
 
+// Creates no task. Composer plugins use this before their own API submission.
+export async function getOrCreateWebSession(conversationKey: string): Promise<{ session_id: string }> {
+  return (await apiFetch('/sessions/get_or_create', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel: 'web', conversation_key: conversationKey }),
+  })).json();
+}
+
 // ── Inbound (send message) ──
+
+let clientRequestSequence = 0;
+/** Request identity, not a credential; also works on non-HTTPS installations. */
+export function createClientRequestId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `web-${Date.now()}-${++clientRequestSequence}-${Math.random().toString(36).slice(2)}`;
+}
 
 export async function postInbound(params: {
   conversation_key: string;
   text: string;
+  message_id?: string;
   attachments?: any[];
   use_context?: boolean;
   entry_node_id?: string;
@@ -146,14 +163,18 @@ export async function postInbound(params: {
   // message. Purpose: operators can talk in the selected session without adding it to
   // the sidebar or accidentally creating a new web session.
   session_id?: string;
-}): Promise<{ session_id: string; inbound_seq: number; accepted: boolean }> {
-  const token = params.session_id ? getStoredAdminToken() : '';
+}): Promise<{ session_id: string; inbound_seq: number; accepted: boolean; handled?: boolean; text?: string }> {
+  const token = getStoredAdminToken();
+  const requestId = params.message_id || createClientRequestId();
   const resp = await apiFetch('/inbound', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(token ? authHeaders(token) : {}) },
     body: JSON.stringify({
       channel: 'web',
       conversation_key: params.conversation_key,
+      message_id: requestId,
+      request_id: requestId,
+      user_input: true,
       text: params.text,
       attachments: params.attachments ?? [],
       use_context: params.use_context ?? true,
@@ -883,8 +904,14 @@ export async function getSessionPendingApprovals(sessionId: string): Promise<any
 
 // ── Preempt ──
 
-export async function preemptTask(taskId: string, message?: string, attachments?: any[]): Promise<any> {
-  const body: Record<string, unknown> = {};
+export async function preemptTask(
+  taskId: string, message?: string, attachments?: any[],
+  sessionId?: string, requestId: string = createClientRequestId(),
+): Promise<{ ok: boolean; handled?: boolean; text?: string; session_id?: string; inbound_seq?: number }> {
+  // This is the authenticated Web composer, not an internal worker callback.
+  // Control replies have their own inbound identity and must not finish the old task.
+  const body: Record<string, unknown> = { user_input: true, request_id: requestId };
+  if (sessionId) body.session_id = sessionId;
   if (message) body.message = message;
   if (attachments && attachments.length > 0) body.attachments = attachments;
   const resp = await apiFetch(`/tasks/${encodeURIComponent(taskId)}/preempt`, {
@@ -1317,6 +1344,8 @@ export async function getWorkspaceTree(
 export interface PluginPanelDecl {
   id: string;
   slot?: string;
+  /** False keeps the panel addressable without a duplicate automatic Header entry. */
+  standalone?: boolean;
   title?: string;
   entry: string;
   /** [AutoC 2026-08-24] Take over a built-in overlay (e.g. 'files') instead of

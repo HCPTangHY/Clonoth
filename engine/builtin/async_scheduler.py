@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from typing import Any
@@ -23,6 +24,7 @@ from ..inference.async_tools import (
     _run_async_tool,
     _snapshot_tool_context,
     report_async_tool_started,
+    settle_inline_registration,
 )
 
 
@@ -47,6 +49,9 @@ def _async_marker(async_id: str, raw_inline: str, handoff_message: str) -> dict[
         "raw_inline": raw_inline,
         "handoff_message": handoff_message,
     }
+
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncScheduler:
@@ -85,13 +90,7 @@ class AsyncScheduler:
             # runtime history, so async tool results must create follow-up
             # inbound messages in the SDK-visible session.
             _cleanup_async_tracker()
-            async_id = uuid.uuid4().hex[:8]
-            _async_tool_tasks[async_id] = {
-                "tool_name": tool_name,
-                "status": "running",
-                "started_at": t0,
-                "task_id": rctx.task_id,
-            }
+            async_id = uuid.uuid4().hex
             # [AutoC 2026-06-27] Why: the loop reuses tool_ctx and rewrites
             # tool_call_id for later calls. How: pass a snapshot to the
             # background task. Purpose: callback artifacts and approvals keep
@@ -108,6 +107,30 @@ class AsyncScheduler:
             denied = await ls.registry.authorize(name=tool_name, arguments=tool_args, ctx=snapshot)
             if denied is not None:
                 return hook_result(modified=True, channels={"execution": denied})
+            try:
+                registration = await report_async_tool_started(
+                    rctx=rctx, node_id=str(getattr(getattr(ls, "node", None), "id", "") or ""),
+                    async_id=async_id, tool_name=tool_name, tool_args=tool_args,
+                )
+            except Exception as exc:
+                # A hook exception would fall through to default execution: return a real error instead.
+                text = f"Async registration was not confirmed; tool was not executed: {exc}"
+                settled = await settle_inline_registration(
+                    rctx=rctx, node_id=str(getattr(getattr(ls, "node", None), "id", "") or ""),
+                    async_id=async_id, tool_name=tool_name, tool_args=tool_args,
+                    status="cancelled", error="registration failed before execution",
+                )
+                _async_tool_tasks[async_id] = {
+                    "tool_name": tool_name, "status": "cancelled" if settled else "registration_failed",
+                    "task_id": rctx.task_id, "started_at": t0, "finished_at": time.monotonic(), "error": text,
+                }
+                return hook_result(modified=True, channels={"execution": {
+                    "ok": False, "error": text, "data": {"result": text},
+                }})
+            _async_tool_tasks[async_id] = {
+                "tool_name": tool_name, "status": "running", "started_at": t0,
+                "task_id": rctx.task_id,
+            }
             asyncio.create_task(
                 _run_async_tool(
                     registry=ls.registry,
@@ -123,12 +146,10 @@ class AsyncScheduler:
                     step=step,
                     index=index,
                     tool_call_id=tool_call_id or async_id,
+                    registration=registration,
+                    authorized=True,
                 ),
                 name=f"async_tool_{tool_name}_{async_id}",
-            )
-            report_async_tool_started(
-                rctx=rctx, node_id=str(getattr(getattr(ls, "node", None), "id", "") or ""), async_id=async_id,
-                tool_name=tool_name, tool_args=tool_args,
             )
             raw_inline = (
                 f'⏳ Async tool "{tool_name}" started (id: {async_id}). '
@@ -167,17 +188,58 @@ class AsyncScheduler:
                 _execute_registry_tool_with_span(ls.registry, tool_name, tool_args, exec_ctx, authorized=True),
                 name=f"execute_command_adaptive_{tool_call_id[:24] or 'call'}",
             )
-            done, _pending = await asyncio.wait({exec_task}, timeout=float(threshold))
+            try:
+                done, _pending = await asyncio.wait({exec_task}, timeout=float(threshold))
+            except asyncio.CancelledError:
+                exec_task.cancel()
+                await asyncio.gather(exec_task, return_exceptions=True)
+                raise
             if exec_task in done:
                 return exec_task.result()
             _cleanup_async_tracker()
-            async_id = uuid.uuid4().hex[:8]
+            async_id = uuid.uuid4().hex
+            try:
+                registration = await report_async_tool_started(
+                    rctx=rctx, node_id=str(getattr(getattr(ls, "node", None), "id", "") or ""),
+                    async_id=async_id, tool_name=tool_name, tool_args=tool_args,
+                    upgraded_from="sync_timeout",
+                )
+            except asyncio.CancelledError:
+                exec_task.cancel()
+                await asyncio.gather(exec_task, return_exceptions=True)
+                raise
+            except Exception as exc:
+                # ponytail: stay synchronous on an uncertain registration; never start the command twice.
+                # The supervisor must keep a possibly accepted registration unresolved until reconciled.
+                logger.warning("Async upgrade not confirmed; retaining synchronous execution %s: %s", async_id, exc)
+                _async_tool_tasks[async_id] = {
+                    "tool_name": tool_name, "status": "registration_failed", "task_id": rctx.task_id,
+                    "started_at": t0, "finished_at": time.monotonic(), "error": str(exc),
+                }
+                outcome, error = "done", ""
+                try:
+                    result = await exec_task
+                    if isinstance(result, dict) and (result.get("ok") is False or result.get("error")):
+                        outcome, error = "failed", str(result.get("error") or "tool returned an unsuccessful result")
+                    return result
+                except asyncio.CancelledError:
+                    outcome = "cancelled"
+                    raise
+                except Exception as work_error:
+                    outcome, error = "failed", str(work_error)
+                    raise
+                finally:
+                    settled = await settle_inline_registration(
+                        rctx=rctx, node_id=str(getattr(getattr(ls, "node", None), "id", "") or ""),
+                        async_id=async_id, tool_name=tool_name, tool_args=tool_args,
+                        upgraded_from="sync_timeout", status=outcome, error=error,
+                        elapsed_sec=round(time.monotonic() - t0, 1),
+                    )
+                    if settled:
+                        _async_tool_tasks[async_id].update(status=outcome, delivery_status="inline")
             _async_tool_tasks[async_id] = {
-                "tool_name": tool_name,
-                "status": "running",
-                "started_at": t0,
-                "task_id": rctx.task_id,
-                "upgraded_from": "sync_timeout",
+                "tool_name": tool_name, "status": "running", "started_at": t0,
+                "task_id": rctx.task_id, "upgraded_from": "sync_timeout",
             }
             try:
                 exec_ctx._async_id = async_id
@@ -200,13 +262,9 @@ class AsyncScheduler:
                     step=step,
                     index=index,
                     tool_call_id=tool_call_id or async_id,
+                    registration=registration,
                 ),
                 name=f"async_upgrade_{tool_name}_{async_id}",
-            )
-            report_async_tool_started(
-                rctx=rctx, node_id=str(getattr(getattr(ls, "node", None), "id", "") or ""), async_id=async_id,
-                tool_name=tool_name, tool_args=tool_args,
-                upgraded_from="sync_timeout",
             )
             raw_inline = (
                 f'⏳ Tool "{tool_name}" exceeded {threshold:.1f}s and was '

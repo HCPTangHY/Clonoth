@@ -115,6 +115,12 @@ registerHostAction('reroll', async () => {
 // postMessage. Opening the overlay also forces the right rail open — an intent
 // that navigates inside a hidden panel would be invisible otherwise. Purpose:
 // the host owns panel routing, plugins own the payload.
+registerHostAction('setRightPanelOpen', open => {
+  if (typeof open !== 'boolean') return false;
+  useSettingsStore.getState().setRightPanelOpen(open);
+  return true;
+});
+
 registerHostAction('openPanel', (panelId, intent) => {
   const id = String(panelId ?? '');
   if (!id) return;

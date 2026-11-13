@@ -767,6 +767,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         "parent_session_id": parent_session_id,
         "caller_node_id": ls.node.id,
         "origin_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+        "origin_execution_id": str(getattr(ls.rctx, "execution_id", "") or ""),
         "parent_conversation_key": parent_conv_key,
         "context_mode": ctx_mode,
     }

@@ -590,6 +590,10 @@ class SessionMixin:
     def _apply_inbound_message(self, *, seq: int, session_id: str, payload: dict[str, Any]) -> None:
         if not isinstance(seq, int) or seq <= 0 or not session_id:
             return
+        # Control commands belong to the direct-reply path, including event replay
+        # after a crash between recording their input and recording their reply.
+        if payload.get("message_type") == "control_input":
+            self._inbound_processed.add(seq)
         # [2026-06-03] Why: the sidebar sorts conversations by session.updated_at, but
         # this (the effective, later-defined) inbound handler never refreshed it, so
         # updated_at stayed equal to created_at and the list was effectively sorted by
@@ -711,6 +715,12 @@ class SessionMixin:
         if not isinstance(payload, dict):
             return
         with self._lock:
+            runtime = getattr(self, "execution_runtime", None)
+            if (runtime is not None and not payload.get("user_input") and not payload.get("dispatch_origin")
+                    and not payload.get("_execution_origin_task_id") and not payload.get("_system_task")
+                    and payload.get("message_type", "user_input") in ("", "user_input")
+                    and seq not in self._inbound_events):
+                runtime.notify("input", session_id, request_id=str(payload.get("message_id") or seq))
             self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
             self._advance_inbound_cursor()
             if session_id and session_id in self.sessions:
@@ -959,6 +969,9 @@ class SessionMixin:
             if not old_session_id:
                 return {"ok": False, "error": f"conversation not found: {conversation_key}"}
 
+            runtime = getattr(self, "execution_runtime", None)
+            if runtime is not None:
+                runtime.session_removed(old_session_id)
             # 方案 A: 标记 session 为已重置
             self._session_store.on_session_reset(old_session_id)
             self._purge_context_usage_for_session(old_session_id)

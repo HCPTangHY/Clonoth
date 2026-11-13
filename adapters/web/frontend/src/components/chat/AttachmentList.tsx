@@ -198,7 +198,7 @@ function AttachmentItem({
       return (
         <figure className={imageShellClass} title={name}>
           <div className={`${isComposer ? 'h-20 w-20' : 'h-32 w-32'} flex items-center justify-center text-[var(--duties-tertiary)]`}>
-            <Icon name="hourglass_empty" size={20} />
+            <Icon name="progress_activity" size={20} className="animate-spin" />
           </div>
           <figcaption className="max-w-56 truncate px-2 py-1 text-[0.68rem] text-[var(--duties-secondary)]">{name}</figcaption>
         </figure>
@@ -222,7 +222,7 @@ function AttachmentItem({
   // File attachment (non-image, or image without URL)
   const fileInner = (
     <>
-      <Icon name={loading ? 'hourglass_empty' : getFileIcon(attachment)} size={18} />
+      <Icon name={loading ? 'progress_activity' : getFileIcon(attachment)} size={18} className={loading ? 'animate-spin' : ''} />
       <span className="min-w-0 flex-1 truncate">{name}</span>
       {meta && <span className="shrink-0 text-[var(--duties-tertiary)]">{meta}</span>}
     </>

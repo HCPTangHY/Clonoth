@@ -55,6 +55,8 @@ class InboundMessageIn(BaseModel):
     # session entry can send into the selected session without creating a sidebar row.
     session_id: str | None = None
     message_id: str | None = None
+    user_input: bool = False
+    request_id: str = ""
     text: str
     attachments: list[dict[str, Any]] | None = None
     use_context: bool = True
@@ -93,6 +95,8 @@ class InboundMessageOut(BaseModel):
     session_id: str
     inbound_seq: int = 0
     accepted: bool = True
+    handled: bool = False
+    text: str = ""
 
 
 class OutboundMessageIn(BaseModel):
@@ -134,6 +138,9 @@ class Task(BaseModel):
     task_id: str
     session_id: str
     session_generation: int = 1
+    execution_id: str = ""
+    completed_execution_id: str = ""
+    completion_state: str = ""
     kind: TaskKind
     node_id: str | None = None
     tool_name: str | None = None
@@ -146,10 +153,13 @@ class Task(BaseModel):
     waiting_for_task_id: str | None = None
     status: TaskStatus = TaskStatus.pending
     cancel_requested: bool = False
+    cancel_reason: str = ""
+    restart_id: str = ""
     preempt_requested: bool = False
     preempted_context_ref: str = ""
     preempt_message: str = ""
     preempt_attachments: list = Field(default_factory=list)
+    preempt_delivery_ids: list[str] = Field(default_factory=list)
     worker_id: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -179,6 +189,7 @@ class Task(BaseModel):
 
 class TaskCompleteIn(BaseModel):
     worker_id: str
+    execution_id: str = ""
     result: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -258,6 +269,8 @@ class RestartIn(BaseModel):
     reason: str | None = None
     approval_id: str | None = None
     session_id: str | None = None
+    task_id: str = ""
+    tool_call_id: str = ""
 
 
 class RestartOut(BaseModel):

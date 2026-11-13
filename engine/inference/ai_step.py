@@ -25,6 +25,7 @@ from ..attachments import build_multimodal_content
 # Phase 1 (Session Conversation Store): 导入 Message 模型用于影子写入。
 # ai_step 在每次 append assistant/tool_result 消息后，best-effort 写入 ConversationStore。
 from ..conversation_store import Message, MessageType, is_dynamic_context
+from ..restart_recovery import interrupted_result
 from ..node import Node
 from .message_assembly import assemble_initial_messages, rebuild_dynamic_context
 from ..protocol import (
@@ -145,7 +146,8 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
         if not ls.rctx.first_shadow_message_id:
             ls.rctx.first_shadow_message_id = msg_id
         ls.rctx.last_shadow_message_id = msg_id
-    except Exception:
+    except Exception as exc:
+        ls.rctx._history_write_error = f"{type(exc).__name__}: {exc}"
         # A dynamic row must reach disk before subsequent replies: otherwise a
         # resume would move its insertion point and invalidate the frozen prefix.
         if message_type == MessageType.DYNAMIC_CONTEXT:
@@ -235,10 +237,27 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
             ls._last_round_tool_sig = ""
             ls._consecutive_round_tool_count = 0
     try:
-        return await _handle_tool_calls_inner(ls, resp, step)
+        action = await _handle_tool_calls_inner(ls, resp, step)
+    except asyncio.CancelledError:
+        # Close terminal/pseudo calls too; the real-tool finally already kept its results.
+        paired = {str(m.get('tool_call_id') or '') for m in ls.messages[ls._step_tool_msg_start:] if m.get('role') == 'tool'}
+        missing = [{"id": tc.id, "name": tc.name, "args": tc.arguments or {}, "format": "json",
+                    "raw_inline": json.dumps(interrupted_result()), "result": interrupted_result()}
+                   for tc in resp.tool_calls if str(tc.id) not in paired]
+        _persist_tool_results(ls, missing, [])
+        for tc in resp.tool_calls:
+            if str(tc.id) not in paired:
+                await ls.rctx.emit_event('tool_call_end', {'node_id': ls.node.id, 'task_id': ls.rctx.task_id,
+                    'tool_call_id': tc.id, 'tool_name': tc.name, 'status': 'cancelled', 'result': interrupted_result()})
+        raise
     finally:
         _flush_step_shadow_writes(ls)
         ls._after_prev_round_msg_idx = len(ls.messages)
+    if getattr(ls.rctx, '_restart_accepted', False):
+        # The accepted control operation already scheduled shutdown. Persist its
+        # receipt first, then yield without executing another model/tool step.
+        await asyncio.Event().wait()
+    return action
 
 
 def _tool_spec_for(ls: _LoopState, tool_name: str) -> dict[str, Any] | None:
@@ -556,6 +575,8 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
                     _early_action = action
                     break
                 ls.use_stream = ls.streaming
+                if getattr(ls.rctx, '_restart_accepted', False):
+                    break
     finally:
         # 若中途因 action/cancel 提前退出，为尚未执行的后续工具补齐配对 tool_result，防止 API 400
         if _idx < len(_ordered_calls):
@@ -574,14 +595,16 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
                         name=str(_rem_item["name"]),
                         arguments=dict(_rem_item.get("arguments") or {}),
                     )
+                _cancelled_result = {**interrupted_result(), 'error': 'Skipped: tool batch interrupted or cancelled before execution.'}
                 _rem_msg = ls.formatter.format_tool_result(
                     _rem_tc,
-                    "Skipped: tool batch interrupted or cancelled before execution.",
+                    json.dumps(_cancelled_result),
                 )
                 set_message_meta(_rem_msg, MessageMeta(
                     tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
                     message_type="tool_result",
                 ))
+                _rem_msg.setdefault('_meta', {})['tool_result_structured'] = _cancelled_result
                 ls.messages.append(_rem_msg)
                 _shadow_write(ls, _rem_msg, MessageType.TOOL_RESULT)
 
@@ -613,6 +636,15 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
         )
 
     _flush_step_shadow_writes(ls)
+
+    if getattr(ls.rctx, '_restart_accepted', False):
+        paired = {str(m.get('tool_call_id') or '') for m in ls.messages[_step_tool_msg_start:] if m.get('role') == 'tool'}
+        _persist_tool_results(ls, [
+            {'id': tc.id, 'name': tc.name, 'args': tc.arguments or {}, 'format': 'json',
+             'raw_inline': json.dumps(interrupted_result()), 'result': interrupted_result()}
+            for tc in resp.tool_calls if str(tc.id) not in paired
+        ], [])
+        return None
 
     # finish/ask 最后执行（同轮真实工具已完成）
     if _terminal_call:
@@ -738,6 +770,7 @@ async def _execute_real_tools(
     _tool_ctx._node_extra = ls.node.extra  # type: ignore[attr-defined]
 
     _tool_entries: list[dict[str, Any]] = []
+    _prepared_batch: list[dict[str, Any]] = []
     _tool_atts: list[dict[str, Any]] = []
     # Phase 3 Hook System：预构造当前批次的真实工具调用对象。
     # 原因：before_tool_call 的审批类 handler 需要看到“当前工具”和“本轮工具集合”。
@@ -766,11 +799,13 @@ async def _execute_real_tools(
 
     try:
         for _batch in _batches:
+            if getattr(ls.rctx, '_restart_accepted', False):
+                break
             if await ls.rctx.check_cancelled():
                 break
 
             # 阶段 1：按顺序执行批次内各工具的 before_tool_call 与 execute_tool 预准备
-            _prepared_batch: list[dict[str, Any]] = []
+            _prepared_batch = []
             for _rtc in _batch:
                 if await ls.rctx.check_cancelled():
                     break
@@ -878,15 +913,22 @@ async def _execute_real_tools(
             async def _await_prepared(_item: dict[str, Any]) -> Any:
                 _ex = _item.get("execution")
                 if _ex is None:
-                    return await _execute_registry_tool_with_span(
+                    result = await _execute_registry_tool_with_span(
                         ls.registry,
                         _item["rtc"]["name"],
                         _item["rtc"]["arguments"],
                         _item["call_ctx"],
                     )
-                if inspect.isawaitable(_ex):
-                    return await _ex
-                return _ex
+                elif inspect.isawaitable(_ex):
+                    result = await _ex
+                else:
+                    result = _ex
+                # Store before another await: cancellation of a sibling or after-hook
+                # must not turn an already completed operation into a cancelled one.
+                _item["t_result"] = result
+                if getattr(_item.get('call_ctx'), '_restart_accepted', False):
+                    ls.rctx._restart_accepted = True
+                return result
 
             _runnable_items = [_it for _it in _prepared_batch if _it["status"] == "run"]
             if len(_runnable_items) > 1:
@@ -1071,14 +1113,22 @@ async def _execute_real_tools(
         # 确保因取消或 hook 提前返回时，未执行的剩余 real_tool_calls 全部补齐配对占位结果并落盘
         # _tool_entries 严格按 real_tool_calls 顺序追加，直接从 len(_tool_entries) 起补齐剩余槽位，
         # 避免同轮出现重复/空 tool_call id 时因 set 去重而漏补。
+        completed_by_call = {str(item['rtc'].get('id') or ''): item['t_result'] for item in _prepared_batch if 't_result' in item}
         for _rtc_rem in real_tool_calls[len(_tool_entries):]:
             _rem_id = str(_rtc_rem.get("id") or "")
+            result = completed_by_call.get(_rem_id, interrupted_result())
+            if not any(str(item['rtc'].get('id') or '') == _rem_id for item in _prepared_batch):
+                result = {**result, 'error': 'Skipped: tool batch interrupted or cancelled before execution.'}
+            fmt, raw = result_to_raw(_rtc_rem['name'], result, tool_spec=ls.registry.get_spec(_rtc_rem['name']))
+            if isinstance(raw, str):
+                raw, _ = truncate_tool_result(_rtc_rem['name'], raw, get_tool_inline_limit(_rtc_rem['name'], ls.runtime_cfg), '', config=ls.runtime_cfg)
             _tool_entries.append({
                 "id": _rem_id,
                 "name": _rtc_rem["name"],
                 "args": _rtc_rem.get("arguments") or {},
-                "format": "text",
-                "raw_inline": "Skipped: tool batch interrupted or cancelled before execution.",
+                "format": fmt,
+                "raw_inline": raw,
+                "result": result,
                 "truncated": False,
                 "ref": "",
                 "elapsed_ms": 0.0,
@@ -1122,6 +1172,8 @@ def _persist_tool_results(
             _tool_meta["tool_result_structured"] = _structured
         _tool_meta["tool_result_raw_inline"] = str(_entry.get("raw_inline") or "")
         _tool_meta["tool_result_format"] = str(_entry.get("format") or "")
+        _tool_meta["tool_result_truncated"] = bool(_entry.get("truncated"))
+        _tool_meta["tool_result_ref"] = str(_entry.get("ref") or "")
         if _entry.get("elapsed_ms") is not None:
             _tool_meta["tool_result_elapsed_ms"] = _entry.get("elapsed_ms")
         _entry_attachments = _entry.get("attachments")
@@ -1241,13 +1293,16 @@ async def run_ai_node(
 
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
+    if getattr(rctx, "is_system_task", False) and rctx.task_context.get("execution_max_steps"):
+        max_steps = min(max_steps, int(rctx.task_context["execution_max_steps"]))
 
     # ---- 收集附件 ----
     # [AutoC 2026-08-20] Why: resume attachment merging is a nested-fallback
     # chain over resume payloads, not loop logic. How: delegate to the resume
     # module collector. Purpose: keep the entry function declarative.
     collected_attachments = collect_resume_attachments(attachments, resume_data)
-    _tool_produced_attachments: list[dict[str, Any]] = []
+    _tool_produced_attachments: list[dict[str, Any]] = list(getattr(rctx, '_restart_tool_attachments', []))
+    rctx._restart_tool_attachments = _tool_produced_attachments
 
     # ---- 恢复或新建消息历史 ----
     step_count = 0
@@ -1319,6 +1374,9 @@ async def run_ai_node(
         if resume_data and not instruction:
             messages = [m for m in messages if not (is_dynamic_context(m) and not m.get("id") and not m.get("_persisted_dynamic"))]
         _assembled_fresh = True
+
+    if resume_data and str(resume_data.get('type') or '') == 'restart_interrupted':
+        step_count = max(step_count, int(getattr(rctx, 'completed_steps', 0)))
 
     if _assembled_fresh:
         _prompt_ctx = HookContext(

@@ -183,37 +183,8 @@ def main() -> None:
     # 初始化阶段的 _reconcile_after_restart() 负责。
     # Purpose: 避免保留一个依赖旧回放路径且实际没有效果的启动步骤。
 
-    # Check for pending restart completion → inject inbound_message (v3: self-awareness)
-    _restart_pending_path = data_dir / "restart_pending.json"
-    if _restart_pending_path.exists():
-        try:
-            import json as _rjson
-            _pending = _rjson.loads(_restart_pending_path.read_text(encoding="utf-8"))
-            _conv_key = _pending.get("conversation_key", "")
-            _channel = _pending.get("channel", "")
-            if _conv_key and _channel:
-                _sid = state.get_or_create_session(channel=_channel, conversation_key=_conv_key)
-                _evt = state.eventlog.append(
-                    session_id=_sid,
-                    component="supervisor",
-                    type_="inbound_message",
-                    payload={
-                        "channel": _channel,
-                        "conversation_key": _conv_key,
-                        "text": "[系统通知] 全量重启已完成，新代码已生效。",
-                    },
-                )
-                state.record_inbound_message_event(_evt)
-                _log(f"[supervisor] Injected restart completion inbound for session {_sid}")
-            else:
-                _log(f"[supervisor] restart_pending.json missing conversation_key/channel, skipped")
-        except Exception as e:
-            _log(f"[supervisor] Failed to process restart_pending.json: {e}")
-        finally:
-            try:
-                _restart_pending_path.unlink()
-            except Exception:
-                pass
+    # Legacy notification files are not task recovery records. Never inject a new input.
+    (data_dir / "restart_pending.json").unlink(missing_ok=True)
 
     # [2026-06-06] Why: TUI and VSC plugin cannot hardcode a port number.
     # How: after binding, write the actual port to data/supervisor.port so

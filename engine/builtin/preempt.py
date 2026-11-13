@@ -233,6 +233,9 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     """
     new_instruction = ls.preempt_inject_info.get("message", "")
     new_attachments = ls.preempt_inject_info.get("attachments", [])
+    delivery_ids = ls.preempt_inject_info.get("delivery_ids") or []
+    if not isinstance(delivery_ids, list) or any(not isinstance(i, str) or not i for i in delivery_ids):
+        raise ValueError("invalid callback delivery identities")
 
     content = (
         build_multimodal_content(
@@ -245,6 +248,9 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
         "preempt": True, "message_type": "user_input",
         "source_task_id": getattr(ls.rctx, "task_id", ""),
     }
+    if delivery_ids:
+        message_meta["delivery_ids"] = list(delivery_ids)
+        message_meta["execution_id"] = getattr(ls.rctx, "execution_id", "")
     if new_attachments:
         message_meta["attachments"] = list(new_attachments)
     message = {"role": "user", "content": content, "_meta": message_meta}
@@ -266,26 +272,35 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
             target_session = getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id
             # Persist the exact content already injected, without re-reading attachments.
             message_id = str(uuid4())
-            store.append(
-                target_session,
-                Message(
-                    id=message_id,
-                    role="user",
-                    content=content,
-                    message_type=MessageType.USER_INPUT,
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                    meta=dict(message_meta),
-                    source_node_id=getattr(ls.node, "id", ""),
-                    source_task_id=getattr(ls.rctx, "task_id", ""),
-                ),
-            )
+            if delivery_ids:
+                import hashlib
+                import json
+                key = json.dumps([ls.rctx.task_id, delivery_ids, new_instruction, new_attachments],
+                                 ensure_ascii=False, sort_keys=True)
+                message_id = "callback-" + hashlib.sha256(key.encode()).hexdigest()
+            existing = delivery_ids and any(row.id == message_id for row in store.load(target_session))
+            if not existing:
+                store.append(
+                    target_session,
+                    Message(
+                        id=message_id,
+                        role="user",
+                        content=content,
+                        message_type=MessageType.USER_INPUT,
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                        meta=dict(message_meta),
+                        source_node_id=getattr(ls.node, "id", ""),
+                        source_task_id=getattr(ls.rctx, "task_id", ""),
+                    ),
+                )
             message["id"] = message_id
     except Exception:
         # Do not persist a dynamic suffix or acknowledge input whose row failed.
         raise
 
     # Publish to the live prompt only after the input row is durable.
-    ls.messages.append(message)
+    if not delivery_ids or not any(row.get("id") == message.get("id") for row in ls.messages):
+        ls.messages.append(message)
     rebuild_dynamic_context(
         ls.messages,
         workspace_root=ls.rctx.workspace_root,
@@ -307,6 +322,7 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     await ls.rctx.consume_preempt(
         str(new_instruction or ""),
         len(new_attachments) if isinstance(new_attachments, list) else 0,
+        **({"delivery_ids": delivery_ids, "message_id": message.get("id", "")} if delivery_ids else {}),
     )
     await ls.rctx.emit_event("preempt_injected", {
         "node_id": ls.node.id,

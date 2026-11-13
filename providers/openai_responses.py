@@ -17,6 +17,7 @@ chat/completions provider in openai.py.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -29,6 +30,8 @@ from providers.base import BaseProvider, ProviderResponse, ToolCall
 from providers.openai import _normalize_base_url
 
 log = logging.getLogger(__name__)
+
+MAX_CACHE_KEY_LEN = 64
 
 # [2026-05-01] NativeToolFormatter stores tool results as user text, and older
 # fake-native history stores tool calls as textual records.  The Responses
@@ -762,6 +765,16 @@ class OpenAIResponsesProvider(BaseProvider):
     # Payload builder (shared between chat and chat_stream)
     # ------------------------------------------------------------------
 
+    def _cache_key(self) -> str:
+        """Reuse the engine's stable routing identity for prompt-cache grouping."""
+        raw = str(self._options.get("_sticky_session_id") or "").strip()
+        if not raw:
+            return ""
+        if len(raw) <= MAX_CACHE_KEY_LEN:
+            return raw
+        # Keep long session identities deterministic and bounded; do not truncate the ID itself.
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
     def _build_payload(
         self,
         *,
@@ -777,6 +790,9 @@ class OpenAIResponsesProvider(BaseProvider):
             # Request encrypted reasoning tokens for multi-turn round-trip
             "include": ["reasoning.encrypted_content"],
         }
+        cache_key = self._cache_key()
+        if cache_key:
+            payload["prompt_cache_key"] = cache_key
         if instructions:
             payload["instructions"] = instructions
         if tools:

@@ -42,6 +42,7 @@ class RunContext:
     default_model: str = "gpt-4o-mini"
     user_text: str = ""
     task_id: str = ""
+    execution_id: str = ""  # Identity of this claim, not the session generation.
     inbound_message_id: str = ""  # Stable identity of the current persisted input.
     inbound_message: dict = field(default_factory=dict)  # Replayable current input, including its type.
     session_generation: int = 0
@@ -85,6 +86,8 @@ class RunContext:
             payload.setdefault("is_system_task", True)
         if self.current_llm_request_id:
             payload.setdefault("llm_request_id", self.current_llm_request_id)
+        if event_type in {"intermediate_reply", "assistant_text"}:
+            payload.setdefault("execution_id", self.execution_id)
         if self.response_info and event_type in {
             "assistant_text", "intermediate_reply", "stream_text_final", "tool_call_start", "tool_call_end",
         }:
@@ -95,12 +98,17 @@ class RunContext:
             payload.setdefault("branch_session_id", self.session_id)
         get_bus().emit(Signal(name=event_type, payload=dict(payload)))
         try:
-            await self.http.post(
+            response = await self.http.post(
                 f"{self.supervisor_url}/v1/sessions/{route_session_id}/events",
                 json={"type": event_type, "payload": payload},
             )
-        except Exception:
-            pass
+            if event_type in {"intermediate_reply", "assistant_text"}:
+                response.raise_for_status()
+        except Exception as exc:
+            if event_type in {"intermediate_reply", "assistant_text"}:
+                # Normal presentation remains best-effort, but automatic review
+                # must not mistake an unacknowledged reply for complete history.
+                self._history_write_error = f"reply event unconfirmed: {type(exc).__name__}: {exc}"
 
     async def check_cancelled(self) -> bool:
         try:
@@ -134,19 +142,47 @@ class RunContext:
             pass
         return {"preempted": False, "message": "", "attachments": []}
 
-    async def consume_preempt(self, message: str = "", attachment_count: int = 0) -> None:
-        """Acknowledge only the prefix already injected into the current history."""
-        try:
-            if self.task_id:
-                await self.http.post(
-                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed",
-                    json={
-                        "consumed_message": str(message or ""),
-                        "consumed_attachment_count": int(attachment_count or 0),
-                    },
-                )
-        except Exception:
-            pass
+    async def consume_preempt(
+        self, message: str = "", attachment_count: int = 0, *,
+        delivery_ids: list[str] | None = None, message_id: str = "",
+    ) -> None:
+        """Acknowledge the observed prefix, with durable callback identities when present."""
+        if not self.task_id:
+            return
+        payload = {
+            "consumed_message": str(message or ""),
+            "consumed_attachment_count": int(attachment_count or 0),
+        }
+        if delivery_ids:
+            payload.update(delivery_ids=list(delivery_ids), message_id=message_id,
+                           execution_id=self.execution_id)
+            await self._confirm_input("preempt_consumed", payload)
+            return
+        # Preserve the legacy text-only protocol; callback acknowledgements above
+        # must never silently claim that a failed HTTP request was accepted.
+        await self.http.post(
+            f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed", json=payload,
+        )
+
+    async def admit_input(self, delivery_ids: list[str], message_id: str) -> None:
+        """Confirm callbacks only after their input row was persisted."""
+        if delivery_ids:
+            await self._confirm_input("inputs_admitted", {
+                "delivery_ids": list(delivery_ids), "message_id": message_id,
+                "execution_id": self.execution_id,
+            })
+
+    async def _confirm_input(self, endpoint: str, payload: dict) -> None:
+        if not payload.get("message_id"):
+            raise ValueError("callback admission requires a persisted message ID")
+        response = await self.http.post(
+            f"{self.supervisor_url}/v1/tasks/{self.task_id}/{endpoint}",
+            json=payload, timeout=10.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise RuntimeError("callback admission was not confirmed")
 
     async def list_active_child_tasks(self) -> list[dict[str, Any]]:
         """Return active child-agent tasks routed under this conversation.

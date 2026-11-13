@@ -93,6 +93,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # 入队去重，lost 后拒绝再入队。
         self._async_tool_pending_cancels: dict[str, list[str]] = {}  # worker_id -> [async_id]
 
+        from .restart_recovery import RestartRecovery
+        self.restart_recovery = RestartRecovery(self)
+        from .execution_runtime import ExecutionRuntime
+        self.execution_runtime = ExecutionRuntime(self)
         self._init_hooks_and_sessions(workspace_root)
 
     def _purge_context_usage_for_session(self, session_id: str) -> None:
@@ -103,8 +107,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
     def _init_hooks_and_sessions(self, workspace_root: Path) -> None:
         """Initialise hook registry, plugins, and session persistence (called from __init__)."""
-        self._pending_restart_notify: str | None = None  # session_id to notify after engine registers
-
         # Why: supervisor feature side effects should be registered handlers rather
         # than hard-coded router or scheduler branches. How: create one unified
         # HookRegistry per SupervisorState and auto-discover built-ins before
@@ -130,6 +132,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self.routes_face = PluginRoutesFace()
         _supervisor_ctx = EngineContext(hooks=self.hook_registry)
         _supervisor_ctx.contributions.mount("routes", self.routes_face)
+        _supervisor_ctx.contributions.mount("execution", self.execution_runtime)
         # [AutoC 2026-08-30] nodes face: plugins declare nodes visible to the
         # supervisor node list and switch-node discovery in this process.
         from engine.faces.nodes import PluginNodesFace
@@ -195,7 +198,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     self.entry_branch_parents[child_sid] = psid
                     self.parent_entry_branches.setdefault(psid, set()).add(child_sid)
 
+        self.restart_recovery.restore()
         self._reconcile_after_restart()
+        self.restart_recovery.consume()
+        self.execution_runtime.mark_ready()
 
     # ── [plugin-admin 2026-08-23] Runtime external-plugin management ───────
 
@@ -558,6 +564,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             # 过期 child 等条件。How: 用 set 做去重，用 list 保留可读的处理顺序。
             # Purpose: 清理日志和计数稳定，不重复删除同一条 sessions.json 记录。
             sid = str(session_id or "").strip()
+            if sid in self.restart_recovery.protected_sessions:
+                return
             if sid and sid not in seen_stale:
                 seen_stale.add(sid)
                 stale_sids.append(sid)
@@ -950,8 +958,12 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             info = self.sessions.get(route_sid)
             if info is None:
                 return None
-            info.workspace = clean
+            previous = dict(info.workspace or {})
             self._session_store.update_workspace(route_sid, clean)
+            info.workspace = clean
+            runtime = getattr(self, "execution_runtime", None)
+            if runtime is not None and previous != clean:
+                runtime.notify("workspace", route_sid, previous=previous, workspace=clean)
             self.eventlog.append(
                 session_id=route_sid,
                 component="supervisor",
@@ -1763,13 +1775,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 if not _sid or _sid not in self.sessions:
                     continue
                 try:
-                    self.inject_async_result(
-                        _sid,
+                    self.execution_runtime.queue_result(
+                        delivery_id=f"lost:{_lost.get('async_id')}:{self.execution_runtime.boot_id}",
+                        work_id=str(_lost.get("async_id") or ""),
+                        origin_task_id=str(_lost.get("task_id") or ""), session_id=_sid,
+                        target_generation=_lost.get("target_generation"),
                         text=(
                             f'⚠️ 异步工具 "{_lost.get("tool_name", "")}" '
                             f'(id: {_lost.get("async_id", "")}) 因引擎重启中断，结果已丢失。'
                         ),
-                        source_task_id=str(_lost.get("task_id") or ""),
                     )
                 except Exception:
                     pass
@@ -1783,29 +1797,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     "generation_id": gid,
                     "previous_generation_id": old_gen or "",
                     "orphans_cancelled": orphan_count,
+                    **self.restart_recovery.registration(wid, gid),
                     "ts": _now().isoformat(),
                 },
             )
-
-            # ---- Deferred restart notification ----
-            # Injected here (after orphan cleanup) so the new task gets the
-            # current generation and won't be reaped as an orphan.
-            if self._pending_restart_notify:
-                _notify_sid = self._pending_restart_notify
-                self._pending_restart_notify = None  # consume once
-                _si = self.sessions.get(_notify_sid)
-                if _si:
-                    _restart_evt = self.eventlog.append(
-                        session_id=_notify_sid,
-                        component="supervisor",
-                        type_="inbound_message",
-                        payload={
-                            "channel": _si.channel,
-                            "conversation_key": _si.conversation_key,
-                            "text": "[系统通知] Engine 重启已完成，新代码已生效。",
-                        },
-                    )
-                    self.record_inbound_message_event(_restart_evt)
 
             return {"ok": True, "orphans_cancelled": orphan_count, "generation_id": gid}
 
@@ -1825,8 +1820,31 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         if not aid:
             return {"ok": False, "error": "async_id required"}
         with self._lock:
+            runtime = getattr(self, "execution_runtime", None)
+            task_id = str(entry.get("task_id") or "")
+            execution_id = str(entry.get("execution_id") or "")
+            task = self.tasks.get(task_id)
+            if execution_id or (task is not None and task.execution_id):
+                if not execution_id or not task or task.execution_id != execution_id or task.worker_id != entry.get("worker_id") or task.status != TaskStatus.running:
+                    return {"ok": False, "error": "stale async execution"}
+                route_sid = self._route_session_id_for_task_locked(task)
+                if str(entry.get("session_id") or "") != route_sid:
+                    return {"ok": False, "error": "async target does not match source"}
+            existing = self._async_tools.get(aid)
+            if existing:
+                identity = {key: str(entry.get(key) or "") for key in
+                            ("task_id", "execution_id", "session_id", "worker_id", "node_id", "tool_name", "upgraded_from")}
+                identity["args_summary"] = str(entry.get("args_summary") or "")[:200]
+                if any(existing.get(key, "") != value for key, value in identity.items()):
+                    return {"ok": False, "error": "async identity conflict"}
+                if runtime is not None:
+                    runtime._save()
+                return {"ok": True, "target_generation": existing.get("target_generation"), "boot_id": existing.get("boot_id", "")}
             self._async_tools[aid] = {
                 "async_id": aid,
+                "execution_id": execution_id,
+                "target_generation": self._current_session_generation_locked(str(entry.get("session_id") or "")) or 1,
+                "boot_id": runtime.boot_id if runtime is not None else "",
                 "tool_name": str(entry.get("tool_name") or ""),
                 "session_id": str(entry.get("session_id") or ""),
                 "task_id": str(entry.get("task_id") or ""),
@@ -1847,8 +1865,12 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if len(finished) > self._ASYNC_TOOLS_MAX:
                 finished.sort(key=lambda k: self._async_tools[k].get("finished_at") or "")
                 for k in finished[: len(finished) - self._ASYNC_TOOLS_MAX]:
-                    del self._async_tools[k]
-        return {"ok": True}
+                    if runtime is None or any(r.get("work_id") == k and r.get("status") == "processed" for r in runtime._receipts.values()):
+                        del self._async_tools[k]
+            if runtime is not None:
+                runtime._save()
+                runtime.notify("task", str(entry.get("session_id") or ""), work=self._async_tools[aid])
+            return {"ok": True, "target_generation": self._async_tools[aid]["target_generation"], "boot_id": self._async_tools[aid]["boot_id"]}
 
     def finish_async_tool(self, async_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """标记一个异步工具完成或失败。engine 在结果投递时调用。"""
@@ -1857,9 +1879,28 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             entry = self._async_tools.get(aid)
             if entry is None:
                 return {"ok": False, "error": "unknown async_id"}
+            if entry.get("execution_id"):
+                if any(body.get(k) != entry.get(k) for k in ("execution_id", "target_generation", "boot_id")) or entry.get("boot_id") != self.execution_runtime.boot_id:
+                    return {"ok": False, "error": "stale async lifecycle report"}
             status = str(body.get("status") or "done").strip()
             if status not in {"done", "failed", "cancelled"}:
-                status = "done"
+                return {"ok": False, "error": "invalid async status"}
+            if entry.get("status") == "lost":
+                return {"ok": False, "error": "async execution was lost"}
+            runtime = getattr(self, "execution_runtime", None)
+            carrier = str(body.get("carrier_task_id") or "")
+            did = str(body.get("delivery_id") or f"inline:{aid}")
+            if body.get("delivered_inline") is True:
+                if carrier != entry["task_id"]:
+                    return {"ok": False, "error": "inline carrier must be source task"}
+                receipt = runtime._receipts.get(did) if runtime is not None else None
+                if receipt is not None and (receipt.get("work_id") != aid or receipt.get("carrier_task_id") != carrier):
+                    return {"ok": False, "error": "inline delivery identity conflict"}
+            if entry.get("status") in {"done", "failed", "cancelled"} and entry["status"] != status:
+                runtime = getattr(self, "execution_runtime", None)
+                delivered = runtime is not None and any(r.get("work_id") == aid and r.get("status") != "lost" for r in runtime._receipts.values())
+                if not (entry["status"] == "done" and status == "cancelled" and not delivered):
+                    return {"ok": False, "error": "async terminal status conflict"}
             entry["status"] = status
             entry["finished_at"] = _now().isoformat()
             # [fix 2026-09-03] a finish report settles the entry; a stale
@@ -1870,6 +1911,14 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             except (TypeError, ValueError):
                 entry["elapsed_sec"] = None
             entry["error"] = str(body.get("error") or "")[:500]
+            runtime = getattr(self, "execution_runtime", None)
+            if runtime is not None:
+                if body.get("delivered_inline") is True:
+                    runtime._receipts.setdefault(did, {"delivery_id": did, "work_id": aid,
+                        "origin_task_id": carrier, "session_id": entry["session_id"],
+                        "carrier_task_id": carrier, "status": "admitted", "message_id": f"inline:{aid}"})
+                runtime._save()
+                runtime.notify("task", entry["session_id"], work=entry)
         return {"ok": True}
 
     def list_async_tools(self) -> list[dict[str, Any]]:
@@ -1922,7 +1971,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         wid = (worker_id or "").strip()
         lost: list[dict[str, Any]] = []
         for entry in self._async_tools.values():
-            if entry.get("worker_id") == wid and entry.get("status") == "running":
+            runtime = getattr(self, "execution_runtime", None)
+            delivered = runtime is not None and any(r.get("work_id") == entry.get("async_id") and r.get("status") != "lost" for r in runtime._receipts.values())
+            if entry.get("worker_id") == wid and (entry.get("status") == "running" or (entry.get("status") == "done" and not delivered)):
                 entry["status"] = "lost"
                 entry["finished_at"] = _now().isoformat()
                 entry["error"] = "engine worker restarted"

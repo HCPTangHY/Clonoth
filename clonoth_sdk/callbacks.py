@@ -597,16 +597,15 @@ class AdapterCallbacks(Protocol):
         self,
         payload: dict[str, Any],
     ) -> None:
-        """Engine worker restarted (generation changed).
+        """Engine lifecycle notification, including a planned restart's two phases.
 
-        Triggered when engine_registered event has a non-empty
-        previous_generation_id, indicating a restart rather than first boot.
-
-        Adapter should notify relevant channels that the engine has restarted.
+        When preserve_tasks=True and restart_id is nonempty, keep delivery and
+        progress bindings; phase is 'stopping' or 'restored'. Clear only partial
+        stream previews. Other restart notifications retain legacy cleanup.
 
         Args:
-            payload: engine_registered event payload containing:
-                worker_id, generation_id, previous_generation_id,
-                orphans_cancelled, ts.
+            payload: engine lifecycle fields including worker_id, generation_id,
+                previous_generation_id, orphans_cancelled and ts; planned restarts
+                additionally carry preserve_tasks, restart_id and phase.
         """
         ...

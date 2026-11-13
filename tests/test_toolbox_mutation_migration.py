@@ -76,6 +76,7 @@ class FakeCtx:
         self.session_id = "test-session"
         self.parent_session_id = ""
         self.task_id = ""
+        self.tool_call_id = ""
         self.worker_id = "test-worker"
         self.supervisor_url = "http://supervisor.invalid"
         self.http = _FakeHttp(http_status)
@@ -727,11 +728,28 @@ class SystemCheckpointTests(unittest.TestCase):
         self.assertFalse(res["data"]["git_commit"]["ok"])
         self.assertTrue(any(url.endswith("/v1/admin/restart") for url, _ in ctx.http.posts))
 
+    def test_restart_carries_invocation_identity_separately_from_parent_route(self) -> None:
+        ctx = FakeCtx(self.root)
+        ctx.session_id = "branch-execution"
+        ctx.parent_session_id = "user-session"
+        ctx.task_id = "running-task"
+        ctx.tool_call_id = "restart-call"
+        res = asyncio.run(system_mod.request_restart({"target": "all"}, ctx))
+        self.assertTrue(res["ok"], res)
+        requests = [body for url, body in ctx.http.posts if url.endswith("/v1/admin/restart")]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["session_id"], "user-session")
+        self.assertEqual(requests[0]["task_id"], "running-task")
+        self.assertEqual(requests[0]["tool_call_id"], "restart-call")
+        self.assertTrue(ctx._restart_accepted)
+        self.assertFalse(any("inbound" in url for url, _ in ctx.http.posts))
+
     def test_restart_endpoint_failure_is_reported(self) -> None:
         ctx = FakeCtx(self.root, http_status=500)
         res = asyncio.run(system_mod.request_restart({"target": "engine"}, ctx))
         self.assertFalse(res["ok"])
         self.assertIn("git_commit", res["data"])
+        self.assertFalse(getattr(ctx, "_restart_accepted", False))
 
 
 # ── search_in_files replace: template validation and write isolation ──────────

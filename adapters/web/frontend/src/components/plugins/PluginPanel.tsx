@@ -21,12 +21,23 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { pluginApiRequest } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
+import { callHostAction } from '../../store/hostActions';
 import { Icon } from '../common';
 import { resolvePanelEntry } from './panelEntry';
 import { applyHostTheme } from './themeBridge';
 
 // module-level refcount for the shared window.__CLONOTH_BOOT__ (see effect below)
 let bootRefCount = 0;
+
+interface PanelContext {
+  sessionId: string;
+  readonly viewportWidth: number;
+  request: (path: string, init?: RequestInit) => Promise<unknown>;
+  call: (name: string, ...args: unknown[]) => Promise<unknown>;
+  close: () => void;
+}
+
+type PanelWindow = Window & { __CLONOTH_PANEL__?: PanelContext };
 
 interface PanelAccess {
   key: string;
@@ -62,6 +73,63 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
   const panelReady = Boolean(adminToken) && Boolean(accessForFrame?.ready);
   const accessError = accessForFrame?.error || '';
   const frameRef = useRef<HTMLIFrameElement>(null);
+  const currentFrameKey = useRef(frameKey);
+  currentFrameKey.current = frameKey;
+  const bridgeDisposer = useRef<(() => void) | null>(null);
+  useEffect(() => () => { bridgeDisposer.current?.(); bridgeDisposer.current = null; }, [frameKey]);
+
+  // A frame-local bridge avoids shared session/token state. Panel modules listen
+  // for this event or read the context immediately if their import finishes later.
+  const attachPanelContext = (frame: HTMLIFrameElement) => {
+    bridgeDisposer.current?.();
+    const target = frame.contentWindow as PanelWindow | null;
+    if (!target) return;
+    let active = true;
+    const pending = new Set<AbortController>();
+    const assertCurrent = () => {
+      if (!active || !frame.isConnected || frameRef.current !== frame
+          || currentFrameKey.current !== frameKey || !adminToken
+          || useSettingsStore.getState().adminToken !== adminToken) {
+        throw new Error('面板会话已失效，请重新打开。');
+      }
+    };
+    const context: PanelContext = {
+      sessionId,
+      get viewportWidth() { assertCurrent(); return window.innerWidth; },
+      async request(path, init) {
+        assertCurrent();
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        if (init?.signal?.aborted) abort();
+        init?.signal?.addEventListener('abort', abort, { once: true });
+        pending.add(controller);
+        try {
+          const headers = Object.fromEntries(new Headers(init?.headers));
+          delete headers.authorization;
+          headers.Authorization = `Bearer ${adminToken}`;
+          const result = await pluginApiRequest(path, { ...init, headers, signal: controller.signal });
+          assertCurrent();
+          return result;
+        } finally {
+          pending.delete(controller);
+          init?.signal?.removeEventListener('abort', abort);
+        }
+      },
+      async call(name, ...args) {
+        assertCurrent();
+        return callHostAction(name, ...args);
+      },
+      close() { assertCurrent(); bridgeDisposer.current?.(); onClose(); },
+    };
+    target.__CLONOTH_PANEL__ = context;
+    bridgeDisposer.current = () => {
+      active = false;
+      for (const controller of pending) controller.abort();
+      if (target.__CLONOTH_PANEL__ === context) delete target.__CLONOTH_PANEL__;
+    };
+    applyHostTheme(frame.contentDocument);
+    target.dispatchEvent(new CustomEvent('clonoth:panel-context'));
+  };
 
   // [2026-09-12] Panel session lifecycle: request a short-lived cookie before the
   // frame mounts and renew it at half the advertised lifetime. Logout clears the
@@ -230,6 +298,7 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
           key={frameKey}
           ref={frameRef}
           src={entry}
+          onLoad={(event) => attachPanelContext(event.currentTarget)}
           title={title}
           className="min-h-0 w-full flex-1 border-0 bg-[var(--duties-bg)]"
         />

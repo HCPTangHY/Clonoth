@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,7 +130,9 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             all_atts: list[dict[str, Any]] = [] 
             for e in entries:
                 _name = e.get("name", "unknown")
-                _raw = e.get("raw_inline", "")
+                _raw = e.get("raw_inline") or e.get("text") or e.get("error") or ""
+                if e.get("cancelled") or e.get("status") == "cancelled":
+                    _raw = f"Cancelled. {_raw} External effects may already have occurred; check actual state before retrying."
                 msgs.append({"role": "user", "content": f'Tool result for "{_name}":\n{_raw}'})
                 atts = _attachments_from_payload(e)
                 if atts:
@@ -150,8 +154,10 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
 
                 if _kind == "tool":
                     _name = e.get("name", "unknown")
-                    _raw = e.get("raw_inline", "")
-                    if _status == "fail":
+                    _raw = e.get("raw_inline") or e.get("text") or e.get("error") or ""
+                    if _status == "cancelled":
+                        msgs.append({"role": "user", "content": f'Tool "{_name}" was cancelled. {_raw} External effects may already have occurred; check actual state before retrying.'})
+                    elif _status == "fail":
                         msgs.append({"role": "user", "content": f'Tool "{_name}" 执行失败：{e.get("error", "")}'})    
                     else:
                         msgs.append({"role": "user", "content": f'Tool result for "{_name}":\n{_raw}'})
@@ -159,7 +165,9 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                     _node = str(e.get("node_id") or "unknown")
                     _instr = str(e.get("instruction") or "")
                     _text = str(e.get("text") or "")
-                    if _status == "fail":
+                    if _status == "cancelled":
+                        msgs.append({"role": "user", "content": f"子节点 {_node} 已取消。{e.get('error') or _text}"})
+                    elif _status == "fail":
                         msgs.append({"role": "user", "content": f"子节点 {_node} 执行失败：{e.get('error', '')}"})    
                     else:
                         lines = [f"子节点 {_node}（指令：{_instr[:100]}）已完成。"]
@@ -260,6 +268,8 @@ def collect_resume_attachments(
     nested fallback chain here and return one merged list. Purpose: the entry
     function keeps only loop construction.
     """
+    while resume_data and resume_data.get("type") == "restart_interrupted":
+        resume_data = resume_data.get("previous_resume_data") or {}
     collected: list[dict[str, Any]] = []
     if attachments:
         collected.extend(attachments)
@@ -367,12 +377,15 @@ def _apply_output_rejected(
             "is_rejection": True,
             "rejection_source": _rej_src,
             "rejection_code": "output_rejected",
+            "resume_id": resume_data.get("resume_id", ""),
         }
         if _cur_tid:
             _rej_meta_dict["source_task_id"] = _cur_tid
         _rej_user_msg = {
             "role": "user",
-            "content": _rej_line,
+            "id": "resume:" + str(resume_data.get("resume_id") or uuid4()),
+            "content": (build_multimodal_content(_rej_line, _attachments_from_payload(_rej_result))
+                        if _attachments_from_payload(_rej_result) else _rej_line),
             "message_type": "output_rejected",
         }
         set_message_meta(_rej_user_msg, MessageMeta(
@@ -385,9 +398,9 @@ def _apply_output_rejected(
         if _store and _target_sid:
             try:
                 _store.append(_target_sid, Message(
-                    id=str(uuid4()),
+                    id=_rej_user_msg["id"],
                     role="user",
-                    content=_rej_line,
+                    content=_rej_user_msg["content"],
                     message_type="output_rejected",
                     created_at=datetime.now(timezone.utc).isoformat(),
                     meta=dict(_rej_meta_dict),
@@ -397,6 +410,7 @@ def _apply_output_rejected(
             except Exception as _wr_exc:
                 logger.warning("output_rejected(implicit): append failed sid=%s: %s",
                             _target_sid, _wr_exc)
+                raise
     else:
         # 显式 finish：找到对应的 tool_result 并替换内容。
         if _finish_call_id:
@@ -426,9 +440,12 @@ def _apply_output_rejected(
             "is_rejection": True,
             "rejection_source": _rej_src,
             "rejection_code": "output_rejected",
+            "resume_id": resume_data.get("resume_id", ""),
+            "source_task_id": _cur_tid,
         })
         if _finish_result_idx >= 0:
             _old_msg_id = str(messages[_finish_result_idx].get("id") or "").strip()
+            _rej_msg["id"] = _old_msg_id
             messages[_finish_result_idx] = _rej_msg
             logger.info("output_rejected(explicit): replaced tool_result at idx=%d fcid=%s",
                      _finish_result_idx, _finish_call_id)
@@ -436,13 +453,19 @@ def _apply_output_rejected(
             _target_sid = getattr(rctx, 'child_session_id', '') or rctx.session_id
             if _old_msg_id and _store:
                 try:
-                    _store.update_message(_target_sid, _old_msg_id, _rej_msg)
+                    if not _store.update_message(_target_sid, _old_msg_id, _rej_msg):
+                        raise RuntimeError("Rejection target was not durably recorded")
                 except Exception as _upd_exc:
                     logger.warning("output_rejected: update_message failed sid=%s msg=%s: %s",
                                 _target_sid, _old_msg_id, _upd_exc)
+                    raise
             elif not _old_msg_id:
                 logger.warning("output_rejected: msg id missing, cannot persist reject to JSONL")
         else:
+            _rej_msg["id"] = "resume:" + str(resume_data.get("resume_id") or uuid4())
+            if _store and _target_sid:
+                _store.append(_target_sid, Message.from_dict({**_rej_msg, "meta": _rej_msg["_meta"],
+                    "message_type": "tool_result", "source_task_id": _cur_tid, "source_node_id": node.id}))
             messages.append(_rej_msg)
             logger.info("output_rejected(explicit): appended orphan tool_result fcid=%s",
                      _finish_call_id)
@@ -507,8 +530,46 @@ async def apply_resume_messages(
     resume types by name. Purpose: keep the entry function slim while resume
     semantics stay in the resume module.
     """
-    messages.extend(_build_resume_messages(resume_data))
     _rtype = str(resume_data.get("type") or "")
+    if _rtype == "restart_interrupted":
+        from ..restart_recovery import repair_restart_history
+        repair_restart_history(messages, resume_data, formatter, rctx, node)
+        previous = resume_data.get("previous_resume_data")
+        if isinstance(previous, dict) and previous:
+            await apply_resume_messages(messages=messages, resume_data=previous, formatter=formatter, node=node, rctx=rctx)
+        return
+    # The caller's resume identity is stable across restart wrappers, not inferred
+    # from the result text. Legacy payloads retain a deterministic fallback.
+    identity = str(resume_data.get("resume_id") or hashlib.sha256(json.dumps(
+        [getattr(rctx, "task_id", ""), getattr(rctx, "_resume_execution_id", ""), resume_data],
+        sort_keys=True, ensure_ascii=False).encode()).hexdigest())
+    store = getattr(rctx, "conversation_store", None)
+    sid = getattr(rctx, "child_session_id", "") or getattr(rctx, "session_id", "")
+    stored = store.load(sid) if store and sid else []
+    consumed = [m for m in stored if m.source_task_id == getattr(rctx, "task_id", "") and m.meta.get("resume_id") == identity]
+    if consumed:
+        present = {m.get("id") for m in messages}
+        for row in consumed:
+            if row.id not in present:
+                replay = {**row.to_dict(), "_meta": {**row.meta, "source_task_id": row.source_task_id}}
+                if row.role == "tool" and not any(call.get("id") == row.tool_call_id
+                        for message in messages for call in message.get("tool_calls", [])):
+                    # Control-history sanitization can remove the finish call. Keep
+                    # its original rejection text without creating an orphan tool row.
+                    replay.update(role="user")
+                    replay.pop("tool_call_id", None)
+                    replay.pop("name", None)
+                messages.append(replay)
+        return
+    built = _build_resume_messages(resume_data)
+    for index, message in enumerate(built):
+        message["id"] = f"resume:{identity}:{index}"
+        message["_meta"] = {"resume_id": identity, "message_type": "resume_input", "source_task_id": getattr(rctx, "task_id", "")}
+    if built and store and sid:
+        store.append_batch(sid, [Message.from_dict({**m, "meta": m["_meta"], "message_type": "resume_input",
+            "source_task_id": getattr(rctx, "task_id", ""), "source_node_id": node.id}) for m in built])
+    messages.extend(built)
+    resume_data = {**resume_data, "resume_id": identity}
     if _rtype == "output_rejected":
         _apply_output_rejected(
             messages=messages, resume_data=resume_data,

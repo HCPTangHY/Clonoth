@@ -7,11 +7,15 @@
 // only startup session loading and the Zustand useChatStore action surface.
 import { create } from 'zustand';
 import { useClientPrefsStore } from './clientPrefsStore';
+import { useSettingsStore } from './settingsStore';
+import { clearComposerDrafts } from './composerModes';
+import { clearPluginStates } from './pluginRuntime';
 import { compileApprovalPreset } from './sessionApprovalRules';
 import { useSessionApprovalStore } from './sessionApprovalStore';
 
 import {
   cancelActiveTasks,
+  createClientRequestId,
   deleteSession,
   getSessionHistoryPage,
   listAllSessions,
@@ -19,6 +23,11 @@ import {
   preemptTask,
   retryInbound,
   uploadAttachment,
+  getOrCreateWebSession,
+  updateSessionApprovalRules,
+  updateSessionProviderOverride,
+  getStoredAdminToken,
+  switchNode,
 } from '../api/supervisorClient';
 import type { Attachment } from '../types/message';
 import { createInitialChatState } from './eventReducer';
@@ -83,6 +92,53 @@ import {
 // ── Module-level State ─────────────────────────────────────────────────────
 
 let startupLoaded = false;
+
+// Session setup must finish before a plugin can start model work. Failed setup
+// leaves no task, and retries reuse the same conversation/session identity.
+const composerSessions = new Map<string, Promise<string>>();
+export async function ensureComposerSession(conversationId: string, isCurrent: () => boolean): Promise<string> {
+  const existing = useChatStore.getState().conversations.find(item => item.id === conversationId);
+  if (existing?.sessionId) return existing.sessionId;
+  let pending = composerSessions.get(conversationId);
+  if (!pending) {
+    const settings = useSettingsStore.getState();
+    const nodeId = settings.activeNodeId || settings.entryNodeId;
+    const override = settings.pendingProviderOverride;
+    const defaults = useClientPrefsStore.getState();
+    const rules = compileApprovalPreset(defaults.approvalLevel, defaults.autoApproveTools);
+    pending = (async () => {
+      const result = await getOrCreateWebSession(`web:${conversationId}`);
+      if (!isCurrent()) throw new Error('会话已切换，目标未提交。');
+      if (nodeId) await switchNode(result.session_id, nodeId);
+      if (!isCurrent()) throw new Error('会话已切换，目标未提交。');
+      if (override) await updateSessionProviderOverride(result.session_id, getStoredAdminToken(), override);
+      if (!isCurrent()) throw new Error('会话已切换，目标未提交。');
+      await updateSessionApprovalRules(result.session_id, rules);
+      if (!isCurrent()) throw new Error('会话已切换，目标未提交。');
+      return result.session_id;
+    })();
+    composerSessions.set(conversationId, pending);
+  }
+  try { return await pending; }
+  catch (error) { composerSessions.delete(conversationId); throw error; }
+}
+
+export function bindComposerSession(conversationId: string, sessionId: string, text: string, activate: boolean): void {
+  const state = useChatStore.getState();
+  const existing = state.conversations.find(item => item.id === conversationId);
+  useChatStore.setState(current => ({
+    conversations: upsertConversationMeta(current.conversations, {
+      ...(existing || createConversationMeta(conversationId)), sessionId,
+      title: existing?.title && existing.title !== '新对话' ? existing.title : getInitialTitleFromClientPrefs(text, '新对话'),
+      updatedAt: new Date().toISOString(),
+    }),
+    conversationIdsBySession: { ...current.conversationIdsBySession, [sessionId]: conversationId },
+    ...(activate ? { activeConversationId: conversationId } : {}),
+  }));
+  if (activate) { setHashForConversation(conversationId); saveLastActiveConversationId(conversationId); }
+  void useSessionApprovalStore.getState().load(sessionId);
+  startEventPump(useChatStore.setState, useChatStore.getState);
+}
 
 type UploadedMessageAttachment = {
   name: string;
@@ -239,6 +295,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     // 在 historyLoader 里统一比较（parent 与 child 两条路径共用）。Purpose:
     // 登出后 store 只接受重新登录后的响应。
     invalidateStoreGeneration();
+    composerSessions.clear();
+    clearComposerDrafts();
+    clearPluginStates();
     startupLoaded = false;
     set({
       ...createInitialChatState(),
@@ -441,6 +500,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     if (!trimmed && (!attachments || attachments.length === 0)) return;
 
     const state = get();
+    const requestId = createClientRequestId();
     const temporarySessionId = state.viewingChildSessionId?.trim() || '';
     const temporaryConversationKey = state.viewingChildConversationKey?.trim() || temporarySessionId;
 
@@ -460,10 +520,12 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       }));
 
       let sessionId = temporarySessionId;
+      let handled = false;
       try {
         const uploadedAttachments = await uploadMessageAttachments(attachments, temporaryConversationKey);
         const result = await postInbound({
           conversation_key: temporaryConversationKey,
+          message_id: requestId,
           text: trimmed,
           attachments: uploadedAttachments,
           use_context: true,
@@ -472,8 +534,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
           session_id: temporarySessionId,
         });
         sessionId = result.session_id || temporarySessionId;
+        handled = Boolean(result.handled);
         const inboundSeq = result.inbound_seq;
-        if (inboundSeq != null) {
+        if (inboundSeq > 0) {
           const targetConversationId = getChildConversationId(sessionId);
           const optimisticId = `message:${targetConversationId}:user:inbound:${inboundSeq}`;
           const now = new Date().toISOString();
@@ -532,7 +595,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
               },
               generatingBySession: {
                 ...current.generatingBySession,
-                [sessionId]: true,
+                [sessionId]: result.handled ? Boolean(current.activeTaskBySession[sessionId]) : true,
               },
               lastSeqBySession: {
                 ...current.lastSeqBySession,
@@ -548,7 +611,8 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
             };
           });
         }
-      } catch {
+      } catch (error) {
+        console.error(`[input] 消息提交未确认成功：${error instanceof Error ? error.message : String(error)}`);
         set((current) => ({
           isGenerating: false,
           connectionStatus: current.connectionStatus === 'open' ? 'open' : 'closed',
@@ -560,6 +624,15 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         return;
       }
 
+      if (handled) {
+        set((current) => {
+          const generatingBySession = { ...current.generatingBySession, [sessionId]: Boolean(current.activeTaskBySession[sessionId]) };
+          return {
+            generatingBySession,
+            isGenerating: isConversationGenerating(current.conversations, current.activeConversationId, generatingBySession, false, current.viewingChildSessionId),
+          };
+        });
+      }
       startEventPump(set, get);
       return;
     }
@@ -587,11 +660,13 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     }));
 
     let sessionId = '';
+    let handled = false;
     try {
       const uploadedAttachments = await uploadMessageAttachments(attachments, conversationKey);
 
       const result = await postInbound({
         conversation_key: conversationKey,
+        message_id: requestId,
         text: trimmed,
         attachments: uploadedAttachments,
         use_context: true,
@@ -600,9 +675,10 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         approval_rules: initialApprovalRules,
       });
       sessionId = result.session_id;
+      handled = Boolean(result.handled);
       void useSessionApprovalStore.getState().load(sessionId);
       const inboundSeq = result.inbound_seq;
-      if (inboundSeq != null) {
+      if (inboundSeq > 0) {
         const optimisticId = `message:${conversationId}:user:inbound:${inboundSeq}`;
         const now = new Date().toISOString();
         set((current) => {
@@ -655,7 +731,8 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
           };
         });
       }
-    } catch {
+    } catch (error) {
+      console.error(`[input] 消息提交未确认成功：${error instanceof Error ? error.message : String(error)}`);
       set((current) => ({
         isGenerating: false,
         connectionStatus: current.connectionStatus === 'open' ? 'open' : 'closed',
@@ -677,9 +754,13 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         ...current.lastSeqBySession,
         [sessionId]: current.lastSeqBySession[sessionId] || 0,
       },
+      // A direct control reply does not start a task. Do not leave an optimistic
+      // spinner, or clear a task that started independently while the POST ran.
+      isGenerating: handled && !current.viewingChildSessionId && current.activeConversationId === conversationId
+        ? Boolean(current.activeTaskBySession[sessionId]) : current.isGenerating,
       generatingBySession: {
         ...current.generatingBySession,
-        [sessionId]: true,
+        [sessionId]: handled ? Boolean(current.activeTaskBySession[sessionId]) : true,
       },
     }));
 
@@ -787,8 +868,12 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     const conversationKey = state.viewingChildConversationKey || (state.activeConversationId ? `web:${state.activeConversationId}` : activeConversation?.id || sessionId);
     try {
       const uploadedAttachments = await uploadMessageAttachments(attachments, conversationKey);
-      await preemptTask(taskId, message, uploadedAttachments);
-    } catch {}
+      await preemptTask(taskId, message, uploadedAttachments, sessionId);
+      // A handled command is answered using a separate inbound. The active task
+      // remains owned by its original lifecycle events, including its spinner.
+    } catch (error) {
+      console.error(`[input] 追加消息未确认成功：${error instanceof Error ? error.message : String(error)}`);
+    }
   },
 
   updateContextUsage: (data) => {

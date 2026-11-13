@@ -7,10 +7,11 @@ one runtime object instead of module-level globals.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
-from collections import deque
-from typing import Any
+from collections import OrderedDict, deque
+from typing import Any, Callable
 
 import discord  # type: ignore[import-untyped]
 
@@ -164,6 +165,42 @@ class DiscordCallbacks:
         self._channel_edit_timestamps: dict[int, deque[float]] = {}
         self._dot_states: dict[int, dict[str, Any]] = {}
         self._child_dot_states: dict[str, dict[str, Any]] = {}
+        self._progress_listeners: set[Callable[[TriggerInfo, str, bool], None]] = set()
+        # ponytail: retain 32 recent task endings for read-only UI consumers, not durable history.
+        self._task_progress_results: OrderedDict[str, tuple[str, bool]] = OrderedDict()
+
+    def subscribe_progress(self, listener: Callable[[TriggerInfo, str, bool], None]) -> Callable[[], None]:
+        """Observe progress synchronously; listeners must not perform I/O or mutate triggers."""
+        self._progress_listeners.add(listener)
+        return lambda: self._progress_listeners.discard(listener)
+
+    def _notify_progress(self, trigger: TriggerInfo, state: MainTaskState | None,
+                         dot_state: dict[str, Any] | None, *, terminal: bool = False,
+                         status: str = "") -> None:
+        if not self._progress_listeners:
+            return
+        # The formatter advances animation state: observers only format detached copies.
+        progress = _format_progress_log("当前轮执行", state.progress_records if state else [],
+                                        dot_state=copy.deepcopy(dot_state))
+        summary = _format_status_summary(copy.deepcopy(dot_state))
+        text = "\n".join(part for part in (status, progress, summary) if part)[:1800]
+        for listener in tuple(self._progress_listeners):
+            try:
+                listener(trigger, text, terminal)
+            except Exception:
+                logger.exception("Progress observer failed")
+
+    def get_task_progress(self, task_id: str) -> tuple[str, bool] | None:
+        """Read exact task progress/end status; absence is not evidence of completion."""
+        state = self.rt.session_state.get_child_state(task_id) if self.rt.session_state else None
+        if state is None:
+            return self._task_progress_results.get(task_id)
+        return self._format_task_progress(state, self._child_dot_states.get(task_id)), False
+
+    def _format_task_progress(self, state: ChildTaskState, dot: dict | None, status: str = "") -> str:
+        progress = _format_progress_log("当前轮执行", state.lines, dot_state=copy.deepcopy(dot))
+        summary = _format_status_summary(copy.deepcopy(dot))
+        return "\n".join(part for part in (status, progress, summary) if part)[:1800]
 
     def _should_edit(self, key: int | str, min_interval: float = 1.0, *, channel_id: int = 0) -> bool:
         """检查 per-key 节流和可选的 per-channel edit 令牌桶。"""
@@ -252,6 +289,8 @@ class DiscordCallbacks:
     ) -> None:
         """Settle background progress and release its adapter-owned state."""
         try:
+            self._notify_progress(trigger, state, self._dot_states.get(trigger.inbound_seq),
+                                  terminal=True, status=status)
             if state is not None:
                 await self._settle_log_msg(state, status)
         finally:
@@ -493,6 +532,7 @@ class DiscordCallbacks:
         seq = trigger.inbound_seq
         pd = trigger.platform_data
         dot_state = self._get_or_create_dot_state(seq)
+        self._notify_progress(trigger, state, dot_state)
 
         if trigger.is_dm and not pd.get("background"):
             # 私聊：status_msg 显示全部进度（stream preview + 工具 + 日志）
@@ -623,6 +663,13 @@ class DiscordCallbacks:
         *,
         is_dm: bool = False,
     ) -> None:
+        if self._progress_listeners:
+            self._task_progress_results[task_key] = (
+                self._format_task_progress(state, self._child_dot_states.get(task_key), status), True,
+            )
+            self._task_progress_results.move_to_end(task_key)
+            while len(self._task_progress_results) > 32:
+                self._task_progress_results.popitem(last=False)
         msg = state.platform_data.get("msg")
         is_dm = getattr(state, "is_dm", is_dm)
         if msg:
@@ -805,7 +852,7 @@ class DiscordCallbacks:
         self,
         payload: dict[str, Any],
     ) -> None:
-        """Engine restarted — close stale progress messages and local task state."""
+        """Preserve planned restarts; close stale state after an unplanned restart."""
         logger.info("on_engine_restarted: generation=%s prev=%s orphans=%s",
                     payload.get("generation_id", "")[:12],
                     payload.get("previous_generation_id", "")[:12],
@@ -813,6 +860,41 @@ class DiscordCallbacks:
 
         session_state = self.rt.session_state
         if not session_state:
+            return
+
+        if payload.get("preserve_tasks") is True and payload.get("restart_id"):
+            stopping = payload.get("phase") == "stopping"
+            status = "系统重启中，任务暂时中断" if stopping else "系统已恢复，任务继续执行"
+            # Keep status/log message objects and source_inbound_seq bindings. Only
+            # throw away partial-stream previews from the interrupted execution.
+            for seq, trigger in list(session_state.triggers.items()):
+                trigger.refresh()
+                trigger.platform_data.pop("last_typing_time", None)
+                self._dot_states.pop(seq, None)
+                self._last_edit_time.pop(seq, None)
+                self._last_edit_time.pop(f"log:{seq}", None)
+                msg = trigger.platform_data.get("status_msg")
+                if msg:
+                    try:
+                        await msg.edit(content=status)  # Preserve the existing cancel view.
+                    except Exception:
+                        pass
+            states = [*session_state.main_task_states.items(), *session_state.child_task_states.items()]
+            for key, state in states:
+                if isinstance(state, MainTaskState):
+                    state.stream_parts.clear()
+                    title, lines = "Agent 执行中", state.progress_records
+                else:
+                    self._child_dot_states.pop(key, None)
+                    self._last_edit_time.pop(key, None)
+                    title, lines = state.prefix, state.lines
+                msg = state.platform_data.get("log_msg") or state.platform_data.get("msg")
+                if msg and not state.platform_data.get("terminal_status"):
+                    try:
+                        # This is a transient status, not _settle_log_msg's terminal marker.
+                        await msg.edit(content=_format_progress_log(title, lines, status=status))
+                    except Exception:
+                        pass
             return
 
         # [2026-05-21 engine-restart cleanup] Why: an engine restart cancels old

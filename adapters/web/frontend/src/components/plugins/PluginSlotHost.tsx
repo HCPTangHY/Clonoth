@@ -14,6 +14,7 @@
 // contributions in that slot are not mounted.
 // Purpose: small widgets (badges, counters) extend the chat UI without iframes.
 import { useEffect, useMemo, useRef } from 'react';
+import type { ComposerApi } from '../../store/composerModes';
 
 import { usePluginsStore, type SlotContribution } from '../../store/pluginsStore';
 import { getPluginSlotApi, type PluginSlotApi } from '../../store/slotApi';
@@ -32,6 +33,7 @@ interface SlotContextShape {
   state: Record<string, unknown>;
   /** Scoped event subscriber; subscriptions auto-revoked when this instance dies. */
   events: PluginEventEmitter;
+  composer?: ComposerApi;
 }
 
 interface SlotModule {
@@ -52,6 +54,7 @@ interface PluginSlotHostProps {
   slot: string;
   data?: Record<string, unknown>;
   className?: string;
+  composer?: ComposerApi;
 }
 
 // [AutoC 2026-08-22] Why: `contributions || []` mints a new array identity every
@@ -59,7 +62,9 @@ interface PluginSlotHostProps {
 // module-level empty constant for both empty cases.
 const EMPTY: SlotContribution[] = [];
 
-export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) => {
+export const PluginSlotHost = ({ slot, data, className, composer }: PluginSlotHostProps) => {
+  const latest = useRef({ data, composer });
+  latest.current = { data, composer };
   const contributions = usePluginsStore((s) => s.slotsBySlot[slot]);
   const clientScriptsEnabled = usePluginsStore((s) => s.clientScriptsEnabled);
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -136,7 +141,8 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
             try {
               fresh.mod.mount?.({
                 el,
-                data,
+                data: latest.current.data,
+                composer: latest.current.composer,
                 api: getPluginSlotApi(),
                 state: getPluginState(contribution.slotId),
                 events: scopedEvents(fresh),
@@ -156,6 +162,7 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
           inst.mod.update?.({
             el,
             data,
+            composer,
             api: getPluginSlotApi(),
             state: getPluginState(contribution.slotId),
             events: scopedEvents(inst),
@@ -166,7 +173,7 @@ export const PluginSlotHost = ({ slot, data, className }: PluginSlotHostProps) =
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [list, data]);
+  }, [list, data, composer]);
 
   // final teardown when the host unmounts (state and events revocation only —
   // private state intentionally survives remounts)

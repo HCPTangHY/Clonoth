@@ -246,17 +246,18 @@ async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         except Exception:
             pass
 
-    # [Fork/Merge 2026-05-17] Why: restart notifications are written back to the
-    # user-facing session, not the temporary branch where a tool may run. How: use
-    # ToolContext's parent-first route session for the restart request. Purpose:
-    # pending restart messages and outbound status reach the correct conversation.
+    # Keep the user-facing route for status events and the concrete invocation for
+    # restart recovery. The accepted restart call must not run again after boot.
     r = await ctx.http.post(
         f"{ctx.supervisor_url}/v1/admin/restart",
-        json={"target": target, "reason": reason, "approval_id": approval_id, "session_id": ctx.route_session_id()},
+        json={"target": target, "reason": reason, "approval_id": approval_id,
+              "session_id": ctx.route_session_id(),
+              "task_id": ctx.task_id or "", "tool_call_id": ctx.tool_call_id or ""},
     )
     if r.status_code >= 400:
         return _err(r.text, git=git_info, git_commit=commit_res)
 
+    ctx._restart_accepted = True
     return _ok(
         f"Restart requested: {target}",
         target=target,

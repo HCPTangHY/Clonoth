@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import uuid
 import logging
 import os
 import sys
@@ -587,7 +588,7 @@ def create_app(
     @app.post("/v1/inbound", response_model=InboundMessageOut)
     async def inbound(msg: InboundMessageIn, request: Request) -> InboundMessageOut:
         st: SupervisorState = app.state.state
-        if "approval_rules" in msg.model_fields_set:
+        if "approval_rules" in msg.model_fields_set or msg.user_input:
             verify_admin_token(request)
         direct_session_id = str(msg.session_id or "").strip()
         if direct_session_id:
@@ -676,6 +677,21 @@ def create_app(
         if "approval_rules" in msg.model_fields_set:
             st.set_session_approval_rules(session_id, msg.approval_rules)
 
+        runtime = getattr(st, "execution_runtime", None)
+        if runtime is not None and msg.user_input and not msg.dispatch_origin:
+            try:
+                handled = runtime.handle_input(session_id, msg.text, msg.request_id or msg.message_id or str(uuid.uuid4()))
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            if handled is not None:
+                return InboundMessageOut(session_id=session_id, inbound_seq=handled["inbound_seq"], handled=True, text=handled["text"])
+        if msg.dispatch_origin and runtime is not None:
+            origin = msg.dispatch_origin
+            source = st.tasks.get(str(origin.get("origin_task_id") or ""))
+            if source is not None:
+                if source.execution_id and origin.get("origin_execution_id") != source.execution_id:
+                    raise HTTPException(409, "stale dispatch source")
+                origin["target_generation"] = runtime.session_info(origin.get("parent_session_id", ""))["generation"]
         evt = st.eventlog.append(
             session_id=session_id,
             component="shell",
@@ -721,7 +737,10 @@ def create_app(
     @app.post("/v1/tasks/{task_id}/complete")
     async def task_complete(task_id: str, body: TaskCompleteIn) -> dict[str, Any]:
         st: SupervisorState = app.state.state
-        task = st.complete_task(task_id=task_id, worker_id=body.worker_id, result=dict(body.result or {}))
+        try:
+            task = st.complete_task(task_id=task_id, worker_id=body.worker_id, result=dict(body.result or {}), execution_id=body.execution_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         return {"ok": True, "task_id": task.task_id, "status": task.status.value}
@@ -743,6 +762,17 @@ def create_app(
         raw_atts = body.get("attachments", [])
         atts = raw_atts if isinstance(raw_atts, list) else []
         st: SupervisorState = app.state.state
+        if body.get("user_input") is True:
+            verify_admin_token(request)
+            task = st.tasks.get(task_id)
+            if task is None:
+                raise HTTPException(404, "task not found")
+            try:
+                handled = st.execution_runtime.handle_input(st._route_session_id_for_task_locked(task), msg, str(body.get("request_id") or ""))
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            if handled is not None:
+                return {"ok": True, **handled}
         ok = st.preempt_task(task_id, message=msg, attachments=atts)
         if not ok:
             raise HTTPException(status_code=404, detail="task not found or not active")
@@ -794,12 +824,25 @@ def create_app(
                 status_code=422,
                 detail="consumed_attachment_count exceeds observed attachments",
             )
-        result = st.consume_preempt_message(
-            task_id,
-            consumed_message=consumed_message,
-            consumed_attachment_count=raw_count,
-        )
+        try:
+            result = st.consume_preempt_message(
+                task_id,
+                consumed_message=consumed_message,
+                consumed_attachment_count=raw_count,
+                delivery_ids=body.get("delivery_ids"), message_id=str(body.get("message_id") or ""),
+                execution_id=str(body.get("execution_id") or ""),
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         return {"ok": True, **result}
+
+    @app.post("/v1/tasks/{task_id}/inputs_admitted")
+    async def task_inputs_admitted(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return app.state.state.execution_runtime.admit(task_id, body.get("delivery_ids"),
+                str(body.get("message_id") or ""), str(body.get("execution_id") or ""))
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/v1/sessions/{session_id}/async_tool_result")
     async def session_async_tool_result(session_id: str, request: Request) -> dict[str, Any]:
@@ -818,7 +861,23 @@ def create_app(
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
-        result = st.inject_async_result(session_id, text=msg, attachments=atts, source_task_id=source_task_id)
+        if body.get("async_id"):
+            work = st._async_tools.get(str(body["async_id"]))
+            if not work or any(body.get(k) != work.get(k) for k in ("execution_id", "target_generation", "boot_id")) or body.get("boot_id") != st.execution_runtime.boot_id:
+                raise HTTPException(409, "stale or unknown async result")
+            if work.get("task_id") != source_task_id or work.get("session_id") != session_id:
+                raise HTTPException(409, "async result source mismatch")
+            if not isinstance(body.get("delivery_id"), str) or not body["delivery_id"]:
+                raise HTTPException(422, "delivery_id required")
+            try:
+                result = st.execution_runtime.queue_result(delivery_id=body["delivery_id"],
+                    work_id=body["async_id"], origin_task_id=source_task_id, session_id=session_id,
+                    text=msg, attachments=[{"path": p} if isinstance(p, str) else p for p in atts],
+                    target_generation=body["target_generation"])
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+        else:
+            result = st.inject_async_result(session_id, text=msg, attachments=atts, source_task_id=source_task_id)
         if not result.get("ok"):
             raise HTTPException(status_code=500, detail=result.get("error", "unknown"))
         return result
@@ -947,7 +1006,7 @@ def create_app(
         st: SupervisorState = app.state.state
         worker_id = str(body.get("worker_id") or "").strip()
         lease_sec = float(body.get("lease_sec", 120.0))
-        ok = st.renew_lease(task_id, worker_id, lease_sec)
+        ok = st.renew_lease(task_id, worker_id, lease_sec, str(body.get("execution_id") or ""))
         return {"ok": ok}
 
     @app.post("/v1/engine/register")
@@ -973,13 +1032,19 @@ def create_app(
     async def async_tool_register(body: dict[str, Any]) -> dict[str, Any]:
         """Engine 调用：登记一个异步工具启动。"""
         st: SupervisorState = app.state.state
-        return st.register_async_tool(body)
+        result = st.register_async_tool(body)
+        if not result.get("ok"):
+            raise HTTPException(409, result.get("error", "registration failed"))
+        return result
 
     @app.post("/v1/async_tools/{async_id}/finish")
     async def async_tool_finish(async_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Engine 调用：标记异步工具完成或失败。"""
         st: SupervisorState = app.state.state
-        return st.finish_async_tool(async_id, body)
+        result = st.finish_async_tool(async_id, body)
+        if not result.get("ok"):
+            raise HTTPException(409, result.get("error", "lifecycle rejected"))
+        return result
 
     @app.get("/v1/admin/async_tools")
     async def admin_async_tools(request: Request) -> list[dict[str, Any]]:
@@ -1435,6 +1500,8 @@ def create_app(
         )
         if ev.type == "outbound_message":
             st.record_outbound_message_event(evt)
+        if ev.type in {"intermediate_reply", "assistant_text"}:
+            st.execution_runtime.record_reply(evt)
         if ev.type == "context_usage":
             st.update_context_usage(session_id, dict(ev.payload or {}))
         # [AutoC 2026-06-03] Why: scheduler stale-task reaper checks task.updated_at
@@ -1553,6 +1620,11 @@ def create_app(
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
         si = st.sessions[session_id]
+        runtime = getattr(st, "execution_runtime", None)
+        if runtime is not None:
+            with st._lock:
+                runtime.session_removed(session_id)
+                st._cancel_session_tasks_locked(session_id)
         # Remove from sessions and conversation_map
         with st._lock:
             del st.sessions[session_id]
@@ -2116,140 +2188,19 @@ def create_app(
             },
         )
 
-        # 2026.4.28: restart engine 暂时禁用，统一走 restart all
-        # 原因：engine 子进程终止时会向 supervisor 泄露信号（SIGINT/SIGTERM），
-        # 导致 uvicorn 触发优雅退出，supervisor 跟着一起死。
-        # 根因是 uvicorn.run() 会覆盖手动设置的信号 handler，
-        # 目前未找到稳定的隔离方案，暂时所有重启统一走 restart all。
-        if inp.target == "engine_DISABLED":
-            # 重新加载 .env，确保修改后的环境变量在 supervisor 进程中生效
-            try:
-                from dotenv import load_dotenv
-                load_dotenv(override=True)
-            except Exception:
-                pass
-            # 先注入 outbound 让 handle_agent 正常闭合（log embed 有终态）
-            if inp.session_id:
-                # 找到当前 session 活跃任务的 source_inbound_seq，
-                # 确保 Bot 端 poller 能匹配到 trigger 并正确关闭 status_msg
-                _restart_src_seq = None
-                for _rt in st.tasks.values():
-                    if (_rt.session_id == inp.session_id
-                            and _rt.status in (TaskStatus.running, TaskStatus.pending)
-                            and _rt.source_inbound_seq):
-                        _restart_src_seq = _rt.source_inbound_seq
-                        break
-                _restart_outbound_payload: dict[str, Any] = {"text": "✅ 已触发 Engine 重启，正在执行..."}
-                if _restart_src_seq:
-                    _restart_outbound_payload["source_inbound_seq"] = _restart_src_seq
-                st.eventlog.append(
-                    session_id=inp.session_id,
-                    component="supervisor",
-                    type_="outbound_message",
-                    payload=_restart_outbound_payload,
-                )
-            # Deferred engine restart: return HTTP 200 first, then kill+restart.
-            # This ensures the tool call in the dying engine receives its response
-            # and can shadow_write the tool_result before being terminated.
-            _restart_session_id = inp.session_id
-            _restart_target = inp.target
-
-            def _deferred_engine_restart() -> None:
-                time.sleep(1)  # let HTTP response reach engine first
-                pm._restarting_engine = True  # 抑制信号 handler 退出
-                try:
-                    pm.stop_engine()
-                    time.sleep(1)  # 等待延迟信号消散
-                    pm.start_engine()
-                    # Brief health check: verify engine process is alive
-                    time.sleep(0.5)
-                    _alive = any(p.popen.poll() is None for p in pm.engines)
-                    if not _alive:
-                        st.eventlog.append(
-                            session_id=_restart_session_id or "__system__",
-                            component="supervisor",
-                            type_="outbound_message",
-                            payload={"text": "❌ Engine 重启失败：进程启动后立即退出。"},
-                        )
-                        return
-                except Exception as exc:
-                    pm._restarting_engine = False
-                    st.eventlog.append(
-                        session_id=_restart_session_id or "__system__",
-                        component="supervisor",
-                        type_="outbound_message",
-                        payload={"text": f"❌ Engine 重启失败：{exc}"},
-                    )
-                    return
-                # ---- 清理旧 engine 遗留的孤儿 task ----
-                _orphan_count = st.cancel_orphaned_tasks()
-                if _orphan_count:
-                    st.eventlog.append(
-                        session_id="__system__",
-                        component="supervisor",
-                        type_="orphan_cleanup",
-                        payload={
-                            "count": _orphan_count,
-                            "trigger": "engine_restart",
-                            "ts": _now().isoformat(),
-                        },
-                    )
-                st.eventlog.append(
-                    session_id="__system__",
-                    component="supervisor",
-                    type_="restart_completed",
-                    payload={"target": _restart_target, "ts": _now().isoformat()},
-                )
-                # Defer restart notification — will be injected in register_engine()
-                # after orphan cleanup, so the task won't be reaped.
-                if _restart_session_id:
-                    st._pending_restart_notify = _restart_session_id
-                pm._restarting_engine = False  # 清除信号抑制
-
-            threading.Thread(target=_deferred_engine_restart, daemon=True, name="restart-engine").start()
-            return RestartOut(scheduled=True, target=_restart_target)
-
-        # 先停 engine，再延迟退出让 HTTP 响应发出去。
-        if inp.session_id:
-            _pending_path = Path(st.workspace_root) / "data" / "restart_pending.json"
-            _si = st.sessions.get(inp.session_id)
-            try:
-                _pending_path.write_text(json.dumps({
-                    "session_id": inp.session_id,
-                    "target": "all",
-                    "conversation_key": _si.conversation_key if _si else "",
-                    "channel": _si.channel if _si else "",
-                    "ts": _now().isoformat(),
-                }), encoding="utf-8")
-            except Exception:
-                pass
-            # 找 source_inbound_seq
-            _all_restart_src_seq = None
-            for _art in st.tasks.values():
-                if (_art.session_id == inp.session_id
-                        and _art.status in (TaskStatus.running, TaskStatus.pending)
-                        and _art.source_inbound_seq):
-                    _all_restart_src_seq = _art.source_inbound_seq
-                    break
-            _all_restart_payload: dict[str, Any] = {"text": "✅ 已触发全量重启，系统即将重启..."}
-            if _all_restart_src_seq:
-                _all_restart_payload["source_inbound_seq"] = _all_restart_src_seq
-            st.eventlog.append(
-                session_id=inp.session_id,
-                component="supervisor",
-                type_="outbound_message",
-                payload=_all_restart_payload,
+        if pm is None:
+            raise HTTPException(status_code=503, detail="No process manager is available")
+        if getattr(pm, "_restart_pending", False):
+            return RestartOut(scheduled=True, target="all")
+        try:
+            handoff = st.restart_recovery.begin(
+                reason=inp.reason or "", task_id=inp.task_id, tool_call_id=inp.tool_call_id,
             )
-
-        # [AutoC 2026-06-11] Why: 全量重启会杀掉 supervisor 进程，WS 断开后
-        # bot 漏掉 engine_registered 事件导致残留 typing/日志/status_msg。
-        # How: 在 WS 还活着时发 engine_restarting 事件让 bot 提前清理。
-        # Purpose: 即使 engine_registered 漏掉也不影响清理。
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=f"Restart handoff could not be saved: {exc}") from exc
         st.eventlog.append(
-            session_id="__system__",
-            component="supervisor",
-            type_="engine_restarting",
-            payload={"target": "all", "ts": _now().isoformat()},
+            session_id="__system__", component="supervisor", type_="engine_restarting",
+            payload={"target": "all", "ts": _now().isoformat(), **handoff},
         )
 
         def _deferred_exit() -> None:
@@ -2262,16 +2213,22 @@ def create_app(
             # closes the server socket properly. Purpose: the restarted
             # process can bind the port immediately.
             time.sleep(1)
-            if pm is not None:
-                try:
-                    pm.stop_engine()
-                except Exception:
-                    pass
-                for _eng in getattr(pm, 'engines', []):
-                    try:
-                        _eng.popen.wait(timeout=5)
-                    except Exception:
-                        pass
+            try:
+                stopping = list(pm.engines)
+                pm.stop_engine()
+                still_running = [proc for proc in stopping if proc.popen.poll() is None]
+                if still_running:
+                    pm.engines = still_running
+                    raise RuntimeError("Some Engine processes did not stop; handoff is not sealed")
+                st.restart_recovery.finalize()
+            except Exception as exc:
+                pm._restart_pending = False
+                st.eventlog.append(
+                    session_id="__system__", component="supervisor", type_="restart_failed",
+                    payload={"restart_id": handoff["restart_id"], "error": str(exc),
+                             "text": "Restart stopped: process shutdown or task handoff could not be confirmed. Inspect process and storage errors before retrying."},
+                )
+                return
             _server = getattr(app.state, '_uvicorn_server', None)
             if _server is not None:
                 _server.should_exit = True
@@ -2313,6 +2270,7 @@ def create_app(
             "instruction": instruction,
             "_async_dispatch": True,
             "_caller_node_id": caller_node_id,
+            "_execution_origin_task_id": str(body.get("origin_task_id") or ""),
         }
         # [2026-04-22] 将附件列表注入 input_data，runner.py L594 已支持读取 input_data["attachments"]
         if attachments and isinstance(attachments, list):
