@@ -74,6 +74,21 @@ let passed = 0;
 async function check(name, test) { await test(); passed++; fs.writeSync(1, `PASS ${name}\n`); }
 
 (async () => {
+  await check('Goal panel omits static policy prose but retains error and attachment notices', async () => {
+    const h = await harness('main');
+    try {
+      await h.resolve(0, record('main'));
+      assert.equal(h.plugin.desktopHint, undefined);
+      assert.equal(h.plugin.draftNotice.hidden, true);
+      assert.doesNotMatch(h.plugin.root.textContent, /侧栏打开时|保存保留当前|关闭面板退出输入模式|全局默认值只影响/);
+      h.plugin.draftError = '提交失败'; h.plugin.renderDraft();
+      assert.equal(h.plugin.draftNotice.hidden, false);
+      assert.equal(h.plugin.draftNotice.textContent, '提交失败');
+      h.plugin.draftError = ''; h.plugin.draftSnapshot = {attachments:[{name:'evidence.txt'}]};
+      h.plugin.renderDraft();
+      assert.equal(h.plugin.draftNotice.textContent, '附件：evidence.txt');
+    } finally { h.plugin.destroy(); }
+  });
   await check('missing sessions do not load; actual children remain non-manageable after identity read', async () => {
     const missing = await harness('');
     try { assert.equal(missing.requests.length, 0); assert.equal(missing.plugin.root.hidden, true); }
@@ -84,7 +99,7 @@ async function check(name, test) { await test(); passed++; fs.writeSync(1, `PASS
       assert.equal(h.plugin.edit.disabled, true);
       await h.resolve(0, record('child', 1, { is_child: true }));
       assert.equal(h.plugin.body.hidden, true);
-      assert.ok(h.plugin.ownerNotice.textContent.includes('真实子会话'));
+      assert.ok(h.plugin.ownerNotice.textContent.includes('子会话不支持'));
       await h.plugin.mutate('resume');
       assert.equal(h.requests.length, 1);
     } finally { h.plugin.destroy(); }
@@ -311,7 +326,7 @@ async function check(name, test) { await test(); passed++; fs.writeSync(1, `PASS
       assert.equal(h.requests.length, 1, 'editing never submits or restarts the Goal');
     } finally { h.plugin.destroy(); }
   });
-  await check('running settings require confirmation and the panel has no popover toggle', async () => {
+  await check('running settings save without forcing a restart or confirmation', async () => {
     const h = await harness();
     try {
       await h.resolve(0, record('main', 1, { status: 'running' }));
@@ -320,11 +335,25 @@ async function check(name, test) { await test(); passed++; fs.writeSync(1, `PASS
       assert.equal(h.plugin.settings.tag, 'details');
       h.input('criteria', 'New settings');
       h.controls.confirm = false;
+      h.input('maxRounds', '512');
       h.click('save');
-      assert.equal(h.requests.length, 1);
-      h.controls.confirm = true;
-      h.click('save');
+      assert.equal(h.requests.length, 2);
       assert.equal(JSON.parse(h.requests[1].options.body).action, 'set');
+      assert.equal(JSON.parse(h.requests[1].options.body).max_rounds, 512);
+      assert.equal(h.plugin.save.textContent, '保存设置');
+    } finally { h.plugin.destroy(); }
+  });
+  await check('round limits retain existing budgets and reject invalid edits without a POST', async () => {
+    const h = await harness();
+    try {
+      await h.resolve(0, record('main', 1, { max_rounds: 8, stagnation: 8 }));
+      assert.equal(h.plugin.maxRounds.value, '8');
+      assert.equal(h.plugin.meta.textContent, '自动续轮 0/8');
+      for (const value of ['', '0', '-1', '1.5', '1000001', 'abc']) {
+        h.input('maxRounds', value); h.click('save');
+        assert.equal(h.requests.length, 1);
+        assert.match(h.plugin.notice.textContent, /整数/);
+      }
     } finally { h.plugin.destroy(); }
   });
   await check('empty and completed panels expose no automatic execution controls', async () => {
@@ -451,7 +480,7 @@ async function check(name, test) { await test(); passed++; fs.writeSync(1, `PASS
         assert.equal(h.controls.edits.at(-1)[1], 'unsent draft', 'keep existing text while recording the explicit edit baseline');
         assert.equal(h.controls.edits.at(-1)[2].action, 'submit');
         assert.equal(h.controls.edits.at(-1)[2].revision, 1);
-        assert.equal(h.plugin.submitDraft.textContent, '修改并重新开始');
+        assert.equal(h.plugin.submitDraft.textContent, '修改并继续');
         assert.equal(h.requests.length, 1, 'modify opens editor without a Goal mutation');
         h.plugin.editingGoal = false;
         h.plugin.renderDraft();
@@ -506,7 +535,7 @@ async function check(name, test) { await test(); passed++; fs.writeSync(1, `PASS
     try {
       await h.resolve(0,record('owner',7,{requested_session_id:'branch'}));
       assert.equal(h.plugin.ownerSessionId,'owner');assert.equal(h.plugin.sessionId,'branch');
-      assert.match(h.plugin.ownerNotice.textContent,/主会话：owner/);
+      assert.match(h.plugin.ownerNotice.textContent,/所属会话：owner/);
       assert.equal(h.plugin.ownerNotice.hidden,false);
       await h.click('edit');
       assert.equal(h.controls.edits.at(-1)[2].sessionId,'branch');

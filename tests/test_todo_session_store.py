@@ -32,9 +32,9 @@ def document(sid="main", count=0, revision=0):
     }
 
 
-def update(sid="main", revision=0, **changes):
+def update(sid="main", revision=0, **kw):
     return {"expected_session_id": sid, "expected_revision": revision,
-            "changes": [{"title": "A"}], **changes}
+            "mode": "append", "items": [{"title": "A"}], **kw}
 
 
 def legacy(root, data, workspace="/missing-directory"):
@@ -261,7 +261,7 @@ def test_concurrent_same_revision_writes_have_one_winner(tmp_path):
     def attempt(title):
         barrier.wait()
         try:
-            return todo.operate(st, "main", update(changes=[{"title": title}]))
+            return todo.operate(st, "main", update(items=[{"title": title}]))
         except HTTPException as exc:
             return exc.status_code
     with ThreadPoolExecutor(max_workers=2) as pool:

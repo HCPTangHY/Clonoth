@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 
-from clonoth_runtime import load_runtime_config
+from clonoth_runtime import get_int, load_runtime_config
 
 from engine.hooks.types import HookResult
 from .goal_review import ReviewInputError, build_input, review_cache_blocks
@@ -32,7 +32,10 @@ MAX_TEXT = 16000
 MAX_REVIEWS = 64
 MAX_REQUESTS = 128
 REVIEW_TIMEOUT = 180
-WAIT_TIMEOUT = 1800
+CHECK_INTERVAL = 1800
+IDLE_THRESHOLD = 600
+DEFAULT_MAX_ROUNDS = 256
+MAX_ROUNDS = 1_000_000
 REVIEW_NODE = "ide.goal_reviewer"
 ACTIVE = {"running", "waiting", "reviewing"}
 STATUSES = ACTIVE | {"empty", "paused", "completed", "blocked"}
@@ -49,10 +52,16 @@ def _text(value: Any, key: str, limit: int, *, empty: bool = False) -> str:
     return value.strip()
 
 
-def _empty(sid: str, *, child: bool = False) -> dict:
+def _round_limit(value: Any) -> int:
+    if type(value) is not int or not 1 <= value <= MAX_ROUNDS:
+        raise HTTPException(422, f"max_rounds 必须是 1 至 {MAX_ROUNDS} 的整数。")
+    return value
+
+
+def _empty(sid: str, *, child: bool = False, max_rounds: int = DEFAULT_MAX_ROUNDS) -> dict:
     return {"schema_version": 1, "session_id": sid, "revision": 0, "goal": "", "criteria": "",
             "goal_version": 0, "status": "empty", "pause_reason": "", "rounds": 0,
-            "max_rounds": 8, "stagnation": 0, "reviews": [], "updated_at": None,
+            "max_rounds": max_rounds, "stagnation": 0, "reviews": [], "updated_at": None,
             "is_child": child, "reviewer_provider": "", "reviewer_model": "",
             "_identity": uuid4().hex, "_roots": [], "_requests": {}, "_candidate": None,
             "_review": None, "_pending_input": None, "_wait_started": None,
@@ -67,7 +76,7 @@ def _public(data: dict) -> dict:
         execution = None
     return {**copy.deepcopy({k: v for k, v in data.items() if not k.startswith("_")}),
             "goal_id": data["_identity"], "execution": copy.deepcopy(execution),
-            "capabilities": {"create": True, "progress": True}}
+            "capabilities": {"create": True, "progress": True}, "preempt_target": None}
 
 
 def parse_verdict(text: str) -> dict:
@@ -119,6 +128,9 @@ class GoalService:
     def _path(self, sid: str) -> Path:
         return self.root / "data" / "ide" / "goals" / "sessions" / (hashlib.sha256(sid.encode()).hexdigest() + ".json")
 
+    def _default_rounds(self) -> int:
+        return _round_limit(get_int(load_runtime_config(self.root), "plugins.ide.goal.default_max_rounds", DEFAULT_MAX_ROUNDS))
+
     def _load(self, sid: str) -> dict:
         if sid in self.documents:
             return self.documents[sid]
@@ -136,7 +148,7 @@ class GoalService:
                     or not isinstance(data.get("goal"), str) or not isinstance(data.get("criteria"), str)):
                 raise ValueError("invalid document")
         except FileNotFoundError:
-            data = _empty(sid)
+            data = _empty(sid, max_rounds=self._default_rounds())
         except (ValueError, TypeError, KeyError):
             raise HTTPException(500, "Goal 数据损坏，未覆盖原文件。") from None
         self.documents[sid] = data
@@ -193,7 +205,16 @@ class GoalService:
             info = self.runtime.session_info(sid)
             if info["is_child"]:
                 return _public(_empty(info["session_id"], child=True))
-            return _public(self._load(info["session_id"]))
+            data = self._load(info["session_id"])
+            result = _public(data)
+            result["preempt_target"] = None
+            if data["status"] in ACTIVE and data["_roots"]:
+                activity = self.runtime.execution_activity(data["_roots"])
+                if activity.get("task_id") and activity.get("execution_id"):
+                    result["preempt_target"] = {key: activity.get(key) for key in
+                        ("task_id", "execution_id", "conversation_key", "source_inbound_seq")}
+                    result["preempt_target"]["session_id"] = info["session_id"]
+            return result
 
     def _pause(self, data: dict, reason: str) -> None:
         data["status"] = "paused"
@@ -246,13 +267,13 @@ class GoalService:
     def operate(self, sid: str, patch: dict) -> dict:
         if self._runtime_error:
             raise HTTPException(503, self._runtime_error)
-        allowed = {"action", "expected_revision", "expected_session_id", "request_id", "goal", "criteria", "reviewer_provider", "reviewer_model"}
+        allowed = {"action", "expected_revision", "expected_session_id", "request_id", "goal", "criteria", "reviewer_provider", "reviewer_model", "max_rounds"}
         if not isinstance(patch, dict) or set(patch) - allowed:
             raise HTTPException(422, "未知 Goal 操作字段。")
         action = patch.get("action")
         if action not in {"create", "set", "submit", "start", "pause", "resume", "clear"}:
             raise HTTPException(422, "未知 Goal 操作。")
-        if action not in {"create", "set", "submit"} and set(patch) & {"goal", "criteria", "reviewer_provider", "reviewer_model"}:
+        if action not in {"create", "set", "submit"} and set(patch) & {"goal", "criteria", "reviewer_provider", "reviewer_model", "max_rounds"}:
             raise HTTPException(422, "只有 create、set 或 submit 可以提交目标或评审配置。")
         expected = patch.get("expected_revision")
         if type(expected) is not int or expected < 0:
@@ -276,7 +297,7 @@ class GoalService:
                     raise HTTPException(409, "request_id 已用于不同操作。")
                 if action == "create" and current.get("_create_cleanup") is not None:
                     raise HTTPException(503, current["pause_reason"])
-                return _public(current)
+                return self.read(sid)
             if current["revision"] != expected:
                 raise HTTPException(409, "Goal 已更新，请重新读取后修改。")
             if current.get("_create_cleanup") is not None:
@@ -288,7 +309,7 @@ class GoalService:
             if action == "create":
                 if data["status"] not in {"empty", "completed"}:
                     raise HTTPException(409, "当前 Goal 尚未完成，不能创建新目标；请先处理当前目标。")
-                fresh = _empty(sid)
+                fresh = _empty(sid, max_rounds=_round_limit(patch.get("max_rounds", self._default_rounds())))
                 fresh.update(goal=_text(patch.get("goal"), "goal", MAX_TEXT),
                              criteria=_text(patch.get("criteria", ""), "criteria", MAX_TEXT, empty=True),
                              reviewer_provider=_text(patch.get("reviewer_provider", ""), "reviewer_provider", 200, empty=True),
@@ -306,28 +327,29 @@ class GoalService:
                                  pause_reason="新 Goal 已保存，等待清理旧 Goal 专属记录。", _wait_started=None)
                 data = fresh
             elif action in {"set", "submit"}:
-                if action == "submit" and (data["rounds"] >= data["max_rounds"] or data["stagnation"] >= 3):
-                    raise HTTPException(409, "累计预算已耗尽或连续无进展；提交不会清零，请明确清除后创建新 Goal。")
+                if action == "submit" and data["rounds"] >= _round_limit(patch.get("max_rounds", data["max_rounds"])):
+                    raise HTTPException(409, "累计续轮预算已耗尽；请提高预算或创建新 Goal。")
                 goal = _text(patch.get("goal"), "goal", MAX_TEXT)
                 criteria = _text(patch.get("criteria", data["criteria"] if action == "submit" else ""), "criteria", MAX_TEXT, empty=True)
                 provider = _text(patch.get("reviewer_provider", data["reviewer_provider"]), "reviewer_provider", 200, empty=True)
                 model = _text(patch.get("reviewer_model", data["reviewer_model"]), "reviewer_model", 200, empty=True)
-                self._pause(data, "目标已保存，等待明确开始或恢复。")
-                # Keep counters and historical verdicts when editing the same Goal.
-                data.update(goal=goal, criteria=criteria, reviewer_provider=provider, reviewer_model=model)
+                continuing = data["status"] in ACTIVE or action == "submit"
+                # Editing changes the objective, not the live execution or spent budget.
+                data.update(goal=goal, criteria=criteria, reviewer_provider=provider, reviewer_model=model,
+                            max_rounds=_round_limit(patch.get("max_rounds", data["max_rounds"])))
                 data["goal_version"] += 1
                 data["_review_outputs"] = []
-                if data["_roots"]:
-                    data.setdefault("_prior_runs", []).append(list(data["_roots"]))
-                    data["_roots"] = []
                 data["_candidate"] = None
                 data["_pending_input"] = None
-                data["_current_execution"] = None
-                data["_needs_input"] = True
-                if action == "submit":
-                    # The old roots stay paused. The next tick creates a new normal
-                    # input; accepting this explicit submission is its authorization.
-                    data.update(status="running", pause_reason="", _wait_started=time.time())
+                data.pop("_pending_preempt", None)
+                data["_pending_edit"] = {"request_id": f"goal:{data['_identity']}:{data['goal_version']}:edit",
+                                         "text": "用户已更新当前 Goal，请继续当前执行，不要重复启动任务。\n目标：\n" + goal
+                                         + "\n验收条件：\n" + (criteria or "按目标要求提供完成证据。")}
+                data["_needs_input"] = False
+                if continuing:
+                    data.update(status="running", pause_reason="")
+                else:
+                    self._pause(data, "目标已保存，等待明确开始或恢复。")
             elif action == "clear":
                 self._pause(data, "")
                 all_roots = [*data["_roots"], *(r for run in data.get("_prior_runs", []) for r in run)]
@@ -361,15 +383,30 @@ class GoalService:
                     and r.get("candidate_id") == (candidate.get("candidate_id") or candidate.get("entry_task_id"))
                     and (r is data.get("_review") or (not r.get("applied") and r.get("verdict")))
                     for r in [data.get("_review"), *data["reviews"]])
-                if (data["rounds"] >= data["max_rounds"] or data["stagnation"] >= 3) and not pending_review:
-                    raise HTTPException(409, "累计预算已耗尽或连续无进展；恢复不会清零，请明确清除后创建新 Goal。")
+                if data["rounds"] >= data["max_rounds"] and not pending_review:
+                    raise HTTPException(409, "累计续轮预算已耗尽；请提高预算后恢复。")
                 # An explicit recovery starts a fresh execution root when the old
-                # one is irrecoverably lost. Preserve the evidence and failure facts.
+                # one is irrecoverably lost or its raw trace was truncated.
                 if data["_roots"]:
                     old = self.runtime.snapshot(data["_roots"])
-                    if old.get("unresolved"):
+                    cand_entry = str((data.get("_candidate") or {}).get("entry_task_id") or "")
+                    truncated_entry = bool(
+                        cand_entry
+                        and not old.get("evidence_missing")
+                        and (
+                            cand_entry in set(old.get("truncated_task_ids", []))
+                            or ("truncated_task_ids" not in old and old.get("evidence_truncated"))
+                        )
+                    )
+                    if old.get("unresolved") or truncated_entry:
                         data.setdefault("_prior_runs", []).append(list(data["_roots"]))
-                        data.setdefault("_interruptions", []).extend(copy.deepcopy(old["unresolved"]))
+                        if old.get("unresolved"):
+                            data.setdefault("_interruptions", []).extend(copy.deepcopy(old["unresolved"]))
+                        elif truncated_entry:
+                            data.setdefault("_interruptions", []).append({
+                                "task_id": cand_entry, "status": "truncated",
+                                "error": "previous round trace exceeded evidence storage limit",
+                            })
                         data["_roots"] = []
                         data["_candidate"] = None
                         data["_needs_input"] = True
@@ -380,14 +417,14 @@ class GoalService:
             self._save(data)
             if action == "create":
                 data = self._cleanup_created_goal(data, activate=True)
-            if action in {"start", "resume"}:
+            if action in {"start", "resume", "submit"}:
                 try:
                     self.runtime.set_paused(data["_roots"], False)
                 except Exception:
                     self.documents[sid].update(status="paused", pause_reason="恢复授权未确认成功。")
                     raise
             self.wake.set()
-            return _public(data)
+            return self.read(sid)
 
     def on_event(self, event: dict) -> None:
         if not self.enabled:
@@ -478,19 +515,32 @@ class GoalService:
                     self.runtime.forget([*roots, *reviews])
                 self._path(sid).unlink(missing_ok=True)
                 return
-            if kind in {"input", "workspace"}:
+            if kind in {"input_routed", "workspace"}:
                 if sid not in self.documents and not self._path(sid).exists():
                     return
                 data = copy.deepcopy(self._load(sid))
                 if data["goal"] and data["status"] not in {"empty", "completed"}:
-                    if kind == "input":
-                        data["_candidate"] = None
-                        data["_needs_input"] = True
                     was_active = data["status"] in ACTIVE
-                    if was_active:
-                        reason = "工作区已切换，Goal 暂停；目标和评审记录保留。" if kind == "workspace" else "收到新的用户输入，Goal 自动推进已暂停。"
-                        self._pause(data, reason)
-                    if kind == "input" or was_active:
+                    if kind == "workspace":
+                        if was_active:
+                            self._pause(data, "工作区已切换，Goal 暂停；目标和评审记录保留。")
+                    else:
+                        # Only accepted user input invalidates old approval, never a failed pre-route request.
+                        data["goal_version"] += 1
+                        data["_candidate"] = None
+                        data["_review_outputs"] = []
+                        data["_needs_input"] = False
+                        tid = event.get("task_id")
+                        if tid:
+                            related = self.runtime.snapshot(data["_roots"]).get("tasks", [])
+                            related_ids = set(related) if isinstance(related, dict) else {row.get("task_id") for row in related}
+                            if tid not in data["_roots"] and tid not in related_ids:
+                                data["_roots"].append(tid)
+                                data["_current_execution"] = {"task_id": tid,
+                                    "source_inbound_seq": event.get("source_inbound_seq"), "started_at": time.time()}
+                                data["_wait_started"] = time.time()
+                            self.runtime.watch(data["_roots"])
+                    if kind != "workspace" or was_active:
                         self._save(data)
                 return
             if kind == "candidate":
@@ -553,7 +603,7 @@ class GoalService:
             log.exception("Goal runtime unavailable; automatic advance disabled")
 
     def _submit(self, data: dict, feedback: str = "", *, continuation: bool = False) -> None:
-        if data["rounds"] >= data["max_rounds"] or data["stagnation"] >= 3:
+        if data["rounds"] >= data["max_rounds"]:
             self._pause(data, "自动续轮预算已耗尽。")
             self._save(data)
             return
@@ -586,6 +636,62 @@ class GoalService:
                     _candidate=None, _needs_input=False, _wait_started=time.time())
         self._save(data)
 
+    def _send_preempt(self, data: dict) -> None:
+        pending = data["_pending_preempt"]
+        accepted = self.runtime.preempt_execution(data["session_id"], pending["task_id"],
+            pending["execution_id"], pending["text"], pending["request_id"], roots=data["_roots"], source="goal")
+        data.pop("_pending_preempt", None)
+        if pending.get("edit"):
+            if accepted:
+                data.pop("_pending_edit", None)
+            # A finished target is re-resolved on the next tick, never blindly recreated.
+        self._save(data)
+
+    def _send_edit(self, data: dict) -> None:
+        activity = self.runtime.execution_activity(data["_roots"])
+        if activity.get("task_id"):
+            edit = data["_pending_edit"]
+            data["_pending_preempt"] = {**edit, "edit": True, "task_id": activity["task_id"],
+                "execution_id": activity["execution_id"],
+                "request_id": edit["request_id"] + ":" + activity["task_id"] + ":" + activity["execution_id"]}
+            self._save(data)
+            self._send_preempt(data)
+        elif not activity.get("has_active_task") and not any(activity.get(key) for key in
+                ("busy_tool", "busy_child", "busy_async", "waiting", "awaiting_approval")):
+            data.pop("_pending_edit", None)
+            data["_needs_input"] = True
+            self._save(data)
+            self._submit(data)
+
+    def _check_progress(self, data: dict, now: float) -> None:
+        activity = self.runtime.execution_activity(data["_roots"])
+        last = activity.get("last_activity_at")
+        # Persist the next anchor even when healthy; slow running tools are not stalled agents.
+        data["_wait_started"] = now
+        if (type(last) in (int, float) and now - last >= IDLE_THRESHOLD
+                and activity.get("task_id") and activity.get("execution_id")
+                and not any(activity.get(key) for key in ("busy_tool", "busy_child", "busy_async", "waiting", "awaiting_approval"))):
+            data["_check_seq"] = data.get("_check_seq", 0) + 1
+            data["_pending_preempt"] = {"request_id": f"goal:{data['_identity']}:{data['goal_version']}:check:{data['_check_seq']}",
+                "task_id": activity["task_id"], "execution_id": activity["execution_id"],
+                "text": "Goal 定期进度检查：近期未观察到工具调用或执行活动。请检查当前任务，继续推进未完成目标；"
+                        "如正在等待已有任务，请核实其状态，不要重复启动，也不要仅因耗时或困难停止。"}
+        self._save(data)
+        if data.get("_pending_preempt"):
+            self._send_preempt(data)
+
+    @staticmethod
+    def _is_step_limit_failure(row: dict) -> bool:
+        return (
+            isinstance(row, dict)
+            and row.get("status") == "failed"
+            and str((row.get("result") or {}).get("error") or "").strip() == "Maximum step limit reached."
+        )
+
+    @classmethod
+    def _blocking_unresolved(cls, snap: dict) -> list[dict]:
+        return [row for row in (snap.get("unresolved") or []) if not cls._is_step_limit_failure(row)]
+
     def _advance(self, sid: str) -> None:
         data = copy.deepcopy(self.documents[sid])
         if data.get("_create_cleanup") is not None:
@@ -596,26 +702,53 @@ class GoalService:
             data = copy.deepcopy(self.documents[sid])
         if data["status"] not in ACTIVE:
             return
+        if data.get("_pending_preempt"):
+            self._send_preempt(data)
+            return
+        if data.get("_pending_edit"):
+            self._send_edit(data)
+            return
         if data.get("_pending_input") or data.get("_needs_input") or not data["_roots"]:
             self._submit(data)
             return
         snap = self.runtime.snapshot(data["_roots"])
-        if snap.get("unresolved"):
+        if self._blocking_unresolved(snap):
             self._pause(data, "相关执行失败、取消或结果丢失；请检查后决定如何处理。")
             self._save(data)
             return
         if snap.get("busy"):
+            now = time.time()
             if data.get("_wait_started") is None:
-                data["_wait_started"] = time.time()
+                data["_wait_started"] = now
                 self._save(data)
-            elif time.time() - data["_wait_started"] >= WAIT_TIMEOUT:
-                self._pause(data, "等待相关执行或结果处理超过 30 分钟；后台工作未取消。")
-                self._save(data)
+            elif now - data["_wait_started"] >= CHECK_INTERVAL:
+                self._check_progress(data, now)
             elif data["status"] != "waiting":
                 data["status"] = "waiting"
                 self._save(data)
             return
         candidate = data.get("_candidate")
+        if (not candidate or candidate.get("goal_version") != data["goal_version"]) and data["_roots"]:
+            latest_root = data["_roots"][-1]
+            tasks_list = list(snap["tasks"].values()) if isinstance(snap.get("tasks"), dict) else (snap.get("tasks") or [])
+            root_row = next((r for r in tasks_list if r.get("task_id") == latest_root), None)
+            if root_row is not None and self._is_step_limit_failure(root_row):
+                cid = f"{latest_root}:{root_row.get('execution_id', '')}:{latest_root}:step_limit"
+                res = root_row.get("result") or {}
+                candidate = {
+                    "candidate_id": cid,
+                    "entry_task_id": latest_root,
+                    "producer_task_id": latest_root,
+                    "task_id": latest_root,
+                    "session_id": data["session_id"],
+                    "node_id": root_row.get("node_id", ""),
+                    "execution_id": root_row.get("execution_id", ""),
+                    "goal_version": data["goal_version"],
+                    "result": {"action": "fail", "error": "Maximum step limit reached.", "step_limit_reached": True},
+                    "model": copy.deepcopy(res.get("_execution_model") or {}),
+                }
+                data["_candidate"] = candidate
+                self._save(data)
         if not candidate or candidate.get("goal_version") != data["goal_version"]:
             return
         if data.get("_review"):
@@ -641,6 +774,39 @@ class GoalService:
         try:
             instruction, input_info = build_input(data, snap, node, runtime_cfg=load_runtime_config(self.root))
         except ReviewInputError as exc:
+            latest = str((candidate or {}).get("entry_task_id") or "")
+            tasks_list = list(snap["tasks"].values()) if isinstance(snap.get("tasks"), dict) else (snap.get("tasks") or [])
+            has_chk_err = any((r.get("result") or {}).get("checkpoint_error") for r in tasks_list)
+            trace_storage_overflow = (
+                bool(latest)
+                and not snap.get("evidence_missing")
+                and not has_chk_err
+                and not set(snap.get("output_truncated_task_ids", [])).intersection({r["task_id"] for r in tasks_list})
+                and (
+                    latest in set(snap.get("truncated_task_ids", []))
+                    or ("truncated_task_ids" not in snap and snap.get("evidence_truncated"))
+                )
+            )
+            if trace_storage_overflow:
+                if data["rounds"] >= data["max_rounds"]:
+                    self._pause(data, "自动续轮预算已耗尽。")
+                    self._save(data)
+                    return
+                if data["_roots"]:
+                    data.setdefault("_prior_runs", []).append(list(data["_roots"]))
+                data.setdefault("_interruptions", []).append({
+                    "task_id": latest, "status": "truncated",
+                    "error": "previous round trace exceeded evidence storage limit",
+                })
+                data["_roots"] = []
+                data["_candidate"] = None
+                self._submit(
+                    data,
+                    "上一轮工具输出体积超过单轮证据存储上限，独立评审未能读取完整原始过程。"
+                    "请勿重复打印超长原始输出；请直接核实当前成果并运行精简、可核对的检查以提供完成证据。",
+                    continuation=True,
+                )
+                return
             # Missing or oversized transport is not a verdict on the work. Keep the
             # candidate for an explicit retry after capacity/records are repaired.
             self._pause(data, str(exc))
@@ -658,7 +824,7 @@ class GoalService:
                   "evidence_task_ids": sorted({input_info["latest_main_task_id"],
                                               *[row["task_id"] for row in data["_review_outputs"]]})}
         data.setdefault("_review_attempts", {})[f"{data['goal_version']}:{snap['version']}"] = attempt + 1
-        data.update(status="reviewing", _review=review, _wait_started=None)
+        data.update(status="reviewing", _review=review, _wait_started=time.time())
         self._save(data)
         task = self.runtime.create_system_task(data["session_id"], REVIEW_NODE, instruction, rid, node_overrides=overrides)
         review.update(task_id=task["task_id"], session_id=task["session_id"])
@@ -695,6 +861,7 @@ class GoalService:
             self._review_error(data, str(exc))
             return
         record = {**review, "verdict": verdict, "error": "", "applied": False, "finished_at": _now()}
+        data["_wait_started"] = time.time()
         data["reviews"].append(record)
         data["reviews"] = data["reviews"][-MAX_REVIEWS:]
         data["_review"] = None
@@ -717,7 +884,7 @@ class GoalService:
         if (review["attempt"] < 1 and review["goal_version"] == data["goal_version"]
                 and not data.get("_needs_input")
                 and review.get("candidate_id") == (candidate.get("candidate_id") or candidate.get("entry_task_id"))
-                and review["evidence_version"] == snap["version"] and not snap.get("busy") and not snap.get("unresolved")):
+                and review["evidence_version"] == snap["version"] and not snap.get("busy") and not self._blocking_unresolved(snap)):
             self._start_review(data, snap, attempt=review["attempt"] + 1)
         else:
             self._pause(data, reason + " 自动重试已停止，请检查后恢复。")
@@ -728,7 +895,7 @@ class GoalService:
         if (data["status"] not in ACTIVE or record.get("applied") or data.get("_needs_input")
                 or record.get("candidate_id") != (candidate.get("candidate_id") or candidate.get("entry_task_id"))
                 or record["goal_version"] != data["goal_version"] or record["evidence_version"] != snap["version"]
-                or snap.get("busy") or snap.get("unresolved")):
+                or snap.get("busy") or self._blocking_unresolved(snap)):
             return
         # Host transaction remains held from snapshot through the next input creation.
         record["applied"] = True
@@ -742,11 +909,13 @@ class GoalService:
         data["stagnation"] = 0 if verdict["progress"] else data["stagnation"] + 1
         if verdict["needs_user"]:
             self._pause(data, "需要用户决定：" + verdict["feedback"])
-        elif data["stagnation"] >= 3:
-            self._pause(data, "连续三次评审没有实质进展。")
         elif data["rounds"] >= data["max_rounds"]:
             self._pause(data, "自动续轮预算已耗尽。")
         if data["status"] in ACTIVE:
+            if snap.get("unresolved"):
+                if data["_roots"]:
+                    data.setdefault("_prior_runs", []).append(list(data["_roots"]))
+                data["_roots"] = []
             feedback = verdict["feedback"]
             if verdict["missing_evidence"]:
                 feedback += "\n缺失证据：\n" + "\n".join(verdict["missing_evidence"])
@@ -784,7 +953,7 @@ def summary(data: dict) -> str:
         return "当前为子会话，仅拥有自己的 Todo，不拥有父会话 Goal。"
     if not data.get("goal"):
         return "当前会话尚未设置 Goal。可通过前端 Goal 输入或 Goal API 提交目标并开始执行。"
-    text = f"当前会话 Goal：{data['goal']}\n验收条件：{data['criteria'] or '按目标提供完成证据'}\n状态：{data['status']}；自动续轮 {data['rounds']}/{data['max_rounds']}；连续无进展 {data['stagnation']}/3。"
+    text = f"当前会话 Goal：{data['goal']}\n验收条件：{data['criteria'] or '按目标提供完成证据'}\n状态：{data['status']}；自动续轮 {data['rounds']}/{data['max_rounds']}；连续未观察到进展 {data['stagnation']} 次（仅统计，不触发暂停）。"
     if data.get("pause_reason"):
         text += "\n说明：" + data["pause_reason"]
     if data["status"] not in ACTIVE:
@@ -802,6 +971,9 @@ def _service(request: Request) -> GoalService:
 
 
 def add_routes(router: APIRouter) -> None:
+    from .goal_input import add_routes as add_input_routes
+    add_input_routes(router)
+
     @router.get("/goal")
     def read_goal(request: Request, session_id: str):
         try:

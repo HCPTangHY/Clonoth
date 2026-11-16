@@ -680,14 +680,74 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         # [AutoC 2026-08-27] MCP 工具预载移除：发现职责归 engine/builtin/mcp 插件，
         # 其后台桥在首个 AI 任务启动时做首次发现（首个任务可能赶不上，第二个起可见）。
 
-        # Direction 1: graceful shutdown via signal handling
+        # Direction 1: graceful shutdown + instant manual task cancellation
         stop_event = asyncio.Event()
         _loop = asyncio.get_running_loop()
 
-        def _request_stop():
-            if not stop_event.is_set():
+        print(f"[engine] worker {wid[:8]} ready (max_concurrent={max_workers})", flush=True)
+        _active: set[asyncio.Task] = set()
+        _active_by_task_id: dict[str, asyncio.Task] = {}
+        _active_task_id_by_task: dict[asyncio.Task, str] = {}
+        _active_sessions_by_task_id: dict[str, set[str]] = {}
+        _manual_cancelled_tasks: set[str] = set()
+        _shutdown_cancelled_tasks: set[asyncio.Task] = set()
+        _poll_iter_task: asyncio.Task | None = None
+        _ws_watch_task: asyncio.Task | None = None
+
+        from .runtime_metrics import WorkerMetrics
+        from engine.inference.async_tools import _async_tool_tasks, mark_async_tool_cancelled
+        metrics = WorkerMetrics(workspace_root, wid, generation_id, runtime_cfg)
+
+        def _cancel_task_now(tid: str, *, manual: bool) -> bool:
+            key = (tid or "").strip()
+            if not key:
+                return False
+            t = _active_by_task_id.get(key)
+            if t is None or t.done():
+                return False
+            if key in _manual_cancelled_tasks or t in _shutdown_cancelled_tasks:
+                return False
+            if manual:
+                _manual_cancelled_tasks.add(key)
+            else:
+                _shutdown_cancelled_tasks.add(t)
+            t.cancel()
+            return True
+
+        def _cancel_session_tasks_now(sid: str) -> None:
+            key = (sid or "").strip()
+            if not key:
+                return
+            for tid, sids in list(_active_sessions_by_task_id.items()):
+                if key in sids:
+                    _cancel_task_now(tid, manual=True)
+
+        def _cancel_all_background_async_tools() -> set[asyncio.Task]:
+            bg: set[asyncio.Task] = set()
+            for aid, entry in list(_async_tool_tasks.items()):
+                task = entry.get("_task") if isinstance(entry, dict) else None
+                if isinstance(task, asyncio.Task) and not task.done():
+                    bg.add(task)
+                    mark_async_tool_cancelled(aid)
+            return bg
+
+        def _request_stop() -> None:
+            first = not stop_event.is_set()
+            if first:
                 print("[engine] received stop signal, initiating graceful shutdown...", flush=True)
                 stop_event.set()
+            if _poll_iter_task is not None and not _poll_iter_task.done():
+                _poll_iter_task.cancel()
+            if _ws_watch_task is not None and not _ws_watch_task.done():
+                _ws_watch_task.cancel()
+            if _active and first:
+                print(f"[engine] shutting down, cancelling {len(_active)} active task(s) immediately...", flush=True)
+            for t in list(_active):
+                tid = _active_task_id_by_task.get(t, "")
+                if not t.done() and t not in _shutdown_cancelled_tasks and tid not in _manual_cancelled_tasks:
+                    _shutdown_cancelled_tasks.add(t)
+                    t.cancel()
+            _cancel_all_background_async_tools()
 
         for _sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -695,102 +755,217 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
             except (NotImplementedError, RuntimeError):
                 pass  # Windows or non-main thread
 
-        print(f"[engine] worker {wid[:8]} ready (max_concurrent={max_workers})", flush=True)
-        _active: set[asyncio.Task] = set()
-        from .runtime_metrics import WorkerMetrics
-        metrics = WorkerMetrics(workspace_root, wid, generation_id, runtime_cfg)
+        def _reap_done_tasks() -> None:
+            _done = {t for t in _active if t.done()}
+            for t in _done:
+                if not t.cancelled():
+                    _exc = t.exception()
+                    if _exc:
+                        print(f"[engine] task error: {_exc}", flush=True)
+                tid = _active_task_id_by_task.pop(t, "")
+                if tid:
+                    if _active_by_task_id.get(tid) is t:
+                        _active_by_task_id.pop(tid, None)
+                    _active_sessions_by_task_id.pop(tid, None)
+                    _manual_cancelled_tasks.discard(tid)
+            _active.difference_update(_done)
+            metrics.reaped += len(_done)
+
+        async def _watch_supervisor_control_ws() -> None:
+            try:
+                import websockets
+            except Exception:
+                return
+            ws_base = (
+                "wss://" + supervisor_url[len("https://"):]
+                if supervisor_url.startswith("https://")
+                else "ws://" + supervisor_url[len("http://"):]
+                if supervisor_url.startswith("http://")
+                else supervisor_url
+            )
+            ws_url = f"{ws_base}/v1/ws"
+            ws_headers = {"Authorization": f"Bearer {_admin_token}"} if _admin_token else {}
+            while not stop_event.is_set():
+                try:
+                    async with websockets.connect(
+                        ws_url,
+                        additional_headers=ws_headers,
+                        open_timeout=5.0,
+                        ping_interval=20.0,
+                        ping_timeout=20.0,
+                        close_timeout=1.0,
+                        max_size=2 * 1024 * 1024,
+                    ) as ws:
+                        async for raw in ws:
+                            if stop_event.is_set():
+                                break
+                            try:
+                                evt = json.loads(raw)
+                            except Exception:
+                                continue
+                            if not isinstance(evt, dict):
+                                continue
+                            et = evt.get("type")
+                            payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
+                            if et in ("task_cancel_requested", "task_cancelled"):
+                                tid = str(payload.get("task_id") or "")
+                                if _cancel_task_now(tid, manual=True):
+                                    print(f"[engine] instant cancel push received for task {tid[:12]}", flush=True)
+                            elif et == "cancel_requested":
+                                sid = str(evt.get("session_id") or payload.get("session_id") or "")
+                                _cancel_session_tasks_now(sid)
+                            elif et == "async_tool_cancel_requested":
+                                target_wid = str(payload.get("worker_id") or "")
+                                aid = str(payload.get("async_id") or "")
+                                if aid and (not target_wid or target_wid == wid):
+                                    mark_async_tool_cancelled(aid)
+                                    print(f"[engine] instant cancel push received for async tool {aid[:12]}", flush=True)
+                            elif et == "engine_restarting":
+                                if str(payload.get("target") or "") in ("all", "engine"):
+                                    _request_stop()
+                                    return
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    if stop_event.is_set():
+                        return
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+
+        async def _poll_once() -> bool:
+            nonlocal _last_reload_seq
+            # 1) Always drain pending task + async-tool cancels first (short timeout)
+            try:
+                cr = await http.get(
+                    f"{supervisor_url}/v1/async_tools/pending_cancels",
+                    params={"worker_id": wid},
+                    timeout=3.0,
+                )
+                if cr.status_code == 200:
+                    cdata = cr.json()
+                    for _tid in (cdata.get("task_ids") or []):
+                        if _cancel_task_now(str(_tid), manual=True):
+                            print(f"[engine] task {_tid} cancel requested via poll", flush=True)
+                    for _aid in (cdata.get("async_ids") or []):
+                        mark_async_tool_cancelled(str(_aid))
+                        print(f"[engine] async tool {_aid} cancel requested", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+            if stop_event.is_set():
+                return False
+
+            # 2) Tools hot-reload check (short timeout)
+            try:
+                rr = await http.get(f"{supervisor_url}/v1/tools/reload-seq", timeout=5.0)
+                if rr.status_code == 200:
+                    new_seq = int(rr.json().get("seq", 0))
+                    if new_seq > _last_reload_seq:
+                        _last_reload_seq = new_seq
+                        count = registry.reload()
+                        remote_count = await registry.load_remote_tools(supervisor_url)
+                        print(f"[engine] tools reloaded ({count} local tools, {remote_count} remote tools)", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+            if stop_event.is_set():
+                return False
+
+            # 3) Poll for new task (only if below capacity, short timeout)
+            if len(_active) < max_workers:
+                nr = await http.get(
+                    f"{supervisor_url}/v1/tasks/next",
+                    params={"worker_id": wid},
+                    timeout=5.0,
+                )
+                if nr.status_code == 200 and not stop_event.is_set():
+                    item = nr.json()
+                    if isinstance(item, dict) and item.get("task_id"):
+                        tid = str(item.get("task_id") or "").strip()
+                        inp = item.get("input") if isinstance(item.get("input"), dict) else {}
+                        sids = {
+                            str(s).strip()
+                            for s in (
+                                item.get("session_id"),
+                                inp.get("parent_session_id"),
+                                inp.get("child_session_id"),
+                            )
+                            if s and str(s).strip()
+                        }
+                        _t = asyncio.create_task(
+                            _handle_task(
+                                http, llm_http, supervisor_url, workspace_root, registry, item, wid,
+                                is_manual_cancel=lambda k: k in _manual_cancelled_tasks,
+                            )
+                        )
+                        _active.add(_t)
+                        if tid:
+                            _active_by_task_id[tid] = _t
+                            _active_task_id_by_task[_t] = tid
+                            _active_sessions_by_task_id[tid] = sids
+                        metrics.claimed += 1
+                        return True
+            return False
+
+        _ws_watch_task = asyncio.create_task(_watch_supervisor_control_ws(), name="supervisor_control_ws")
 
         while not stop_event.is_set():
             try:
-                # ---- reap finished tasks ----
-                _done = {t for t in _active if t.done()}
-                for t in _done:
-                    if not t.cancelled():
-                        _exc = t.exception()
-                        if _exc:
-                            print(f"[engine] task error: {_exc}", flush=True)
-                _active -= _done
-                metrics.reaped += len(_done)
-                _done.clear()
+                _reap_done_tasks()
                 metrics.sample(_active, registry)
 
-                # ---- tools hot-reload check ----
-                try:
-                    rr = await http.get(f"{supervisor_url}/v1/tools/reload-seq")
-                    if rr.status_code == 200:
-                        new_seq = int(rr.json().get("seq", 0))
-                        if new_seq > _last_reload_seq:
-                            _last_reload_seq = new_seq
-                            count = registry.reload()
-                            # [AutoC 2026-08-01] Reload remote tools after script reload.
-                            # Why: Supervisor bumps reload-seq when worker tool pools change.
-                            # How: re-run remote broker discovery in the same hot reload branch;
-                            # MCP tools live in the reload snapshots (registered via
-                            # register_builtin_tool by the mcp builtin plugin) and survive
-                            # reload without re-discovery. Purpose: engine tool tables track
-                            # live remote workers.
-                            remote_count = await registry.load_remote_tools(supervisor_url)
-                            print(f"[engine] tools reloaded ({count} local tools, {remote_count} remote tools)", flush=True)
-                except Exception:
-                    pass
-
-                # ---- poll for new task (only if below capacity) ----
-                if len(_active) < max_workers:
-                    nr = await http.get(f"{supervisor_url}/v1/tasks/next", params={"worker_id": wid})
-                    if nr.status_code == 200:
-                        item = nr.json()
-                        if isinstance(item, dict) and item.get("task_id"):
-                            _t = asyncio.create_task(
-                                _handle_task(http, llm_http, supervisor_url, workspace_root, registry, item, wid)
-                            )
-                            _active.add(_t)
-                            metrics.claimed += 1
-                            continue
-
-                # [AutoC 2026-09-02] 异步工具取消消费：supervisor 的待消费队列
-                # 每秒随轮询拉一次，命中的 async_id 在本地登记表里标取消意图；
-                # execute_command 的 0.2s 循环与投递路径都会感知。
-                try:
-                    from engine.inference.async_tools import mark_async_tool_cancelled
-                    cr = await http.get(
-                        f"{supervisor_url}/v1/async_tools/pending_cancels",
-                        params={"worker_id": wid},
-                        timeout=2.0,
-                    )
-                    if cr.status_code == 200:
-                        for _aid in (cr.json().get("async_ids") or []):
-                            mark_async_tool_cancelled(str(_aid))
-                            print(f"[engine] async tool {_aid} cancel requested", flush=True)
-                except Exception:
-                    pass
+                _poll_iter_task = asyncio.create_task(_poll_once())
+                claimed_any = await _poll_iter_task
+                _poll_iter_task = None
+                if claimed_any and not stop_event.is_set():
+                    continue
             except asyncio.CancelledError:
-                stop_event.set()
+                if not stop_event.is_set():
+                    stop_event.set()
+                break
+            except httpx.TimeoutException:
+                pass
             except Exception as e:
-                print(f"[engine] error: {e}", flush=True)
-            # Stop-aware sleep: wake immediately on stop signal
+                print(f"[engine] error: {e or type(e).__name__}", flush=True)
+            finally:
+                _poll_iter_task = None
+
+            if stop_event.is_set():
+                break
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=poll_sec)
             except asyncio.TimeoutError:
                 pass
             except asyncio.CancelledError:
                 stop_event.set()
+                break
 
         # Follow production's bounded task cancellation; release diagnostics last.
         try:
+            if _ws_watch_task is not None and not _ws_watch_task.done():
+                _ws_watch_task.cancel()
+                try:
+                    await _ws_watch_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             # Background tools must settle cancellation while the HTTP client still
             # exists, not during asyncio.run's final teardown after it has closed.
-            from engine.inference.async_tools import _async_tool_tasks, mark_async_tool_cancelled
-            background = set()
-            for aid, entry in list(_async_tool_tasks.items()):
-                task = entry.get('_task') if isinstance(entry, dict) else None
-                if isinstance(task, asyncio.Task) and not task.done():
-                    background.add(task)
-                    mark_async_tool_cancelled(aid)
-            if _active or background:
-                print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)
-                for task in _active:
+            background = _cancel_all_background_async_tools()
+            for task in list(_active):
+                tid = _active_task_id_by_task.get(task, "")
+                if not task.done() and task not in _shutdown_cancelled_tasks and tid not in _manual_cancelled_tasks:
+                    _shutdown_cancelled_tasks.add(task)
                     task.cancel()
-                await asyncio.wait(_active | background, timeout=15.0)
+            pending_all = {t for t in (_active | background) if not t.done()}
+            if pending_all:
+                await asyncio.wait(pending_all, timeout=15.0)
+            _reap_done_tasks()
         finally:
             metrics.close()
         print(f"[engine] worker {wid[:8]} stopped (generation {generation_id[:8]})", flush=True)
@@ -829,6 +1004,8 @@ async def _handle_task(
     registry: ToolRegistry,
     item: dict[str, Any],
     worker_id: str,
+    *,
+    is_manual_cancel: Any = None,
 ) -> None:
     task_id = str(item.get("task_id") or "").strip()
     execution_id = str(item.get("execution_id") or "")
@@ -863,50 +1040,78 @@ async def _handle_task(
         else:
             result = {"action": "fail", "node_id": "", "error": f"未知 task kind: {kind}"}
     except asyncio.CancelledError:
-        # Direction 1: engine graceful shutdown — write terminal state before exiting
-        print(f"[engine] task {task_id} cancelled (engine shutdown)", flush=True)
-        result = cancelled_task_result(current_context.get(), str(item.get("node_id") or ""))
+        if callable(is_manual_cancel) and is_manual_cancel(task_id):
+            print(f"[engine] task {task_id} cancelled (manual cancel)", flush=True)
+            rctx_cur = current_context.get()
+            node_or_tool = str(item.get("node_id") or item.get("tool_name") or "")
+            if rctx_cur is not None:
+                try:
+                    _ack_task = asyncio.create_task(
+                        rctx_cur.emit_event(
+                            "cancel_acknowledged",
+                            {"node_id": node_or_tool, "task_id": task_id},
+                        )
+                    )
+                    try:
+                        await asyncio.shield(_ack_task)
+                    except asyncio.CancelledError:
+                        await asyncio.gather(_ack_task, return_exceptions=True)
+                except (Exception, asyncio.CancelledError):
+                    pass
+            result = {"action": "cancelled", "node_id": node_or_tool, "error": "task cancelled"}
+            if rctx_cur is not None and getattr(rctx_cur, "child_session_id", ""):
+                result["child_session_id"] = rctx_cur.child_session_id
+        else:
+            # Direction 1: engine graceful shutdown — write terminal state before exiting
+            print(f"[engine] task {task_id} cancelled (engine shutdown)", flush=True)
+            result = cancelled_task_result(current_context.get(), str(item.get("node_id") or ""))
     except Exception as exc:
         import traceback as _tb
         print(f"[engine] task {task_id} crashed: {exc}", flush=True)
         _tb.print_exc()
         result = {"action": "fail", "node_id": str(item.get("node_id") or ""), "error": f"引擎内部错误: {exc}"}
     finally:
+        if _hb is not None:
+            _hb.cancel()
         _current_sticky_sid_var.reset(sticky_token)
         current_context.reset(restart_token)
 
     if _hb is not None:
-        _hb.cancel()
-        await asyncio.gather(_hb, return_exceptions=True)
-    # 重试 complete_task POST，防止因网络/超时导致 task 永久孤立
-    try:
-        for _complete_attempt in range(3):
-            try:
-                _cr = await http.post(
-                    f"{sup_url}/v1/tasks/{task_id}/complete",
-                    json={"worker_id": worker_id, "result": result,
-                          **({"execution_id": execution_id} if execution_id else {})},
-                )
-                if _cr.status_code < 500:
-                    break  # 成功或客户端错误（如 404），不再重试
-            except asyncio.CancelledError:
-                raise  # Propagate to outer handler for final attempt
-            except Exception as _ce:
-                print(f"[engine] task {task_id} complete POST failed (attempt {_complete_attempt + 1}/3): {_ce}", flush=True)
-                if _complete_attempt < 2:
-                    await asyncio.sleep(2 ** _complete_attempt)  # 1s, 2s
-        else:
-            print(f"[engine] task {task_id} ORPHANED - all complete POST attempts failed", flush=True)
-    except asyncio.CancelledError:
-        # Shutdown interrupted the retry loop; make one final attempt
         try:
-            await http.post(
+            await asyncio.gather(_hb, return_exceptions=True)
+        except asyncio.CancelledError:
+            pass
+    async def _post_complete_shielded() -> httpx.Response:
+        _post_task = asyncio.create_task(
+            http.post(
                 f"{sup_url}/v1/tasks/{task_id}/complete",
                 json={"worker_id": worker_id, "result": result,
                       **({"execution_id": execution_id} if execution_id else {})},
+                timeout=10.0,
             )
-        except Exception:
-            print(f"[engine] task {task_id} ORPHANED - shutdown interrupted complete POST", flush=True)
+        )
+        while True:
+            try:
+                return await asyncio.shield(_post_task)
+            except asyncio.CancelledError:
+                # Never abort an already-started /complete report; finish awaiting it.
+                continue
+
+    # 重试 complete_task POST，防止因网络/超时导致 task 永久孤立
+    for _complete_attempt in range(3):
+        try:
+            _cr = await _post_complete_shielded()
+            if _cr.status_code < 500:
+                break  # 成功或客户端错误（如 404），不再重试
+        except Exception as _ce:
+            print(f"[engine] task {task_id} complete POST failed (attempt {_complete_attempt + 1}/3): {_ce}", flush=True)
+            if _complete_attempt < 2:
+                try:
+                    await asyncio.sleep(2 ** _complete_attempt)  # 1s, 2s
+                except asyncio.CancelledError:
+                    pass
+    else:
+        print(f"[engine] task {task_id} ORPHANED - all complete POST attempts failed", flush=True)
 
 
 _TASK_ACTION_FIELDS = set(TaskAction.__dataclass_fields__)
@@ -1430,6 +1635,8 @@ async def _run_node_task(
             streaming=bool(get_bool(runtime_cfg, "engine.streaming", False)),
             attachments=input_attachments,
         )
+        if getattr(rctx, "_restart_accepted", False):
+            return cancelled_task_result(rctx, node.id)
 
     # Child Session 隔离（Phase B）：将 child_session_id 写入 task result，
     # 供 supervisor 侧 _route_completed_task_locked 和调试/监控使用。

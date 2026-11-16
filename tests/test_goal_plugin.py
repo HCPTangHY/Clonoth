@@ -56,6 +56,21 @@ class Runtime:
     def set_paused(self, roots, paused):
         self.paused.update(roots) if paused else self.paused.difference_update(roots)
 
+    def execution_activity(self, roots):
+        live = next((self.tasks[r] for r in reversed(roots) if r in self.tasks
+                     and self.tasks[r]['status'] in {'pending', 'running'}), None)
+        return {'task_id': live['task_id'] if live else '', 'execution_id': 'test' if live else '',
+                'last_activity_at': None, 'busy_tool': False, 'busy_child': False,
+                'awaiting_approval': False, 'has_active_task': bool(live)}
+
+    def preempt_execution(self, sid, task_id, execution_id, text, request_id, *, roots, source='goal', attachments=None):
+        if request_id in self.requests:
+            return True
+        if self.tasks.get(task_id, {}).get('status') not in {'running', 'pending'}:
+            return False
+        self.requests[request_id] = {'task_id': task_id, 'text': text, 'source': source}
+        return True
+
     def snapshot(self, roots):
         tasks = [copy.deepcopy(self.tasks[r]) for r in roots if r in self.tasks]
         facts = [self.facts.get(r, {}) for r in roots]
@@ -130,7 +145,9 @@ def answer(e, tid, *, passed=False, progress=True, invalid=False):
 
 def test_eight_continuations_not_nine(env):
     e = env
-    launch(e)
+    command(e, 'set', goal='Make checker pass', max_rounds=8)
+    command(e, 'start')
+    e.service.tick()
     for _ in range(9):
         tid = candidate(e)
         answer(e, tid)
@@ -142,13 +159,13 @@ def test_eight_continuations_not_nine(env):
     assert err.value.status_code == 409
 
 
-def test_three_stagnant_reviews_pause(env):
+def test_three_stagnant_reviews_continue(env):
     launch(env)
     for _ in range(3):
         answer(env, candidate(env), progress=False)
     data = env.service.read('main')
-    assert data['stagnation'] == 3 and data['rounds'] == 2
-    assert data['status'] == 'paused'
+    assert data['stagnation'] == 3 and data['rounds'] == 3
+    assert data['status'] in {'running', 'waiting'}
 
 
 def test_pause_retains_verdict_and_same_version_resume(env):
@@ -273,16 +290,16 @@ def test_pause_write_failure_revokes_local_advance_permission(env, monkeypatch):
     assert env.rt.tasks[tid]['status'] == 'running'
 
 
-def test_user_input_invalidates_candidate_without_changing_goal_version(env):
+def test_accepted_user_input_invalidates_candidate_without_pausing(env):
     launch(env)
     tid = candidate(env)
     version = env.service.read('main')['goal_version']
-    env.service.on_event({'kind': 'input', 'session_id': 'main'})
+    new = env.rt.submit_input('main', 'Additional instruction', 'user-input')
+    env.service.on_event({'kind': 'input_routed', 'session_id': 'main', 'task_id': new['task_id'],
+                          'source_inbound_seq': new['inbound_seq'], 'user_input': True})
     answer(env, tid, passed=True)
-    command(env, 'resume')
-    env.service.tick()
     data = env.service.read('main')
-    assert data['status'] == 'running' and data['goal_version'] == version
+    assert data['status'] in {'running', 'waiting'} and data['goal_version'] == version + 1
     assert len(env.rt.inputs) == 2
     assert data['reviews'][-1]['applied'] is False
 

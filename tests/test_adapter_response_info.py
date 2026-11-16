@@ -250,6 +250,109 @@ class RuntimeResponseInfoTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(loop.provider, primary)
             self.assertNotIn("response_info", result.result)
 
+    async def test_retry_fallback_and_cancel_fail_notices_persist_for_history_without_polluting_llm(self):
+        from engine.builtin import fallback_provider
+        from engine.conversation_store import ConversationStore, Message
+        from engine.inference import llm_call
+        from engine.inference.loop_state import _LoopState
+        from engine.node import Node
+        from supervisor.eventlog import EventLog
+        from supervisor.state import SupervisorState
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config" / "nodes").mkdir(parents=True)
+            (root / "config" / "nodes" / "main.yaml").write_text("id: main\ntype: ai\noutput_mode: hybrid\n", encoding="utf-8")
+
+            # 1. Verify _call_llm_with_retry records retry reasons in rctx.step_notices
+            attempts = [
+                ProviderResponse(ok=False, error="502 Bad Gateway upstream", status_code=502),
+                ProviderResponse(ok=True, text="recovered answer", usage={"prompt_tokens": 10, "completion_tokens": 5}),
+            ]
+            idx = {"i": 0}
+
+            class FlakyProvider:
+                name = "pri"
+                model = "pri-model"
+
+                async def chat(self, **kwargs):
+                    res = attempts[idx["i"]]
+                    idx["i"] += 1
+                    return res
+
+            rctx = SimpleNamespace(
+                workspace_root=root, task_id="t1", session_id="s1",
+                begin_llm_request=lambda: "req-1", emit_event=AsyncMock(),
+                check_cancelled=AsyncMock(return_value=False),
+                check_preempted=AsyncMock(return_value={}),
+                response_info={}, step_notices=[], llm_http=None,
+            )
+            ls = _LoopState(
+                rctx=rctx, node=Node(id="main", type="ai"), provider=FlakyProvider(),
+                registry=None, run_id="r", context_ref="", runtime_cfg={},
+                streaming=False, use_stream=False, messages=[{"role": "user", "content": "hi"}],
+                system_prompt=[], is_block_mode=False, openai_tools=[], history=[],
+                collected_attachments=[], tool_produced_attachments=[],
+                retry_max=3, retry_initial_delay=0.01, retry_max_delay=0.02, retry_backoff=1.0,
+            )
+            with patch.object(llm_call.hook_registry, "afire", new=AsyncMock(return_value=HookResult())):
+                resp = await llm_call._call_llm_with_retry(ls, 0)
+            self.assertTrue(resp.ok)
+            self.assertEqual(len(rctx.step_notices), 1)
+            self.assertEqual(rctx.step_notices[0]["code"], "llm.retry")
+            self.assertIn("502 Bad Gateway upstream", rctx.step_notices[0]["text"])
+
+            # 2. Verify fallback_provider includes original error reason in response_notices
+            fb_prov = SimpleNamespace(name="backup", model="backup-model")
+            ctx = HookContext(
+                messages=ls.messages, tools=[], node=ls.node, provider=ls.provider, rctx=rctx,
+                response=ProviderResponse(ok=False, error="429 rate limited", status_code=429),
+                extra={"loop_state": ls, "call_provider": AsyncMock(return_value=ProviderResponse(ok=True, text="fb ok"))},
+            )
+            with patch.object(fallback_provider, "_load_config", return_value={"fallbacks": [{"provider": "openai", "base_url": "https://fb.example", "api_key": "secret-k", "model": "backup-model"}]}), \
+                 patch.object(fallback_provider, "_create_fallback_provider", return_value=fb_prov):
+                fb_res = await fallback_provider.FallbackProviderHandler().handle(ctx)
+            fb_notice = fb_res.channels["response_notices"][0]
+            self.assertIn("429 rate limited", fb_notice["text"])
+            self.assertNotIn("secret-k", fb_notice["text"])
+
+            # 3. Verify Supervisor persists cancelled & error notices to JSONL and exports response_info even with empty meta
+            with patch("supervisor.state.auto_discover_and_register", return_value={}), \
+                 patch("engine.hooks.loader.load_external_plugins", return_value=0):
+                state = SupervisorState(workspace_root=root, eventlog=EventLog(root / "data" / "events.jsonl", run_id="b1"), policy=SimpleNamespace())
+            state._default_entry_node = lambda: "main"
+            state._maybe_trigger_turn_summary_locked = lambda task: None
+            sid = state.get_or_create_session(channel="web", conversation_key="web:hist")
+            store = ConversationStore(root / "data" / "conversations")
+            store.append(sid, Message(
+                id="a-empty-meta", role="assistant", content="ok", meta={},
+                response_info={"provider": "backup", "model": "backup-model", "notices": [*rctx.step_notices, fb_notice]},
+            ))
+
+            # Manual cancel on running entry task
+            inb = state.execution_runtime.submit_input(sid, "stop me", "req-stop-1")
+            tid = inb["task_id"]
+            claimed = state.assign_next_task(worker_id="w1")
+            state.cancel_single_task(tid)
+            state.complete_task(task_id=tid, worker_id="w1", execution_id=claimed["execution_id"], result={"action": "cancelled", "error": "task cancelled"})
+
+            # Orphan cancel merges branch and writes restart interruption notice
+            inb2 = state.execution_runtime.submit_input(sid, "restart me", "req-restart-2")
+            tid2 = inb2["task_id"]
+            state.assign_next_task(worker_id="w1")
+            branch_sid = state.tasks[tid2].session_id
+            store.append(branch_sid, Message(id="partial-tool", role="assistant", content="working...", source_task_id=tid2))
+            state.cancel_orphaned_tasks()
+
+            structured = state.session_history_structured(session_id=sid)
+            self.assertEqual(structured[0]["response_info"]["notices"][0]["code"], "llm.retry")
+            self.assertEqual(structured[0]["response_info"]["notices"][1]["code"], "fallback_provider.used")
+            cancel_rows = [m for m in structured if m.get("message_type") == "cancelled"]
+            self.assertEqual(len(cancel_rows), 2)
+            self.assertIn("手动取消", cancel_rows[0]["content"])
+            self.assertIn("服务重启中断", cancel_rows[1]["content"])
+            self.assertTrue(any(m.get("id") == "partial-tool" for m in structured))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -103,7 +103,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     },
     "supervisor": {
         "process_manager": {
-            "stop_wait_timeout_sec": 5.0,
+            "stop_wait_timeout_sec": 20.0,
             "engine_workers": 2,
         },
     },

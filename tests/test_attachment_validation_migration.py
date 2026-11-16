@@ -271,6 +271,94 @@ class AttachmentValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside allowed data/"):
             save_attachment(self.root, "../../outside", self.png, filename="picture.png")
 
+    def test_session_history_structured_filters_phantom_and_read_file_attachments(self):
+        import json
+        import threading
+        from supervisor.session import SessionMixin
+
+        class DummySessionHost(SessionMixin):
+            def __init__(self, workspace_root: Path):
+                self.workspace_root = workspace_root
+                self._lock = threading.RLock()
+
+            def _entry_branch_ids_for_parent_locked(self, session_id: str) -> list[str]:
+                return []
+
+        conv_dir = self.root / "data" / "conversations"
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        sid = "sess-structured-att"
+        rows = [
+            {
+                "id": "m1",
+                "role": "user",
+                "content": "hello",
+                "meta": {
+                    "attachments": [
+                        {"path": "data/attachments/user.png", "name": "user.png", "type": "image"},
+                        {"name": "phantom-without-path"},
+                    ],
+                },
+            },
+            {
+                "id": "m2",
+                "role": "tool",
+                "name": "read_file",
+                "tool_call_id": "call_1",
+                "content": "[img]",
+                "meta": {
+                    "tool_result_attachments": [
+                        {"path": "data/attachments/read_file/123.png", "name": "ui.png", "type": "image"},
+                    ],
+                },
+            },
+            {
+                "id": "m3",
+                "role": "user",
+                "message_type": "tool_result_attachment",
+                "content": "",
+                "meta": {
+                    "attachments": [
+                        {"path": "data/attachments/read_file/123.png", "name": "ui.png", "type": "image"},
+                    ],
+                },
+            },
+            {
+                "id": "m4",
+                "role": "tool",
+                "name": "list_dir",
+                "tool_call_id": "call_2",
+                "content": "{}",
+                "meta": {
+                    "tool_result_structured": {
+                        "ok": True,
+                        "data": {"result": [{"path": "src/index.ts", "name": "index.ts"}]},
+                    },
+                },
+            },
+            {
+                "id": "m5",
+                "role": "tool",
+                "name": "generate_image",
+                "tool_call_id": "call_3",
+                "content": "{}",
+                "meta": {
+                    "tool_result_structured": {
+                        "ok": True,
+                        "data": {"attachments": ["data/attachments/gen.png"]},
+                    },
+                },
+            },
+        ]
+        (conv_dir / f"{sid}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        structured = DummySessionHost(self.root).session_history_structured(session_id=sid, limit=0)
+        by_id = {m["id"]: m for m in structured}
+        self.assertEqual([a["path"] for a in by_id["m1"]["attachments"]], ["data/attachments/user.png"])
+        self.assertNotIn("tool_attachments", by_id["m2"])
+        self.assertNotIn("attachments", by_id["m3"])
+        self.assertNotIn("tool_attachments", by_id["m4"])
+        self.assertEqual([a["path"] for a in by_id["m5"]["tool_attachments"]], ["data/attachments/gen.png"])
+
 
 if __name__ == "__main__":
     unittest.main()

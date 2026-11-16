@@ -152,34 +152,39 @@ async def call_remote_tool(ctx: Any, registered_name: str, args: dict[str, Any],
     except Exception as exc:
         return _result(False, f"ERROR: remote call creation failed: {exc}", error=f"remote call creation failed: {exc}")
 
-    while True:
-        try:
-            if hasattr(ctx, "check_cancelled") and await ctx.check_cancelled():
-                await _cancel_remote_call(http, base_url, call_id, "task cancelled")
-                return _result(False, "ERROR: remote tool cancelled", error="remote tool cancelled", cancelled=True, call_id=call_id)
-        except Exception:
-            pass
+    try:
+        while True:
+            try:
+                if hasattr(ctx, "check_cancelled") and await ctx.check_cancelled():
+                    await _cancel_remote_call(http, base_url, call_id, "task cancelled")
+                    return _result(False, "ERROR: remote tool cancelled", error="remote tool cancelled", cancelled=True, call_id=call_id)
+            except Exception:
+                pass
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            await _cancel_remote_call(http, base_url, call_id, "remote tool timeout")
-            return _result(False, f"ERROR: remote tool timeout after {timeout_sec}s", error=f"remote tool timeout after {timeout_sec}s", call_id=call_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await _cancel_remote_call(http, base_url, call_id, "remote tool timeout")
+                return _result(False, f"ERROR: remote tool timeout after {timeout_sec}s", error=f"remote tool timeout after {timeout_sec}s", call_id=call_id)
 
-        wait_sec = max(0.1, min(2.0, remaining))
-        try:
-            result_resp = await http.get(
-                f"{base_url}/v1/remote/calls/{call_id}/result",
-                params={"wait_sec": wait_sec},
-                timeout=wait_sec + 5.0,
-            )
-            if result_resp.status_code == 202:
-                await asyncio.sleep(0)
-                continue
-            result_resp.raise_for_status()
-            return _normalize_tool_result(result_resp.json())
-        except httpx.HTTPStatusError as exc:
-            text = exc.response.text[:500] if exc.response is not None else str(exc)
-            return _result(False, f"ERROR: remote call result failed: {text}", error=f"remote call result failed: {text}", call_id=call_id)
-        except Exception as exc:
-            return _result(False, f"ERROR: remote call result failed: {exc}", error=f"remote call result failed: {exc}", call_id=call_id)
+            wait_sec = max(0.1, min(2.0, remaining))
+            try:
+                result_resp = await http.get(
+                    f"{base_url}/v1/remote/calls/{call_id}/result",
+                    params={"wait_sec": wait_sec},
+                    timeout=wait_sec + 5.0,
+                )
+                if result_resp.status_code == 202:
+                    await asyncio.sleep(0)
+                    continue
+                result_resp.raise_for_status()
+                return _normalize_tool_result(result_resp.json())
+            except httpx.HTTPStatusError as exc:
+                text = exc.response.text[:500] if exc.response is not None else str(exc)
+                return _result(False, f"ERROR: remote call result failed: {text}", error=f"remote call result failed: {text}", call_id=call_id)
+            except Exception as exc:
+                return _result(False, f"ERROR: remote call result failed: {exc}", error=f"remote call result failed: {exc}", call_id=call_id)
+    except asyncio.CancelledError:
+        if call_id:
+            await asyncio.shield(_cancel_remote_call(http, base_url, call_id, "task cancelled"))
+        raise
 

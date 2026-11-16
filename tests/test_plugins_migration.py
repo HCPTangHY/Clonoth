@@ -65,8 +65,7 @@ def todo_list(items=(), revision=0, session_id="s1") -> dict:
 
 
 def patch(session_id="s1", **kw) -> dict:
-    base = {"expected_revision": 0, "expected_session_id": session_id, "changes": [],
-            "remove_ids": [], "order": None}
+    base = {"expected_revision": 0, "expected_session_id": session_id, "items": []}
     base.update(kw)
     return base
 
@@ -284,13 +283,56 @@ class SupervisorRoutesTests(unittest.TestCase):
 
 
 class ApplyUpdateTests(unittest.TestCase):
-    def test_add_appends_and_bumps_revision(self) -> None:
+    def test_replace_default_creates_short_ids_and_overwrites_old_items(self) -> None:
         current = todo_list()
-        result = apply_update(current, patch(changes=[{"id": None, "title": "A"}]), ACTOR)
+        result = apply_update(current, patch(items=[{"title": "A"}, {"title": "B", "status": "in_progress"}]), ACTOR)
         self.assertEqual(result["revision"], 1)
-        self.assertEqual([(i["title"], i["status"]) for i in result["items"]], [("A", "pending")])
+        self.assertEqual([(i["id"], i["title"], i["status"]) for i in result["items"]],
+                         [("1", "A", "pending"), ("2", "B", "in_progress")])
         self.assertEqual(result["items"][0]["updated_by"], ACTOR)
         self.assertEqual(current["items"], [])  # input stays pristine
+
+        # Default replace overwrites completed and unfinished items alike and resets numbering.
+        rewritten = apply_update(
+            result,
+            patch(expected_revision=1, items=[{"title": "Fresh task 1"}, {"title": "Fresh task 2"}]),
+            ACTOR,
+        )
+        self.assertEqual(rewritten["revision"], 2)
+        self.assertEqual([(i["id"], i["title"], i["status"]) for i in rewritten["items"]],
+                         [("1", "Fresh task 1", "pending"), ("2", "Fresh task 2", "pending")])
+
+        # Passing items=[] clears the entire list in one step.
+        cleared = apply_update(rewritten, patch(expected_revision=2, items=[]), ACTOR)
+        self.assertEqual((cleared["revision"], cleared["items"]), (3, []))
+
+    def test_append_mode_merges_by_id_and_appends_new_short_ids(self) -> None:
+        legacy_current = todo_list([item(id="f4bfcff15f914c1fa96fc9f17bb07f4d", title="legacy")], revision=2)
+        step1 = apply_update(
+            legacy_current,
+            patch(expected_revision=2, mode="append", items=[
+                {"id": "f4bfcff15f914c1fa96fc9f17bb07f4d", "status": "completed"},
+                {"title": "next step"},
+            ]),
+            ACTOR,
+        )
+        self.assertEqual([(i["id"], i["title"], i["status"]) for i in step1["items"]], [
+            ("f4bfcff15f914c1fa96fc9f17bb07f4d", "legacy", "completed"),
+            ("1", "next step", "pending"),
+        ])
+        step2 = apply_update(
+            step1,
+            patch(expected_revision=3, mode="append", items=[
+                {"id": "1", "status": "in_progress", "title": None, "note": None},
+                {"id": None, "title": "third step", "status": None, "note": None},
+            ]),
+            ACTOR,
+        )
+        self.assertEqual([(i["id"], i["title"], i["status"]) for i in step2["items"]], [
+            ("f4bfcff15f914c1fa96fc9f17bb07f4d", "legacy", "completed"),
+            ("1", "next step", "in_progress"),
+            ("2", "third step", "pending"),
+        ])
 
     def test_revision_conflict_and_session_mismatch(self) -> None:
         expect(self, 409, apply_update, todo_list(revision=3), patch(), ACTOR)
@@ -298,49 +340,51 @@ class ApplyUpdateTests(unittest.TestCase):
 
     def test_failed_batch_leaves_input_untouched(self) -> None:
         current = todo_list([item()], revision=2)
-        bad = patch(expected_revision=2,
-                    changes=[{"id": "i1", "title": "renamed"}, {"id": "ghost", "title": "x"}])
+        bad = patch(expected_revision=2, mode="append",
+                    items=[{"id": "i1", "title": "renamed"}, {"id": "ghost", "title": "x"}])
         snapshot = (repr(current), repr(bad))
-        expect(self, 404, apply_update, current, bad, ACTOR)  # second change is invalid
+        expect(self, 404, apply_update, current, bad, ACTOR)  # second item is invalid
         self.assertEqual((repr(current), repr(bad)), snapshot)
 
     def test_blocked_and_cancelled_require_note(self) -> None:
         current = todo_list([item()])
-        expect(self, 422, apply_update, current, patch(changes=[{"id": "i1", "status": "blocked"}]), ACTOR)
+        expect(self, 422, apply_update, current, patch(mode="append", items=[{"id": "i1", "status": "blocked"}]), ACTOR)
         ok = apply_update(todo_list([item()]),
-                          patch(changes=[{"id": "i1", "status": "cancelled", "note": "dropped"}]), ACTOR)
+                          patch(mode="append", items=[{"id": "i1", "status": "cancelled", "note": "dropped"}]), ACTOR)
         self.assertEqual((ok["items"][0]["status"], ok["items"][0]["note"]), ("cancelled", "dropped"))
-        expect(self, 422, apply_update, current, patch(changes=[{"id": "i1", "status": "bogus"}]), ACTOR)
+        expect(self, 422, apply_update, current, patch(mode="append", items=[{"id": "i1", "status": "bogus"}]), ACTOR)
 
     def test_field_limits_and_unknown_fields(self) -> None:
         current = todo_list([item()])
-        expect(self, 422, apply_update, current, patch(changes=[{"id": "i1", "title": "t" * 501}]), ACTOR)
-        expect(self, 422, apply_update, current, patch(changes=[{"id": "i1", "note": "n" * 2001}]), ACTOR)
-        expect(self, 422, apply_update, current, patch(changes=[{"id": "i1", "extra": 1}]), ACTOR)
+        expect(self, 422, apply_update, current, patch(mode="append", items=[{"id": "i1", "title": "t" * 501}]), ACTOR)
+        expect(self, 422, apply_update, current, patch(mode="append", items=[{"id": "i1", "note": "n" * 2001}]), ACTOR)
+        expect(self, 422, apply_update, current, patch(mode="append", items=[{"id": "i1", "extra": 1}]), ACTOR)
+        expect(self, 422, apply_update, current, patch(mode="bogus"), ACTOR)
+        expect(self, 422, apply_update, current, patch(items=[{}]), ACTOR)  # new item missing title
+        expect(self, 422, apply_update, current, patch(items=[{"id": "i1"}, {"id": "i1"}]), ACTOR)  # duplicate ID
         expect(self, 422, apply_update, current, patch(expected_revision=True), ACTOR)  # bool is not int
         expect(self, 422, apply_update, current, patch(unknown=1), ACTOR)
+        expect(self, 422, apply_update, current, {"expected_revision": 0, "expected_session_id": "s1"}, ACTOR)
 
     def test_item_cap_is_200(self) -> None:
-        full = todo_list([item(id=f"i{n}") for n in range(200)])
-        self.assertEqual(apply_update(full, patch(), ACTOR)["revision"], 0)  # 200 is allowed
-        expect(self, 422, apply_update, full, patch(changes=[{"id": None, "title": "over"}]), ACTOR)
-        expect(self, 422, apply_update, todo_list(), patch(changes=[{"id": None, "title": "x"}] * 201), ACTOR)
+        full = todo_list([item(id=str(n + 1)) for n in range(200)])
+        self.assertEqual(apply_update(full, patch(mode="append", items=[]), ACTOR)["revision"], 0)  # 200 is allowed
+        expect(self, 422, apply_update, full, patch(mode="append", items=[{"title": "over"}]), ACTOR)
+        expect(self, 422, apply_update, todo_list(), patch(items=[{"title": "x"}] * 201), ACTOR)
 
-    def test_remove_only_completed_or_cancelled(self) -> None:
-        done = todo_list([item(status="completed")])
-        expect(self, 422, apply_update, todo_list([item()]), patch(remove_ids=["i1"]), ACTOR)
-        self.assertEqual(apply_update(done, patch(remove_ids=["i1"]), ACTOR)["items"], [])
-        expect(self, 404, apply_update, done, patch(remove_ids=["nope"]), ACTOR)
-        expect(self, 422, apply_update, done, patch(remove_ids=["i1", "i1"]), ACTOR)
-
-    def test_noop_patch_and_order_validation(self) -> None:
-        current = todo_list([item(), item(id="i2", title="b")], revision=4)
-        noop = apply_update(current, patch(expected_revision=4), ACTOR)
-        self.assertEqual((noop["revision"], noop["items"]), (4, current["items"]))
-        expect(self, 422, apply_update, current, patch(expected_revision=4, order=[]), ACTOR)
-        expect(self, 422, apply_update, current, patch(expected_revision=4, order=["i1"]), ACTOR)
-        ordered = apply_update(current, patch(expected_revision=4, order=["i2", "i1"]), ACTOR)
-        self.assertEqual([i["id"] for i in ordered["items"]], ["i2", "i1"])
+    def test_noop_and_replace_reorder(self) -> None:
+        current = todo_list([item(id="1", title="a"), item(id="2", title="b")], revision=4)
+        noop_append = apply_update(current, patch(expected_revision=4, mode="append", items=[]), ACTOR)
+        self.assertEqual((noop_append["revision"], noop_append["items"]), (4, current["items"]))
+        noop_empty = apply_update(todo_list(revision=4), patch(expected_revision=4, items=[]), ACTOR)
+        self.assertEqual((noop_empty["revision"], noop_empty["items"]), (4, []))
+        reordered = apply_update(
+            current,
+            patch(expected_revision=4, items=[{"title": "prep"}, {"id": "2"}, {"id": "1"}]),
+            ACTOR,
+        )
+        self.assertEqual([(i["id"], i["title"]) for i in reordered["items"]],
+                         [("3", "prep"), ("2", "b"), ("1", "a")])
 
 
 class State:
@@ -379,14 +423,14 @@ class OperateTests(unittest.TestCase):
     def test_read_write_and_session_isolation(self) -> None:
         state = self.state()
         self.assertEqual(operate(state, "s1")["revision"], 0)
-        self.assertEqual(operate(state, "s1", patch(changes=[{"id": None, "title": "A"}]))["revision"], 1)
+        self.assertEqual(operate(state, "s1", patch(items=[{"id": None, "title": "A"}]))["revision"], 1)
         self.assertEqual(operate(state, "s1")["items"][0]["title"], "A")
         self.assertEqual(operate(state, "s2")["items"], [])  # sibling session: own list
         self.assertEqual(len(list((self.tmp / "data" / "ide" / "todos" / "sessions").glob("*.json"))), 1)
 
     def test_workspace_switch_preserves_the_session_list(self) -> None:
         state = self.state()
-        original = operate(state, "s1", patch(changes=[{"title": "A"}]))
+        original = operate(state, "s1", patch(items=[{"title": "A"}]))
         state.sessions["s1"].workspace = {"name": "other", "path": str(self.other)}
         self.assertEqual(operate(state, "s1"), original)
         state.sessions["s1"].workspace = {}
@@ -422,7 +466,7 @@ class OperateTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"{not json")
         expect(self, 500, ide_todo.read_list, self.tmp, "s1")
-        expect(self, 500, operate, self.state(), "s1", patch(changes=[{"id": None, "title": "A"}]))
+        expect(self, 500, operate, self.state(), "s1", patch(items=[{"id": None, "title": "A"}]))
         self.assertEqual(path.read_bytes(), b"{not json")  # write path never clobbered it
         path.write_bytes(b'{"schema_version": 2, "session_id": "other", "revision": 0, "items": []}')
         expect(self, 500, ide_todo.read_list, self.tmp, "s1")  # foreign session id

@@ -36,16 +36,24 @@ export async function loadContextUsageIntoStore(sessionId: string, set: StoreSet
   get().updateContextUsage({ ...response, session_id: response.session_id || sessionId });
 }
 
-export async function replayPendingApprovals(sessionId: string, set: StoreSetter, get: StoreGetter): Promise<void> {
+export function prefetchSessionPendingApprovals(sessionId: string): Promise<any[]> {
+  return getSessionPendingApprovals(sessionId).catch(() => []);
+}
+
+export async function replayPendingApprovals(
+  sessionId: string,
+  set: StoreSetter,
+  get: StoreGetter,
+  prefetchedPromise?: Promise<any[]>,
+): Promise<void> {
   // [AutoC 2026-06-16] Rebuild pending approval cards after reconnect or selection.
   // Why: approval_requested events may have been missed while the WebSocket was down.
-  // How: fetch pending approvals and replay them as synthetic reducer events only for
-  // the active session. Purpose: users can still decide outstanding approvals after
-  // session recovery without chatStore importing reducer details.
+  // How: fetch pending approvals (concurrently with history when prefetchedPromise is
+  // passed) and replay them as synthetic reducer events only for the active session.
   const generation = captureStoreGeneration();
   let approvals: any[];
   try {
-    approvals = await getSessionPendingApprovals(sessionId);
+    approvals = prefetchedPromise ? await prefetchedPromise : await getSessionPendingApprovals(sessionId);
   } catch {
     return;
   }

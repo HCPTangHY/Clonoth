@@ -509,12 +509,18 @@ class ActionGateTests(unittest.TestCase):
         self.assertFalse(is_tool_action_allowed(only_node, "manage_schedule", {"action": "nuke"}))
 
     def test_unknown_default_is_not_invented_by_the_action_gate(self):
-        # Production applies action restrictions only when an action is known.
+        # Undeclared tools do not invent sub-actions; explicit action_field without default_action fails closed on omission.
         node = Node(id="n", type="ai", tool_access=ToolAccess(mode="all", deny=["external_script:upsert"]))
-        self.assertTrue(is_tool_action_allowed(node, "external_script", {}))
-        self.assertTrue(is_tool_action_allowed(node, "external_script", {"action": "run"}))
-        self.assertFalse(is_tool_action_allowed(node, "external_script", {"action": "upsert"}))
-        # A tool without action rules is unaffected.
+        self.assertFalse(is_tool_action_allowed(node, "external_script", {"action": "run"}))
+        declared = {
+            "name": "external_script",
+            "action_field": "op",
+            "input_schema": {"properties": {"op": {"type": "string", "enum": ["run", "upsert"]}}},
+        }
+        self.assertFalse(is_tool_action_allowed(node, "external_script", {}, declared))
+        self.assertTrue(is_tool_action_allowed(node, "external_script", {"op": "run"}, declared))
+        self.assertFalse(is_tool_action_allowed(node, "external_script", {"op": "upsert"}, declared))
+        # A tool without action rules is unaffected even without declarations.
         open_node = Node(id="n2", type="ai", tool_access=ToolAccess(mode="all"))
         self.assertTrue(is_tool_action_allowed(open_node, "external_script", {}))
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hmac
 import os
 import shutil
 import secrets
@@ -61,31 +62,132 @@ def init_web_auth(data_dir: Path) -> None:
         print("[admin] Web JWT 不可用 (缺少 bcrypt/PyJWT)，仅使用 admin token", flush=True)
 
 
-def verify_admin_token(request: Request) -> None:
-    """Dual-mode auth: try JWT first, then fall back to admin token.
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
-    This lets the Web UI use JWT while machine clients (engine, SDK, bots)
-    continue to use the static admin token — all existing endpoints work
-    without modification.
+
+def verify_admin_token(
+    request: Request,
+    *,
+    allow_jwt: bool = True,
+    allow_query: bool = False,
+) -> str:
+    """Dual-mode auth: try JWT first (if allowed), then fall back to machine admin token.
+
+    Returns ``"jwt"`` or ``"machine"``.
     """
     auth = request.headers.get("Authorization", "")
     bearer_value = auth[7:].strip() if auth.startswith("Bearer ") else ""
 
-    # 1) Try JWT if web_auth is configured
-    wa = get_web_auth()
-    if wa and wa.available and wa.setup_completed and bearer_value:
-        payload = wa.verify_jwt(bearer_value)
-        if payload is not None:
-            return  # JWT valid
+    # 1) Try JWT if web_auth is configured and allowed for this endpoint
+    if allow_jwt:
+        wa = get_web_auth()
+        if wa and wa.available and wa.setup_completed and bearer_value:
+            payload = wa.verify_jwt(bearer_value)
+            if payload is not None:
+                request.state.auth_kind = "jwt"
+                request.state.auth_user = str(payload.get("sub") or "")
+                return "jwt"
 
-    # 2) Fall back to admin token
+    # 2) Fall back to machine admin token (constant-time comparison)
     token = get_admin_token()
-    if bearer_value == token:
-        return
-    if request.query_params.get("token") == token:
-        return
+    if bearer_value and hmac.compare_digest(bearer_value, token):
+        request.state.auth_kind = "machine"
+        return "machine"
+    if allow_query:
+        qtok = request.query_params.get("token", "")
+        if qtok and hmac.compare_digest(qtok, token):
+            request.state.auth_kind = "machine"
+            return "machine"
 
     raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def verify_machine_admin_token(request: Request) -> str:
+    """Require machine-level CLONOTH_ADMIN_TOKEN (rejects Web JWT unless explicitly enabled)."""
+    allow_jwt = _env_truthy("CLONOTH_ALLOW_JWT_HIGH_RISK")
+    return verify_admin_token(request, allow_jwt=allow_jwt, allow_query=False)
+
+
+def _require_http_feature(env_name: str, action_desc: str) -> None:
+    if not _env_truthy(env_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Forbidden via HTTP API: {action_desc} is disabled by default (set {env_name}=1 to override)",
+        )
+
+
+def _extract_script_schedules(raw_text: str) -> list[dict[str, Any]]:
+    data = yaml.safe_load(raw_text) if raw_text.strip() else {}
+    if data is None:
+        return []
+    if not isinstance(data, dict):
+        raise ValueError("schedules.yaml root must be a mapping")
+    items = data.get("schedules")
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise ValueError("'schedules' must be a list")
+    scripts: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("each schedule entry must be a mapping")
+        stype = str(item.get("type") or "message").strip().lower()
+        has_cmd = bool(str(item.get("command") or "").strip())
+        if stype == "script" or has_cmd:
+            scripts.append(dict(item))
+    return scripts
+
+
+def _validate_schedules_raw_update(workspace_root: Path, new_content: str) -> None:
+    import base64
+    import re
+    from .policy import PolicyEngine, SafetyLevel
+
+    try:
+        new_scripts = _extract_script_schedules(new_content)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid schedules YAML: {exc}") from exc
+
+    if not new_scripts:
+        return
+
+    policy = PolicyEngine(workspace_root=workspace_root)
+    _b64_pipe_pat = re.compile(
+        r"(?:base64\s+(?:-d|--decode)|xxd\s+-r).*?\|\s*(?:ba|da|z|k|a)?sh\b|\|\s*(?:ba|da|z|k|a)?sh\b",
+        re.IGNORECASE,
+    )
+    _b64_tok_pat = re.compile(r"[A-Za-z0-9+/]{8,}={0,2}")
+
+    for item in new_scripts:
+        cmd = str(item.get("command") or "").strip()
+        if not cmd:
+            continue
+        decision = policy.evaluate_execute_command(command=cmd)
+        if decision.safety_level == SafetyLevel.deny:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Forbidden schedule command ({decision.reason})",
+            )
+        # Also inspect decoded base64 fragments so encoded blacklist commands cannot bypass PolicyEngine
+        for tok in _b64_tok_pat.findall(cmd):
+            try:
+                raw = base64.b64decode(tok, validate=True)
+                decoded = raw.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+            if len(decoded) >= 4:
+                dec_res = policy.evaluate_execute_command(command=decoded)
+                if dec_res.safety_level == SafetyLevel.deny:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Forbidden encoded schedule command ({dec_res.reason})",
+                    )
+        if "base64" in cmd.lower() and _b64_pipe_pat.search(cmd):
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden schedule command (obfuscated base64 pipe to shell is blocked)",
+            )
 
 
 def create_admin_router(workspace_root: Path) -> APIRouter:
@@ -265,8 +367,9 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         
     @router.put("/runtime/raw")
     def update_runtime(payload: RawContent) -> dict[str, Any]:
-        p = workspace_root / "config" / "runtime.yaml"
-        return _write_text(p, payload.content)
+        from .runtime_config import write_raw
+        write_raw(workspace_root, payload.content)
+        return {"ok": True}
 
     # ----- Policy -----
     @router.get("/policy/raw")
@@ -292,6 +395,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.put("/schedules/raw")
     def update_schedules(payload: RawContent) -> dict[str, Any]:
         p = workspace_root / "data" / "schedules.yaml"
+        _validate_schedules_raw_update(workspace_root, payload.content)
         return _write_text(p, payload.content)
 
     # ----- Tools (external scripts) -----

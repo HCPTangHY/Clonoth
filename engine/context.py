@@ -61,6 +61,7 @@ class RunContext:
     sticky_session_id: str = ""
     # Presentation metadata is separate from model-visible messages.
     response_info: dict[str, Any] = field(default_factory=dict)
+    step_notices: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.sticky_session_id:
@@ -86,8 +87,10 @@ class RunContext:
             payload.setdefault("is_system_task", True)
         if self.current_llm_request_id:
             payload.setdefault("llm_request_id", self.current_llm_request_id)
-        if event_type in {"intermediate_reply", "assistant_text"}:
-            payload.setdefault("execution_id", self.execution_id)
+        # Activity belongs to this claim; late tool events must not affect a newer execution.
+        if self.task_id:
+            payload.setdefault("task_id", self.task_id)
+        payload.setdefault("execution_id", self.execution_id)
         if self.response_info and event_type in {
             "assistant_text", "intermediate_reply", "stream_text_final", "tool_call_start", "tool_call_end",
         }:
@@ -101,6 +104,7 @@ class RunContext:
             response = await self.http.post(
                 f"{self.supervisor_url}/v1/sessions/{route_session_id}/events",
                 json={"type": event_type, "payload": payload},
+                timeout=5.0,
             )
             if event_type in {"intermediate_reply", "assistant_text"}:
                 response.raise_for_status()

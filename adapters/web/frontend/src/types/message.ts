@@ -210,6 +210,7 @@ export interface ApprovalBlockLocation {
   // beside legacy block coordinates. Purpose: approval_decided can update the same
   // tool card while old approval blocks still use messageId/blockId.
   toolCallId?: string;
+  toolStableId?: string;
 }
 
 export interface TaskNodeInfo {

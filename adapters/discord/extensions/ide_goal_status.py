@@ -69,7 +69,7 @@ class GoalStatusCard:
                               colour=0xFEAF2C)
         status = data["status"]
         embed.add_field(name="目标状态", value=self.error or LABELS[status], inline=True)
-        embed.add_field(name="自动续轮", value=f"{data.get('rounds', 0)}/{data.get('max_rounds', 8)}", inline=True)
+        embed.add_field(name="自动续轮", value=f"{data.get('rounds', 0)}/{data.get('max_rounds', 256)}", inline=True)
         if data.get("pause_reason"):
             embed.add_field(name="原因", value=discord.utils.escape_markdown(data["pause_reason"])[:1000], inline=False)
         execution = data.get("execution") or {}

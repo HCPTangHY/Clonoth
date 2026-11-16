@@ -399,3 +399,27 @@ def test_trusted_authorized_flag_without_preflight_preserves_legacy_contract():
         old.assert_awaited_once()
         assert requests == []
     asyncio.run(run())
+
+
+def test_spec_with_callable_action_resolver_authorizes_and_detects_resolver_change():
+    async def run():
+        registry, old, new, ctx, entered, release, requests = setup_registry()
+        resolver_a = lambda args: "search"
+        resolver_b = lambda args: "replace"
+        registry._tool_specs[NAME]["action_field"] = "mode"
+        registry._tool_specs[NAME]["action_resolver"] = resolver_a
+        release.set()
+        assert (await registry.execute(name=NAME, arguments=ARGS, ctx=ctx))["ok"]
+        old.assert_awaited_once()
+
+        # Swapping action_resolver while waiting for approval must invalidate the grant.
+        release.clear()
+        entered.clear()
+        task = asyncio.create_task(registry.execute(name=NAME, arguments=ARGS, ctx=ctx))
+        await asyncio.wait_for(entered.wait(), 1)
+        registry._tool_specs[NAME]["action_resolver"] = resolver_b
+        release.set()
+        result = await asyncio.wait_for(task, 1)
+        assert result["ok"] is False and result["rejection_code"] == "tool_changed"
+        assert old.await_count == 1
+    asyncio.run(run())

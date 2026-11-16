@@ -92,6 +92,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # engine 轮询拉走 → 标 cancel_requested。幂等：同一 async_id 重复
         # 入队去重，lost 后拒绝再入队。
         self._async_tool_pending_cancels: dict[str, list[str]] = {}  # worker_id -> [async_id]
+        self._task_pending_cancels: dict[str, list[str]] = {}  # worker_id -> [task_id]
 
         from .restart_recovery import RestartRecovery
         self.restart_recovery = RestartRecovery(self)
@@ -1865,7 +1866,18 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if len(finished) > self._ASYNC_TOOLS_MAX:
                 finished.sort(key=lambda k: self._async_tools[k].get("finished_at") or "")
                 for k in finished[: len(finished) - self._ASYNC_TOOLS_MAX]:
-                    if runtime is None or any(r.get("work_id") == k and r.get("status") == "processed" for r in runtime._receipts.values()):
+                    entry_k = self._async_tools[k]
+                    unsettled = runtime is not None and any(
+                        r.get("work_id") == k and r.get("status") not in ("processed", "lost")
+                        for r in runtime._receipts.values()
+                    )
+                    if (
+                        runtime is None
+                        or entry_k.get("receipt_settled")
+                        or (entry_k.get("result_delivered") and not unsettled)
+                        or (entry_k.get("status") in ("lost", "failed", "cancelled") and not unsettled)
+                        or any(r.get("work_id") == k and r.get("status") == "processed" for r in runtime._receipts.values())
+                    ):
                         del self._async_tools[k]
             if runtime is not None:
                 runtime._save()
@@ -1898,7 +1910,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     return {"ok": False, "error": "inline delivery identity conflict"}
             if entry.get("status") in {"done", "failed", "cancelled"} and entry["status"] != status:
                 runtime = getattr(self, "execution_runtime", None)
-                delivered = runtime is not None and any(r.get("work_id") == aid and r.get("status") != "lost" for r in runtime._receipts.values())
+                delivered = bool(entry.get("receipt_settled") or entry.get("result_delivered")) or (
+                    runtime is not None
+                    and any(r.get("work_id") == aid and r.get("status") != "lost" for r in runtime._receipts.values())
+                )
                 if not (entry["status"] == "done" and status == "cancelled" and not delivered):
                     return {"ok": False, "error": "async terminal status conflict"}
             entry["status"] = status
@@ -1914,6 +1929,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             runtime = getattr(self, "execution_runtime", None)
             if runtime is not None:
                 if body.get("delivered_inline") is True:
+                    entry["result_delivered"] = True
                     runtime._receipts.setdefault(did, {"delivery_id": did, "work_id": aid,
                         "origin_task_id": carrier, "session_id": entry["session_id"],
                         "carrier_task_id": carrier, "status": "admitted", "message_id": f"inline:{aid}"})
@@ -1956,7 +1972,36 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if aid not in queue:
                 queue.append(aid)
             entry["cancel_requested"] = True
+            self.eventlog.append(
+                session_id=str(entry.get("session_id") or SYSTEM_SESSION_ID),
+                component="supervisor",
+                type_="async_tool_cancel_requested",
+                payload={
+                    "async_id": aid,
+                    "worker_id": wid,
+                    "task_id": str(entry.get("task_id") or ""),
+                    "session_id": str(entry.get("session_id") or ""),
+                },
+                transient=True,
+            )
         return {"ok": True}
+
+    def _enqueue_worker_task_cancel_locked(self, task: Any) -> None:
+        wid = str(getattr(task, "worker_id", "") or "").strip()
+        tid = str(getattr(task, "task_id", "") or "").strip()
+        if not wid or not tid:
+            return
+        queue = self._task_pending_cancels.setdefault(wid, [])
+        if tid not in queue:
+            queue.append(tid)
+
+    def pull_pending_task_cancels(self, worker_id: str) -> list[str]:
+        """engine 轮询拉取并清空该 worker 的待消费任务取消队列。"""
+        wid = (worker_id or "").strip()
+        if not wid:
+            return []
+        with self._lock:
+            return self._task_pending_cancels.pop(wid, [])
 
     def pull_pending_cancels(self, worker_id: str) -> list[str]:
         """engine 轮询拉取并清空该 worker 的待消费取消队列。"""
@@ -1972,7 +2017,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         lost: list[dict[str, Any]] = []
         for entry in self._async_tools.values():
             runtime = getattr(self, "execution_runtime", None)
-            delivered = runtime is not None and any(r.get("work_id") == entry.get("async_id") and r.get("status") != "lost" for r in runtime._receipts.values())
+            delivered = bool(entry.get("receipt_settled") or entry.get("result_delivered")) or (
+                runtime is not None
+                and any(r.get("work_id") == entry.get("async_id") and r.get("status") != "lost" for r in runtime._receipts.values())
+            )
             if entry.get("worker_id") == wid and (entry.get("status") == "running" or (entry.get("status") == "done" and not delivered)):
                 entry["status"] = "lost"
                 entry["finished_at"] = _now().isoformat()
@@ -1980,6 +2028,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 entry.pop("cancel_requested", None)
                 lost.append(dict(entry))
         self._async_tool_pending_cancels.pop(wid, None)
+        self._task_pending_cancels.pop(wid, None)
         return lost
 
     def _cancel_worker_orphans_locked(self, worker_id: str) -> int:
@@ -1998,6 +2047,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if task.waiting_for_task_id:
                 task.waiting_for_task_id = None
             task.result = {"action": "cancelled", "error": f"engine worker {worker_id} restarted (generation mismatch)"}
+            self._finalize_branch_task_locked(task, merge=True)
+            self._persist_cancel_message_locked(task, default_reason="任务因引擎进程重启中断。")
             self._cleanup_tool_result_artifacts_for_task(task.task_id)
             self._event_task_snapshot("task_cancelled", task)
             count += 1

@@ -261,6 +261,9 @@ def main() -> None:
                             if task.updated_at + timedelta(minutes=5) < now:
                                 should_reap = True
                                 reason = "no lease, stale >5min"
+                        elif task.cancel_requested and task.lease_expires_at < now:
+                            should_reap = True
+                            reason = "cancel requested, lease expired"
                         elif task.lease_expires_at + _GRACE < now:
                             should_reap = True
                             reason = "lease expired"
@@ -281,12 +284,17 @@ def main() -> None:
                         route_session_id = state._route_session_id_for_task_locked(task)
                         if task.session_id in _sessions_with_pending_approval or route_session_id in _sessions_with_pending_approval:
                             continue
+                        was_cancel_requested = bool(task.cancel_requested)
                         task.cancel_requested = True
-                        task.status = TaskStatus.failed
+                        task.status = TaskStatus.cancelled if was_cancel_requested else TaskStatus.failed
                         task.updated_at = now
                         task.lease_expires_at = None
-                        task.result = {"action": "fail", "error": f"zombie reaped by background ({reason})"}
-                        state._event_task_snapshot("task_completed", task)
+                        task.result = (
+                            {"action": "cancelled", "error": f"cancelled task reaped ({reason})"}
+                            if was_cancel_requested
+                            else {"action": "fail", "error": f"zombie reaped by background ({reason})"}
+                        )
+                        state._event_task_snapshot("task_cancelled" if was_cancel_requested else "task_completed", task)
                         # [Fork/Merge 2026-05-17] background zombie reaping
                         # follows the same terminal path as API reaping.
                         state._route_completed_task_locked(task)
@@ -308,16 +316,39 @@ def main() -> None:
     env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
     access_log = bool(args.access_log or env_access_log)
 
-    # uvicorn 日志全部写到文件，不输出到终端。
+    # uvicorn 日志全部写到文件，不输出到终端，并对 query token 脱敏。
+    import logging as _logging
+    import re as _re
+
+    class _TokenRedactFilter(_logging.Filter):
+        _PAT = _re.compile(r"([?&](?:token|access_token|api_key)=)[^&\s\"']+", _re.IGNORECASE)
+
+        def filter(self, record: _logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+                redacted = self._PAT.sub(r"\1[REDACTED]", msg)
+                if redacted != msg:
+                    record.msg = redacted
+                    record.args = ()
+            except Exception:
+                pass
+            return True
+
     _uvi_log_cfg = {
         "version": 1,
         "disable_existing_loggers": False,
+        "filters": {
+            "redact_tokens": {
+                "()": lambda: _TokenRedactFilter(),
+            },
+        },
         "handlers": {
             "file": {
                 "class": "logging.FileHandler",
                 "filename": str(_supervisor_log_path),
                 "mode": "a",
                 "encoding": "utf-8",
+                "filters": ["redact_tokens"],
             },
         },
         "loggers": {

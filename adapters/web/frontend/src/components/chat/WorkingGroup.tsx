@@ -79,6 +79,23 @@ function useWorkingGroupElapsed(cards: WsMessage[], active: boolean): string {
 export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: WorkingGroupProps) => {
   const [expanded, setExpanded] = useState(defaultExpanded);
 
+  const hasPendingApproval = useMemo(() => cards.some((card) => {
+    if (card.status === 'awaiting_approval') return true;
+    return card.blocks.some((block) => {
+      if (block.kind === 'approval') return block.status === 'pending';
+      if (block.kind === 'tool') {
+        return block.toolIds.some((id) => toolsById[id]?.status === 'awaiting_approval');
+      }
+      return false;
+    });
+  }), [cards, toolsById]);
+
+  useEffect(() => {
+    if (hasPendingApproval) {
+      setExpanded(true);
+    }
+  }, [hasPendingApproval]);
+
   // Detect if the last card is a completion card (finish/reply/ask) — its text
   // blocks render outside the fold, while its thinking/tool blocks stay inside.
   const lastCard = cards[cards.length - 1];
@@ -124,8 +141,8 @@ export const WorkingGroup = ({ cards, toolsById, defaultExpanded = false }: Work
             <time className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]" dateTime={cards[0]?.createdAt}>
               {cards[0]?.createdAt ? new Date(cards[0].createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : ''}
             </time>
-            <span className={`font-mono text-[0.55rem] ${isActive ? 'text-blue-500' : 'text-[var(--duties-tertiary)]'}`}>
-              {isActive ? '输出中' : '已完成'}
+            <span className={`font-mono text-[0.55rem] ${hasPendingApproval ? 'text-orange-600' : isActive ? 'text-blue-500' : 'text-[var(--duties-tertiary)]'}`}>
+              {hasPendingApproval ? '等待审批' : isActive ? '输出中' : '已完成'}
             </span>
             {isActive && <span aria-label="工作进行中" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />}
             {hasCompletion && lastCard && completionTextBlocks.length > 0 && (

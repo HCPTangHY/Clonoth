@@ -62,9 +62,9 @@ class ProcessManager:
         self.stop_wait_timeout_sec = get_float(
             runtime_cfg,
             "supervisor.process_manager.stop_wait_timeout_sec",
-            5.0,
+            20.0,
             min_value=0.1,
-            max_value=30.0,
+            max_value=60.0,
         )
         self.engine_workers = get_int(
             runtime_cfg,
@@ -174,8 +174,28 @@ class ProcessManager:
             self.engines.append(proc)
 
     def stop_engine(self) -> None:
-        for proc in list(self.engines):
-            self._stop(proc)
+        procs = list(self.engines)
+        live: list[ManagedProcess] = []
+        for proc in procs:
+            if proc.popen.poll() is None:
+                try:
+                    proc.popen.terminate()
+                except Exception:
+                    pass
+                live.append(proc)
+        deadline = time.monotonic() + float(self.stop_wait_timeout_sec)
+        for proc in live:
+            p = proc.popen
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                p.wait(timeout=remaining)
+            except Exception:
+                try:
+                    p.kill()
+                    p.wait(timeout=5)  # reap after SIGKILL to release ports
+                except Exception:
+                    pass
+            self._log(f"[process_manager] stopped {proc.name} pid={p.pid}")
         self.engines = []
 
     def restart_engine(self) -> None:

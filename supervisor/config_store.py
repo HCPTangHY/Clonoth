@@ -133,20 +133,38 @@ class ConfigStore:
         with self._lock:
             return self._config.model_copy(deep=True)
 
+    def _active_openai_compat_public(self, cfg: AppConfigSecret, raw: dict[str, Any]) -> OpenAIConfigPublic:
+        """Return redacted OpenAI-shaped summary matching the active provider when non-openai."""
+        active = str(raw.get("provider") or cfg.provider or "openai").strip()
+        if active != "openai":
+            block = raw.get(active)
+            if self._is_provider_block(block):
+                base_url = _resolve_env_value(str(block.get("base_url") or ""))
+                model = _resolve_env_value(str(block.get("model") or ""))
+                api_key = _resolve_env_value(str(block.get("api_key") or ""))
+                present, redacted = _redact_api_key(api_key)
+                return OpenAIConfigPublic(
+                    base_url=base_url,
+                    model=model,
+                    api_key_present=present,
+                    api_key=redacted,
+                )
+        base_url = _resolve_env_value(cfg.openai.base_url)
+        api_key = _resolve_env_value(cfg.openai.api_key)
+        model = _resolve_env_value(cfg.openai.model)
+        present, redacted = _redact_api_key(api_key)
+        return OpenAIConfigPublic(
+            base_url=base_url,
+            model=model,
+            api_key_present=present,
+            api_key=redacted,
+        )
+
     def get_public(self) -> AppConfigPublic:
         with self._lock:
             cfg = self._config.model_copy(deep=True)
-            cfg.openai.base_url = _resolve_env_value(cfg.openai.base_url)
-            cfg.openai.api_key = _resolve_env_value(cfg.openai.api_key)
-            cfg.openai.model = _resolve_env_value(cfg.openai.model)
-            present, redacted = _redact_api_key(cfg.openai.api_key)
-            openai_pub = OpenAIConfigPublic(
-                base_url=cfg.openai.base_url,
-                model=cfg.openai.model,
-                api_key_present=present,
-                api_key=redacted,
-            )
             data = self._load_raw()
+            openai_pub = self._active_openai_compat_public(cfg, data)
             pm: dict[str, str] = {}
             for k, v in data.items():
                 if k in self._META_KEYS:
@@ -155,7 +173,8 @@ class ConfigStore:
                     m = str(_resolve_env_value(v.get("model", ""))).strip()
                     if m:
                         pm[k] = m
-            return AppConfigPublic(version=cfg.version, provider=cfg.provider, openai=openai_pub, provider_models=pm)
+            active = str(data.get("provider") or cfg.provider or "openai").strip()
+            return AppConfigPublic(version=cfg.version, provider=active, openai=openai_pub, provider_models=pm)
 
     def get_openai_secret(self) -> OpenAIConfigSecret:
         with self._lock:
@@ -168,16 +187,8 @@ class ConfigStore:
     def get_openai_public(self) -> OpenAIConfigPublic:
         with self._lock:
             cfg = self._config.model_copy(deep=True)
-            cfg.openai.base_url = _resolve_env_value(cfg.openai.base_url)
-            cfg.openai.api_key = _resolve_env_value(cfg.openai.api_key)
-            cfg.openai.model = _resolve_env_value(cfg.openai.model)
-            present, redacted = _redact_api_key(cfg.openai.api_key)
-            return OpenAIConfigPublic(
-                base_url=cfg.openai.base_url,
-                model=cfg.openai.model,
-                api_key_present=present,
-                api_key=redacted,
-            )
+            data = self._load_raw()
+            return self._active_openai_compat_public(cfg, data)
 
     def update_openai(self, update: OpenAIConfigUpdateIn) -> AppConfigPublic:
         with self._lock:

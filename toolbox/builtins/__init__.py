@@ -73,13 +73,13 @@ from .list_dir import list_dir  # noqa: E402,F401
 from .read_file import read_file  # noqa: E402,F401
 from .write_file import write_file  # noqa: E402,F401
 from .execute_command import execute_command  # noqa: E402,F401
-from .search_in_files import search_in_files  # noqa: E402,F401
+from .search_in_files import search_in_files, resolve_grep_action  # noqa: E402,F401
 # Why: skill CRUD tools moved into engine.builtin.knowledge_inject. How: keep the
 # names reserved above but stop importing the removed skill-tool module.
 # Purpose: registry startup no longer depends on deleted knowledge files.
-from .tool_manage import manage_tool  # noqa: E402,F401
+from .tool_manage import manage_tool, resolve_manage_tool_action  # noqa: E402,F401
 from .system import request_restart  # noqa: E402,F401
-from .schedules import manage_schedule  # noqa: E402,F401
+from .schedules import manage_schedule, resolve_manage_schedule_action  # noqa: E402,F401
 from .tasks import get_context_window  # noqa: E402,F401
 # Why: memory CRUD tools moved into engine.builtin.knowledge_inject. How: keep the
 # names reserved above but stop importing the removed memory-tool module.

@@ -190,12 +190,12 @@ def test_user_input_cannot_use_old_verdict_to_bypass_exhausted_budget(env):
     tid = candidate(env)
     command(env, 'pause')
     answer(env, tid, passed=True)
-    env.service.documents['main']['rounds'] = 8
-    env.service.on_event({'kind': 'input', 'session_id': 'main'})
+    env.service.documents['main']['rounds'] = env.service.documents['main']['max_rounds']
+    env.service.on_event({'kind': 'input_routed', 'session_id': 'main', 'user_input': True})
     with pytest.raises(HTTPException) as exc:
         command(env, 'resume')
     assert exc.value.status_code == 409
-    assert env.service.read('main')['rounds'] == 8
+    assert env.service.read('main')['rounds'] == env.service.read('main')['max_rounds']
     assert len(env.rt.inputs) == 1
 
 

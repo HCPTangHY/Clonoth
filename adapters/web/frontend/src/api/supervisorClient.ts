@@ -218,16 +218,18 @@ export function connectGlobalWS(
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const _wsToken = getStoredAdminToken();
-  const wsUrl = `${wsProtocol}//${window.location.host}/v1/ws${_wsToken ? `?token=${encodeURIComponent(_wsToken)}` : ''}`;
+  const wsUrl = `${wsProtocol}//${window.location.host}/v1/ws`;
   const ws = new WebSocket(wsUrl);
   _globalWs = ws;
 
   ws.onopen = () => {
     // [2026-06-03] Why: /v1/ws uses a global sequence cursor, unlike the old
-    // per-session endpoint. How: send the latest known EventLog seq across all
-    // sessions once the socket opens. Purpose: reconnect catch-up covers every
-    // session without session event polling.
+    // per-session endpoint. How: authenticate via first-frame JSON before
+    // sending the latest known EventLog seq so JWT never leaks into URL logs.
     _globalWsReconnectDelay = 1000;
+    if (_wsToken) {
+      ws.send(JSON.stringify({ type: 'auth', token: _wsToken }));
+    }
     ws.send(JSON.stringify({ last_seq: Math.max(0, lastSeq || 0) }));
     onOpen?.();
   };

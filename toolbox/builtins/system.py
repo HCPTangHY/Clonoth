@@ -84,6 +84,8 @@ def _write_text_artifact(*, ctx: ToolContext, filename: str, text: str) -> str:
 
 def _git_snapshot(ctx: ToolContext) -> dict[str, Any]:
     root = ctx.workspace_root
+    if not (root / ".git").exists():
+        return {"git_ok": False, "git_error": "not a git repo"}
 
     runtime_cfg = load_runtime_config(root)
     diff_max_chars = get_int(runtime_cfg, "meta.git.diff_max_chars", 400_000, min_value=10_000, max_value=2_000_000)

@@ -14,13 +14,13 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 
 from engine.hooks.types import HookResult
 
 STATUSES = ("pending", "in_progress", "completed", "blocked", "cancelled")
+MODES = ("replace", "append")
 MAX_ITEMS = 200
 MAX_BYTES = 512 * 1024
 MAX_SUMMARY = 6000
@@ -41,7 +41,7 @@ def _fields(value: Any, allowed: set[str]) -> None:
 
 def apply_update(current: dict, patch: dict, actor: dict) -> dict:
     """Validate the entire batch before mutating anything; compare-and-swap once."""
-    _fields(patch, {"expected_revision", "expected_session_id", "changes", "remove_ids", "order"})
+    _fields(patch, {"expected_revision", "expected_session_id", "mode", "items"})
     expected_sid = _text(patch.get("expected_session_id"), "expected_session_id", 200)
     if expected_sid != current["session_id"]:
         raise HTTPException(409, "待办所属会话不同，请重新读取当前会话清单。")
@@ -50,58 +50,69 @@ def apply_update(current: dict, patch: dict, actor: dict) -> dict:
         raise HTTPException(422, "expected_revision must be a nonnegative integer")
     if revision != current["revision"]:
         raise HTTPException(409, "待办已更新，请重新读取清单后再修改。")
-    changes, removed = patch.get("changes", []), patch.get("remove_ids", [])
-    if not isinstance(changes, list) or len(changes) > MAX_ITEMS:
-        raise HTTPException(422, "changes must be a bounded array")
-    if not isinstance(removed, list) or any(not isinstance(i, str) for i in removed) or len(set(removed)) != len(removed):
-        raise HTTPException(422, "remove_ids must contain unique string IDs")
-    items = {item["id"]: dict(item) for item in current["items"]}
-    now = datetime.now(timezone.utc).isoformat()
-    seen = set()
-    for change in changes:
-        _fields(change, {"id", "title", "status", "note"})
-        item_id = change.get("id")
-        if item_id is not None:
-            item_id = _text(item_id, "id", 64)
-            if item_id not in items:
+    mode = patch.get("mode")
+    if mode is None:
+        mode = "replace"
+    elif mode not in MODES:
+        raise HTTPException(422, "mode must be 'replace' or 'append'")
+    raw_items = patch.get("items")
+    if not isinstance(raw_items, list) or len(raw_items) > MAX_ITEMS:
+        raise HTTPException(422, "items must be a bounded array")
+    existing = {item["id"]: dict(item) for item in current["items"]}
+    seen: set[str] = set()
+    for entry in raw_items:
+        _fields(entry, {"id", "title", "status", "note"})
+        raw_id = entry.get("id")
+        if raw_id is not None:
+            eid = _text(raw_id, "id", 64)
+            if eid not in existing:
                 raise HTTPException(404, "unknown todo ID")
+            if eid in seen:
+                raise HTTPException(422, "duplicate todo ID")
+            seen.add(eid)
+    taken = set(existing) if mode == "append" else set(seen)
+    seq = max((int(i) for i in taken if i.isascii() and i.isdigit()), default=0)
+    now = datetime.now(timezone.utc).isoformat()
+    built: list[dict] = []
+    appended: list[dict] = []
+    merged = {k: dict(v) for k, v in existing.items()} if mode == "append" else {}
+    for entry in raw_items:
+        raw_id = entry.get("id")
+        is_new = raw_id is None
+        if is_new:
+            seq += 1
+            while str(seq) in taken:
+                seq += 1
+            item_id = str(seq)
+            taken.add(item_id)
+            item: dict[str, Any] = {"id": item_id, "status": "pending", "note": "", "created_at": now}
         else:
-            item_id = uuid4().hex
-        if item_id in seen or item_id in removed:
-            raise HTTPException(422, "duplicate or conflicting change")
-        seen.add(item_id)
-        item = dict(items.get(item_id, {"id": item_id, "status": "pending", "note": "", "created_at": now}))
-        # Explicit null has the same meaning as omission in partial updates.
-        # This also supports tool clients that require every schema field.
-        if change.get("title") is not None:
-            item["title"] = _text(change["title"], "title", 500)
+            item_id = raw_id.strip()
+            item = dict(existing[item_id])
+        if entry.get("title") is not None:
+            item["title"] = _text(entry["title"], "title", 500)
         if "title" not in item:
             raise HTTPException(422, "new items require title")
-        if change.get("status") is not None:
-            if change["status"] not in STATUSES:
+        if entry.get("status") is not None:
+            if entry["status"] not in STATUSES:
                 raise HTTPException(422, "invalid status")
-            item["status"] = change["status"]
-        if change.get("note") is not None:
-            item["note"] = _text(change["note"], "note", 2000, empty=True)
+            item["status"] = entry["status"]
+        if entry.get("note") is not None:
+            item["note"] = _text(entry["note"], "note", 2000, empty=True)
         if item["status"] in ("blocked", "cancelled") and not item["note"]:
             raise HTTPException(422, "受阻或取消事项必须填写原因。")
-        if item != items.get(item_id):
+        if is_new or item != existing[item_id]:
             item.update(updated_at=now, updated_by=actor)
-        items[item_id] = item
-    for item_id in removed:
-        if item_id not in items:
-            raise HTTPException(404, "unknown removal ID")
-        if items[item_id]["status"] not in ("completed", "cancelled"):
-            raise HTTPException(422, "只能移除已完成或已取消事项；未完成事项请先明确取消。")
-        del items[item_id]
-    if len(items) > MAX_ITEMS:
-        raise HTTPException(422, f"最多保留 {MAX_ITEMS} 项；请明确移除不再需要的完成项。")
-    order = patch.get("order")
-    if order is None:
-        order = list(items)  # Keep existing order and append newly created IDs.
-    if not isinstance(order, list) or any(not isinstance(i, str) for i in order) or len(order) != len(items) or set(order) != set(items):
-        raise HTTPException(422, "order must contain every resulting ID exactly once")
-    result = {**current, "items": [items[i] for i in order]}
+        if mode == "replace":
+            built.append(item)
+        elif is_new:
+            appended.append(item)
+        else:
+            merged[item_id] = item
+    result_items = built if mode == "replace" else [merged[i["id"]] for i in current["items"]] + appended
+    if len(result_items) > MAX_ITEMS:
+        raise HTTPException(422, f"最多保留 {MAX_ITEMS} 项；请改用 mode='replace' 重写清单。")
+    result = {**current, "items": result_items}
     if result["items"] != current["items"]:
         result.update(revision=revision + 1, updated_at=now, updated_by=actor)
     return result
@@ -218,6 +229,28 @@ def save_list(root: Path, data: dict) -> None:
             os.close(directory)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+UPDATE_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "required": ["expected_session_id", "expected_revision", "items"],
+    "properties": {
+        "expected_revision": {"type": "integer", "minimum": 0},
+        "expected_session_id": {"type": "string", "description": "当前清单返回的 session_id；仅核对身份，不是跨会话访问入口。"},
+        "mode": {"type": "string", "enum": list(MODES),
+            "description": "可选，默认 'replace'（整表覆盖，items=[] 即清空）；'append' 为按 id 修改已有事项或在末尾追加新事项。"},
+        "items": {"type": "array", "maxItems": MAX_ITEMS,
+            "description": "mode='replace' 时为替换后的完整事项列表（传 [] 清空）；mode='append' 时为要追加或按 id 更新的事项。",
+            "items": {"type": "object", "additionalProperties": False,
+                "properties": {
+                    "id": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 64}, {"type": "null"}],
+                        "description": "可选。新增时不填或填 null；修改/保留已有事项时填真实事项 ID，禁止空字符串。"},
+                    "title": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 500}, {"type": "null"}],
+                        "description": "新增必须填写非空标题；按 id 修改已有事项时不填或填 null 表示保留原标题。"},
+                    "status": {"anyOf": [{"type": "string", "enum": list(STATUSES)}, {"type": "null"}],
+                        "description": "可选。新增时默认为 'pending'；按 id 修改时不填或填 null 表示保持原状态。"},
+                    "note": {"anyOf": [{"type": "string", "maxLength": 2000}, {"type": "null"}],
+                        "description": "可选。新增默认空；按 id 修改时不填或填 null 保留原说明，填 '' 清空。受阻、取消后必须有原因。"}}}}}}
 
 
 def _can_use(node: Any, tool: str) -> bool:
@@ -366,17 +399,22 @@ def summary(data: dict) -> str:
              "expected_session_id=" + json.dumps(data["session_id"], ensure_ascii=False),
              "本清单只属于上述 session；父会话、子会话和历史中的其他清单不属于当前清单。",
              "可直接使用本摘要的 expected_session_id、revision 和事项 ID 调用 update_todos，无需重复读取。",
-             "update_todos 新增用 id=null，不重排用 order=null；不修改的 title/status/note 用 null。",
-             "用 read_todos 读取完整清单或解决版本冲突。不要丢弃未完成事项。"]
+             "update_todos 默认 mode='replace' 整表覆盖（开启新任务时直接传入新步骤从头写，传 items=[] 清空）；"
+             "同一任务推进中可用 mode='append' 按 ID 改状态或在末尾追加。少于 3 步的简单任务或纯问答无需建待办。",
+             "用 read_todos 读取完整清单或解决版本冲突。同一任务推进中不要漏掉未完成步骤。"]
+    active = False
     # Preserve original order within each status; prioritize actionable work.
     for status in ("in_progress", "blocked", "pending"):
         for item in data["items"]:
             if item["status"] != status:
                 continue
+            active = True
             line = json.dumps({k: item[k] for k in ("id", "title", "status", "note")}, ensure_ascii=False)
             if sum(map(len, lines)) + len(line) > MAX_SUMMARY - 100:
                 return "\n".join(lines) + "\n清单摘要已截断，请用工具读取其余事项。"
             lines.append(line)
+    if data["items"] and not active:
+        lines.append("当前清单无未完成事项；若原任务已结束，开启新任务时直接用默认 mode='replace' 重写，或传 items=[] 清空旧记录。")
     return "\n".join(lines)
 
 
@@ -419,36 +457,14 @@ def register_engine(ctx: Any) -> None:
         "当前摘要已含所需信息时无需重复读取。",
         {"type": "object", "properties": {}, "additionalProperties": False}, read_todos)
     tools.register_builtin_tool(TOOL_UPDATE,
-        "创建或增量更新待办清单，不替换整份清单。新增事项填 id=null 和非空 title，禁止用空字符串 ID。"
-        "修改已有事项使用其真实 ID；title/status/note 填 null 表示不修改，note=空字符串表示清空说明。"
+        "创建、整表重写或增量更新当前会话的待办清单（少于 3 步的简单任务或纯问答无需建待办）。"
+        "默认 mode='replace' 整表覆盖：传入完整新清单直接替换旧清单（开启新任务时直接从头写，传 items=[] 清空）。"
+        "同一任务推进中可用 mode='append' 增量合并：条目带已有 id 修改对应事项（未改字段可省略或填 null），不带 id 在末尾追加新事项。"
+        "新增事项只需填非空 title（status 默认 'pending'，note 默认空，自动分配短序号 ID）；受阻或取消必须有 note 原因。"
         "expected_session_id 和 expected_revision 必须来自当前清单的最新摘要或 read_todos 结果，"
         "不能使用父会话的清单身份；expected_session_id 只校验归属，不能选择其他会话。"
-        "无新增或修改时 changes=[]，无移除时 remove_ids=[]；不重排时 order=null，不能用空数组代替。"
-        "显式排序数组须包含修改后全部事项 ID。受阻或取消必须有 note 原因；仅可移除已完成或已取消项。"
         "冲突或网络错误后先重新读取，禁止覆盖用户更新。标记 completed 不代表 Goal 验收通过。",
-        # All fields are representable even when a provider requires every
-        # property. Keep null outside the status enum for schema sanitizers.
-        {"type": "object", "additionalProperties": False,
-         "required": ["expected_session_id", "expected_revision", "changes", "remove_ids", "order"],
-         "properties": {
-            "expected_revision": {"type": "integer", "minimum": 0},
-            "expected_session_id": {"type": "string", "description": "当前清单返回的 session_id；仅核对身份，不是跨会话访问入口。"},
-            "changes": {"type": "array", "maxItems": MAX_ITEMS,
-                "description": "增量新增或修改事项；无操作填 []。",
-                "items": {"type": "object", "additionalProperties": False,
-                    "required": ["id", "title", "status", "note"], "properties": {
-                        "id": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 64}, {"type": "null"}],
-                            "description": "新增填 null；修改填真实事项 ID，禁止空字符串。"},
-                        "title": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 500}, {"type": "null"}],
-                            "description": "新增必须填写非空标题；修改时 null 表示保留原标题。"},
-                        "status": {"anyOf": [{"type": "string", "enum": list(STATUSES)}, {"type": "null"}],
-                            "description": "null 表示保持原状态；新增时默认为 pending。"},
-                        "note": {"anyOf": [{"type": "string", "maxLength": 2000}, {"type": "null"}],
-                            "description": "null 表示保留原说明（新增默认空）；空字符串表示明确清空。受阻、取消后必须仍有原因。"}}}},
-            "remove_ids": {"type": "array", "items": {"type": "string"},
-                "description": "仅可移除已完成或已取消事项；无移除填 []。"},
-            "order": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}],
-                "description": "不重排填 null，保留顺序并追加新增事项；数组必须包含修改后全部 ID。仅结果为空时可填 []。"}}}, update_todos)
+        UPDATE_SCHEMA, update_todos)
     # The request hook gets an isolated copy. It never mutates a persisted prefix
     # or inserts a user row between a native tool call and its pending result.
     ctx.hooks.register("before_llm_call", refresh_context, priority=40)

@@ -170,7 +170,8 @@ def test_evidence_owner_budget_isolated_and_total_limited(runtime):
     # One exhausted session must not consume another session's quota.
     rt._evidence[tid] = [{'content': 'x' * 2_000_000}]
     store(rt).append(state.tasks[other].session_id, Message(id='m', role='tool', content='证据', source_task_id=other))
-    rt.capture_evidence(state.tasks[other])
+    with patch('supervisor.execution_runtime.OWNER_EVIDENCE_LIMIT', 2_000_000):
+        rt.capture_evidence(state.tasks[other])
     assert rt._evidence[other][0]['content'] == '证据'
     with patch('supervisor.execution_runtime.TOTAL_EVIDENCE_LIMIT', 2_000_000):
         rt.capture_evidence(state.tasks[other])

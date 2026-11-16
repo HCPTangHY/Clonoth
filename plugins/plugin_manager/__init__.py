@@ -40,11 +40,12 @@ def register(ctx) -> None:
     if routes is None:
         return
 
-    from fastapi import APIRouter, HTTPException, Request
+    from fastapi import APIRouter, Depends, HTTPException, Request
 
     from engine.faces.routes import static_router
+    from supervisor.admin_api import verify_admin_token
 
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(verify_admin_token)])
 
     def _state(request: Request):
         st = getattr(request.app.state, "state", None)

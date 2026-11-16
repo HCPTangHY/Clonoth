@@ -8,8 +8,10 @@ import logging
 # globals 中解析——Request 与 payload 模型必须 import/定义在模块层。此前
 # 它们在 _register_admin_routes 函数体内，注解解析失败，request/payload 被
 # 当作必填 query 参数，所有端点 422。
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
+
+from supervisor.admin_api import verify_admin_token
 
 
 class RawContent(BaseModel):
@@ -2197,9 +2199,15 @@ async def manage_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 # Why: toolbox.registry.py no longer owns these knowledge tool specs. How: attach
 # exact copied descriptions and input schemas to PLUGIN_META after the functions
 # exist. Purpose: let engine.builtin.loader register plugin-owned builtin tools.
+def _resolve_knowledge_action(args: dict[str, Any]) -> str:
+    return str((args or {}).get("action") or "").strip().lower() or "list"
+
+
 PLUGIN_META["tools"] = [
     {
         "name": "manage_skill",
+        "action_field": "action",
+        "action_resolver": _resolve_knowledge_action,
         "description": (
             "Manage local skills under skills/<name>/SKILL.md: "
             "action='list' lists all local skills (default); "
@@ -2231,6 +2239,8 @@ PLUGIN_META["tools"] = [
     },
     {
         "name": "manage_memory",
+        "action_field": "action",
+        "action_resolver": _resolve_knowledge_action,
         "description": (
             "Manage persistent memory entries in books: "
             "action='list' lists memory entries (default; passing id returns that entry's full untruncated content); "
@@ -2772,7 +2782,7 @@ def _register_admin_routes(routes: Any) -> None:
     """组装 admin/config 端点与设置面板静态资源（纯注册，无注解）。"""
     from engine.faces.routes import static_router
 
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(verify_admin_token)])
     router.add_api_route("/skills", _skills_list_route, methods=["GET"])
     router.add_api_route("/skills/{name}/raw", _skills_raw_route, methods=["GET"])
     router.add_api_route("/skills/{name}/raw", _skills_update_route, methods=["PUT"])
@@ -2782,7 +2792,7 @@ def _register_admin_routes(routes: Any) -> None:
     router.add_api_route("/skill_pins", _skill_pins_put_route, methods=["PUT"])
     routes.register(router, mount="admin/config", description="skills 配置端点")
 
-    mem_router = APIRouter()
+    mem_router = APIRouter(dependencies=[Depends(verify_admin_token)])
     mem_router.add_api_route("/memory", _memory_list_route, methods=["GET"])
     mem_router.add_api_route("/memory/raw", _memory_raw_route, methods=["GET"])
     mem_router.add_api_route("/memory/raw", _memory_raw_put_route, methods=["PUT"])

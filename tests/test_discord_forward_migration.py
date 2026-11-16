@@ -137,7 +137,8 @@ class DiscordForwardTests(unittest.IsolatedAsyncioTestCase):
              patch.object(agent, "_derive_initial_workspace", return_value=None):
             await agent._handle_agent_inner(rt, current, "now", 10, "discord:10")
         orphan.delete.assert_awaited_once()
-        rt.clonoth_client.submit_inbound.assert_awaited_once()
+        rt.clonoth_client.preempt_task.assert_awaited_once()
+        rt.clonoth_client.submit_inbound.assert_not_awaited()
         self.assertIsNone(rt.session_state.get_trigger(t.inbound_seq))
 
     async def test_precise_transient_id_filter_and_promotion(self):

@@ -90,6 +90,7 @@ class ToolContext:
         await self.http.post(
             f"{self.supervisor_url}/v1/sessions/{route_session_id}/events",
             json={"type": type_, "payload": payload},
+            timeout=5.0,
         )
 
     async def request_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:

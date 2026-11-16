@@ -120,28 +120,26 @@ def test_restart_before_initial_input_preserves_original_instruction(tmp_path, m
     assert any(m.content=='original work' for m in ConversationStore(tmp_path/'data/conversations').load('main'))
 
 
-def test_accepted_restart_receipt_is_persisted_before_wait_and_later_calls_never_run(tmp_path):
+def test_accepted_restart_receipt_is_persisted_and_returns_cancelled_without_running_later_calls(tmp_path):
     async def run():
-        accepted=asyncio.Event()
         async def restarting(args,ctx):
-            ctx._restart_accepted=True;accepted.set()
+            ctx._restart_accepted=True
             return {'ok':True,'scheduled':True,'data':{'scheduled':True}}
         registry=FakeRegistry({'restart_control':spec('restart_control'),'later':spec('later')},{'restart_control':restarting})
         store=ConversationStore(tmp_path/'history')
         ls=make_ls(tmp_path,registry=registry,allowed_real={'restart_control','later'},allowed_pseudo={'finish'},store=store)
         with patch.object(ai_step.hook_registry,'afire',side_effect=no_hook):
-            task=asyncio.create_task(ai_step._handle_tool_calls(ls,ProviderResponse(ok=True,text='',tool_calls=[
+            action=await ai_step._handle_tool_calls(ls,ProviderResponse(ok=True,text='',tool_calls=[
                 ToolCall(id='a',name='restart_control',arguments={}),ToolCall(id='b',name='later',arguments={}),
-                ToolCall(id='c',name='finish',arguments={'text':'premature'})]),0))
-            await accepted.wait();await asyncio.sleep(0)
-            assert not task.done() and registry.started==['restart_control']
+                ToolCall(id='c',name='finish',arguments={'text':'premature'})]),0)
+            assert action is not None and action.action=='cancelled'
+            assert action.error=='engine graceful shutdown'
+            assert registry.started==['restart_control']
             rows=store.load('session')
             tools=[m for m in rows if m.role=='tool']
             assert [m.tool_call_id for m in tools]==['a','b','c']
             assert tools[0].meta['tool_result_structured']['scheduled'] is True
             assert all(m.meta['tool_result_structured']['cancelled'] for m in tools[1:])
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError): await task
     asyncio.run(run())
 
 
@@ -162,4 +160,320 @@ def test_handle_task_cancellation_reports_runtime_not_only_terminal_error(tmp_pa
         assert result['action']=='cancelled'
         assert result['_runtime_state']['completed_steps']==4
         assert result['_runtime_state']['tool_produced_attachments']==[{'path':'result.png'}]
+    asyncio.run(run())
+
+
+def test_worker_loop_manual_cancel_and_restart_immediately_interrupt_inflight_requests(tmp_path, monkeypatch):
+    import json
+    import time
+    monkeypatch.delenv('CLONOTH_SUPERVISOR_URL', raising=False)
+
+    async def run():
+        # Part 1: manual cancel immediately interrupts an unending in-flight request
+        in_request = asyncio.Event()
+        trigger_cancel = asyncio.Event()
+        completed_payloads = []
+        claimed_once = False
+
+        async def blocked_node_task(**kwargs):
+            ctx = SimpleNamespace(completed_steps=2, tool_call_log=[], total_usage={},
+                                  _restart_tool_attachments=[], emit_event=AsyncMock())
+            current_context.set(ctx)
+            in_request.set()
+            await asyncio.Event().wait()  # Never finishes unless task.cancel() interrupts it
+
+        async def handler_manual(req: httpx.Request) -> httpx.Response:
+            nonlocal claimed_once
+            path = req.url.path
+            if path == '/v1/health':
+                return httpx.Response(200, json={'ok': True})
+            if path == '/v1/engine/register':
+                return httpx.Response(200, json={'ok': True, 'orphans_cancelled': 0})
+            if path == '/v1/remote/tools':
+                return httpx.Response(200, json={'tools': []})
+            if path == '/v1/tools/reload-seq':
+                return httpx.Response(200, json={'seq': 0})
+            if path == '/v1/tasks/next':
+                if not claimed_once:
+                    claimed_once = True
+                    return httpx.Response(200, json={
+                        'task_id': 'manual-t1', 'execution_id': 'exec-1', 'kind': 'node',
+                        'node_id': 'n', 'session_id': 's1', 'session_generation': 1, 'input': {},
+                    })
+                return httpx.Response(204)
+            if path == '/v1/async_tools/pending_cancels':
+                if trigger_cancel.is_set():
+                    trigger_cancel.clear()
+                    return httpx.Response(200, json={'ok': True, 'async_ids': [], 'task_ids': ['manual-t1']})
+                return httpx.Response(200, json={'ok': True, 'async_ids': [], 'task_ids': []})
+            if path.endswith('/complete'):
+                completed_payloads.append(json.loads(req.content))
+                return httpx.Response(200, json={'ok': True})
+            return httpx.Response(200, json={'ok': True})
+
+        real_async_client = httpx.AsyncClient
+        monkeypatch.setattr(
+            runner.httpx, 'AsyncClient',
+            lambda **kw: real_async_client(transport=httpx.MockTransport(handler_manual), headers=kw.get('headers'), timeout=kw.get('timeout')),
+        )
+        monkeypatch.setattr(runner, '_run_node_task', blocked_node_task)
+        monkeypatch.setattr(runner, 'fetch_llm_secret', AsyncMock(return_value={}))
+        monkeypatch.setattr(runner, 'normalize_llm_secret', lambda _: ('', '', ''))
+        monkeypatch.setattr(runner, 'load_runtime_config', lambda _: {'engine': {'poll_interval_sec': 0.1, 'max_workers': 2}})
+
+        loop_task = asyncio.create_task(runner.worker_loop(supervisor_url='http://sup.local', workspace_root=tmp_path, worker_id='w1'))
+        await asyncio.wait_for(in_request.wait(), timeout=2.0)
+        t0 = time.monotonic()
+        trigger_cancel.set()
+        for _ in range(40):
+            if completed_payloads:
+                break
+            await asyncio.sleep(0.02)
+        elapsed_manual = time.monotonic() - t0
+        assert completed_payloads, 'manual cancel did not complete task'
+        assert elapsed_manual < 0.5
+        assert completed_payloads[0]['result']['action'] == 'cancelled'
+        assert completed_payloads[0]['result']['error'] == 'task cancelled'
+        assert '_runtime_state' not in completed_payloads[0]['result']
+
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+        # Part 2: engine restart interrupts BOTH a hung poll request AND an active in-flight task immediately
+        in_request_2 = asyncio.Event()
+        in_slow_poll = asyncio.Event()
+        completed_restart = []
+        claimed_2 = False
+
+        async def blocked_node_task_2(**kwargs):
+            ctx = SimpleNamespace(completed_steps=3, tool_call_log=[{'name': 'grep'}], total_usage={'total_tokens': 9},
+                                  _restart_tool_attachments=[])
+            current_context.set(ctx)
+            in_request_2.set()
+            await asyncio.Event().wait()
+
+        async def handler_restart(req: httpx.Request) -> httpx.Response:
+            nonlocal claimed_2
+            path = req.url.path
+            if path == '/v1/health':
+                return httpx.Response(200, json={'ok': True})
+            if path == '/v1/engine/register':
+                return httpx.Response(200, json={'ok': True, 'orphans_cancelled': 0})
+            if path == '/v1/remote/tools':
+                return httpx.Response(200, json={'tools': []})
+            if path == '/v1/tools/reload-seq':
+                return httpx.Response(200, json={'seq': 0})
+            if path == '/v1/async_tools/pending_cancels':
+                return httpx.Response(200, json={'ok': True, 'async_ids': [], 'task_ids': []})
+            if path == '/v1/tasks/next':
+                if not claimed_2:
+                    claimed_2 = True
+                    return httpx.Response(200, json={
+                        'task_id': 'restart-t2', 'execution_id': 'exec-2', 'kind': 'node',
+                        'node_id': 'n', 'session_id': 's2', 'session_generation': 1, 'input': {},
+                    })
+                in_slow_poll.set()
+                await asyncio.sleep(30.0)
+                return httpx.Response(204)
+            if path.endswith('/complete'):
+                completed_restart.append(json.loads(req.content))
+                return httpx.Response(200, json={'ok': True})
+            return httpx.Response(200, json={'ok': True})
+
+        monkeypatch.setattr(
+            runner.httpx, 'AsyncClient',
+            lambda **kw: real_async_client(transport=httpx.MockTransport(handler_restart), headers=kw.get('headers'), timeout=kw.get('timeout')),
+        )
+        monkeypatch.setattr(runner, '_run_node_task', blocked_node_task_2)
+
+        import signal
+        captured_stop = {}
+        orig_get_loop = asyncio.get_running_loop
+
+        class LoopProxy:
+            def __init__(self, real):
+                self._real = real
+            def add_signal_handler(self, sig, cb, *args):
+                if sig == signal.SIGTERM:
+                    captured_stop['cb'] = cb
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        monkeypatch.setattr(runner.asyncio, 'get_running_loop', lambda: LoopProxy(orig_get_loop()))
+        loop_task_2 = asyncio.create_task(runner.worker_loop(supervisor_url='http://sup.local', workspace_root=tmp_path, worker_id='w2'))
+        await asyncio.wait_for(in_request_2.wait(), timeout=2.0)
+        await asyncio.wait_for(in_slow_poll.wait(), timeout=2.0)
+
+        t1 = time.monotonic()
+        captured_stop['cb']()
+        await asyncio.wait_for(loop_task_2, timeout=1.0)
+        elapsed_restart = time.monotonic() - t1
+        assert elapsed_restart < 0.5
+        assert len(completed_restart) == 1
+        assert completed_restart[0]['result']['error'] == 'engine graceful shutdown'
+        assert completed_restart[0]['result']['_runtime_state']['completed_steps'] == 3
+
+    asyncio.run(run())
+
+
+def test_remote_tool_aborts_broker_call_immediately_on_task_cancellation(monkeypatch):
+    from toolbox import remote_runtime
+
+    async def run():
+        in_poll = asyncio.Event()
+        cancelled_calls = []
+
+        async def handler(req: httpx.Request) -> httpx.Response:
+            path = req.url.path
+            if path == '/v1/remote/calls':
+                return httpx.Response(200, json={'ok': True, 'call_id': 'rc-1'})
+            if path == '/v1/remote/calls/rc-1/result':
+                in_poll.set()
+                await asyncio.sleep(30.0)
+                return httpx.Response(202)
+            if path == '/v1/remote/calls/rc-1/cancel':
+                cancelled_calls.append(path)
+                return httpx.Response(200, json={'call_id': 'rc-1', 'status': 'cancelled'})
+            return httpx.Response(200, json={})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(remote_runtime, '_get_http_client', lambda timeout=360.0: client)
+        try:
+            ctx = SimpleNamespace(session_id='s', task_id='t')
+            call_task = asyncio.create_task(remote_runtime.call_remote_tool(ctx, 'rmt_echo', {}, 60.0, 'http://sup.local'))
+            await asyncio.wait_for(in_poll.wait(), timeout=2.0)
+            call_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(call_task, timeout=1.0)
+            assert cancelled_calls == ['/v1/remote/calls/rc-1/cancel']
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_duplicate_manual_cancels_and_shutdown_do_not_abort_complete_post(tmp_path, monkeypatch):
+    """Regression: WS push + pending_cancels poll + shutdown must not cancel in-flight /complete POST."""
+    import json
+    (tmp_path / 'config').mkdir(parents=True, exist_ok=True)
+    (tmp_path / 'config/runtime.yaml').write_text(
+        'engine:\n  poll_interval_sec: 0.05\n  max_workers: 4\n',
+        encoding='utf-8',
+    )
+
+    monkeypatch.delenv('CLONOTH_SUPERVISOR_URL', raising=False)
+
+    async def run():
+        in_task = asyncio.Event()
+        in_complete_post = asyncio.Event()
+        allow_complete_finish = asyncio.Event()
+        completed_payloads = []
+        dispatched = {'done': False}
+        poll_cancel_sent = {'count': 0}
+
+        async def slow_node(**kwargs):
+            ctx = SimpleNamespace(completed_steps=1, tool_call_log=[], total_usage={},
+                                  _restart_tool_attachments=[], emit_event=AsyncMock())
+            current_context.set(ctx)
+            in_task.set()
+            await asyncio.sleep(30.0)
+            return {'action': 'finish', 'result': {'text': 'never'}}
+
+        monkeypatch.setattr(runner, '_run_node_task', slow_node)
+        monkeypatch.setattr(runner, 'fetch_llm_secret', AsyncMock(return_value={}))
+        monkeypatch.setattr(runner, 'normalize_llm_secret', lambda _: ('', '', ''))
+        monkeypatch.setattr(runner.ToolRegistry, 'load_remote_tools', AsyncMock(return_value=0))
+
+        async def sup_handler(req: httpx.Request) -> httpx.Response:
+            path = req.url.path
+            if path == '/v1/health':
+                return httpx.Response(200, json={'ok': True})
+            if path == '/v1/engine/register':
+                return httpx.Response(200, json={'ok': True, 'orphans_cancelled': 0})
+            if path == '/v1/async_tools/pending_cancels':
+                if in_complete_post.is_set() and poll_cancel_sent['count'] < 2:
+                    poll_cancel_sent['count'] += 1
+                    return httpx.Response(200, json={'task_ids': ['dup-cancel-1'], 'async_ids': []})
+                return httpx.Response(200, json={'task_ids': [], 'async_ids': []})
+            if path == '/v1/tools/reload-seq':
+                return httpx.Response(200, json={'seq': 0})
+            if path == '/v1/internal/llm_secret':
+                return httpx.Response(200, json={'api_key': 'k', 'base_url': 'http://llm', 'model': 'm'})
+            if path == '/v1/tasks/next':
+                if not dispatched['done']:
+                    dispatched['done'] = True
+                    return httpx.Response(200, json={
+                        'task_id': 'dup-cancel-1', 'execution_id': 'ex-dup', 'kind': 'node',
+                        'node_id': 'main', 'session_id': 'sid-dup', 'session_generation': 1, 'input': {},
+                    })
+                return httpx.Response(200, json={})
+            if path == '/v1/tasks/dup-cancel-1/complete':
+                in_complete_post.set()
+                await allow_complete_finish.wait()
+                completed_payloads.append(json.loads(req.content.decode('utf-8')))
+                return httpx.Response(200, json={'ok': True})
+            return httpx.Response(200, json={'ok': True})
+
+        real_client_cls = httpx.AsyncClient
+        monkeypatch.setattr(
+            runner.httpx,
+            'AsyncClient',
+            lambda **kw: real_client_cls(transport=httpx.MockTransport(sup_handler), headers=kw.get('headers'), timeout=kw.get('timeout')),
+        )
+
+        ws_queue: asyncio.Queue = asyncio.Queue()
+
+        class FakeWS:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                item = await ws_queue.get()
+                if item is None:
+                    raise StopAsyncIteration
+                return json.dumps(item)
+
+        import sys
+        monkeypatch.setitem(sys.modules, 'websockets', SimpleNamespace(connect=lambda *a, **kw: FakeWS()))
+
+        import signal
+        captured_stop = {}
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            'add_signal_handler',
+            lambda sig, cb, *args: captured_stop.__setitem__('cb', cb) if sig == signal.SIGTERM else None,
+        )
+
+        loop_task = asyncio.create_task(runner.worker_loop(supervisor_url='http://sup.local', workspace_root=tmp_path, worker_id='w-dup'))
+        try:
+            await asyncio.wait_for(in_task.wait(), timeout=2.0)
+
+            # 1st cancel via WS push -> interrupts slow_node and enters /complete POST
+            await ws_queue.put({'type': 'task_cancel_requested', 'payload': {'task_id': 'dup-cancel-1'}})
+            await asyncio.wait_for(in_complete_post.wait(), timeout=2.0)
+
+            # Fire duplicate WS cancel + pending_cancels poll + stop signal WHILE /complete is in flight!
+            await ws_queue.put({'type': 'task_cancelled', 'payload': {'task_id': 'dup-cancel-1'}})
+            await asyncio.sleep(0.12)
+            captured_stop['cb']()
+            await asyncio.sleep(0.05)
+            allow_complete_finish.set()
+
+            await asyncio.wait_for(loop_task, timeout=2.0)
+            assert len(completed_payloads) == 1
+            assert completed_payloads[0]['result']['action'] == 'cancelled'
+            assert completed_payloads[0]['result']['error'] == 'task cancelled'
+        finally:
+            allow_complete_finish.set()
+            if not loop_task.done():
+                loop_task.cancel()
+                await asyncio.gather(loop_task, return_exceptions=True)
+
     asyncio.run(run())

@@ -297,6 +297,7 @@ class FallbackProviderHandler:
                 await rctx.emit_event("llm_fallback", {
                     "node_id": ctx.node.id, "task_id": rctx.task_id,
                     "requested": requested, "original_status": status_code,
+                    "original_model": original_model, "original_error": str(original_error or "")[:300],
                     "attempt": attempt, "elapsed_ms": elapsed,
                 })
 
@@ -308,7 +309,9 @@ class FallbackProviderHandler:
                     )
                     ctx.response = new_resp
                     ctx.provider = fb_provider  # This hook response only, not the configured provider.
-                    text = f"原渠道 {original_model} 请求失败，本次改用 {fb_model}（{fb_provider_type}）。"
+                    _orig_err_part = f"（原因：{str(original_error)[:300]}）" if original_error else ""
+                    _prior_fb_part = f"；此前备用尝试失败：{' | '.join(fallback_errors)}" if fallback_errors else ""
+                    text = f"原渠道 {original_model} 请求失败{_orig_err_part}{_prior_fb_part}，本次改用 {fb_model}（{fb_provider_type}）。"
                     return hook_result(modified=True, channels={"response_notices": [{
                         "code": "fallback_provider.used", "label": "备用模型", "text": text,
                         "requested": requested, "original_status": status_code,

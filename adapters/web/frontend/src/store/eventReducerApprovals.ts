@@ -152,11 +152,55 @@ export function normalizeApprovalStatus(status: unknown, decision: unknown): App
   return 'pending';
 }
 
-export function findToolByCallId(state: ChatState, toolCallId: string): ToolExecution | undefined {
-  // [AutoC 2026-05-31] Why: approval events carry the provider tool_call_id, not
-  // the reducer's stable id. How: scan the normalized tool table for the external
-  // id field. Purpose: approvals can attach to tools regardless of block location.
-  return Object.values(state.toolExecutionsById).find((tool) => tool.id === toolCallId);
+export interface FindToolByCallIdOptions {
+  taskId?: string;
+  approvalId?: string;
+  requireActive?: boolean;
+}
+
+export function findToolByCallId(
+  state: ChatState,
+  toolCallId: string,
+  options: FindToolByCallIdOptions = {},
+): ToolExecution | undefined {
+  // Providers such as Gemini reuse external tool_call_id values ("call_1") across
+  // turns and steps. Resolve exact approval bindings first, then scan newest-first
+  // while honoring taskId and active-lifecycle filters so approvals never attach to
+  // historical completed cards.
+  if (options.approvalId) {
+    const location = state.approvalBlockById[options.approvalId];
+    if (location?.toolStableId && state.toolExecutionsById[location.toolStableId]) {
+      return state.toolExecutionsById[location.toolStableId];
+    }
+    for (let i = state.toolExecutionOrder.length - 1; i >= 0; i--) {
+      const candidate = state.toolExecutionsById[state.toolExecutionOrder[i]];
+      if (candidate && candidate.approvalId === options.approvalId) {
+        return candidate;
+      }
+    }
+  }
+
+  if (!toolCallId) return undefined;
+
+  const matchesCandidate = (tool: ToolExecution | undefined): tool is ToolExecution => {
+    if (!tool || tool.id !== toolCallId) return false;
+    if (options.taskId && tool.taskId && tool.taskId !== options.taskId) return false;
+    if (options.requireActive && TERMINAL_TOOL_STATUSES.has(tool.status)) return false;
+    return true;
+  };
+
+  for (let i = state.toolExecutionOrder.length - 1; i >= 0; i--) {
+    const tool = state.toolExecutionsById[state.toolExecutionOrder[i]];
+    if (matchesCandidate(tool)) return tool;
+  }
+
+  const values = Object.values(state.toolExecutionsById);
+  for (let i = values.length - 1; i >= 0; i--) {
+    const tool = values[i];
+    if (matchesCandidate(tool)) return tool;
+  }
+
+  return undefined;
 }
 
 export function buildApprovalDetails(payload: EventPayload): Record<string, unknown> {

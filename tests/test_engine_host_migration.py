@@ -157,26 +157,37 @@ class ToolActionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     actual = (await tool_manage.manage_tool(args, SimpleNamespace()))['selected']
                     self.assertEqual(resolve_effective_action('manage_tool', args)[1], actual)
 
-    async def test_external_mode_selector_cannot_be_bypassed_by_extra_action(self):
+    async def test_declared_selector_cannot_be_bypassed_and_undeclared_mode_is_untouched(self):
         from engine.inference.pseudo_tools import is_tool_action_allowed, resolve_effective_action
         from engine.node import ToolAccess
         node = Node(id='limited', type='ai', tool_access=ToolAccess(mode='all', deny=['external:write']))
-        spec = {'name': 'external', 'input_schema': {'properties': {'mode': {'enum': ['read', 'write']}}}}
-        self.assertFalse(is_tool_action_allowed(node, 'external', {'action': 'read', 'mode': 'write'}, spec))
+        spec = {'name': 'external', 'action_field': 'op', 'input_schema': {'properties': {'op': {'enum': ['read', 'write']}}}}
+        self.assertFalse(is_tool_action_allowed(node, 'external', {'action': 'read', 'mode': 'read', 'op': 'write'}, spec))
         self.assertFalse(is_tool_action_allowed(node, 'external', {'action': 'read'}, spec))
-        self.assertTrue(is_tool_action_allowed(node, 'external', {'mode': 'read'}, spec))
-        self.assertEqual(resolve_effective_action('external', {'mode': 'write'}, spec), ('external', 'write'))
-        # External servers may treat unrecognized spellings as a different mode.
+        self.assertTrue(is_tool_action_allowed(node, 'external', {'op': 'read'}, spec))
+        self.assertEqual(resolve_effective_action('external', {'op': 'write'}, spec), ('external', 'write'))
+        # External servers may treat unrecognized spellings as a different action.
         for value in (' READ ', 'read ', True):
-            self.assertFalse(is_tool_action_allowed(node, 'external', {'mode': value}, spec))
+            self.assertFalse(is_tool_action_allowed(node, 'external', {'op': value}, spec))
         node.control_tools = 'none'
         _, tools = build_node_tool_specs(registry=SimpleNamespace(list_specs=lambda: [spec]), node=node)
-        self.assertIn('mode', tools[0]['function']['parameters']['required'])
+        self.assertIn('op', tools[0]['function']['parameters']['required'])
+
+        # Undeclared tools with a business 'mode' parameter never get 'mode' forced into required,
+        # and fail closed if someone misconfigures sub-action rules on them.
+        plain_spec = {'name': 'plain_tool', 'input_schema': {'properties': {'mode': {'enum': ['replace', 'append']}}, 'required': []}}
+        open_node = Node(id='open', type='ai', control_tools='none', tool_access=ToolAccess(mode='all'))
+        _, plain_tools = build_node_tool_specs(registry=SimpleNamespace(list_specs=lambda: [plain_spec]), node=open_node)
+        self.assertEqual(plain_tools[0]['function']['parameters'].get('required', []), [])
+        misconfigured = Node(id='mis', type='ai', control_tools='none', tool_access=ToolAccess(mode='all', deny=['plain_tool:replace']))
+        self.assertFalse(is_tool_action_allowed(misconfigured, 'plain_tool', {'mode': 'append'}, plain_spec))
+        _, hidden_tools = build_node_tool_specs(registry=SimpleNamespace(list_specs=lambda: [plain_spec]), node=misconfigured)
+        self.assertEqual(hidden_tools, [])
 
     async def test_allow_entries_are_alternatives_and_deny_still_wins(self):
         from engine.inference.pseudo_tools import is_tool_action_allowed
         from engine.node import ToolAccess
-        spec = {'name': 'manage_memory', 'input_schema': {'properties': {'action': {'enum': ['list', 'upsert', 'delete']}}}}
+        spec = {'name': 'manage_memory', 'action_field': 'action', 'input_schema': {'properties': {'action': {'enum': ['list', 'upsert', 'delete']}}}}
         cases = [
             (['manage_memory:list', 'manage_memory:upsert'], [], {'list', 'upsert'}),
             (['manage_memory:!delete'], [], {'list', 'upsert'}),
@@ -220,7 +231,7 @@ class ToolActionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         from engine.node import ToolAccess
         node = Node(id='limited', type='ai', control_tools='none',
                     tool_access=ToolAccess(mode='all', deny=['external:write']))
-        spec = {'name': 'external', 'input_schema': {'properties': {'mode': {'enum': ['READ', 'WRITE']}}}}
+        spec = {'name': 'external', 'action_field': 'mode', 'input_schema': {'properties': {'mode': {'enum': ['READ', 'WRITE']}}}}
         self.assertFalse(is_tool_action_allowed(node, 'external', {'mode': 'WRITE'}, spec))
         self.assertTrue(is_tool_action_allowed(node, 'external', {'mode': 'READ'}, spec))
         self.assertFalse(is_tool_action_allowed(node, 'external', {'mode': 'read'}, spec))

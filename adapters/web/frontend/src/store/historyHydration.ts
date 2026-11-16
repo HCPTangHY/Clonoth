@@ -46,70 +46,115 @@ export function summarizeArguments(toolName: string, args: Record<string, unknow
 
 // ── History Tool Result Index ──────────────────────────────────────────────
 
-export function buildHistoryToolResultIndex(messages: readonly StructuredMessage[]): Map<string, HistoryToolResult> {
-  const resultIndex = new Map<string, HistoryToolResult>();
+const INTERNAL_READ_ATTACHMENT_TOOLS = new Set(['read_file', 'read_media']);
 
-  for (const message of messages) {
-    if (message.role !== 'tool' || !message.tool_call_id) continue;
+function isInternalHistoryReadAttachmentPath(value: string | undefined): boolean {
+  const norm = (value || '').replace(/\\/g, '/').replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
+  return norm.startsWith('data/attachments/read_file/') || norm.includes('/data/attachments/read_file/');
+}
 
-    const toolName = message.tool_name || message.name || '';
-    const rawContent = stringifyContent(message.content);
-    const trimmed = rawContent.trim();
-    const rejected = Boolean(message.tool_rejected);
-    const status: HistoryToolResult['status'] = rejected || /^ERROR(?:\b|:)/i.test(trimmed) ? 'error' : 'success';
-    const isAutoResult = status === 'success' && CONTROL_TOOL_NAMES.has(toolName) && trimmed.toLowerCase() === 'ok';
+function parseHistoryToolResult(message: StructuredMessage): HistoryToolResult {
+  const toolName = message.tool_name || message.name || '';
+  const rawContent = stringifyContent(message.content);
+  const trimmed = rawContent.trim();
+  const rejected = Boolean(message.tool_rejected);
+  const status: HistoryToolResult['status'] = rejected || /^ERROR(?:\b|:)/i.test(trimmed) ? 'error' : 'success';
+  const isAutoResult = status === 'success' && CONTROL_TOOL_NAMES.has(toolName) && trimmed.toLowerCase() === 'ok';
 
-    const structured = (message as unknown as Record<string, unknown>).tool_result_structured;
-    let resolvedResult: unknown;
-    if (isAutoResult) {
-      resolvedResult = undefined;
-    } else if (status === 'error') {
-      resolvedResult = rawContent;
-    } else if (typeof structured === 'object' && structured !== null) {
-      resolvedResult = structured;
-    } else {
-      try {
-        const parsed = JSON.parse(rawContent);
-        if (typeof parsed === 'object' && parsed !== null) {
-          resolvedResult = parsed;
-        } else {
-          resolvedResult = truncateForPreview(collapseForPreview(rawContent), 120) || undefined;
-        }
-      } catch {
+  const structured = (message as unknown as Record<string, unknown>).tool_result_structured;
+  let resolvedResult: unknown;
+  if (isAutoResult) {
+    resolvedResult = undefined;
+  } else if (status === 'error') {
+    resolvedResult = rawContent;
+  } else if (typeof structured === 'object' && structured !== null) {
+    resolvedResult = structured;
+  } else {
+    try {
+      const parsed = JSON.parse(rawContent);
+      if (typeof parsed === 'object' && parsed !== null) {
+        resolvedResult = parsed;
+      } else {
         resolvedResult = truncateForPreview(collapseForPreview(rawContent), 120) || undefined;
       }
+    } catch {
+      resolvedResult = truncateForPreview(collapseForPreview(rawContent), 120) || undefined;
     }
-
-    const rawInline = message.tool_result_raw_inline || message.raw_inline || rawContent;
-    const elapsedMs = typeof message.tool_result_elapsed_ms === 'number'
-      ? message.tool_result_elapsed_ms
-      : typeof message.elapsed_ms === 'number'
-        ? message.elapsed_ms
-        : undefined;
-    const attachments = mergeHistoryAttachments(
-      normalizeHistoryAttachments(message),
-      normalizeHistoryAttachmentList(message.tool_attachments),
-      extractHistoryAttachmentsFromValue(structured),
-      extractHistoryAttachmentsFromValue(rawContent),
-    );
-
-    resultIndex.set(message.tool_call_id, {
-      status,
-      rawInline,
-      format: message.tool_result_format || message.format || undefined,
-      elapsedMs,
-      // [2026-09-10] 后端落盘的 tool summary 优先于前端按参数推导的摘要。
-      summary: message.tool_result_summary || message.tool_summary || undefined,
-      attachments: attachments.length > 0 ? attachments : undefined,
-      rejected: rejected || undefined,
-      rejectionCode: message.tool_rejection_code || undefined,
-      resultVisibility: message.tool_result_visibility || undefined,
-      isAutoResult: isAutoResult || undefined,
-      result: resolvedResult,
-    });
   }
 
+  const rawInline = message.tool_result_raw_inline || message.raw_inline || rawContent;
+  const elapsedMs = typeof message.tool_result_elapsed_ms === 'number'
+    ? message.tool_result_elapsed_ms
+    : typeof message.elapsed_ms === 'number'
+      ? message.elapsed_ms
+      : undefined;
+  const attachments = INTERNAL_READ_ATTACHMENT_TOOLS.has(toolName)
+    ? []
+    : mergeHistoryAttachments(
+        normalizeHistoryAttachments(message),
+        normalizeHistoryAttachmentList(message.tool_attachments, true),
+        extractHistoryAttachmentsFromValue(structured),
+        extractHistoryAttachmentsFromValue(rawContent),
+      );
+
+  return {
+    status,
+    rawInline,
+    format: message.tool_result_format || message.format || undefined,
+    elapsedMs,
+    // [2026-09-10] 后端落盘的 tool summary 优先于前端按参数推导的摘要。
+    summary: message.tool_result_summary || message.tool_summary || undefined,
+    attachments: attachments.length > 0 ? attachments : undefined,
+    rejected: rejected || undefined,
+    rejectionCode: message.tool_rejection_code || undefined,
+    resultVisibility: message.tool_result_visibility || undefined,
+    isAutoResult: isAutoResult || undefined,
+    result: resolvedResult,
+  };
+}
+
+export function buildHistoryToolResultIndex(messages: readonly StructuredMessage[]): Map<string, HistoryToolResult> {
+  const resultIndex = new Map<string, HistoryToolResult>();
+  for (const message of messages) {
+    if (message.role !== 'tool' || !message.tool_call_id) continue;
+    resultIndex.set(message.tool_call_id, parseHistoryToolResult(message));
+  }
   return resultIndex;
+}
+
+function buildScopedHistoryToolResultMaps(
+  messages: readonly StructuredMessage[],
+): { byAssistantIndex: Map<number, Map<string, HistoryToolResult>>; fallback: Map<string, HistoryToolResult> } {
+  const byAssistantIndex = new Map<number, Map<string, HistoryToolResult>>();
+  const fallback = new Map<string, HistoryToolResult>();
+  let activeAssistantIndex: number | null = null;
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.role === 'assistant') {
+      if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+        activeAssistantIndex = i;
+        byAssistantIndex.set(i, new Map<string, HistoryToolResult>());
+      } else {
+        activeAssistantIndex = null;
+      }
+      continue;
+    }
+    if (message.role === 'tool' && message.tool_call_id) {
+      const parsed = parseHistoryToolResult(message);
+      if (activeAssistantIndex !== null) {
+        byAssistantIndex.get(activeAssistantIndex)?.set(message.tool_call_id, parsed);
+      } else {
+        fallback.set(message.tool_call_id, parsed);
+      }
+      continue;
+    }
+    if (message.role === 'user' && message.message_type !== 'tool_result_attachment') {
+      activeAssistantIndex = null;
+    }
+  }
+
+  return { byAssistantIndex, fallback };
 }
 
 // ── History Tool Call Normalization ─────────────────────────────────────────
@@ -138,12 +183,12 @@ function getHistoryAttachmentName(path: string, fallback = '附件'): string {
   return safeDecodeHistoryPath(clean.split('/').pop() || fallback);
 }
 
-function normalizeHistoryAttachmentPath(value: unknown): Attachment | null {
+function normalizeHistoryAttachmentPath(value: unknown, excludeInternalRead = false): Attachment | null {
   // Strip file:// prefix but preserve leading / for absolute paths —
   // the backend /v1/sessions/{id}/file resolves absolutes and checks
   // workspace containment.
   const path = getHistoryString(value).replace(/^file:\/\//, '').trim();
-  if (!path) return null;
+  if (!path || (excludeInternalRead && isInternalHistoryReadAttachmentPath(path))) return null;
   const imageLike = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(path);
   return {
     name: getHistoryAttachmentName(path, imageLike ? '图片' : '附件'),
@@ -153,11 +198,13 @@ function normalizeHistoryAttachmentPath(value: unknown): Attachment | null {
   };
 }
 
-function normalizeHistoryAttachmentItem(value: unknown): Attachment | null {
-  if (typeof value === 'string') return normalizeHistoryAttachmentPath(value);
+function normalizeHistoryAttachmentItem(value: unknown, excludeInternalRead = false): Attachment | null {
+  if (typeof value === 'string') return normalizeHistoryAttachmentPath(value, excludeInternalRead);
   if (!isRecord(value)) return null;
   const path = getHistoryString(value.path).replace(/^file:\/\//, '').trim();
-  const url = getHistoryString(value.url) || undefined;
+  const url = getHistoryString(value.url).trim() || undefined;
+  if (!path && !url) return null;
+  if (excludeInternalRead && path && isInternalHistoryReadAttachmentPath(path)) return null;
   const name = getHistoryString(value.name) || getHistoryAttachmentName(path || url || '', '附件');
   const mimeType = getHistoryString(value.mime_type) || undefined;
   const type = getHistoryString(value.type) || (mimeType?.startsWith('image/') ? 'image' : undefined);
@@ -171,10 +218,10 @@ function normalizeHistoryAttachmentItem(value: unknown): Attachment | null {
   };
 }
 
-function normalizeHistoryAttachmentList(value: unknown): Attachment[] {
+function normalizeHistoryAttachmentList(value: unknown, excludeInternalRead = false): Attachment[] {
   if (!Array.isArray(value)) return [];
   return value
-    .map((item) => normalizeHistoryAttachmentItem(item))
+    .map((item) => normalizeHistoryAttachmentItem(item, excludeInternalRead))
     .filter((item): item is Attachment => Boolean(item));
 }
 
@@ -197,18 +244,17 @@ function extractHistoryAttachmentsFromValue(value: unknown, depth = 0): Attachme
   }
   if (Array.isArray(value)) {
     return mergeHistoryAttachments(
-      normalizeHistoryAttachmentList(value),
-      ...value.map((item) => extractHistoryAttachmentsFromValue(item, depth + 1)),
+      ...value
+        .filter((item) => isRecord(item))
+        .map((item) => extractHistoryAttachmentsFromValue(item, depth + 1)),
     );
   }
   if (!isRecord(value)) return [];
 
   const direct = mergeHistoryAttachments(
-    normalizeHistoryAttachmentList(value.attachments),
-    normalizeHistoryAttachmentList(value.tool_attachments),
-    normalizeHistoryAttachmentList(value.tool_result_attachments),
-    normalizeHistoryAttachmentList(value.attachment_paths),
-    normalizeHistoryAttachmentList(value.attachmentPaths),
+    normalizeHistoryAttachmentList(value.attachments, true),
+    normalizeHistoryAttachmentList(value.tool_attachments, true),
+    normalizeHistoryAttachmentList(value.tool_result_attachments, true),
   );
 
   const nested = mergeHistoryAttachments(
@@ -221,6 +267,8 @@ function extractHistoryAttachmentsFromValue(value: unknown, depth = 0): Attachme
 function normalizeHistoryAttachments(message: StructuredMessage): Attachment[] {
   const attachments: Attachment[] = [];
   const seen = new Set<string>();
+  const isToolBridge = message.message_type === 'tool_result_attachment';
+  const excludeInternalRead = isToolBridge || message.role === 'tool' || message.role === 'assistant';
   const add = (attachment: Attachment | null) => {
     if (!attachment) return;
     const key = attachment.path || attachment.url || attachment.name;
@@ -230,16 +278,17 @@ function normalizeHistoryAttachments(message: StructuredMessage): Attachment[] {
   };
 
   if (Array.isArray(message.attachments)) {
-    for (const item of message.attachments) add(normalizeHistoryAttachmentItem(item));
+    for (const item of message.attachments) add(normalizeHistoryAttachmentItem(item, excludeInternalRead));
   }
 
-  if (Array.isArray(message.content)) {
+  if (message.role === 'user' && !isToolBridge && Array.isArray(message.content)) {
     for (const part of message.content) {
       if (!isRecord(part)) continue;
       const type = getHistoryString(part.type);
       if (type === 'image_url' && isRecord(part.image_url)) {
         const rawUrl = getHistoryString(part.image_url.url);
         const path = rawUrl.replace(/^file:\/\//, '').replace(/^\/+/, '');
+        if (!path && !rawUrl) continue;
         add({
           name: getHistoryAttachmentName(path || rawUrl, '图片'),
           type: 'image',
@@ -253,10 +302,11 @@ function normalizeHistoryAttachments(message: StructuredMessage): Attachment[] {
         const pattern = /\[Attached file:\s*([^|\]]+?)\s*\|\s*type:\s*([^|\]]+?)\s*\|\s*path:\s*([^\]]+?)\]/g;
         for (const match of text.matchAll(pattern)) {
           const path = match[3].trim().replace(/^file:\/\//, '').replace(/^\/+/, '');
+          if (!path) continue;
           add({
             name: match[1].trim() || getHistoryAttachmentName(path),
             type: 'file',
-            path: path || undefined,
+            path,
             mime_type: match[2].trim() || undefined,
           });
         }
@@ -266,6 +316,7 @@ function normalizeHistoryAttachments(message: StructuredMessage): Attachment[] {
 
   if (Array.isArray(message.tool_calls)) {
     for (const toolCall of message.tool_calls) {
+      if (!CONTROL_TOOL_NAMES.has(toolCall.name || '')) continue;
       const args = isRecord(toolCall.arguments) ? toolCall.arguments : undefined;
       const paths = args?.attachment_paths;
       if (Array.isArray(paths)) {
@@ -349,9 +400,31 @@ export function extractControlToolText(toolCalls: readonly HistoryToolCall[]): {
   return { text: '' };
 }
 
-function historyToolStatus(result: HistoryToolResult | undefined): ToolStatus {
-  if (!result) return 'success';
+function historyToolStatus(
+  result: HistoryToolResult | undefined,
+  toolName: string,
+  isInFlightTailStep = false,
+): ToolStatus {
+  if (!result) {
+    if (isInFlightTailStep && !CONTROL_TOOL_NAMES.has(toolName)) {
+      return 'running';
+    }
+    return 'success';
+  }
   return result.status;
+}
+
+function isTailInFlightAssistantMessage(
+  messages: readonly StructuredMessage[],
+  assistantIndex: number,
+): boolean {
+  for (let i = assistantIndex + 1; i < messages.length; i++) {
+    const next = messages[i];
+    if (next.role === 'tool') continue;
+    if (next.role === 'user' && (next.message_type === 'tool_result_attachment' || next.is_preempt)) continue;
+    return false;
+  }
+  return true;
 }
 
 // ── History Tool Execution Factory ─────────────────────────────────────────
@@ -363,6 +436,8 @@ export function createHistoryToolExecutions(
   createdAt: string,
   sessionId: string,
   nodeId?: string,
+  taskId?: string,
+  isInFlightTailStep = false,
 ): ToolExecution[] {
   return toolCalls.map((toolCall, index) => {
     const result = toolCall.id ? resultIndex.get(toolCall.id) : undefined;
@@ -373,7 +448,7 @@ export function createHistoryToolExecutions(
       id: toolCall.id,
       index,
       name: toolCall.name,
-      status: historyToolStatus(result),
+      status: historyToolStatus(result, toolCall.name, isInFlightTailStep),
       arguments: toolCall.arguments,
       argumentsText: toolCall.arguments ? JSON.stringify(toolCall.arguments) : undefined,
       summary: result?.summary || summarizeArguments(toolCall.name, toolCall.arguments),
@@ -386,6 +461,7 @@ export function createHistoryToolExecutions(
       rejectionCode: result?.rejectionCode,
       resultVisibility: result?.resultVisibility,
       hidden: result?.resultVisibility === 'hidden' || (CONTROL_TOOL_NAMES.has(toolCall.name) && result?.isAutoResult && !result?.rejected),
+      taskId,
       nodeId,
       createdAt,
       updatedAt: createdAt,
@@ -454,10 +530,34 @@ export function appendHistoryMessage(
   const order = state.messageOrderByConversation[message.conversationId] || [];
   const nextToolExecutionsById = { ...state.toolExecutionsById };
   const nextToolExecutionOrder = [...state.toolExecutionOrder];
+  const nextToolStableIdByExternalId = { ...state.toolStableIdByExternalId };
+  const nextAssistantMessageByTurn = { ...state.assistantMessageByTurn };
+  const nextTaskTurnKeys = { ...state.taskTurnKeys };
 
   for (const tool of tools) {
     nextToolExecutionsById[tool.stableId] = tool;
     if (!nextToolExecutionOrder.includes(tool.stableId)) nextToolExecutionOrder.push(tool.stableId);
+    if (tool.id) {
+      nextToolStableIdByExternalId[`${message.id}|external:${tool.id}`] = tool.stableId;
+    }
+  }
+
+  if (message.role === 'assistant' && message.status === 'running_tools') {
+    const { taskId, inboundSeq, llmRequestId } = message.source;
+    if (llmRequestId) {
+      if (inboundSeq !== undefined) {
+        nextAssistantMessageByTurn[`inbound:${inboundSeq}:llm:${llmRequestId}`] = message.id;
+      }
+      if (taskId) {
+        nextAssistantMessageByTurn[`task:${taskId}:llm:${llmRequestId}`] = message.id;
+      }
+      nextAssistantMessageByTurn[`session:${message.sessionId}:llm:${llmRequestId}`] = message.id;
+    }
+    if (taskId) {
+      const turnKey = `task:${taskId}`;
+      nextAssistantMessageByTurn[turnKey] = message.id;
+      nextTaskTurnKeys[taskId] = turnKey;
+    }
   }
 
   let nextOrder: string[];
@@ -474,8 +574,11 @@ export function appendHistoryMessage(
       ...state.messageOrderByConversation,
       [message.conversationId]: nextOrder,
     },
+    assistantMessageByTurn: nextAssistantMessageByTurn,
+    taskTurnKeys: nextTaskTurnKeys,
     toolExecutionsById: nextToolExecutionsById,
     toolExecutionOrder: nextToolExecutionOrder,
+    toolStableIdByExternalId: nextToolStableIdByExternalId,
   };
 }
 
@@ -534,11 +637,40 @@ export function hydrateStructuredHistory(
   history: readonly StructuredMessage[],
   preserveExistingMessages = false,
 ): ChatState {
-  const resultIndex = buildHistoryToolResultIndex(history);
+  const scopedResults = buildScopedHistoryToolResultMaps(history);
   let nextState = preserveExistingMessages ? state : removeConversationMessages(state, conversationId);
   const existingSourceIds = new Set<string>();
   const existingMessageIds = new Set<string>();
   const existingContentSignatures = new Set<string>();
+  const unmatchedLivePreemptCounts = new Map<string, number>();
+  const historyPrefix = `history:${sessionId}:`;
+
+  const incrementPreemptCount = (key: string) => {
+    unmatchedLivePreemptCounts.set(key, (unmatchedLivePreemptCounts.get(key) || 0) + 1);
+  };
+
+  const consumeLivePreemptMatch = (taskId: string | undefined, text: string): boolean => {
+    const compact = collapseForPreview(text);
+    if (!compact) return false;
+    const keys = taskId ? [`${taskId}:${compact}`, `:${compact}`] : [`:${compact}`];
+    for (const key of keys) {
+      const count = unmatchedLivePreemptCounts.get(key) || 0;
+      if (count > 0) {
+        unmatchedLivePreemptCounts.set(key, count - 1);
+        return true;
+      }
+    }
+    if (!taskId) {
+      const suffix = `:${compact}`;
+      for (const [key, count] of unmatchedLivePreemptCounts.entries()) {
+        if (count > 0 && key.endsWith(suffix)) {
+          unmatchedLivePreemptCounts.set(key, count - 1);
+          return true;
+        }
+      }
+    }
+    return false;
+  };
 
   if (preserveExistingMessages) {
     for (const id of nextState.messageOrderByConversation[conversationId] || []) {
@@ -546,7 +678,22 @@ export function hydrateStructuredHistory(
       if (!existingMessage) continue;
       existingMessageIds.add(existingMessage.id);
       for (const eventId of existingMessage.eventIds || []) {
-        if (eventId.startsWith(`history:${sessionId}:`)) existingSourceIds.add(eventId);
+        if (eventId.startsWith(historyPrefix)) existingSourceIds.add(eventId);
+      }
+      for (const block of existingMessage.blocks) {
+        let blockFromHistory = false;
+        for (const eventId of block.eventIds || []) {
+          if (eventId.startsWith(historyPrefix)) {
+            existingSourceIds.add(eventId);
+            blockFromHistory = true;
+          }
+        }
+        if (!blockFromHistory && block.kind === 'notice' && block.level === 'preempt') {
+          const compact = collapseForPreview(block.text || '追加指令已注入');
+          if (compact) {
+            incrementPreemptCount(`${existingMessage.source.taskId || ''}:${compact}`);
+          }
+        }
       }
       const signature = createHistoryContentSignature(existingMessage.role, getMessageTextForHistoryDedupe(existingMessage));
       if (signature) existingContentSignatures.add(signature);
@@ -574,11 +721,37 @@ export function hydrateStructuredHistory(
   let accumulatedThinking: HistoryThinkingSegment[] = [];
   let accumulatedTools: ToolExecution[] = [];
   let accumulatedCreatedAt = '';
+  let pendingTurnAttachments: Attachment[] = [];
 
   const resetAccumulatedAssistant = () => {
     accumulatedThinking = [];
     accumulatedTools = [];
     accumulatedCreatedAt = '';
+  };
+
+  const flushPendingTurnAttachmentsToLastAssistant = () => {
+    if (pendingTurnAttachments.length === 0) return;
+    const order = nextState.messageOrderByConversation[conversationId] || [];
+    for (let k = order.length - 1; k >= 0; k--) {
+      const candidate = nextState.messagesById[order[k]];
+      if (!candidate) continue;
+      if (candidate.role === 'assistant') {
+        nextState = {
+          ...nextState,
+          messagesById: {
+            ...nextState.messagesById,
+            [candidate.id]: {
+              ...candidate,
+              attachments: mergeHistoryAttachments(candidate.attachments || [], pendingTurnAttachments),
+            },
+          },
+        };
+        pendingTurnAttachments = [];
+        return;
+      }
+      if (candidate.role === 'user' || candidate.role === 'dispatch_callback') break;
+    }
+    pendingTurnAttachments = [];
   };
 
   const pushAssistantMessage = (
@@ -602,11 +775,51 @@ export function hydrateStructuredHistory(
       ...tool,
       messageId,
     }));
-    const attachments = mergeHistoryAttachments(
-      ...tools.map((tool) => tool.attachments || []),
+    const ownAttachments = mergeHistoryAttachments(
+      ...tools
+        .filter((tool) => !INTERNAL_READ_ATTACHMENT_TOOLS.has(tool.name))
+        .map((tool) => tool.attachments || []),
       normalizeHistoryAttachments(sourceMessage),
     );
+    const isFoldedIntermediateWorkCard = !completionType && !text.trim() && tools.length > 0;
+    let attachments: Attachment[] = [];
+    if (isFoldedIntermediateWorkCard) {
+      if (ownAttachments.length > 0) {
+        pendingTurnAttachments = mergeHistoryAttachments(pendingTurnAttachments, ownAttachments);
+      }
+    } else {
+      attachments = mergeHistoryAttachments(pendingTurnAttachments, ownAttachments);
+      pendingTurnAttachments = [];
+    }
+    const rawResponseInfo = normalizeResponseInfo(sourceMessage.response_info);
+    const retryNotices = (rawResponseInfo?.notices || []).filter(
+      (n) => n.code === 'llm.retry' || n.code === 'llm.reactive_compact',
+    );
+    const remainingNotices = (rawResponseInfo?.notices || []).filter(
+      (n) => n.code !== 'llm.retry' && n.code !== 'llm.reactive_compact',
+    );
+    const cleanedResponseInfo = rawResponseInfo
+      ? {
+          ...rawResponseInfo,
+          notices: remainingNotices.length > 0 ? remainingNotices : undefined,
+        }
+      : undefined;
+
     const blocks: RenderBlock[] = [];
+
+    for (const [index, retryNotice] of retryNotices.entries()) {
+      blocks.push({
+        id: `${messageId}|block:notice:retry:${index}`,
+        kind: 'notice',
+        level: 'warning',
+        title: retryNotice.label || '模型请求重试',
+        text: retryNotice.text,
+        eventType: retryNotice.code === 'llm.reactive_compact' ? 'reactive_compact' : 'llm_retry',
+        createdAt,
+        updatedAt: createdAt,
+        eventIds: [historyEventId],
+      });
+    }
 
     for (const [index, thinking] of thinkingSegments.entries()) {
       blocks.push(createThinkingBlock(
@@ -631,7 +844,8 @@ export function hydrateStructuredHistory(
       tools.forEach((tool, index) => { tools[index] = { ...tool, blockId }; });
     }
 
-    const status: MessageStatus = 'completed';
+    const hasInFlightTool = tools.some((tool) => tool.status === 'running' || tool.status === 'awaiting_approval');
+    const status: MessageStatus = hasInFlightTool ? 'running_tools' : 'completed';
     const message: WsMessage = {
       id: messageId,
       conversationId,
@@ -641,6 +855,7 @@ export function hydrateStructuredHistory(
       createdAt,
       updatedAt: createdAt,
       source: {
+        inboundSeq: sourceMessage.source_inbound_seq ?? undefined,
         nodeId: sourceMessage.source_node_id || undefined,
         taskId: sourceMessage.source_task_id || undefined,
         llmRequestId: sourceMessage.llm_request_id || undefined,
@@ -648,7 +863,7 @@ export function hydrateStructuredHistory(
         providerMetadata: sourceMessage.provider_metadata,
         // [2026-09-12] 历史 JSONL 里的 response_info 可能是旧形状（notices 非数组），
         // 复用 live 路径的规范化函数，避免 MessageCard 在渲染时抛错。
-        responseInfo: normalizeResponseInfo(sourceMessage.response_info),
+        responseInfo: cleanedResponseInfo,
         usage: sourceMessage.usage,
       },
       blocks,
@@ -677,49 +892,23 @@ export function hydrateStructuredHistory(
     }, '', []);
   };
 
-  for (const message of history) {
-    if (message.role === 'user') {
+  for (let msgIdx = 0; msgIdx < history.length; msgIdx++) {
+    const message = history[msgIdx];
+    if (
+      message.role === 'system'
+      || message.message_type === 'error'
+      || message.message_type === 'cancelled'
+      || message.message_type === 'summary'
+    ) {
       flushDanglingAssistant();
+      flushPendingTurnAttachmentsToLastAssistant();
 
       const createdAt = message.created_at || new Date().toISOString();
-      const messageId = `message:${conversationId}:history:${message.id || `user-${nextState.messageOrderByConversation[conversationId]?.length || 0}`}`;
+      const messageId = `message:${conversationId}:history:${message.id || `sys-${nextState.messageOrderByConversation[conversationId]?.length || 0}`}`;
       const historyEventId = getHistoryEventId(sessionId, message.id, messageId);
       const text = getHistoryTextContent(message);
-      const attachments = normalizeHistoryAttachments(message);
-
-      if (message.message_type === 'tool_result_attachment') {
-        // [AutoC 2026-06-17] Why: tool-generated attachment rows are LLM-history
-        // support messages, not human-authored chat. How: attach their persisted
-        // attachment metadata to the previous assistant card. Purpose: refresh shows
-        // tool output files on the tool card without creating a fake user message.
-        const order = nextState.messageOrderByConversation[conversationId] || [];
-        let targetMsg: WsMessage | undefined;
-        for (let k = order.length - 1; k >= 0; k--) {
-          const candidate = nextState.messagesById[order[k]];
-          if (candidate?.role === 'assistant') { targetMsg = candidate; break; }
-        }
-        if (targetMsg && attachments.length > 0) {
-          nextState = {
-            ...nextState,
-            messagesById: {
-              ...nextState.messagesById,
-              [targetMsg.id]: {
-                ...targetMsg,
-                attachments: mergeHistoryAttachments(targetMsg.attachments || [], attachments),
-                eventIds: [...targetMsg.eventIds, historyEventId],
-              },
-            },
-          };
-        }
-        rememberHydratedHistoryMessage(historyEventId, messageId);
-        continue;
-      }
-
-      if (INTERNAL_USER_MESSAGE_TYPES.has(message.message_type || '') && message.message_type !== 'summary') continue;
 
       if (message.message_type === 'error') {
-        // [2026-08-26] fail 落盘：上游 API 报错等失败现写入 JSONL（role=system,
-        // message_type=error），刷新后渲染为错误卡片，不再凭空消失。
         if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, 'system', text)) continue;
         const noticeBlock: NoticeBlock = {
           id: `${messageId}|block:notice:error`,
@@ -737,10 +926,47 @@ export function hydrateStructuredHistory(
           conversationId,
           sessionId,
           role: 'system',
-          status: 'completed',
+          status: 'failed',
           createdAt,
           updatedAt: createdAt,
-          source: {},
+          source: {
+            nodeId: message.source_node_id || undefined,
+            taskId: message.source_task_id || undefined,
+          },
+          blocks: [noticeBlock],
+          eventIds: [historyEventId],
+          hydratedFromHistory: true,
+        };
+        nextState = appendHistoryMessage(nextState, wsMessage, []);
+        rememberHydratedHistoryMessage(historyEventId, messageId);
+        continue;
+      }
+
+      if (message.message_type === 'cancelled') {
+        if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, 'system', text)) continue;
+        const noticeBlock: NoticeBlock = {
+          id: `${messageId}|block:notice:cancelled`,
+          kind: 'notice',
+          level: 'info',
+          title: '任务已取消',
+          text: text || '任务已手动取消。',
+          eventType: 'task_cancelled',
+          createdAt,
+          updatedAt: createdAt,
+          eventIds: [historyEventId],
+        };
+        const wsMessage: WsMessage = {
+          id: messageId,
+          conversationId,
+          sessionId,
+          role: 'system',
+          status: 'cancelled',
+          createdAt,
+          updatedAt: createdAt,
+          source: {
+            nodeId: message.source_node_id || undefined,
+            taskId: message.source_task_id || undefined,
+          },
           blocks: [noticeBlock],
           eventIds: [historyEventId],
           hydratedFromHistory: true,
@@ -782,39 +1008,126 @@ export function hydrateStructuredHistory(
         };
         nextState = appendHistoryMessage(nextState, wsMessage, []);
         rememberHydratedHistoryMessage(historyEventId, messageId);
+      }
+      continue;
+    }
+
+    if (message.role === 'user') {
+      flushDanglingAssistant();
+
+      const createdAt = message.created_at || new Date().toISOString();
+      const messageId = `message:${conversationId}:history:${message.id || `user-${nextState.messageOrderByConversation[conversationId]?.length || 0}`}`;
+      const historyEventId = getHistoryEventId(sessionId, message.id, messageId);
+      const text = getHistoryTextContent(message);
+      const attachments = normalizeHistoryAttachments(message);
+
+      if (message.message_type === 'tool_result_attachment') {
+        if (attachments.length > 0) {
+          const order = nextState.messageOrderByConversation[conversationId] || [];
+          let targetMsg: WsMessage | undefined;
+          for (let k = order.length - 1; k >= 0; k--) {
+            const candidate = nextState.messagesById[order[k]];
+            if (candidate?.role === 'assistant') { targetMsg = candidate; break; }
+            if (candidate?.role === 'user' || candidate?.role === 'dispatch_callback') break;
+          }
+          const targetHasVisibleReply = Boolean(
+            targetMsg && (targetMsg.completionType || targetMsg.blocks.some((b) => b.kind === 'text' && b.text.trim())),
+          );
+          if (targetMsg && targetHasVisibleReply) {
+            nextState = {
+              ...nextState,
+              messagesById: {
+                ...nextState.messagesById,
+                [targetMsg.id]: {
+                  ...targetMsg,
+                  attachments: mergeHistoryAttachments(targetMsg.attachments || [], attachments),
+                  eventIds: [...targetMsg.eventIds, historyEventId],
+                },
+              },
+            };
+          } else {
+            pendingTurnAttachments = mergeHistoryAttachments(pendingTurnAttachments, attachments);
+          }
+        }
+        rememberHydratedHistoryMessage(historyEventId, messageId);
         continue;
       }
 
+      if (!message.is_preempt) {
+        flushPendingTurnAttachmentsToLastAssistant();
+      }
+
+      if (INTERNAL_USER_MESSAGE_TYPES.has(message.message_type || '')) continue;
+
       const hydratedRole: WsMessage['role'] = isDispatchResultHistoryMessage(message, text) ? 'dispatch_callback' : 'user';
-      if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, hydratedRole, text)) continue;
       if (message.is_preempt) {
+        const preemptText = text || '追加指令已注入';
+        const noticeBlockId = `${messageId}|block:notice:preempt`;
+        if (preserveExistingMessages && (
+          existingSourceIds.has(historyEventId)
+          || existingMessageIds.has(messageId)
+          || consumeLivePreemptMatch(message.source_task_id, preemptText)
+        )) {
+          continue;
+        }
         const order = nextState.messageOrderByConversation[conversationId] || [];
         let targetMsg: WsMessage | undefined;
-        for (let k = order.length - 1; k >= 0; k--) {
-          const candidate = nextState.messagesById[order[k]];
-          if (candidate?.role === 'assistant') { targetMsg = candidate; break; }
+        if (message.source_task_id) {
+          let fallbackSameTask: WsMessage | undefined;
+          for (let k = order.length - 1; k >= 0; k--) {
+            const candidate = nextState.messagesById[order[k]];
+            if (candidate?.role !== 'assistant' || candidate.source.taskId !== message.source_task_id) continue;
+            if (!fallbackSameTask) fallbackSameTask = candidate;
+            if (!createdAt || !candidate.createdAt || candidate.createdAt <= createdAt) {
+              targetMsg = candidate;
+              break;
+            }
+          }
+          targetMsg = targetMsg || fallbackSameTask;
+        }
+        if (!targetMsg && !preserveExistingMessages) {
+          for (let k = order.length - 1; k >= 0; k--) {
+            const candidate = nextState.messagesById[order[k]];
+            if (!candidate) continue;
+            if (candidate.role === 'assistant') { targetMsg = candidate; break; }
+            if (candidate.role === 'user' || candidate.role === 'dispatch_callback') break;
+          }
         }
         if (targetMsg) {
-          const noticeBlock: NoticeBlock = {
-            id: `${messageId}|block:notice:preempt`,
-            kind: 'notice',
-            level: 'preempt' as const,
-            text,
-            createdAt,
-            updatedAt: createdAt,
-            eventIds: [historyEventId],
-          };
-          nextState = {
-            ...nextState,
-            messagesById: {
-              ...nextState.messagesById,
-              [targetMsg.id]: { ...targetMsg, blocks: [...targetMsg.blocks, noticeBlock] },
-            },
-          };
+          if (!targetMsg.blocks.some((block) => block.id === noticeBlockId)) {
+            const noticeBlock: NoticeBlock = {
+              id: noticeBlockId,
+              kind: 'notice',
+              level: 'preempt' as const,
+              text: preemptText,
+              createdAt,
+              updatedAt: createdAt,
+              eventIds: [historyEventId],
+            };
+            const nextEventIds = targetMsg.eventIds.includes(historyEventId)
+              ? targetMsg.eventIds
+              : [...targetMsg.eventIds, historyEventId];
+            nextState = {
+              ...nextState,
+              messagesById: {
+                ...nextState.messagesById,
+                [targetMsg.id]: {
+                  ...targetMsg,
+                  blocks: [...targetMsg.blocks, noticeBlock],
+                  eventIds: nextEventIds,
+                },
+              },
+            };
+          }
+          rememberHydratedHistoryMessage(historyEventId, messageId);
+          continue;
+        }
+        if (preserveExistingMessages) {
           rememberHydratedHistoryMessage(historyEventId, messageId);
           continue;
         }
       }
+      if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, hydratedRole, text)) continue;
       const userBlocks: RenderBlock[] = [createTextBlock(`${messageId}|block:text:history`, createdAt, text)];
       const wsMessage: WsMessage = {
         id: messageId,
@@ -853,7 +1166,18 @@ export function hydrateStructuredHistory(
 
     const pendingMessageId = `message:${conversationId}|history-pending:${message.id || 'assistant'}`;
     const toolCalls = normalizeHistoryToolCalls(message.tool_calls);
-    const currentTools = createHistoryToolExecutions(toolCalls, resultIndex, pendingMessageId, message.created_at || new Date().toISOString(), sessionId, message.source_node_id);
+    const resultIndex = scopedResults.byAssistantIndex.get(msgIdx) || scopedResults.fallback;
+    const inFlightTail = isTailInFlightAssistantMessage(history, msgIdx);
+    const currentTools = createHistoryToolExecutions(
+      toolCalls,
+      resultIndex,
+      pendingMessageId,
+      message.created_at || new Date().toISOString(),
+      sessionId,
+      message.source_node_id,
+      message.source_task_id || undefined,
+      inFlightTail,
+    );
     const controlText = extractControlToolText(toolCalls);
     const contentText = stringifyContent(message.content);
     const displayText = contentText.trim() ? contentText : controlText.text;
@@ -880,6 +1204,7 @@ export function hydrateStructuredHistory(
   }
 
   flushDanglingAssistant();
+  flushPendingTurnAttachmentsToLastAssistant();
   return {
     ...nextState,
     conversationIdsBySession: {

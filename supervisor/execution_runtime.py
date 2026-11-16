@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,9 +21,9 @@ from .types import TaskKind, TaskStatus
 
 log = logging.getLogger(__name__)
 TERMINAL = {"completed", "failed", "cancelled", "lost"}
-EVIDENCE_LIMIT = 256_000
-OWNER_EVIDENCE_LIMIT = 2_000_000
-TOTAL_EVIDENCE_LIMIT = 32_000_000
+EVIDENCE_LIMIT = 4_000_000
+OWNER_EVIDENCE_LIMIT = 16_000_000
+TOTAL_EVIDENCE_LIMIT = 64_000_000
 
 
 class ExecutionRuntime:
@@ -79,12 +80,29 @@ class ExecutionRuntime:
                     self._output_truncated.update(tid for tid in self._related(self._watched)
                                                   if not self._tasks.get(tid, {}).get("is_system_task"))
                 state._async_tools.update(data.get("work", {}))
+                for did, row in self._receipts.items():
+                    settled = state._async_tools.get(row.get("work_id"))
+                    if settled is None:
+                        continue
+                    if row.get("status") == "processed":
+                        settled["receipt_settled"] = True
+                        settled["result_delivered"] = True
+                    elif not str(did).startswith(("lost:", "restart:")) and (
+                        row.get("status") in {"held", "queued", "admitted"}
+                        or (settled.get("status") == "done" and str(did).endswith(":result"))
+                    ):
+                        settled["result_delivered"] = True
                 for row in self._tasks.values():
                     if row.get("status") not in TERMINAL:
                         row["status"] = "lost"
                 receipt_work = {r.get("work_id") for r in self._receipts.values()}
                 for row in state._async_tools.values():
-                    if row.get("status") == "running" or (row.get("status") == "done" and row.get("async_id") not in receipt_work):
+                    if row.get("status") == "running" or (
+                        row.get("status") == "done"
+                        and not row.get("receipt_settled")
+                        and not row.get("result_delivered")
+                        and row.get("async_id") not in receipt_work
+                    ):
                         row.update(status="lost", error="supervisor restarted before delivery")
                 for row in self._receipts.values():
                     if row.get("status") != "processed":
@@ -109,7 +127,12 @@ class ExecutionRuntime:
         # Keep all unsettled work, but bound completed unrelated bookkeeping.
         removable = [did for did, row in self._receipts.items() if row.get("status") == "processed" and row.get("origin_task_id") not in selected]
         for did in removable[:-200]:
-            self._receipts.pop(did, None)
+            evicted = self._receipts.pop(did, None)
+            if evicted:
+                settled = self.state._async_tools.get(evicted.get("work_id"))
+                if settled is not None:
+                    settled["receipt_settled"] = True
+                    settled["result_delivered"] = True
         for key in list(self._requests)[:-1000]:
             row = self._requests[key]
             if row.get("phase") == "done" and row.get("result", {}).get("task_id") not in selected:
@@ -286,12 +309,21 @@ class ExecutionRuntime:
                "owner_session_id": inp.get("_execution_owner_session_id", ""),
                "node_id": task.node_id, "status": str(getattr(task.status, "value", task.status)),
                "execution_id": task.execution_id, "routing_pending": task.completion_state == "routing", "parents": sorted(set(p for p in parents if p and p != task.task_id)),
-               "is_system_task": bool(inp.get("_system_task")), "result": copy.deepcopy(task.result)}
+               "is_system_task": bool(inp.get("_system_task")),
+               "is_main_entry": task.kind == TaskKind.node and not task.caller_task_id and not origin and not inp.get("_async_dispatch"),
+               "result": copy.deepcopy(task.result)}
         row["result"].pop("_runtime_state", None)
         row["result"].pop("dispatch_input", None)
         if len(json.dumps(row["result"], ensure_ascii=False)) > 64_000:
             row["result"] = {"action": row["result"].get("action"), "error": "result exceeds snapshot limit", "truncated": True}
-        for key in ("identity_unverified", "candidate_digest"):
+        prior = self._tasks.get(task.task_id, {})
+        if prior.get("execution_id") == task.execution_id:
+            for key in ("last_activity_at", "last_tool_activity_at", "active_tools"):
+                if key in prior:
+                    row[key] = copy.deepcopy(prior[key])
+        if prior.get("status") != row["status"] or prior.get("execution_id") != task.execution_id:
+            row["last_activity_at"] = time.time()
+        for key in ("identity_unverified", "candidate_digest", "input_revision"):
             if key in self._tasks.get(task.task_id, {}):
                 row[key] = self._tasks[task.task_id][key]
         self._tasks[task.task_id] = row
@@ -335,7 +367,7 @@ class ExecutionRuntime:
                 return
             self._output_truncated.add(task.task_id)  # Identity conflict is not a revised prefix.
         else:
-            # ponytail: separate 2 MB/owner and 32 MB total output budget; an
+            # ponytail: separate per-owner and total output budget; an
             # oversized output is explicitly unavailable, never silently sliced.
             owner = self._evidence_owner(task.task_id)
             sizes = [(r["task_id"], len(json.dumps(r, ensure_ascii=False).encode())) for r in self._outputs.values()]
@@ -414,7 +446,7 @@ class ExecutionRuntime:
         if action.get("checkpoint_error") or (action.get("_runtime_state") or {}).get("checkpoint_error"):
             self._truncated.add(task.task_id)
             self._output_truncated.add(task.task_id)
-        # ponytail: 2 MB per owning session, 32 MB total. At the global ceiling
+        # ponytail: 16 MB per owning session, 64 MB total. At the global ceiling
         # report truncation; paging/archival is intentionally not a new storage layer.
         owner = self._evidence_owner(task.task_id)
         sizes = {tid: len(json.dumps(rows, ensure_ascii=False).encode()) for tid, rows in self._evidence.items() if tid != task.task_id}
@@ -515,7 +547,18 @@ class ExecutionRuntime:
         task.completion_state = "routed"
         self.task_changed(task, notify=False)
         candidates, self._pending_candidates = self._pending_candidates, []
-        completed_ids = {task.task_id} if task.status == TaskStatus.completed and (task.result or {}).get("action") == "finish" else set()
+        watched_related = self._related(self._watched)
+        relevant = task.task_id in watched_related
+        completed_ids = {task.task_id} if task.status in {TaskStatus.completed, TaskStatus.failed} else set()
+        if not relevant and task.status in {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}:
+            completed_ids.add(task.task_id)
+        if task.output_chain_entry_task_id:
+            chain_entry = self.state.tasks.get(str(task.output_chain_entry_task_id).strip())
+            if chain_entry is not None and (
+                (chain_entry.status == TaskStatus.completed and (task.result or {}).get("action") == "finish")
+                or (chain_entry.task_id not in watched_related and chain_entry.status in {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled})
+            ):
+                completed_ids.add(chain_entry.task_id)
         for candidate in candidates:
             entry = self.state.tasks.get(candidate["entry_task_id"])
             if entry is not None:
@@ -525,20 +568,26 @@ class ExecutionRuntime:
                     json.dumps(candidate, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
                 if entry.status == TaskStatus.completed:
                     completed_ids.add(entry.task_id)
+        settled_any = False
         for receipt in self._receipts.values():
             if receipt.get("carrier_task_id") in completed_ids and receipt.get("status") == "admitted":
                 receipt["status"] = "processed"
+                settled_any = True
                 work = self.state._async_tools.get(receipt.get("work_id"))
-                if work and work.get("cancel_reason") == "service_restart":
-                    work["restart_result_consumed"] = True
-        relevant = task.task_id in self._related(self._watched)
+                if work is not None:
+                    work["receipt_settled"] = True
+                    work["result_delivered"] = True
+                    if work.get("cancel_reason") == "service_restart":
+                        work["restart_result_consumed"] = True
         try:
-            if relevant:
+            if relevant or settled_any:
                 self._save()
         except Exception:
-            self._load_error = True
-            log.exception("Execution facts could not be committed; automatic operations disabled")
-            return
+            if relevant:
+                self._load_error = True
+                log.exception("Execution facts could not be committed; automatic operations disabled")
+                return
+            log.warning("Unwatched receipt settlement save failed; keeping in-memory settlement")
         self.notify("task", task.input.get("_execution_owner_session_id") or self._tasks[task.task_id]["session_id"], task=self._tasks[task.task_id])
         for candidate in candidates:
             self.notify("candidate", candidate["session_id"], candidate=candidate)
@@ -567,13 +616,18 @@ class ExecutionRuntime:
             busy = busy or any(row.get("status") not in {"processed", "lost"} for row in receipts)
             # A computed tool result without its receipt is not delivered.
             receipt_work = {row.get("work_id") for row in receipts}
-            busy = busy or any(row.get("async_id") not in receipt_work and row.get("status") != "lost" for row in work)
+            busy = busy or any(
+                row.get("async_id") not in receipt_work
+                and not row.get("receipt_settled")
+                and row.get("status") != "lost"
+                for row in work
+            )
             evidence = [copy.deepcopy(row) for tid in sorted(selected) for row in self._evidence.get(tid, [])]
             outputs = [copy.deepcopy(row) for row in self._outputs.values() if row["task_id"] in selected]
             outputs.sort(key=lambda row: row["sequence"])
             output_truncated = sorted(selected.intersection(self._output_truncated))
             # Heartbeats are excluded; evidence, candidate results and uncertainty are not.
-            facts = {"tasks": [{k: r.get(k) for k in ("task_id", "execution_id", "status", "parents", "routing_pending", "identity_unverified", "candidate_digest", "result")} for r in tasks],
+            facts = {"tasks": [{k: r.get(k) for k in ("task_id", "execution_id", "status", "parents", "routing_pending", "identity_unverified", "candidate_digest", "input_revision", "result")} for r in tasks],
                      "work": [{k: r.get(k) for k in ("async_id", "task_id", "status", "execution_id")} for r in work],
                      "receipts": [{k: r.get(k) for k in ("delivery_id", "status", "carrier_task_id", "message_id", "metadata")} for r in receipts],
                      "evidence_digest": hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
@@ -585,6 +639,184 @@ class ExecutionRuntime:
                     "evidence_truncated": bool(selected.intersection(self._truncated)),
                     "truncated_task_ids": sorted(selected.intersection(self._truncated)),
                     "outputs": outputs, "output_truncated_task_ids": output_truncated, "boot_id": self.boot_id}
+
+    def record_activity(self, event):
+        """Accept production activity for the exact live claim, never lease/usage heartbeats."""
+        kind = event.get("type")
+        if kind not in {"stream_delta", "stream_end", "tool_call_delta", "tool_call_start", "tool_call_end",
+                        "assistant_text", "intermediate_reply", "stream_text_final"}:
+            return False
+        with self.transaction():
+            payload = event.get("payload") or {}
+            task = self.state.tasks.get(str(payload.get("task_id") or ""))
+            if (task is None or task.status != TaskStatus.running or task.cancel_requested
+                    or not task.execution_id or payload.get("execution_id") != task.execution_id
+                    or self.state._route_session_id_for_task_locked(task)
+                    != self.state._route_session_id_for_session_locked(str(event.get("session_id") or ""))):
+                return False
+            from datetime import datetime, timezone
+            now = time.time()
+            task.last_activity_at = datetime.fromtimestamp(now, timezone.utc)
+            task.updated_at = task.last_activity_at
+            row = self._tasks.get(task.task_id)
+            if row is None or row.get("execution_id") != task.execution_id:
+                self.task_changed(task, notify=False)
+                row = self._tasks[task.task_id]
+            row["last_activity_at"] = now
+            if kind in {"tool_call_start", "tool_call_end", "tool_call_delta"}:
+                row["last_tool_activity_at"] = now
+                call_id = str(payload.get("tool_call_id") or "")
+                if call_id:
+                    tools = row.setdefault("active_tools", {})
+                    if kind == "tool_call_start":
+                        tools[call_id] = str(payload.get("tool_name") or "")
+                    elif kind == "tool_call_end":
+                        tools.pop(call_id, None)
+                if kind == "tool_call_start":
+                    task.current_phase, task.current_detail = "tool_call", str(payload.get("tool_name") or "")
+                elif kind == "tool_call_end" and not row.get("active_tools"):
+                    task.current_phase, task.current_detail = "", ""
+            elif kind == "stream_delta":
+                task.current_phase = "thinking" if payload.get("type") == "thinking" else "generating"
+                task.current_detail = ""
+            elif kind == "stream_end":
+                task.current_phase, task.current_detail = "", ""
+            # Stream chunks can be frequent. They remain live facts; stable tool boundaries
+            # persist activity without rewriting the execution file for every token.
+            if kind in {"tool_call_start", "tool_call_end"} and task.task_id in self._related(self._watched):
+                self._save()
+            return True
+
+    def execution_activity(self, root_ids):
+        """Return an unambiguous main execution target and its related wait facts."""
+        roots = [root_ids] if isinstance(root_ids, str) else list(root_ids)
+        with self.transaction():
+            selected = self._related(roots)
+            main = set(roots)
+            changed = True
+            while changed:
+                changed = False
+                for task in self.state.tasks.values():
+                    if task.task_id in main or task.input.get("_system_task"):
+                        continue
+                    if (task.output_chain_entry_task_id in main
+                            or (not task.caller_task_id and not task.input.get("_dispatch_origin")
+                                and task.input.get("_dispatch_owner_root_task_id") in main)):
+                        main.add(task.task_id)
+                        changed = True
+            live = [t for tid, t in self.state.tasks.items() if tid in selected
+                    and t.status in {TaskStatus.running, TaskStatus.pending, TaskStatus.suspended}
+                    and not t.cancel_requested and not t.input.get("_system_task")]
+            candidates = [t for t in live if t.task_id in main and t.kind == TaskKind.node
+                          and (t.status in {TaskStatus.running, TaskStatus.pending}
+                               or t.status == TaskStatus.suspended and bool(t.waiting_for_task_id))]
+            # A suspended output-chain ancestor yields to its current main-chain leaf.
+            candidates = [t for t in candidates if t.waiting_for_task_id not in main]
+            owners = set()
+            for root in roots:
+                row = self._tasks.get(root, {})
+                root_task = self.state.tasks.get(root)
+                main_entry = row.get("is_main_entry")
+                if root_task is not None:
+                    main_entry = (root_task.kind == TaskKind.node and not root_task.caller_task_id
+                                  and not root_task.input.get("_dispatch_origin") and not root_task.input.get("_async_dispatch"))
+                if not row or row.get("is_system_task") or not main_entry:
+                    continue
+                try:
+                    info = self.session_info(row.get("owner_session_id") or row.get("session_id"))
+                    if not info["is_child"]:
+                        owners.add(info["session_id"])
+                except ValueError:
+                    pass
+            sid = next(iter(owners)) if len(owners) == 1 else ""
+            candidates = [t for t in candidates if sid and self.state._route_session_id_for_task_locked(t) == sid]
+            target = candidates[0] if len(candidates) == 1 else None
+            rows = [self._tasks.get(tid, {}) for tid in selected]
+            activity = [r.get("last_activity_at") for r in rows]
+            activity += [t.last_activity_at.timestamp() for t in live if t.last_activity_at]
+            tool_activity = [r.get("last_tool_activity_at") for r in rows]
+            busy_tool = any(t.kind == TaskKind.tool or t.current_phase == "tool_call"
+                            or self._tasks.get(t.task_id, {}).get("active_tools") for t in live)
+            busy_child = any(t.task_id not in main for t in live)
+            approval = any(str(getattr(a.status, "value", a.status)) == "pending" and a.task_id in selected
+                           for a in self.state.approvals.values())
+            busy_async = any(w.get("task_id") in selected and w.get("status") == "running"
+                             for w in self.state._async_tools.values())
+            reasons = [name for name, value in (("tool", busy_tool), ("child", busy_child),
+                       ("approval", approval), ("async_work", busy_async),
+                       ("pending", target is not None and target.status == TaskStatus.pending),
+                       ("preempt", target is not None and target.preempt_requested)) if value]
+            info = self.state.sessions.get(sid)
+            return {"task_id": target.task_id if target else "", "execution_id": target.execution_id if target else "",
+                    "session_id": sid, "conversation_key": info.conversation_key if info else "",
+                    "source_inbound_seq": target.source_inbound_seq if target else None,
+                    "last_activity_at": max((n for n in activity if isinstance(n, (float, int))), default=None),
+                    "last_tool_activity_at": max((n for n in tool_activity if isinstance(n, (float, int))), default=None),
+                    "busy_tool": bool(busy_tool), "busy_child": busy_child, "awaiting_approval": approval,
+                    "busy_async": busy_async, "has_active_task": bool(live), "waiting": bool(reasons),
+                    "wait_reasons": reasons, "ambiguous": len(candidates) > 1 or len(owners) > 1,
+                    "live_task_ids": sorted(t.task_id for t in live)}
+
+    def _invalidate_input(self, sid):
+        # This fact participates in evidence.version even if a plugin callback fails.
+        for root in self._watched:
+            row = self._tasks.get(root, {})
+            owner = row.get("owner_session_id") or row.get("session_id")
+            if owner and self.state._route_session_id_for_session_locked(owner) == sid:
+                row["input_revision"] = row.get("input_revision", 0) + 1
+
+    def input_routed(self, task, request_id, *, preempt=False, invalidated=False):
+        """Announce accepted user input, not a speculative pre-route notification."""
+        sid = self.state._route_session_id_for_task_locked(task)
+        if task.input.get("_system_task") or self.session_info(sid)["is_child"]:
+            return
+        if not invalidated:
+            self._invalidate_input(sid)
+            self._save()
+        self.notify("input_routed", sid, task_id=task.task_id, execution_id=task.execution_id,
+                    source_inbound_seq=task.source_inbound_seq, request_id=request_id,
+                    preempt=preempt, user_input=True)
+
+    def preempt_execution(self, session_id, task_id, execution_id, text, request_id, *, roots,
+                          source="goal", attachments=None):
+        """Durably deduplicate a preempt for a verified main-chain target; never spawn work."""
+        if source not in {"goal", "user"} or not isinstance(text, str) or not text.strip():
+            raise ValueError("preempt source and nonempty text required")
+        if attachments is not None and not isinstance(attachments, list):
+            raise ValueError("attachments must be a list")
+        roots = [roots] if isinstance(roots, str) else list(roots)
+        with self.transaction():
+            info = self.session_info(session_id)
+            if info["is_child"]:
+                return False
+            sid = info["session_id"]
+            key = self._request_key(sid, request_id)
+            fingerprint = self._fingerprint("preempt", sid, text, task_id=task_id, execution_id=execution_id,
+                                            roots=sorted(set(roots)), source=source, attachments=attachments or [])
+            old = self._existing_request(key, fingerprint)
+            if old is not None:
+                return bool(old["result"]["ok"])
+            activity = self.execution_activity(roots)
+            if (activity["task_id"] != task_id or not task_id or activity["execution_id"] != execution_id
+                    or activity["session_id"] != sid or any(r in self._related(self._closed) for r in roots)
+                    or any(self._is_paused(r) for r in roots)):
+                return False
+            row = self._begin_request(key, fingerprint, "preempt")
+            task = self.state.tasks[task_id]
+            try:
+                self.state._append_preempt_to_task_locked(task, text, attachments, source=source)
+                # Existing durable task snapshots include pending preempt text and are replayed.
+                self.state._event_task_snapshot("task_requeued", task)
+                if source == "user":
+                    self._invalidate_input(sid)
+                row.update(phase="done", result={"ok": True, "task_id": task_id, "execution_id": execution_id})
+                self._save()
+                if source == "user":
+                    self.input_routed(task, request_id, preempt=True, invalidated=True)
+            except Exception:
+                row["phase"] = "failed_closed"
+                raise
+            return True
 
     def _request_key(self, sid, request_id):
         if not isinstance(request_id, str) or not request_id or len(request_id) > 300:
@@ -831,17 +1063,30 @@ class ExecutionRuntime:
                             "metadata": dict(metadata or {})}
                 if any(previous.get(k) != v for k, v in expected.items()):
                     raise ValueError("delivery identity conflict")
+                if not str(delivery_id).startswith(("lost:", "restart:")):
+                    work_entry = self.state._async_tools.get(work_id)
+                    if work_entry is not None:
+                        work_entry["result_delivered"] = True
                 self._save()
                 if previous["status"] == "held" and not self._is_paused(origin_task_id):
                     return self._route_receipt(previous)
                 return {"ok": True, "deduped": True, "strategy": previous["status"], "task_id": previous.get("carrier_task_id", "")}
             if origin_task_id in self._related(self._closed):
+                if not str(delivery_id).startswith(("lost:", "restart:")):
+                    work_entry = self.state._async_tools.get(work_id)
+                    if work_entry is not None:
+                        work_entry["result_delivered"] = True
+                        self._save()
                 return {"ok": True, "strategy": "closed"}
             receipt = {"delivery_id": delivery_id, "work_id": work_id, "origin_task_id": origin_task_id,
                        "session_id": info["session_id"], "target_generation": info["generation"],
                        "status": "held", "text": text, "attachments": list(attachments or []),
                        "message_type": message_type, "metadata": dict(metadata or {}), "carrier_task_id": ""}
             self._receipts[delivery_id] = receipt
+            if not str(delivery_id).startswith(("lost:", "restart:")):
+                work_entry = self.state._async_tools.get(work_id)
+                if work_entry is not None:
+                    work_entry["result_delivered"] = True
             self._save()  # Record the obligation before releasing it to a consumer.
             if self._is_paused(origin_task_id):
                 return {"ok": True, "strategy": "held"}

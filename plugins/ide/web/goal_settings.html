@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Goal 设置</title>
+  <style>
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--duties-bg,#f1f0ee); color:var(--duties-text,#252525); font:14px/1.6 system-ui,sans-serif; }
+    main { max-width:720px; padding:24px; margin:auto; }
+    h1 { margin:0 0 24px; font-size:22px; }
+    section { padding:20px; border:1px solid var(--duties-border,#ccc); }
+    label { display:block; font-weight:600; }
+    input { display:block; width:100%; margin:12px 0; padding:10px; border:1px solid var(--duties-border,#ccc); background:transparent; color:inherit; font:16px ui-monospace,monospace; }
+    p { color:var(--duties-secondary,#555); }
+    button { padding:7px 14px; margin:8px 8px 0 0; border:1px solid var(--duties-border,#ccc); background:transparent; color:inherit; font:inherit; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:default; }
+    :focus-visible { outline:2px solid var(--duties-accent,#feaf2c); outline-offset:2px; }
+    #status { min-height:1.6em; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Goal 设置</h1>
+    <section>
+      <form id="settings">
+        <label for="rounds">新 Goal 默认最大自动续轮数</label>
+        <input id="rounds" type="number" min="1" max="1000000" step="1" required disabled>
+        <button id="save" type="submit" disabled>保存</button>
+        <button id="reload" type="button" disabled>重新读取</button>
+        <p id="status" role="status" aria-live="polite">正在加载…</p>
+      </form>
+    </section>
+  </main>
+  <script type="module">
+    const rounds = document.getElementById('rounds');
+    const save = document.getElementById('save');
+    const reload = document.getElementById('reload');
+    const status = document.getElementById('status');
+    let bridge, revision = '', busy = false;
+    function lock(value) { busy = value; rounds.disabled = value || !revision; save.disabled = value || !revision; reload.disabled = value; }
+    function accept(data) {
+      if (!Number.isSafeInteger(data?.default_max_rounds) || data.default_max_rounds < 1 || data.default_max_rounds > 1000000 || typeof data.revision !== 'string') throw new Error('配置响应无效。');
+      rounds.value = String(data.default_max_rounds); revision = data.revision;
+    }
+    async function load() {
+      if (!bridge || busy) return;
+      lock(true); status.textContent = '正在加载…';
+      try { accept(await bridge.request('/plugins/ide/goal/settings')); status.textContent = ''; }
+      catch (error) { status.textContent = error.message; }
+      finally { lock(false); }
+    }
+    reload.addEventListener('click', load);
+    document.getElementById('settings').addEventListener('submit', async event => {
+      event.preventDefault(); if (!bridge || busy || !revision) return;
+      const value = Number(rounds.value);
+      if (!Number.isSafeInteger(value) || value < 1 || value > 1000000) { status.textContent = '请输入 1 至 1000000 的整数。'; return; }
+      lock(true); status.textContent = '正在保存…';
+      try {
+        accept(await bridge.request('/plugins/ide/goal/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({default_max_rounds:value, expected_revision:revision})}));
+        status.textContent = '已保存，将用于新建 Goal。';
+      } catch (error) { revision = ''; status.textContent = `${error.message} 请重新读取后保存。`; }
+      finally { lock(false); }
+    });
+    function mount() { if (bridge || !window.__CLONOTH_PANEL__) return; bridge = window.__CLONOTH_PANEL__; void load(); }
+    window.addEventListener('clonoth:panel-context', mount);
+    mount();
+  </script>
+</body>
+</html>

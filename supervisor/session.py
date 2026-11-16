@@ -439,6 +439,9 @@ class SessionMixin:
                 self._event_task_snapshot("task_cancelled", task)
                 return True
             if not was_requested:
+                enqueue_cancel = getattr(self, "_enqueue_worker_task_cancel_locked", None)
+                if callable(enqueue_cancel):
+                    enqueue_cancel(task)
                 self._event_task_snapshot("task_cancel_requested", task)
                 return True
         return False
@@ -716,15 +719,15 @@ class SessionMixin:
             return
         with self._lock:
             runtime = getattr(self, "execution_runtime", None)
-            if (runtime is not None and not payload.get("user_input") and not payload.get("dispatch_origin")
-                    and not payload.get("_execution_origin_task_id") and not payload.get("_system_task")
-                    and payload.get("message_type", "user_input") in ("", "user_input")
-                    and seq not in self._inbound_events):
-                runtime.notify("input", session_id, request_id=str(payload.get("message_id") or seq))
             self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
             self._advance_inbound_cursor()
             if session_id and session_id in self.sessions:
-                self._create_entry_task_for_inbound_locked(inbound_seq=seq, session_id=session_id, payload=payload)
+                task = self._create_entry_task_for_inbound_locked(inbound_seq=seq, session_id=session_id, payload=payload)
+                if (task is not None and runtime is not None and not payload.get("dispatch_origin")
+                        and not payload.get("_execution_origin_task_id") and not payload.get("_system_task")
+                        and not payload.get("schedule_id") and not payload.get("_dispatch_owner_root_task_id")
+                        and payload.get("message_type", "user_input") in ("", "user_input")):
+                    runtime.input_routed(task, str(payload.get("request_id") or payload.get("message_id") or seq))
 
     def record_outbound_message_event(self, evt: dict[str, Any]) -> None:
         if not isinstance(evt, dict) or evt.get("type") != "outbound_message":
@@ -1334,12 +1337,22 @@ class SessionMixin:
                 for cid in ids:
                     hidden_tool_result_ids[cid] = code
 
-        def _history_attachment_from_item(item: Any) -> dict[str, Any] | None:
+        def _is_internal_read_attachment_path(raw_path: str) -> bool:
+            norm = raw_path.replace("\\", "/").replace("file://", "").lstrip("/").strip()
+            return norm.startswith("data/attachments/read_file/") or "/data/attachments/read_file/" in f"/{norm}"
+
+        def _history_attachment_from_item(item: Any, *, exclude_internal_read: bool = False) -> dict[str, Any] | None:
             if isinstance(item, dict):
+                path = str(item.get("path") or "").replace("file://", "").strip()
+                url = str(item.get("url") or "").strip()
+                if not path and not url:
+                    return None
+                if exclude_internal_read and path and _is_internal_read_attachment_path(path):
+                    return None
                 return dict(item)
             if isinstance(item, str):
                 path = item.replace("file://", "").lstrip("/").strip()
-                if not path:
+                if not path or (exclude_internal_read and _is_internal_read_attachment_path(path)):
                     return None
                 suffix = Path(path).suffix.lower()
                 image_exts = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
@@ -1366,19 +1379,17 @@ class SessionMixin:
             if isinstance(value, list):
                 out: list[dict[str, Any]] = []
                 for item in value:
-                    att = _history_attachment_from_item(item)
-                    if att is not None:
-                        out.append(att)
-                    out.extend(_history_attachments_from_value(item, depth + 1))
+                    if isinstance(item, dict):
+                        out.extend(_history_attachments_from_value(item, depth + 1))
                 return out
             if not isinstance(value, dict):
                 return []
             out: list[dict[str, Any]] = []
-            for key in ("attachments", "tool_attachments", "tool_result_attachments", "attachment_paths", "attachmentPaths"):
+            for key in ("attachments", "tool_attachments", "tool_result_attachments"):
                 raw = value.get(key)
                 if isinstance(raw, list):
                     for item in raw:
-                        att = _history_attachment_from_item(item)
+                        att = _history_attachment_from_item(item, exclude_internal_read=True)
                         if att is not None:
                             out.append(att)
             for key in ("data", "result", "output", "payload"):
@@ -1416,6 +1427,8 @@ class SessionMixin:
                     entry["source_inbound_seq"] = int(msg.meta["source_inbound_seq"])
                 except (ValueError, TypeError):
                     pass
+            if msg.response_info:
+                entry["response_info"] = dict(msg.response_info)
             # Extract thinking/reasoning from meta
             if isinstance(msg.meta, dict):
                 # [2026-11-02] 审计修复：恢复 get_reasoning_text 统一读取。
@@ -1506,12 +1519,15 @@ class SessionMixin:
                 if isinstance(_attachments, list):
                     # [AutoC 2026-06-17] Why: web history hydration cannot infer file
                     # names, MIME types, and paths from plain content reliably. How:
-                    # forward the attachment metadata stored by runner/preempt. Purpose:
-                    # refreshed inbound messages render the same image/file cards as
-                    # realtime WebSocket messages.
-                    entry["attachments"] = list(_attachments)
-                if msg.response_info:
-                    entry["response_info"] = dict(msg.response_info)
+                    # forward the attachment metadata stored by runner/preempt while
+                    # dropping internal read_file multimodal cache bridges.
+                    _is_tool_bridge = msg.message_type == "tool_result_attachment"
+                    _filtered_atts = [
+                        att for item in _attachments
+                        if (att := _history_attachment_from_item(item, exclude_internal_read=_is_tool_bridge)) is not None
+                    ]
+                    if _filtered_atts:
+                        entry["attachments"] = _filtered_atts
                 _provider = str(msg.meta.get("provider") or "").strip()
                 if _provider:
                     entry["provider"] = _provider
@@ -1539,13 +1555,20 @@ class SessionMixin:
                 if isinstance(_result_elapsed, (int, float)):
                     entry["elapsed_ms"] = _result_elapsed
                     entry["tool_result_elapsed_ms"] = _result_elapsed
-                _tool_result_attachments = msg.meta.get("tool_result_attachments")
-                if isinstance(_tool_result_attachments, list):
-                    entry["tool_attachments"] = list(_tool_result_attachments)
-                else:
-                    _structured_atts = _history_attachments_from_value(msg.meta.get("tool_result_structured"))
-                    if _structured_atts:
-                        entry["tool_attachments"] = _structured_atts
+                _tool_name_norm = str(msg.name or "").strip()
+                if _tool_name_norm not in ("read_file", "read_media"):
+                    _tool_result_attachments = msg.meta.get("tool_result_attachments")
+                    if isinstance(_tool_result_attachments, list):
+                        _filtered_tool_atts = [
+                            att for item in _tool_result_attachments
+                            if (att := _history_attachment_from_item(item, exclude_internal_read=True)) is not None
+                        ]
+                        if _filtered_tool_atts:
+                            entry["tool_attachments"] = _filtered_tool_atts
+                    else:
+                        _structured_atts = _history_attachments_from_value(msg.meta.get("tool_result_structured"))
+                        if _structured_atts:
+                            entry["tool_attachments"] = _structured_atts
                 # [2026-06-07] Forward structured tool rejection metadata.
                 # Why: frontend should not parse rejection text. How: expose fields
                 # persisted by MessageMeta on tool_result rows. Purpose: UI can hide

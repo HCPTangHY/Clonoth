@@ -751,6 +751,11 @@ async def _do_replace(
 #  Main entry
 # ---------------------------------------------------------------------------
 
+def resolve_grep_action(args: dict[str, Any]) -> str:
+    """Resolve canonical gate action for grep."""
+    return str((args or {}).get("mode") or "search").strip().lower()
+
+
 async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     query = _as_str(args.get("query"))
     mode = _as_str(args.get("mode"), "search").lower()

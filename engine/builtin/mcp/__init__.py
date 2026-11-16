@@ -30,8 +30,10 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+
+from supervisor.admin_api import verify_admin_token
 
 from . import mcp_runtime
 
@@ -769,8 +771,9 @@ def get_mcp_clients_raw_endpoint(request: Request) -> dict[str, str]:
 
 
 def update_mcp_clients_raw_endpoint(payload: RawContent, request: Request) -> dict[str, Any]:
+    ws_root = _workspace_root(request)
     try:
-        mcp_runtime.save_raw_config_content(_workspace_root(request), payload.content)
+        mcp_runtime.save_raw_config_content(ws_root, payload.content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True}
@@ -779,7 +782,7 @@ def update_mcp_clients_raw_endpoint(payload: RawContent, request: Request) -> di
 def _register_admin_routes(routes: Any) -> None:
     from engine.faces.routes import static_router
 
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(verify_admin_token)])
     router.add_api_route("/mcp-clients", list_mcp_clients_endpoint, methods=["GET"])
     router.add_api_route("/mcp-clients/raw", get_mcp_clients_raw_endpoint, methods=["GET"])
     router.add_api_route("/mcp-clients/raw", update_mcp_clients_raw_endpoint, methods=["PUT"])
@@ -872,6 +875,8 @@ PLUGIN_META = {
     "tools": [
         {
             "name": "manage_mcp_client",
+            "action_field": "action",
+            "action_resolver": lambda a: str((a or {}).get("action") or "").strip().lower() or "list",
             "description": (
                 "Manage MCP client configurations in data/mcp_clients.yaml: "
                 "action='list' lists all configured MCP clients; "

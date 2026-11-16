@@ -76,6 +76,8 @@ class WebAuthManager:
             return {"ok": False, "error": "already configured"}
         if not username.strip() or not password:
             return {"ok": False, "error": "username and password required"}
+        if len(password) < 8:
+            return {"ok": False, "error": "password must be at least 8 characters"}
 
         pw_hash = bcrypt.hashpw(
             password.encode("utf-8"), bcrypt.gensalt(),
@@ -147,13 +149,41 @@ class WebAuthManager:
         except Exception:
             return None
 
-    def change_password(self, username: str, new_password: str) -> bool:
-        """Change password for an existing user."""
+    def change_password(
+        self,
+        username: str,
+        new_password: str,
+        *,
+        old_password: str | None = None,
+        require_old: bool = False,
+        rotate_jwt_secret: bool = True,
+    ) -> bool:
+        """Change password for an existing user.
+
+        When ``require_old`` is True, verifies ``old_password`` first and
+        raises ValueError on mismatch or weak password.
+        """
+        if require_old and len(new_password) < 8:
+            raise ValueError("new password must be at least 8 characters")
         for user in self._data.get("users", []):
             if user.get("username") == username:
+                if require_old:
+                    if not old_password:
+                        raise ValueError("old_password required")
+                    try:
+                        ok = bcrypt.checkpw(
+                            old_password.encode("utf-8"),
+                            user["password_hash"].encode("utf-8"),
+                        )
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        raise ValueError("invalid old password")
                 user["password_hash"] = bcrypt.hashpw(
                     new_password.encode("utf-8"), bcrypt.gensalt(),
                 ).decode("utf-8")
+                if rotate_jwt_secret:
+                    self._data["jwt_secret"] = secrets.token_urlsafe(32)
                 self._save()
                 return True
         return False

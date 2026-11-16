@@ -219,3 +219,106 @@ def test_paused_async_result_does_not_create_automatic_carrier(case):
     assert c.service.read(c.sid)['status'] == 'paused'
     control(c, 'resume')
     assert len(c.state.tasks) == len(tasks_before) + 1
+
+
+def test_step_limit_reached_runs_normal_review_and_continues_or_completes(case):
+    c = case
+    root = start(c)
+    claim(c, root)
+    sid = c.state.tasks[root].session_id
+    c.store.append_batch(sid, [
+        Message(
+            id=root + '-call', role='assistant', content='running step 64 check', source_task_id=root,
+            tool_calls=[{'id': 'step64', 'type': 'function', 'function': {'name': 'execute_command', 'arguments': '{"command":"pytest"}'}}],
+            meta={'reasoning': 'drop me', 'usage': {'total_tokens': 5000}},
+        ),
+        Message(
+            id=root + '-result', role='tool', content='partial progress ok', source_task_id=root,
+            tool_call_id='step64', name='execute_command', message_type='tool_result',
+            meta={'tool_result_structured': {'huge_duplicate': 'x' * 50000}},
+        ),
+    ])
+    c.state.complete_task(
+        task_id=root, worker_id='test-worker', execution_id=c.state.tasks[root].execution_id,
+        result={
+            'action': 'fail', 'node_id': 'main', 'error': 'Maximum step limit reached.',
+            '_execution_model': {'provider': 'openai', 'model': 'test-model'},
+        },
+    )
+    assert c.state.tasks[root].status == 'failed'
+    assert 'partial progress ok' in json.dumps(c.state.execution_runtime.snapshot([root])['evidence'], ensure_ascii=False)
+
+    # Must enter normal review instead of pausing on unresolved failure!
+    rid1 = reviewer(c)
+    payload1 = json.loads(c.state.tasks[rid1].input['instruction'])
+    assert payload1['current']['latest_main_task']['task_id'] == root
+    assert payload1['current']['latest_main_task']['status'] == 'failed'
+    assert payload1['current']['candidate']['step_limit_reached'] is True
+
+    # Reviewer rejects -> Goal archives failed root into _prior_runs and starts round 2 automatically.
+    finish(c, rid1, verdict(False), evidence=False)
+    c.service.tick()
+    doc = c.service.documents[c.sid]
+    assert doc['status'] in {'running', 'waiting'}
+    assert doc['rounds'] == 1
+    assert doc['_prior_runs'] == [[root]]
+    second = doc['_roots'][-1]
+    assert second != root
+
+    claim(c, second)
+    finish(c, second, 'All checks green')
+    rid2 = reviewer(c)
+    finish(c, rid2, verdict(True), evidence=False)
+    c.service.tick()
+    assert c.service.read(c.sid)['status'] == 'completed'
+
+
+def test_large_4mb_trace_succeeds_and_extreme_truncation_auto_continues(case):
+    c = case
+    (c.root / 'config/runtime.yaml').write_text(
+        'engine:\n  compact:\n    threshold_tokens: 900000\n',
+        encoding='utf-8',
+    )
+    root = start(c)
+    claim(c, root)
+    sid = c.state.tasks[root].session_id
+    # 400 KB tool output previously blew the 256 KB ceiling; now fits easily under 4 MB.
+    c.store.append_batch(sid, [
+        Message(
+            id=root + '-call', role='assistant', content='', source_task_id=root,
+            tool_calls=[{'id': 'big1', 'type': 'function', 'function': {'name': 'read_file', 'arguments': '{"path":"a.txt"}'}}],
+        ),
+        Message(
+            id=root + '-result', role='tool', content='A' * 400_000, source_task_id=root,
+            tool_call_id='big1', name='read_file', message_type='tool_result',
+        ),
+    ])
+    finish(c, root, 'Read 400KB and verified', evidence=False)
+    assert c.state.execution_runtime.snapshot([root])['truncated_task_ids'] == []
+    rid1 = reviewer(c)
+    finish(c, rid1, verdict(False), evidence=False)
+    c.service.tick()
+
+    # Now simulate an extreme turn that exceeds even the configured storage ceiling -> auto-continues instead of pausing!
+    second = c.service.documents[c.sid]['_roots'][-1]
+    claim(c, second)
+    with patch('supervisor.execution_runtime.EVIDENCE_LIMIT', 1024):
+        c.store.append_batch(c.state.tasks[second].session_id, [
+            Message(
+                id=second + '-call', role='assistant', content='', source_task_id=second,
+                tool_calls=[{'id': 'huge', 'type': 'function', 'function': {'name': 'execute_command', 'arguments': '{}'}}],
+            ),
+            Message(
+                id=second + '-result', role='tool', content='B' * 5000, source_task_id=second,
+                tool_call_id='huge', name='execute_command', message_type='tool_result',
+            ),
+        ])
+        finish(c, second, 'Huge log turn', evidence=False)
+    assert second in c.state.execution_runtime.snapshot([second])['truncated_task_ids']
+    c.service.tick()
+    doc = c.service.documents[c.sid]
+    assert doc['status'] in {'running', 'waiting'}
+    assert doc['rounds'] == 2
+    third = doc['_roots'][-1]
+    assert third != second
+    assert '精简' in c.state.tasks[third].input['instruction']

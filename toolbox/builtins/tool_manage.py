@@ -140,6 +140,16 @@ async def _reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         return _err(e)
 
 
+def resolve_manage_tool_action(args: dict[str, Any]) -> str:
+    """Resolve canonical gate action for manage_tool."""
+    act = str((args or {}).get("action") or "").strip().lower()
+    if not act:
+        return "upsert" if ((args or {}).get("name") or (args or {}).get("script")) else "reload"
+    if act in ("create", "update"):
+        return "upsert"
+    return act
+
+
 async def manage_tool(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create/update a script or reload the external-tool registry."""
     action = str(args.get("action") or "").strip().lower()

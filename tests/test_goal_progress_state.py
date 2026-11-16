@@ -87,7 +87,7 @@ def test_two_rounds_expose_distinct_execution_and_keep_final_execution(case):
 
 
 @pytest.mark.parametrize('action', ['set', 'submit'])
-def test_target_edit_preserves_identity_and_clears_previous_execution(case, action):
+def test_target_edit_preserves_identity_and_current_execution(case, action):
     c = case
     create(c)
     started = tick_at(c, 1000.0)
@@ -95,19 +95,17 @@ def test_target_edit_preserves_identity_and_clears_previous_execution(case, acti
     claim(c, root)
     edited = control(c, action, goal='Different work')
     assert edited['goal_id'] == started['goal_id']
-    assert edited['execution'] is None
-    assert c.service.documents[c.sid]['_current_execution'] is None
+    assert edited['execution'] == started['execution']
+    assert c.service.documents[c.sid]['_current_execution'] == started['execution']
     assert edited['goal_version'] == started['goal_version'] + 1
-    if action == 'set':
-        assert edited['status'] == 'paused'
-        control(c, 'start')
+    assert edited['status'] == 'running'
     next_round = tick_at(c, 2000.0)
-    assert next_round['execution']['task_id'] != root
-    assert next_round['execution']['started_at'] == 2000.0
+    assert next_round['execution']['task_id'] == root
+    assert next_round['execution']['started_at'] == 1000.0
     assert next_round['goal_id'] == started['goal_id']
 
 
-def test_pause_preserves_execution_but_normal_input_hides_previous_round(case):
+def test_pause_and_unaccepted_input_preserve_execution(case):
     c = case
     create(c)
     started = tick_at(c, 1000.0)
@@ -116,7 +114,7 @@ def test_pause_preserves_execution_but_normal_input_hides_previous_round(case):
     assert paused['goal_id'] == started['goal_id']
     c.service.on_event({'kind': 'input', 'session_id': c.sid})
     after_input = c.service.read(c.sid)
-    assert after_input['execution'] is None
+    assert after_input['execution'] == started['execution']
     assert after_input['goal_id'] == started['goal_id']
     assert c.service.documents[c.sid]['_current_execution'] == started['execution']
 

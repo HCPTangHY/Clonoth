@@ -15,6 +15,7 @@ import type {
   WsMessage,
 } from '../types/message';
 import {
+  CONTROL_TOOL_NAMES,
   TERMINAL_TOOL_STATUSES,
   type ToolPatch,
   getPayload,
@@ -90,6 +91,8 @@ export const CHAT_EVENT_TYPE_VALUES = [
   'approval_requested',
   'approval_decided',
   'llm_retry',
+  'llm_fallback',
+  'reactive_compact',
   'node_switch',
   'preempt_injected',
   'system_notice',
@@ -242,6 +245,12 @@ export function reduceChatEvent(state: ChatState, event: SupervisorEvent): ChatS
     case 'llm_retry':
       nextState = applyLlmRetry(nextState, event);
       break;
+    case 'llm_fallback':
+      nextState = applyLlmFallback(nextState, event);
+      break;
+    case 'reactive_compact':
+      nextState = applyReactiveCompact(nextState, event);
+      break;
     case 'node_switch':
       nextState = applyNodeSwitch(nextState, event);
       break;
@@ -305,8 +314,10 @@ function mergeAttachments(...groups: readonly (readonly Attachment[] | undefined
   return result;
 }
 
-function attachmentsFromToolArguments(args: Record<string, unknown> | undefined): Attachment[] {
-  if (!args) return [];
+const INTERNAL_READ_ATTACHMENT_TOOLS = new Set(['read_file', 'read_media']);
+
+function attachmentsFromToolArguments(toolName: string, args: Record<string, unknown> | undefined): Attachment[] {
+  if (!args || !CONTROL_TOOL_NAMES.has(toolName)) return [];
   const direct = getAttachments(args.attachments);
   const paths = Array.isArray(args.attachment_paths)
     ? args.attachment_paths.map(attachmentFromPath).filter((item): item is Attachment => Boolean(item))
@@ -314,17 +325,42 @@ function attachmentsFromToolArguments(args: Record<string, unknown> | undefined)
   return mergeAttachments(direct, paths);
 }
 
-function collectMessageAttachmentsFromTools(state: ChatState, message: WsMessage): Attachment[] {
+function collectSingleCardToolAttachments(state: ChatState, message: WsMessage): Attachment[] {
   const groups: Attachment[][] = [];
   for (const block of message.blocks) {
     if (block.kind !== 'tool') continue;
     for (const toolId of block.toolIds) {
       const tool = state.toolExecutionsById[toolId];
-      if (!tool) continue;
-      groups.push(mergeAttachments(tool.attachments, attachmentsFromToolArguments(tool.arguments)));
+      if (!tool || INTERNAL_READ_ATTACHMENT_TOOLS.has(tool.name)) continue;
+      groups.push(mergeAttachments(tool.attachments, attachmentsFromToolArguments(tool.name, tool.arguments)));
     }
   }
   return mergeAttachments(...groups);
+}
+
+function collectMessageAttachmentsFromTools(state: ChatState, message: WsMessage): Attachment[] {
+  const order = state.messageOrderByConversation[message.conversationId] || [];
+  const targetIdx = order.lastIndexOf(message.id);
+  if (targetIdx < 0) {
+    return collectSingleCardToolAttachments(state, message);
+  }
+
+  // Collect tool-generated output attachments from preceding intermediate work
+  // cards of the same turn (stopping at user/callback or an earlier reply/finish
+  // card that already surfaced its own attachments) so generated files land on
+  // the visible completion card rather than on folded intermediate work cards.
+  const cardGroups: Attachment[][] = [];
+  for (let i = targetIdx; i >= 0; i--) {
+    const candidate = state.messagesById[order[i]];
+    if (!candidate) continue;
+    if (i < targetIdx) {
+      if (candidate.role !== 'assistant') break;
+      if (candidate.completionType) break;
+      if (message.source.taskId && candidate.source.taskId && candidate.source.taskId !== message.source.taskId) break;
+    }
+    cardGroups.unshift(collectSingleCardToolAttachments(state, candidate));
+  }
+  return mergeAttachments(...cardGroups);
 }
 
 export function replaySupervisorEvents(
@@ -536,8 +572,35 @@ function applyOutboundMessage(state: ChatState, event: SupervisorEvent): ChatSta
     message = replaceAssistantTextWithOutbound(message, event, text);
   }
 
-  // Read action_type from backend payload (finish/reply/ask)
-  const actionType = getString(payload.action_type) as WsMessage['completionType'] | '';
+  // Read action_type from backend payload (finish/reply/ask/fail)
+  const rawActionType = getString(payload.action_type);
+  if (rawActionType === 'fail') {
+    const cleanErr = text.replace(/^\[error\]\s*/i, '').trim() || '未知错误';
+    const failBlockId = `${message.id}|notice:fail:${getEventId(event)}`;
+    const hasFailNotice = message.blocks.some((b) => b.kind === 'notice' && b.eventType === 'task_failed');
+    const nextBlocks = hasFailNotice
+      ? message.blocks.filter((b) => !(b.kind === 'text' && b.text === text))
+      : [
+          ...message.blocks.filter((b) => !(b.kind === 'text' && b.text === text)),
+          {
+            id: failBlockId,
+            kind: 'notice' as const,
+            level: 'error' as const,
+            title: '任务失败',
+            text: cleanErr,
+            eventType: 'task_failed',
+            createdAt: event.ts,
+            updatedAt: event.ts,
+            eventIds: [getEventId(event)],
+          },
+        ];
+    message = {
+      ...setMessageStatus(finalizeStreamingBlocks({ ...message, blocks: nextBlocks }, event), 'failed', event),
+      roundComplete: true,
+    };
+    return upsertMessage(nextState, message);
+  }
+  const actionType = rawActionType as WsMessage['completionType'] | '';
   const resolvedAttachments = attachments.length > 0
     ? attachments
     : collectMessageAttachmentsFromTools(nextState, message);
@@ -615,7 +678,10 @@ function applyToolCallDelta(state: ChatState, event: SupervisorEvent): ChatState
   const deltaType = getString(payload.event);
 
   if (deltaType === 'tool_call_start') {
-    const attachments = getAttachments(payload.attachments);
+    const deltaToolName = getString(payload.name) || getString(payload.tool_name);
+    const attachments = INTERNAL_READ_ATTACHMENT_TOOLS.has(deltaToolName)
+      ? []
+      : getAttachments(payload.attachments, true);
     const patch: ToolPatch = {
       id: getString(payload.id) || getString(payload.tool_call_id),
       index: getNumber(payload.index),
@@ -663,12 +729,15 @@ function applyToolCallDelta(state: ChatState, event: SupervisorEvent): ChatState
 function applyToolCallStart(state: ChatState, event: SupervisorEvent): ChatState {
   const payload = getPayload(event);
   const args = getRecord(payload.arguments);
-  const attachments = getAttachments(payload.attachments);
+  const toolName = getString(payload.tool_name) || getString(payload.name);
+  const attachments = INTERNAL_READ_ATTACHMENT_TOOLS.has(toolName)
+    ? []
+    : getAttachments(payload.attachments, true);
   const patch: ToolPatch = {
     id: getString(payload.tool_call_id) || getString(payload.id),
     itemId: getString(payload.item_id),
     index: getNumber(payload.index),
-    name: getString(payload.tool_name) || getString(payload.name),
+    name: toolName,
     status: 'running',
     arguments: args,
     argumentsText: args ? stringifyJson(args) : undefined,
@@ -685,12 +754,15 @@ function applyToolCallEnd(state: ChatState, event: SupervisorEvent): ChatState {
   const payload = getPayload(event);
   const result = payload.result;
   const resultRecord = getRecord(result);
-  const attachments = mergeAttachments(getAttachments(payload.attachments), getAttachments(payload.tool_attachments));
+  const toolName = getString(payload.tool_name) || getString(payload.name);
+  const attachments = INTERNAL_READ_ATTACHMENT_TOOLS.has(toolName)
+    ? []
+    : mergeAttachments(getAttachments(payload.attachments, true), getAttachments(payload.tool_attachments, true));
   const patch: ToolPatch = {
     id: getString(payload.tool_call_id) || getString(payload.id),
     itemId: getString(payload.item_id),
     index: getNumber(payload.index),
-    name: getString(payload.tool_name) || getString(payload.name),
+    name: toolName,
     status: normalizeToolStatus(payload.status),
     summary: getString(payload.summary),
     result,
@@ -798,27 +870,62 @@ function applyTaskCompleted(state: ChatState, event: SupervisorEvent): ChatState
 
 function applyTaskCancelled(state: ChatState, event: SupervisorEvent): ChatState {
   const nextState = recordTaskAndNodeInfo(state, event);
+  const payload = getPayload(event);
+  const cancelReason = getString(payload.cancel_reason);
+  const resultRec = getRecord(payload.result);
+  const actErr = resultRec ? getString(resultRec.error) : '';
+  const cancelText = cancelReason === 'service_restart'
+    ? '任务因服务重启中断。'
+    : actErr && actErr !== 'task cancelled' && actErr !== 'cancelled'
+      ? `任务已取消（${actErr}）`
+      : '任务已手动取消。';
   const turnKey = getTurnKey(nextState, event);
-  const message = getAssistantMessageByTurn(nextState, turnKey);
-
+  const existing = getAssistantMessageByTurn(nextState, turnKey);
+  let workingState = nextState;
+  let message = existing;
   if (!message) {
-    return nextState;
+    if (getString(payload.caller_task_id)) return nextState;
+    const created = getOrCreateAssistantMessage(nextState, event, turnKey);
+    workingState = created.state;
+    message = created.message;
   }
-
-  return upsertMessage(nextState, setMessageStatus(finalizeStreamingBlocks(message, event), 'cancelled', event));
+  const finalized = finalizeStreamingBlocks(message, event);
+  const hasCancelNotice = finalized.blocks.some((b) => b.kind === 'notice' && b.eventType === 'task_cancelled');
+  const nextBlocks = hasCancelNotice
+    ? finalized.blocks
+    : [
+        ...finalized.blocks,
+        {
+          id: `${finalized.id}|notice:cancelled:${getEventId(event)}`,
+          kind: 'notice' as const,
+          level: 'info' as const,
+          title: '任务已取消',
+          text: cancelText,
+          eventType: 'task_cancelled',
+          createdAt: event.ts,
+          updatedAt: event.ts,
+          eventIds: [getEventId(event)],
+        },
+      ];
+  return upsertMessage(workingState, setMessageStatus({ ...finalized, blocks: nextBlocks }, 'cancelled', event));
 }
 
 function applyApprovalRequested(state: ChatState, event: SupervisorEvent): ChatState {
   const payload = getPayload(event);
   const approvalId = getString(payload.approval_id);
   const toolCallId = getString(payload.tool_call_id);
+  const taskId = getString(payload.task_id);
 
   if (!approvalId) {
     return state;
   }
 
   if (toolCallId) {
-    const tool = findToolByCallId(state, toolCallId);
+    const tool = findToolByCallId(state, toolCallId, {
+      taskId,
+      approvalId,
+      requireActive: true,
+    });
     if (tool) {
       // [AutoC 2026-05-31] Why: approval_requested now identifies the tool call
       // that is waiting. How: update that ToolExecution instead of appending an
@@ -846,6 +953,7 @@ function applyApprovalRequested(state: ChatState, event: SupervisorEvent): ChatS
             messageId: updatedTool.messageId,
             blockId: updatedTool.blockId || updatedTool.stableId,
             toolCallId,
+            toolStableId: updatedTool.stableId,
           },
         },
       };
@@ -857,21 +965,29 @@ function applyApprovalRequested(state: ChatState, event: SupervisorEvent): ChatS
     // awaiting tool card directly from the pending approval payload. Purpose: a
     // refreshed or reconnected session still shows the actionable approval card.
     const details = getRecord(payload.details) || {};
-    const toolName = getString(details.tool_name) || getString(details.tool) || getString(payload.operation) || 'tool';
+    const policyOp = getString(payload.operation);
+    const toolName = getString(details.tool_name)
+      || getString(details.tool)
+      || (policyOp === 'restart' ? 'request_restart' : policyOp)
+      || 'tool';
     const args = getRecord(details.arguments) || getRecord(details.parameters) || details;
     const patch: ToolPatch = {
       id: toolCallId,
       name: toolName,
       status: 'awaiting_approval',
       arguments: args,
-      taskId: getString(payload.task_id),
+      taskId,
       nodeId: getString(payload.node_id),
       approvalId,
       approvalStatus: 'pending',
       approvalDetails: buildApprovalDetails(payload),
     };
     let nextState = applyToolPatchToAssistant(state, event, patch, true);
-    const createdTool = findToolByCallId(nextState, toolCallId);
+    const createdTool = findToolByCallId(nextState, toolCallId, {
+      taskId,
+      approvalId,
+      requireActive: true,
+    });
     if (createdTool) {
       const message = nextState.messagesById[createdTool.messageId];
       if (message) {
@@ -885,6 +1001,7 @@ function applyApprovalRequested(state: ChatState, event: SupervisorEvent): ChatS
             messageId: createdTool.messageId,
             blockId: createdTool.blockId || createdTool.stableId,
             toolCallId,
+            toolStableId: createdTool.stableId,
           },
         },
       };
@@ -898,6 +1015,7 @@ function applyApprovalDecided(state: ChatState, event: SupervisorEvent): ChatSta
   const payload = getPayload(event);
   const approvalId = getString(payload.approval_id);
   const location = approvalId ? state.approvalBlockById[approvalId] : undefined;
+  const taskId = getString(payload.task_id);
 
   if (!approvalId) {
     return state;
@@ -905,12 +1023,12 @@ function applyApprovalDecided(state: ChatState, event: SupervisorEvent): ChatSta
 
   // [AutoC 2026-05-31] Why: clients can reconnect after approval_requested has
   // already been processed elsewhere, leaving no local approvalBlockById entry.
-  // How: prefer the tool_call_id carried by approval_decided and only require the
-  // legacy location for ApprovalBlock fallback. Purpose: tool-card decisions still
-  // update during partial catch-up or mixed event ordering.
+  // How: prefer the exact approval location when available, else resolve newest
+  // matching tool_call_id scoped by task_id. Purpose: tool-card decisions still
+  // update during partial catch-up without mutating historical call_1 cards.
   const toolCallId = getString(payload.tool_call_id) || location?.toolCallId || '';
-  if (toolCallId) {
-    const tool = findToolByCallId(state, toolCallId);
+  if (toolCallId || location?.toolStableId) {
+    const tool = findToolByCallId(state, toolCallId, { approvalId, taskId });
     if (tool) {
       // [AutoC 2026-05-31] Why: approval decisions should close the inline
       // approval state on the same tool card. How: resolve the approval back to
@@ -966,6 +1084,48 @@ function applyLlmRetry(state: ChatState, event: SupervisorEvent): ChatState {
     level: 'warning',
     title: '模型请求重试',
     text: pieces.join(' '),
+    eventType: event.type,
+  });
+}
+
+function applyLlmFallback(state: ChatState, event: SupervisorEvent): ChatState {
+  const payload = getPayload(event);
+  const attempt = getRecord(payload.attempt);
+  if (!attempt || attempt.success !== true) {
+    return state;
+  }
+  const origModel = getString(payload.original_model) || '主模型';
+  const origErr = getString(payload.original_error);
+  const fbModel = getString(attempt.model) || '备用模型';
+  const fbProvider = getString(attempt.provider) || '';
+  const errPart = origErr ? `（原因：${origErr}）` : '';
+  const text = `原渠道 ${origModel} 请求失败${errPart}，本次改用 ${fbModel}${fbProvider ? `（${fbProvider}）` : ''}。`;
+  const turnKey = getTurnKey(state, event);
+  const { state: nextState, message } = getOrCreateAssistantMessage(state, event, turnKey);
+  const prevNotices = message.source.responseInfo?.notices || [];
+  if (prevNotices.some((n) => n.code === 'fallback_provider.used' && n.text === text)) {
+    return nextState;
+  }
+  const nextResponseInfo = {
+    ...(message.source.responseInfo || {}),
+    provider: fbProvider || message.source.responseInfo?.provider,
+    model: fbModel || message.source.responseInfo?.model,
+    notices: [...prevNotices, { code: 'fallback_provider.used', label: '备用模型', text }],
+  };
+  return upsertMessage(nextState, {
+    ...message,
+    source: { ...message.source, responseInfo: nextResponseInfo },
+  });
+}
+
+function applyReactiveCompact(state: ChatState, event: SupervisorEvent): ChatState {
+  const payload = getPayload(event);
+  const cleared = getNumber(payload.cleared) || 0;
+  const error = getString(payload.error);
+  return appendNoticeToAssistant(state, event, {
+    level: 'warning',
+    title: '超长自动精简重试',
+    text: `请求超长，已自动精简 ${cleared} 条旧工具输出后重试。${error ? ` 原因：${error}` : ''}`,
     eventType: event.type,
   });
 }

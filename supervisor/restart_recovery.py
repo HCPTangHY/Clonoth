@@ -139,7 +139,14 @@ class RestartRecovery:
             task.cancel_reason = "user_cancel"
         self.save()
 
-    def intercept_completion(self, task: Task, result: dict[str, Any]) -> bool:
+    def intercept_completion(
+        self,
+        task: Task,
+        result: dict[str, Any],
+        *,
+        execution_id: str = "",
+        worker_id: str = "",
+    ) -> bool:
         if not self.preparing or not self.plan or task.restart_id != self.plan["restart_id"]:
             return False
         if (not self.eligible(task) or result.get("action") != "cancelled"
@@ -153,6 +160,10 @@ class RestartRecovery:
         task.lease_expires_at = None
         task.updated_at = _now()
         task.completion_state = "interrupted"
+        if execution_id:
+            task.completed_execution_id = execution_id
+        if worker_id:
+            task.input["_completed_worker_id"] = worker_id
         self.state._event_task_snapshot("task_interrupted", task, component="engine")
         return True
 
@@ -307,6 +318,18 @@ class RestartRecovery:
             runtime.planned_restart = info
             st._async_tools = copy.deepcopy(data.get("async_tools", {}))
             runtime._receipts = copy.deepcopy(data.get("receipts", {}))
+            for did, receipt in runtime._receipts.items():
+                settled = st._async_tools.get(receipt.get("work_id"))
+                if settled is None:
+                    continue
+                if receipt.get("status") == "processed":
+                    settled["receipt_settled"] = True
+                    settled["result_delivered"] = True
+                elif not str(did).startswith(("lost:", "restart:")) and (
+                    receipt.get("status") in {"held", "queued", "admitted"}
+                    or (settled.get("status") == "done" and str(did).endswith(":result"))
+                ):
+                    settled["result_delivered"] = True
             for task in tasks.values():
                 runtime.task_changed(task, notify=False)
             runtime._save()

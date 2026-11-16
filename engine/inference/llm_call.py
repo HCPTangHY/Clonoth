@@ -278,6 +278,9 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
 
     resp = None
     _retry_attempt = 0
+    ls._last_retry_count = 0
+    if hasattr(ls.rctx, "step_notices"):
+        ls.rctx.step_notices = []
 
     # Phase 1: Signal System — 初始化信号总线，发射 llm.call.start
     # 不使用 span 上下文管理器，避免整个函数体缩进变动。
@@ -502,10 +505,18 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
 
         if _retry_reason and _retry_attempt < ls.retry_max:
             _retry_attempt += 1
+            ls._last_retry_count = _retry_attempt
             _delay = min(
                 ls.retry_initial_delay * (ls.retry_backoff ** (_retry_attempt - 1)),
                 ls.retry_max_delay,
             )
+            if hasattr(ls.rctx, "step_notices"):
+                ls.rctx.step_notices.append({
+                    "code": "llm.retry",
+                    "level": "warning",
+                    "label": "模型请求重试",
+                    "text": f"模型请求将重试。 第 {_retry_attempt} 次，共 {ls.retry_max} 次。 {round(_delay, 2)} 秒后重试。 原因：{_retry_reason}",
+                })
             await ls.rctx.emit_event("llm_retry", {
                 "node_id": ls.node.id,
                 "step": step,
@@ -577,6 +588,13 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     ls.messages, gap_minutes=0, keep_recent=3, min_tool_results=1,
                 )
                 if _rc_cleared:
+                    if hasattr(ls.rctx, "step_notices"):
+                        ls.rctx.step_notices.append({
+                            "code": "llm.reactive_compact",
+                            "level": "warning",
+                            "label": "超长自动精简重试",
+                            "text": f"请求超长，已自动精简 {_rc_cleared} 条旧工具输出后重试。 原因：{(resp.error or '')[:240]}",
+                        })
                     await ls.rctx.emit_event("reactive_compact", {
                         "node_id": ls.node.id, "step": step,
                         "cleared": _rc_cleared, "error": resp.error or "",

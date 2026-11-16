@@ -77,6 +77,7 @@ import { hydrateStructuredHistory, removeConversationMessages } from './historyH
 import { resetEventPumpState, startEventPump, stopEventPump } from './eventPump';
 import {
   loadContextUsageIntoStore,
+  prefetchSessionPendingApprovals,
   replayPendingApprovals,
   restoreGeneratingStateFromBackend,
 } from './sessionRecovery';
@@ -266,10 +267,11 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   }
   if (activeConv?.sessionId) {
     void loadContextUsageIntoStore(activeConv.sessionId, set, get);
+    const pendingApprovalsPromise = prefetchSessionPendingApprovals(activeConv.sessionId);
     await loadSessionHistoryIntoStore(activeConv.id, activeConv.sessionId, set, get);
     // 历史加载期间登出：后续的两个恢复请求属于旧账号，不再发出。
     if (!isCurrentStoreGeneration(storeGeneration)) return;
-    await replayPendingApprovals(activeConv.sessionId, set, get);
+    await replayPendingApprovals(activeConv.sessionId, set, get, pendingApprovalsPromise);
     if (!isCurrentStoreGeneration(storeGeneration)) return;
     void restoreGeneratingStateFromBackend(activeConv.id, activeConv.sessionId, set, get, { reloadHistory: false });
   }
@@ -331,13 +333,11 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         return;
       }
       void (async () => {
-        // [AutoC 2026-06-18] Why: pending approval replay creates synthetic
-        // approval_requested events that should attach to already rebuilt tool cards.
-        // How: wait for session history hydration before fetching and replaying any
-        // outstanding approvals. Purpose: switching conversations does not create
-        // orphan approval cards before the tool history exists.
+        // Fetch pending approvals in parallel with history so large history payloads
+        // never delay rendering approval buttons after hydration completes.
+        const pendingApprovalsPromise = prefetchSessionPendingApprovals(target.sessionId);
         await loadSessionHistoryIntoStore(target.id, target.sessionId, set, get);
-        await replayPendingApprovals(target.sessionId, set, get);
+        await replayPendingApprovals(target.sessionId, set, get, pendingApprovalsPromise);
       })();
       void loadContextUsageIntoStore(target.sessionId, set, get);
     }

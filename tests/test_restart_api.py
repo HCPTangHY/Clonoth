@@ -56,3 +56,48 @@ def test_admin_restart_seals_after_stop_only_and_deduplicates_request(tmp_path, 
         assert not [e for e in state.eventlog.events if e['type'] == 'inbound_message']
         assert bool([e for e in state.eventlog.events if e['type'] == 'restart_failed']) == bool(failure)
     asyncio.run(run())
+
+
+def test_process_manager_stops_engines_in_parallel_and_kills_only_survivors(tmp_path):
+    from subprocess import TimeoutExpired
+    from supervisor.process_manager import ManagedProcess, ProcessManager
+
+    events = []
+
+    class FakePopen:
+        def __init__(self, pid, *, hangs=False):
+            self.pid = pid
+            self.hangs = hangs
+            self.stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def terminate(self):
+            events.append(('terminate', self.pid))
+            if not self.hangs:
+                self.stopped = True
+
+        def wait(self, timeout=None):
+            events.append(('wait', self.pid, round(float(timeout or 0), 2)))
+            if not self.stopped:
+                raise TimeoutExpired(cmd='engine', timeout=timeout or 0)
+            return 0
+
+        def kill(self):
+            events.append(('kill', self.pid))
+            self.stopped = True
+
+    with patch('supervisor.process_manager.atexit.register'), patch.object(ProcessManager, '_install_signal_handlers'):
+        pm = ProcessManager(supervisor_url='http://127.0.0.1:8765', workspace_root=tmp_path, log_dir=tmp_path / 'logs')
+    assert pm.stop_wait_timeout_sec == 20.0
+    pm.stop_wait_timeout_sec = 0.05
+    p1 = FakePopen(101, hangs=False)
+    p2 = FakePopen(102, hangs=True)
+    pm.engines = [ManagedProcess('engine-1', p1, None), ManagedProcess('engine-2', p2, None)]
+    pm.stop_engine()
+    # Both processes receive SIGTERM before any blocking wait runs.
+    assert events[:2] == [('terminate', 101), ('terminate', 102)]
+    assert ('kill', 101) not in events
+    assert ('kill', 102) in events
+    assert pm.engines == []

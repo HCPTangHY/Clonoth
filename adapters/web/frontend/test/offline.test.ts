@@ -19,10 +19,10 @@ import {
   resolveChildSessionHistoryView,
   shouldHideChildNode,
 } from '../src/store/chatTypes';
-import { createInitialChatState } from '../src/store/eventReducer';
+import { createInitialChatState, reduceChatEvent } from '../src/store/eventReducer';
 import { loadChildSessionHistoryIntoStore } from '../src/store/historyLoader';
 import { mergeSource, normalizeResponseInfo } from '../src/store/eventReducerState';
-import { normalizeHistoryThinkingSegments } from '../src/store/historyHydration';
+import { hydrateStructuredHistory, normalizeHistoryThinkingSegments } from '../src/store/historyHydration';
 import { compileApprovalPreset, identifyApprovalPreset } from '../src/store/sessionApprovalRules';
 import { shouldAutoApproveTool } from '../src/store/clientPrefsStore';
 import { resolvePanelEntry } from '../src/components/plugins/panelEntry';
@@ -417,6 +417,388 @@ check('a child history failure keeps previously loaded messages', async () => {
   assert.equal(snapshot.childSessionLoadFailed['child-keep'], true);
   assert.equal(snapshot.childSessionMessages['child-keep'].length, 1);
   assert.equal(snapshot.childSessionEmpty['child-keep'], false);
+});
+
+// ── reconnect history hydration preempt deduplication ─────────────────────
+
+check('preserve-mode hydration deduplicates live/prior preempts and scopes offline preempts to their own task', () => {
+  const sessionId = 'sess-preempt';
+  const conversationId = 'conv-preempt';
+  let live = createInitialChatState();
+  const emit = (seq: number, type: SupervisorEvent['type'], payload: Record<string, unknown>, ts: string) => {
+    live = reduceChatEvent(live, {
+      seq,
+      event_id: `ev-${seq}`,
+      ts,
+      session_id: sessionId,
+      type,
+      payload: { conversation_key: `web:${conversationId}`, ...payload },
+    });
+  };
+
+  // Turn 1: live user message + assistant + user preempt + async tool preempt
+  emit(1, 'inbound_message', { text: 'first turn' }, '2026-11-13T07:00:00Z');
+  emit(2, 'stream_delta', { task_id: 'task-1', source_inbound_seq: 1, type: 'text', content: 'working 1' }, '2026-11-13T07:00:01Z');
+  emit(3, 'preempt_injected', { task_id: 'task-1', source_inbound_seq: 1, message: 'old user preempt' }, '2026-11-13T07:00:02Z');
+  emit(4, 'preempt_injected', {
+    task_id: 'task-1',
+    source_inbound_seq: 1,
+    message: '<dispatch_result kind="async_tool">\ndone\n</dispatch_result>',
+  }, '2026-11-13T07:00:03Z');
+  emit(5, 'outbound_message', { task_id: 'task-1', source_inbound_seq: 1, text: 'turn 1 finished', action_type: 'finish' }, '2026-11-13T07:00:04Z');
+
+  // Turn 2: currently generating; one live preempt seen, one offline preempt missed while disconnected
+  emit(6, 'inbound_message', { text: 'second turn' }, '2026-11-13T07:01:00Z');
+  emit(7, 'stream_delta', { task_id: 'task-2', source_inbound_seq: 6, type: 'text', content: 'working 2' }, '2026-11-13T07:01:01Z');
+  emit(8, 'preempt_injected', { task_id: 'task-2', source_inbound_seq: 6, message: 'live preempt 2' }, '2026-11-13T07:01:02Z');
+
+  const history: StructuredMessage[] = [
+    { id: 'u1', role: 'user', content: 'first turn', source_task_id: 'task-1', created_at: '2026-11-13T07:00:00Z' },
+    { id: 'a1', role: 'assistant', content: 'turn 1 finished', source_task_id: 'task-1', created_at: '2026-11-13T07:00:01Z' },
+    { id: 'p1', role: 'user', content: 'old user preempt', is_preempt: true, source_task_id: 'task-1', created_at: '2026-11-13T07:00:02Z' },
+    { id: 'p2', role: 'user', content: '<dispatch_result kind="async_tool">\ndone\n</dispatch_result>', is_preempt: true, source_task_id: 'task-1', created_at: '2026-11-13T07:00:03Z' },
+    { id: 'p-orphan', role: 'user', content: 'ancient unrendered preempt', is_preempt: true, source_task_id: 'task-0', created_at: '2026-11-13T06:50:00Z' },
+    { id: 'u2', role: 'user', content: 'second turn', source_task_id: 'task-2', created_at: '2026-11-13T07:01:00Z' },
+    { id: 'a2', role: 'assistant', content: 'working 2', source_task_id: 'task-2', created_at: '2026-11-13T07:01:01Z' },
+    { id: 'p3', role: 'user', content: 'live preempt 2', is_preempt: true, source_task_id: 'task-2', created_at: '2026-11-13T07:01:02Z' },
+    { id: 'p4', role: 'user', content: 'missed while offline', is_preempt: true, source_task_id: 'task-2', created_at: '2026-11-13T07:01:03Z' },
+  ];
+
+  // Reconnect #1 while generating (preserveExistingMessages = true)
+  const reconnectedOnce = hydrateStructuredHistory(live, sessionId, conversationId, history, true);
+  // Reconnect #2 while still generating must remain idempotent
+  const reconnectedTwice = hydrateStructuredHistory(reconnectedOnce, sessionId, conversationId, history, true);
+
+  const order = reconnectedTwice.messageOrderByConversation[conversationId] || [];
+  const lastMsg = reconnectedTwice.messagesById[order[order.length - 1]];
+  assert.equal(lastMsg.role, 'assistant');
+  assert.equal(lastMsg.source.taskId, 'task-2');
+
+  const lastPreemptTexts = lastMsg.blocks
+    .filter((b) => b.kind === 'notice' && b.level === 'preempt')
+    .map((b) => (b.kind === 'notice' ? b.text : ''));
+
+  // Only task-2's live preempt (1 copy) + missed offline preempt (1 copy); never task-1's or task-0's!
+  assert.deepEqual(lastPreemptTexts, ['live preempt 2', 'missed while offline']);
+
+  // Turn 1's assistant card keeps only its original 2 preempts without duplication
+  const turn1Assistant = order
+    .map((id) => reconnectedTwice.messagesById[id])
+    .find((m) => m?.role === 'assistant' && m.source.taskId === 'task-1');
+  assert.ok(turn1Assistant);
+  const turn1Preempts = turn1Assistant.blocks.filter((b) => b.kind === 'notice' && b.level === 'preempt');
+  assert.equal(turn1Preempts.length, 2);
+
+  // Unmatched ancient preempt is not appended as a standalone user card at the bottom
+  assert.equal(
+    order.some((id) => reconnectedTwice.messagesById[id]?.blocks.some((b) => b.kind === 'text' && b.text === 'ancient unrendered preempt')),
+    false,
+  );
+});
+
+// ── approval card matching under repeated provider tool_call_id ("call_1") ──
+
+check('live stream and reconnect replay attach approvals to the active call_1 card instead of historical call_1 cards', () => {
+  const sessionId = 'sess-approval';
+  const conversationId = 'conv-approval';
+  const history: StructuredMessage[] = [
+    { id: 'u1', role: 'user', content: 'turn 1', source_task_id: 'task-old', created_at: '2026-11-13T10:00:00Z' },
+    {
+      id: 'a1',
+      role: 'assistant',
+      content: '',
+      source_task_id: 'task-old',
+      created_at: '2026-11-13T10:00:01Z',
+      tool_calls: [{ id: 'call_1', name: 'execute_command', arguments: { command: 'echo old' } }],
+    },
+    { id: 't1', role: 'tool', tool_call_id: 'call_1', name: 'execute_command', content: 'old ok', created_at: '2026-11-13T10:00:02Z' },
+    { id: 'a1-done', role: 'assistant', content: 'done 1', source_task_id: 'task-old', created_at: '2026-11-13T10:00:03Z' },
+  ];
+
+  // 1. Live stream path: history has an old completed call_1, current task runs two call_1 steps
+  let live = hydrateStructuredHistory(createInitialChatState(), sessionId, conversationId, history, false);
+  const oldStableId = live.toolExecutionOrder[0];
+  assert.equal(live.toolExecutionsById[oldStableId].id, 'call_1');
+  assert.equal(live.toolExecutionsById[oldStableId].status, 'success');
+
+  const emitLive = (seq: number, type: SupervisorEvent['type'], payload: Record<string, unknown>, ts: string) => {
+    live = reduceChatEvent(live, {
+      seq,
+      event_id: `live-ap-${seq}`,
+      ts,
+      session_id: sessionId,
+      type,
+      payload: { conversation_key: `web:${conversationId}`, ...payload },
+    });
+  };
+
+  emitLive(10, 'inbound_message', { text: 'deploy now' }, '2026-11-13T10:01:00Z');
+  emitLive(11, 'tool_call_start', {
+    task_id: 'task-new', source_inbound_seq: 10, llm_request_id: 'req-step-1',
+    tool_call_id: 'call_1', tool_name: 'execute_command', arguments: { command: 'echo check' },
+  }, '2026-11-13T10:01:01Z');
+  emitLive(12, 'tool_call_end', {
+    task_id: 'task-new', source_inbound_seq: 10, llm_request_id: 'req-step-1',
+    tool_call_id: 'call_1', tool_name: 'execute_command', status: 'success', raw_inline: 'check',
+  }, '2026-11-13T10:01:02Z');
+  emitLive(13, 'stream_end', { task_id: 'task-new', source_inbound_seq: 10, llm_request_id: 'req-step-1' }, '2026-11-13T10:01:02Z');
+
+  // Step 2 reuses tool_call_id="call_1" for request_restart and pauses for approval
+  emitLive(14, 'tool_call_start', {
+    task_id: 'task-new', source_inbound_seq: 10, llm_request_id: 'req-step-2',
+    tool_call_id: 'call_1', tool_name: 'request_restart', arguments: { target: 'all', reason: 'deploy' },
+  }, '2026-11-13T10:01:03Z');
+  emitLive(15, 'approval_requested', {
+    approval_id: 'ap-live-1', operation: 'restart', status: 'pending',
+    tool_call_id: 'call_1', task_id: 'task-new', node_id: 'bootstrap.coder',
+    details: { target: 'all', reason: 'deploy' },
+  }, '2026-11-13T10:01:04Z');
+
+  // Historical call_1 and step-1 call_1 stay 'success'; only step-2 request_restart becomes 'awaiting_approval'!
+  assert.equal(live.toolExecutionsById[oldStableId].status, 'success');
+  assert.equal(live.toolExecutionsById[oldStableId].approvalId, undefined);
+  const newestStableId = live.toolExecutionOrder[live.toolExecutionOrder.length - 1];
+  assert.equal(live.toolExecutionsById[newestStableId].name, 'request_restart');
+  assert.equal(live.toolExecutionsById[newestStableId].status, 'awaiting_approval');
+  assert.equal(live.toolExecutionsById[newestStableId].approvalId, 'ap-live-1');
+
+  emitLive(16, 'approval_decided', {
+    approval_id: 'ap-live-1', decision: 'allow', tool_call_id: 'call_1', task_id: 'task-new',
+  }, '2026-11-13T10:01:05Z');
+  assert.equal(live.toolExecutionsById[newestStableId].status, 'running');
+  assert.equal(live.toolExecutionsById[newestStableId].approvalStatus, 'allowed');
+  assert.equal(live.toolExecutionsById[oldStableId].status, 'success');
+
+  // 2. Reconnect / page-refresh path: /history only has completed call_1 rows; pending approval must synthesize a new bottom card!
+  let reconnected = hydrateStructuredHistory(createInitialChatState(), sessionId, conversationId, history, false);
+  const reconnectedOldId = reconnected.toolExecutionOrder[0];
+  reconnected = reduceChatEvent(reconnected, {
+    seq: 99,
+    event_id: 'synthetic-approval-ap-reconnect-1',
+    ts: '2026-11-13T10:02:00Z',
+    session_id: sessionId,
+    type: 'approval_requested',
+    payload: {
+      approval_id: 'ap-reconnect-1',
+      operation: 'restart',
+      status: 'pending',
+      tool_call_id: 'call_1',
+      task_id: 'task-new',
+      node_id: 'bootstrap.coder',
+      details: { target: 'all', reason: 'deploy' },
+      conversation_key: `web:${conversationId}`,
+    },
+  });
+  assert.equal(reconnected.toolExecutionsById[reconnectedOldId].status, 'success');
+  assert.equal(reconnected.toolExecutionsById[reconnectedOldId].approvalId, undefined);
+  const synthStableId = reconnected.toolExecutionOrder[reconnected.toolExecutionOrder.length - 1];
+  assert.notEqual(synthStableId, reconnectedOldId);
+  assert.equal(reconnected.toolExecutionsById[synthStableId].name, 'request_restart');
+  assert.equal(reconnected.toolExecutionsById[synthStableId].status, 'awaiting_approval');
+  assert.equal(reconnected.toolExecutionsById[synthStableId].approvalId, 'ap-reconnect-1');
+});
+
+// ── phantom attachment prevention & completion-card attachment placement ──
+
+check('history hydration scopes repeated call_2 results, ignores read_file/json-array/worker-arg phantom attachments, and moves generated images to the visible completion card', () => {
+  const sessionId = 'sess-att';
+  const conversationId = 'conv-att';
+  const history: StructuredMessage[] = [
+    // Turn 1: call_2 is a plain list_dir returning JSON array of dicts + spawn_worker with attachment_paths
+    { id: 'u1', role: 'user', content: 'check files', source_task_id: 't1', created_at: '2026-11-13T11:00:00Z' },
+    {
+      id: 'a1-work',
+      role: 'assistant',
+      content: '',
+      source_task_id: 't1',
+      created_at: '2026-11-13T11:00:01Z',
+      tool_calls: [
+        { id: 'call_1', name: 'spawn_worker', arguments: { instruction: 'inspect', attachment_paths: ['docs/spec.md'] } },
+        { id: 'call_2', name: 'list_dir', arguments: { paths: ['src'] } },
+      ],
+    },
+    { id: 't1-1', role: 'tool', tool_call_id: 'call_1', tool_name: 'spawn_worker', content: 'spawned', created_at: '2026-11-13T11:00:02Z' },
+    {
+      id: 't1-2',
+      role: 'tool',
+      tool_call_id: 'call_2',
+      tool_name: 'list_dir',
+      content: '{"ok":true,"data":{"result":[{"name":"index.ts","type":"file"},{"path":"src/app.tsx","type":"file"}]}}',
+      tool_result_structured: {
+        ok: true,
+        data: { result: [{ name: 'index.ts', type: 'file' }, { path: 'src/app.tsx', type: 'file' }] },
+      },
+      created_at: '2026-11-13T11:00:02Z',
+    } as unknown as StructuredMessage,
+    { id: 'a1-done', role: 'assistant', content: 'checked', source_task_id: 't1', created_at: '2026-11-13T11:00:03Z' },
+
+    // Turn 2: call_2 is read_file reading an image + tool_result_attachment bridge, then call_2 in next step is generate_image!
+    { id: 'u2', role: 'user', content: 'inspect and draw', source_task_id: 't2', created_at: '2026-11-13T11:01:00Z' },
+    {
+      id: 'a2-read',
+      role: 'assistant',
+      content: '',
+      source_task_id: 't2',
+      created_at: '2026-11-13T11:01:01Z',
+      tool_calls: [{ id: 'call_2', name: 'read_file', arguments: { path: 'ui.png' } }],
+    },
+    {
+      id: 't2-read',
+      role: 'tool',
+      tool_call_id: 'call_2',
+      tool_name: 'read_file',
+      content: '[Image]',
+      tool_attachments: [{ type: 'image', path: 'data/attachments/read_file/abc123.png', name: 'ui.png' }],
+      created_at: '2026-11-13T11:01:02Z',
+    } as unknown as StructuredMessage,
+    {
+      id: 'u2-bridge',
+      role: 'user',
+      message_type: 'tool_result_attachment',
+      content: '',
+      attachments: [{ type: 'image', path: 'data/attachments/read_file/abc123.png', name: 'ui.png' }],
+      created_at: '2026-11-13T11:01:02Z',
+    },
+    {
+      id: 'a2-gen',
+      role: 'assistant',
+      content: '',
+      source_task_id: 't2',
+      created_at: '2026-11-13T11:01:03Z',
+      tool_calls: [{ id: 'call_2', name: 'generate_image', arguments: { prompt: 'cat' } }],
+    },
+    {
+      id: 't2-gen',
+      role: 'tool',
+      tool_call_id: 'call_2',
+      tool_name: 'generate_image',
+      content: '{"attachments":["data/attachments/cat.png"]}',
+      tool_attachments: [{ type: 'image', path: 'data/attachments/cat.png', name: 'cat.png' }],
+      created_at: '2026-11-13T11:01:04Z',
+    } as unknown as StructuredMessage,
+    { id: 'a2-final', role: 'assistant', content: 'here is your cat', source_task_id: 't2', created_at: '2026-11-13T11:01:05Z' },
+  ];
+
+  const hydrated = hydrateStructuredHistory(createInitialChatState(), sessionId, conversationId, history, false);
+  const cards = (hydrated.messageOrderByConversation[conversationId] || []).map((id) => hydrated.messagesById[id]);
+
+  // Turn 1 cards have ZERO phantom attachments (no call_2 leak from Turn 2, no list_dir dicts, no spawn_worker arg leak)
+  const turn1Cards = cards.filter((c) => c.source.taskId === 't1');
+  for (const card of turn1Cards) {
+    assert.deepEqual(card.attachments || [], []);
+  }
+
+  // Turn 2 intermediate work cards (a2-read and a2-gen) have ZERO top-of-turn attachments;
+  // read_file's internal png is dropped completely, and cat.png lands ONLY on a2-final!
+  const turn2AssistantCards = cards.filter((c) => c.role === 'assistant' && c.source.taskId === 't2');
+  assert.equal(turn2AssistantCards.length, 3);
+  assert.deepEqual(turn2AssistantCards[0].attachments || [], []);
+  assert.deepEqual(turn2AssistantCards[1].attachments || [], []);
+  assert.equal(turn2AssistantCards[2].completionType, 'finish');
+  assert.deepEqual((turn2AssistantCards[2].attachments || []).map((a) => a.path), ['data/attachments/cat.png']);
+});
+
+check('refreshing while a tail tool call is awaiting approval keeps the hydrated card active and attaches approval in place without duplicate cards', () => {
+  const sessionId = 'sess-tail-approval';
+  const conversationId = 'conv-tail-approval';
+  const historyWithInFlightTail: StructuredMessage[] = [
+    { id: 'u1', role: 'user', content: 'deploy', source_task_id: 'task-48ad', source_inbound_seq: 100, created_at: '2026-11-13T16:28:00Z' },
+    {
+      id: 'a-reply',
+      role: 'assistant',
+      content: '',
+      source_task_id: 'task-48ad',
+      source_inbound_seq: 100,
+      llm_request_id: 'req-1',
+      created_at: '2026-11-13T16:39:32Z',
+      tool_calls: [{ id: 'call_1', name: 'intermediate_reply', arguments: { text: 'preparing restart' } }],
+    },
+    { id: 't-reply', role: 'tool', tool_call_id: 'call_1', tool_name: 'intermediate_reply', content: 'ok', created_at: '2026-11-13T16:39:32Z' },
+    {
+      id: 'a-restart',
+      role: 'assistant',
+      content: '',
+      source_task_id: 'task-48ad',
+      source_inbound_seq: 100,
+      llm_request_id: 'req-2',
+      source_node_id: 'bootstrap.coder',
+      created_at: '2026-11-13T16:42:30Z',
+      tool_calls: [{ id: 'call_1', name: 'request_restart', arguments: { target: 'all', reason: 'deploy' } }],
+    },
+    // No role='tool' result row for a-restart yet (blocked on user approval)
+  ];
+
+  let state = hydrateStructuredHistory(createInitialChatState(), sessionId, conversationId, historyWithInFlightTail, false);
+  const orderBefore = state.messageOrderByConversation[conversationId] || [];
+  assert.equal(orderBefore.length, 3);
+  const tailMsgBefore = state.messagesById[orderBefore[2]];
+  assert.equal(tailMsgBefore.status, 'running_tools');
+  const tailToolId = state.toolExecutionOrder[state.toolExecutionOrder.length - 1];
+  assert.equal(state.toolExecutionsById[tailToolId].name, 'request_restart');
+  assert.equal(state.toolExecutionsById[tailToolId].status, 'running');
+  assert.equal(state.toolExecutionsById[tailToolId].taskId, 'task-48ad');
+
+  // Pending approval replay attaches directly to the hydrated a-restart card (no duplicate card!)
+  state = reduceChatEvent(state, {
+    seq: 500,
+    event_id: 'synthetic-approval-tail-1',
+    session_id: sessionId,
+    type: 'approval_requested',
+    ts: '2026-11-13T16:42:30Z',
+    payload: {
+      approval_id: 'ap-tail-1',
+      operation: 'restart',
+      status: 'pending',
+      tool_call_id: 'call_1',
+      task_id: 'task-48ad',
+      node_id: 'bootstrap.coder',
+      details: { target: 'all', reason: 'deploy' },
+      conversation_key: `web:${conversationId}`,
+    },
+  });
+
+  const orderAfterReplay = state.messageOrderByConversation[conversationId] || [];
+  assert.equal(orderAfterReplay.length, 3);
+  assert.equal(state.messagesById[orderAfterReplay[2]].status, 'awaiting_approval');
+  assert.equal(state.toolExecutionsById[tailToolId].status, 'awaiting_approval');
+  assert.equal(state.toolExecutionsById[tailToolId].approvalId, 'ap-tail-1');
+
+  // Subsequent live approval_decided + tool_call_end also update the same card in place
+  state = reduceChatEvent(state, {
+    seq: 501,
+    event_id: 'live-ap-decided-1',
+    session_id: sessionId,
+    type: 'approval_decided',
+    ts: '2026-11-13T16:42:35Z',
+    payload: {
+      approval_id: 'ap-tail-1',
+      decision: 'deny',
+      tool_call_id: 'call_1',
+      task_id: 'task-48ad',
+      conversation_key: `web:${conversationId}`,
+    },
+  });
+  state = reduceChatEvent(state, {
+    seq: 502,
+    event_id: 'live-tool-end-1',
+    session_id: sessionId,
+    type: 'tool_call_end',
+    ts: '2026-11-13T16:42:36Z',
+    payload: {
+      task_id: 'task-48ad',
+      source_inbound_seq: 100,
+      llm_request_id: 'req-2',
+      tool_call_id: 'call_1',
+      tool_name: 'request_restart',
+      status: 'error',
+      raw_inline: 'ERROR: user denied approval',
+      conversation_key: `web:${conversationId}`,
+    },
+  });
+
+  assert.equal((state.messageOrderByConversation[conversationId] || []).length, 3);
+  assert.equal(state.toolExecutionsById[tailToolId].status, 'error');
+  assert.equal(state.toolExecutionsById[tailToolId].approvalStatus, 'denied');
 });
 
 // ── runner ────────────────────────────────────────────────────────────────

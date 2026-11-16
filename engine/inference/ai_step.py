@@ -247,16 +247,20 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         _persist_tool_results(ls, missing, [])
         for tc in resp.tool_calls:
             if str(tc.id) not in paired:
-                await ls.rctx.emit_event('tool_call_end', {'node_id': ls.node.id, 'task_id': ls.rctx.task_id,
-                    'tool_call_id': tc.id, 'tool_name': tc.name, 'status': 'cancelled', 'result': interrupted_result()})
+                try:
+                    await ls.rctx.emit_event('tool_call_end', {'node_id': ls.node.id, 'task_id': ls.rctx.task_id,
+                        'tool_call_id': tc.id, 'tool_name': tc.name, 'status': 'cancelled', 'result': interrupted_result()})
+                except Exception:
+                    pass
         raise
     finally:
         _flush_step_shadow_writes(ls)
         ls._after_prev_round_msg_idx = len(ls.messages)
     if getattr(ls.rctx, '_restart_accepted', False):
-        # The accepted control operation already scheduled shutdown. Persist its
-        # receipt first, then yield without executing another model/tool step.
-        await asyncio.Event().wait()
+        # The accepted control operation already scheduled shutdown and flushed its
+        # receipt above. Exit immediately so runner reports the restart checkpoint
+        # without waiting passively for SIGTERM.
+        return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, error="engine graceful shutdown")
     return action
 
 
@@ -1584,7 +1588,7 @@ async def run_ai_node(
             resp = _usage_ctx.response
 
         if not resp.ok:
-            return _build_failure_action(ls, resp, step)
+            return _build_failure_action(ls, resp, step, getattr(ls, "_last_retry_count", 0))
 
         # Only the accepted response supplies message provenance and usage.
         # The configured ls.provider is intentionally unchanged for the next step.
@@ -1592,10 +1596,13 @@ async def run_ai_node(
         ls.last_usage = dict(resp.usage or {})
         if isinstance(ls.last_usage.get("prompt_tokens"), int):
             ls.last_prompt_tokens = ls.last_usage["prompt_tokens"]
+        _step_notices = list(getattr(ls.rctx, "step_notices", None) or [])
+        if hasattr(ls.rctx, "step_notices"):
+            ls.rctx.step_notices = []
         ls.rctx.response_info = {
             "provider": getattr(_usage_ctx.provider, "name", "") or "unknown",
             "model": getattr(_usage_ctx.provider, "model", "") or "",
-            "notices": list(_usage_result.channels.get("response_notices") or []),
+            "notices": _step_notices + list(_usage_result.channels.get("response_notices") or []),
             "usage": dict(ls.last_usage),
         }
 

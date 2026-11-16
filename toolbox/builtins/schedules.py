@@ -129,13 +129,29 @@ async def _delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, 
     return _ok(f"Schedule deleted: {sid}", deleted=True, id=sid)
 
 
+_SCHEDULE_UPDATE_KEYS = (
+    "cron", "text", "command", "type", "enabled", "once", "timeout",
+    "silent", "conversation_key", "entry_node_id", "workflow_id",
+)
+
+
+def resolve_manage_schedule_action(args: dict[str, Any]) -> str:
+    """Resolve canonical gate action for manage_schedule."""
+    act = str((args or {}).get("action") or "").strip().lower()
+    if not act:
+        return "upsert" if ((args or {}).get("id") and any((args or {}).get(k) is not None for k in _SCHEDULE_UPDATE_KEYS)) else "list"
+    if act in ("create", "update"):
+        return "upsert"
+    if act == "remove":
+        return "delete"
+    return act
+
+
 async def manage_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """List schedules, upsert selected fields, or delete one schedule."""
     action = str(args.get("action") or "").strip().lower()
     if not action:
-        updates = ("cron", "text", "command", "type", "enabled", "once", "timeout",
-                   "silent", "conversation_key", "entry_node_id", "workflow_id")
-        action = "upsert" if args.get("id") and any(args.get(k) is not None for k in updates) else "list"
+        action = "upsert" if args.get("id") and any(args.get(k) is not None for k in _SCHEDULE_UPDATE_KEYS) else "list"
     if action == "list":
         return await _list_schedules(args, ctx)
     if action == "upsert":

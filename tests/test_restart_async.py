@@ -106,3 +106,108 @@ def test_unconfirmed_stop_keeps_checkpoint_blocked_and_reconcile_failure_keeps_p
     assert restored.tasks[owner.task_id].status == TaskStatus.suspended
     assert restored.tasks[owner.task_id].cancel_reason == 'restart_checkpoint_failed'
     assert restored.assign_next_task(worker_id='worker') is None
+
+
+def test_evicted_processed_receipts_never_trigger_false_lost_callbacks_after_restart(tmp_path):
+    state = make_state(tmp_path, 'before')
+    sid = state.get_or_create_session(channel='discord_guild', conversation_key='discord:room-1')
+    rt = state.execution_runtime
+
+    # Produce 205 settled async tool deliveries so >5 processed receipts get evicted by _save().
+    for idx in range(205):
+        aid = f'done-{idx:03d}'
+        carrier = task(state, sid)
+        state.assign_next_task(worker_id='worker')
+        state._async_tools[aid] = {
+            'async_id': aid, 'task_id': carrier.task_id, 'session_id': sid,
+            'execution_id': carrier.execution_id, 'boot_id': 'before', 'target_generation': 1,
+            'tool_name': 'remote_exec', 'status': 'done', 'worker_id': 'worker',
+            'finished_at': f'2026-11-12T12:00:{idx % 60:02d}+00:00',
+        }
+        did = f'{aid}:result'
+        rt._receipts[did] = {
+            'delivery_id': did, 'work_id': aid, 'origin_task_id': carrier.task_id,
+            'session_id': sid, 'target_generation': 1, 'status': 'admitted',
+            'carrier_task_id': carrier.task_id, 'message_id': f'msg-{idx}',
+        }
+        complete(state, carrier)
+
+    rt._save()
+    assert len(rt._receipts) == 200
+    assert state._async_tools['done-000'].get('receipt_settled') is True
+    assert 'done-000:result' not in rt._receipts
+
+    # Run a planned restart and re-register worker with a new generation.
+    live_task = task(state, sid)
+    state.assign_next_task(worker_id='worker')
+    state.restart_recovery.begin()
+    complete(state, live_task, 'cancelled')
+    state.restart_recovery.finalize()
+
+    restored = make_state(tmp_path, 'after')
+    inbound_before = [e for e in restored.eventlog.events if e['type'] == 'inbound_message']
+    restored.register_engine('worker', 'new-gen-1')
+    inbound_after = [e for e in restored.eventlog.events if e['type'] == 'inbound_message']
+    assert inbound_after == inbound_before
+    assert restored._async_tools['done-000']['status'] == 'done'
+
+
+@pytest.mark.parametrize('restart_kind', ['planned', 'unplanned'])
+def test_admitted_and_unwatched_async_deliveries_never_trigger_false_lost_callbacks(tmp_path, restart_kind):
+    import json
+    state = make_state(tmp_path, 'before')
+    sid = state.get_or_create_session(channel='discord_guild', conversation_key='discord:room-2')
+    rt = state.execution_runtime
+
+    # Case A: unwatched carrier completes with finish -> persisted immediately to runtime.json as processed.
+    c1 = task(state, sid)
+    state.assign_next_task(worker_id='worker')
+    ack1 = state.register_async_tool({
+        'async_id': 'unwatched-finish', 'task_id': c1.task_id, 'execution_id': c1.execution_id,
+        'worker_id': 'worker', 'session_id': sid, 'tool_name': 'execute_command',
+    })
+    state.finish_async_tool('unwatched-finish', {**ack1, 'execution_id': c1.execution_id, 'status': 'done'})
+    rt.queue_result(
+        delivery_id='unwatched-finish:result', work_id='unwatched-finish',
+        origin_task_id=c1.task_id, session_id=sid, text='done 1',
+    )
+    store = ConversationStore(tmp_path / 'data/conversations')
+    store.append(c1.session_id, Message(id='m-1', role='user', content='done 1',
+                                        source_task_id=c1.task_id, meta={'delivery_ids': ['unwatched-finish:result']}))
+    rt.admit(c1.task_id, ['unwatched-finish:result'], 'm-1', c1.execution_id)
+    c1.preempt_message = ''
+    c1.preempt_requested = False
+    c1.preempt_delivery_ids.clear()
+    complete(state, c1)
+    persisted = json.loads(rt._path.read_text(encoding='utf-8'))
+    assert persisted['receipts']['unwatched-finish:result']['status'] == 'processed'
+    assert persisted['work']['unwatched-finish']['receipt_settled'] is True
+    assert persisted['work']['unwatched-finish']['result_delivered'] is True
+
+    # Case B: legacy/in-flight admitted receipt (like historical production runtime.json rows without settled flags).
+    c2 = task(state, sid)
+    state.assign_next_task(worker_id='worker')
+    state._async_tools['legacy-admitted'] = {
+        'async_id': 'legacy-admitted', 'task_id': c2.task_id, 'session_id': sid,
+        'execution_id': c2.execution_id, 'boot_id': 'before', 'target_generation': 1,
+        'tool_name': 'remote_exec', 'status': 'done', 'worker_id': 'worker',
+    }
+    rt._receipts['legacy-admitted:result'] = {
+        'delivery_id': 'legacy-admitted:result', 'work_id': 'legacy-admitted',
+        'origin_task_id': c2.task_id, 'session_id': sid, 'target_generation': 1,
+        'status': 'admitted', 'carrier_task_id': c2.task_id, 'message_id': 'm-2',
+    }
+    rt._save()
+
+    if restart_kind == 'planned':
+        state.restart_recovery.begin()
+        complete(state, c2, 'cancelled')
+        state.restart_recovery.finalize()
+
+    restored = make_state(tmp_path, 'after')
+    inbound_before = [e for e in restored.eventlog.events if e['type'] == 'inbound_message']
+    restored.register_engine('worker', 'new-gen-2')
+    inbound_after = [e for e in restored.eventlog.events if e['type'] == 'inbound_message']
+    assert inbound_after == inbound_before
+    assert restored._async_tools['unwatched-finish']['status'] == 'done'
+    assert restored._async_tools['legacy-admitted']['status'] == 'done'

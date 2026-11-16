@@ -165,7 +165,6 @@ export default {
     });
     this.draftNotice = element('p', 'ide-goal__hint');
     this.draftNotice.setAttribute('role', 'status');
-    this.desktopHint = element('p', 'ide-goal__hint', 'Goal 侧栏打开时，输入框用于提交目标，不是发送聊天消息。未完成时修改目标并保留预算；已完成时创建独立目标，重置预算和专属记录。关闭侧栏后恢复普通对话。');
     this.compose.append(draftLabel, this.submitDraft, this.retryDraft, this.draftNotice);
     if (ctx.composer?.getDraft) this.draftTimer = window.setInterval(() => { if (!document.hidden) void this.syncDraft(); }, 400);
     this.criteriaText = element('p', 'ide-goal__criteria');
@@ -173,12 +172,12 @@ export default {
     const models = element('div', 'ide-goal__models');
     this.provider = this.field('评审渠道（留空跟随本轮）', 'input', 200, models);
     this.model = this.field('评审模型（留空跟随本轮）', 'input', 200, models);
+    this.maxRounds = this.field('最大自动续轮数', 'input', 7);
+    this.maxRounds.type = 'number';
+    this.maxRounds.min = '1'; this.maxRounds.max = '1000000'; this.maxRounds.step = '1';
     this.form.append(models);
     this.actions = element('div', 'ide-goal__actions');
-    this.save = this.button('保存设置并暂停', () => {
-      if (ACTIVE.has(this.data?.status) && !window.confirm('保存设置将暂停当前目标，之后恢复会启动新一轮执行。是否保存？')) return;
-      void this.mutate('set');
-    }, true);
+    this.save = this.button('保存设置', () => { void this.mutate('set'); }, true);
     this.start = this.button('开始', () => { void this.mutate('start'); }, true);
     this.resume = this.button('恢复', () => { void this.mutate('resume'); }, true);
     this.pause = this.button('暂停', () => { void this.mutate('pause'); });
@@ -215,9 +214,8 @@ export default {
     this.emptyReviews = element('p', 'ide-goal__criteria', '尚无评审记录。');
     reviewSection.append(this.reviewHeading, this.emptyReviews, this.reviews);
     this.settings = element('details', 'ide-goal__section ide-goal__settings');
-    this.settings.append(element('summary', '', '评审设置'), this.form, this.actions, this.confirm,
-      element('p', 'ide-goal__hint', '保存设置会暂停目标。恢复时开启新一轮，已有计数不清零。'));
-    this.body.append(this.compose, this.desktopHint, this.skeleton, this.goalText, this.meta, this.controls, this.criteriaSection, reviewSection, this.settings);
+    this.settings.append(element('summary', '', 'Goal 设置'), this.form, this.actions, this.confirm);
+    this.body.append(this.compose, this.skeleton, this.goalText, this.meta, this.controls, this.criteriaSection, reviewSection, this.settings);
     this.ownerNotice = element('p', 'ide-goal__hint');
     this.ownerNotice.setAttribute('role', 'status');
     card.append(summary, this.ownerNotice, this.notice, this.body);
@@ -268,9 +266,8 @@ export default {
     const active = ACTIVE.has(this.data?.status);
     this.compose.hidden = !this.mobile || !this.ctx.composer?.getDraft
       || (!this.editingGoal && (active || (!this.data && this.sessionId !== 'no-session')));
-    this.desktopHint.hidden = Boolean(this.mobile);
     this.submitDraft.textContent = snapshot?.busy || this.submittingDraft ? '正在提交…'
-      : !this.data || ['empty', 'completed'].includes(this.data.status) ? '创建并开始' : '修改并重新开始';
+      : !this.data || ['empty', 'completed'].includes(this.data.status) ? '创建并开始' : '修改并继续';
     this.retryDraft.hidden = !this.draftError;
     this.retryDraft.disabled = !this.data || this.submittingDraft || snapshot?.busy;
     this.draft.disabled = !snapshot || snapshot.busy || snapshot.mode !== 'ide.goal' || this.submittingDraft
@@ -278,7 +275,8 @@ export default {
     this.submitDraft.disabled = this.draft.disabled || !this.draft.value.trim();
     const attachments = snapshot?.attachments?.map(item => item.name).join('、');
     this.draftNotice.textContent = this.draftError || (this.submittingDraft || snapshot?.busy ? '正在提交，请稍候。'
-      : attachments ? `随目标提交的附件：${attachments}` : '关闭面板退出输入模式，草稿保留；不会暂停已开始的目标。');
+      : attachments ? `附件：${attachments}` : '');
+    this.draftNotice.hidden = !this.draftNotice.textContent;
   },
 
   async submitGoal() {
@@ -393,6 +391,7 @@ export default {
     this.criteriaText.textContent = this.data?.criteria || '未单独设置，按目标要求验收。';
     this.provider.value = this.data?.reviewer_provider || '';
     this.model.value = this.data?.reviewer_model || '';
+    this.maxRounds.value = String(this.data?.max_rounds ?? 256);
   },
 
   async load() {
@@ -427,10 +426,16 @@ export default {
     if (action === 'set' && !this.data.goal.trim()) return;
     if (action !== 'set' && action !== 'pause' && this.dirty) return;
     const ownerSessionId = this.ownerSessionId;
+    const maxRounds = Number(this.maxRounds.value);
+    if (action === 'set' && (!Number.isSafeInteger(maxRounds) || maxRounds < 1 || maxRounds > 1000000)) {
+      this.notice.textContent = '最大自动续轮数须为 1 至 1000000 的整数。';
+      this.notice.hidden = false;
+      return;
+    }
     const body = { action, expected_session_id: ownerSessionId, expected_revision: this.data.revision, request_id: requestId() };
     if (action === 'set') Object.assign(body, {
       goal: this.data.goal, criteria: this.criteria.value.trim(),
-      reviewer_provider: this.provider.value.trim(), reviewer_model: this.model.value.trim(),
+      reviewer_provider: this.provider.value.trim(), reviewer_model: this.model.value.trim(), max_rounds: maxRounds,
     });
     this.abort();
     const seq = this.seq;
@@ -477,7 +482,7 @@ export default {
     const unavailable = !this.data || this.isChild || Boolean(this.error) || this.mutating || this.conflict;
     const status = this.data?.status || 'empty';
     const active = ACTIVE.has(status);
-    for (const field of [this.criteria, this.provider, this.model]) field.disabled = !this.data || this.isChild || this.mutating || Boolean(this.error);
+    for (const field of [this.criteria, this.provider, this.model, this.maxRounds]) field.disabled = !this.data || this.isChild || this.mutating || Boolean(this.error);
     this.save.disabled = unavailable || !this.data?.goal;
     this.edit.disabled = unavailable || !this.ctx.composer;
     this.edit.textContent = this.data?.status === 'completed' ? '以此创建新目标' : '修改目标';
@@ -493,20 +498,20 @@ export default {
     this.discard.disabled = !this.data || this.mutating || Boolean(this.error);
     this.notice.hidden = !this.error && !this.conflict && !this.mutating;
     this.notice.textContent = this.error || (this.mutating ? '正在保存，请稍候。' : this.conflict
-      ? '状态已更新或上次操作结果未确认。草稿已保留；请核对最新状态，复制需要的内容，再选择“采用最新内容”。' : '');
+      ? '状态已更新，草稿已保留。请核对后再保存。' : '');
   },
 
   render() {
     this.root.hidden = !this.sessionId;
     this.body.hidden = this.isChild;
     this.ownerNotice.hidden = !this.isChild && (!this.ownerSessionId || this.ownerSessionId === this.sessionId);
-    this.ownerNotice.textContent = this.isChild ? '当前为真实子会话，不能管理父会话 Goal。'
+    this.ownerNotice.textContent = this.isChild ? '子会话不支持管理 Goal。'
       : this.ownerSessionId && this.ownerSessionId !== this.sessionId
-        ? `当前查看入口分支：${this.sessionId}\n此 Goal 属于主会话：${this.ownerSessionId}。以下操作将作用于该主会话。` : '';
+        ? `所属会话：${this.ownerSessionId}` : '';
     const status = this.data?.status || 'empty';
     this.root.dataset.status = status;
     this.title.textContent = '当前目标';
-    this.goalText.textContent = this.data?.goal || (this.data || this.sessionId === 'no-session' ? '尚未设置目标。输入正文后开始。' : '');
+    this.goalText.textContent = this.data?.goal || (this.data || this.sessionId === 'no-session' ? '尚未设置目标。' : '');
     this.badge.textContent = this.error ? '读取未确认' : this.data ? LABELS[status] : this.sessionId === 'no-session' ? '未设置' : '读取中';
     this.settings.hidden = !this.data?.goal;
     this.criteriaSection.hidden = !this.data?.goal;
@@ -517,7 +522,7 @@ export default {
     this.root.setAttribute('aria-busy', String(this.mutating || (!this.data && !this.error)));
     this.form.hidden = !this.data;
     this.meta.textContent = this.data
-      ? `自动续轮 ${this.data.rounds ?? 0}/${this.data.max_rounds ?? 8} · 连续无进展 ${this.data.stagnation ?? 0}/3${this.data.pause_reason ? '\n' + this.data.pause_reason : ''}` : '';
+      ? `自动续轮 ${this.data.rounds ?? 0}/${this.data.max_rounds ?? 256}${this.data.pause_reason ? '\n' + this.data.pause_reason : ''}` : '';
     this.renderControls();
     this.renderDraft();
     const signature = this.data ? `${this.sessionId}:${this.data.revision}` : '';

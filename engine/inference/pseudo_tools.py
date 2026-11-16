@@ -75,7 +75,7 @@ def allowed_pseudo_names(openai_tools: list[dict], node: Any = None) -> set[str]
     # only worker-control authorization. tool_access deny/exclusion applies to pseudo tools too,
     # so a control tool excluded by the node is never authorized here.
     if node is not None:
-        names = {n for n in names if is_tool_action_allowed(node, n, {})}
+        names = {n for n in names if _is_pseudo_tool_permitted(node, n)}
     return names
 
 
@@ -661,23 +661,59 @@ def _sanitize_schema_patterns(obj: Any) -> Any:
     return obj
 
 
-def _require_declared_selector(params: dict, name: str) -> dict:
-    """Make a schema-declared ``mode`` selector mandatory when the engine cannot default it.
+_BUILTIN_ACTION_FIELDS: dict[str, str] = {
+    "grep": "mode",
+    "manage_schedule": "action",
+    "manage_tool": "action",
+    "manage_skill": "action",
+    "manage_memory": "action",
+    "manage_mcp_client": "action",
+}
 
-    Why: the action gate reads ``mode`` for such tools and fails closed when it is
-    missing, so the schema must ask for it explicitly instead of relying on an
-    implicit server-side default the engine cannot see. How: only touch schemas
-    whose selector is ``mode`` and whose resolver has no verified default (grep
-    keeps its 'search' default). Purpose: visible schema and gate agree.
+
+def _declared_action_selector(spec: dict[str, Any] | None) -> tuple[str, list | None] | None:
+    """Return ``(field, enum_or_none)`` ONLY when ``spec`` or a core builtin declares ``action_field``.
+
+    Why: guessing action selectors from parameter names like ``action`` or ``mode``
+    both misses arbitrary tool schemas and mutates unrelated business parameters.
+    How: require non-core tools that support ``tool:subaction`` rules to declare
+    ``action_field`` explicitly at registration time. Purpose: explicit, stable
+    contract between tool registrations and the node action gate.
+    """
+    if not isinstance(spec, dict):
+        return None
+    raw_field = spec.get("action_field")
+    if not isinstance(raw_field, str) or not raw_field.strip():
+        cons_name = _LEGACY_TO_CONSOLIDATED.get(str(spec.get("name") or ""), str(spec.get("name") or ""))
+        raw_field = _BUILTIN_ACTION_FIELDS.get(cons_name)
+    if not isinstance(raw_field, str) or not raw_field.strip():
+        return None
+    field = raw_field.strip()
+    schema = spec.get("input_schema")
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    prop = props.get(field) if isinstance(props, dict) else None
+    enum = prop.get("enum") if isinstance(prop, dict) else None
+    return field, (enum if isinstance(enum, list) and enum else None)
+
+
+def _require_declared_selector(spec: dict[str, Any], params: dict) -> dict:
+    """Make an explicitly declared ``action_field`` mandatory when it has no default.
+
+    Tools without ``action_field`` are never touched, even if their schema happens
+    to contain properties named ``mode`` or ``action``.
     """
     if not isinstance(params, dict) or not params:
         return params
-    if "mode" not in (params.get("properties") or {}):
+    selector = _declared_action_selector(spec)
+    if selector is None:
         return params
-    if resolve_effective_action(name, {}, {"name": name, "input_schema": params})[1] is not None:
+    field = selector[0]
+    if field not in (params.get("properties") or {}):
         return params
-    required = [r for r in (params.get("required") or []) if r != "mode"]
-    return {**params, "required": required + ["mode"]}
+    if resolve_effective_action(spec.get("name", ""), {}, spec)[1] is not None:
+        return params
+    required = [r for r in (params.get("required") or []) if r != field]
+    return {**params, "required": required + [field]}
 
 
 def _to_openai_tools(specs: list[dict]) -> list[dict]:
@@ -692,7 +728,7 @@ def _to_openai_tools(specs: list[dict]) -> list[dict]:
             "function": {
                 "name": s["name"],
                 "description": desc,
-                "parameters": _sanitize_schema_patterns(_require_declared_selector(params, s["name"])),
+                "parameters": _sanitize_schema_patterns(_require_declared_selector(s, params)),
             },
         })
     return result
@@ -733,30 +769,24 @@ _LEGACY_TO_CONSOLIDATED_ACTION: dict[str, tuple[str, str]] = {
     "reload_tools": ("manage_tool", "reload"),
 }
 
+_MANAGE_WORKERS_ACTIONS = ("list", "message", "preempt", "cancel")
 
-def _schema_action_selector(spec: dict[str, Any] | None) -> tuple[str, list] | None:
-    """Return (field, enum) when a tool schema uses ``mode`` as its action selector.
 
-    Why: nodes gate calls on the *effective action*, so the engine must read the
-    same field the tool itself reads. External tools (MCP / script) commonly
-    declare ``mode`` with an enum and no ``action``; a sibling ``action`` argument
-    is then a free-form extra the server ignores, so trusting it would let a
-    denied mode slip through under an allowed-looking action.
-    How: only the schema decides. A schema that also declares ``action`` keeps
-    ``action`` semantics (the manage_* tools), and the grep family is handled by
-    its verified default before this helper is consulted.
-    Purpose: one shared selector definition for resolve / gate / spec pruning.
-    """
-    if not isinstance(spec, dict):
-        return None
-    schema = spec.get("input_schema")
-    props = schema.get("properties") if isinstance(schema, dict) else None
-    if not isinstance(props, dict) or "action" in props:
-        return None
-    mode = props.get("mode")
-    enum = mode.get("enum") if isinstance(mode, dict) else None
-    if isinstance(enum, list) and enum:
-        return "mode", enum
+def _builtin_action_resolver(cons_name: str):
+    """Fallback resolver map for core multi-action tools when callers omit ``spec``."""
+    if cons_name == "grep":
+        from toolbox.builtins.search_in_files import resolve_grep_action
+        return resolve_grep_action
+    if cons_name == "manage_schedule":
+        from toolbox.builtins.schedules import resolve_manage_schedule_action
+        return resolve_manage_schedule_action
+    if cons_name == "manage_tool":
+        from toolbox.builtins.tool_manage import resolve_manage_tool_action
+        return resolve_manage_tool_action
+    if cons_name in ("manage_skill", "manage_memory", "manage_mcp_client"):
+        return lambda a: str((a or {}).get("action") or "").strip().lower() or "list"
+    if cons_name == "manage_workers":
+        return lambda a: str((a or {}).get("action") or "").strip().lower() or None
     return None
 
 
@@ -765,54 +795,30 @@ def resolve_effective_action(
     args: dict[str, Any] | None = None,
     spec: dict[str, Any] | None = None,
 ) -> tuple[str, str | None]:
-    """Resolve (canonical_tool_name, effective_action) for a tool call, handling defaults and synonyms.
+    """Resolve ``(canonical_tool_name, effective_action)`` using explicit declarations only.
 
-    ``spec`` (the tool's registry schema, when the caller has it) makes the
-    resolution schema-aware for tools whose action selector is not ``action``.
+    Never guesses action selectors from arbitrary ``action`` or ``mode`` parameter names.
     """
     if tool_name in _LEGACY_TO_CONSOLIDATED_ACTION:
         return _LEGACY_TO_CONSOLIDATED_ACTION[tool_name]
     cons_name = _LEGACY_TO_CONSOLIDATED.get(tool_name, tool_name)
     a = args if isinstance(args, dict) else {}
-    if cons_name in ("grep", "search_in_files"):
-        return "grep", str(a.get("mode") or "search").strip().lower()
-    selector = _schema_action_selector(spec)
+    resolver = (spec.get("action_resolver") if isinstance(spec, dict) else None) or _builtin_action_resolver(cons_name)
+    if callable(resolver):
+        resolved = resolver(a)
+        return cons_name, (resolved.strip().lower() if isinstance(resolved, str) and resolved.strip() else None)
+    selector = _declared_action_selector(spec)
     if selector is not None:
-        # Require exact enum membership first: the server may interpret other
-        # spellings differently. Then use the same canonical policy token as
-        # rule parsing and schema pruning; an uppercase enum cannot bypass deny.
-        _raw_mode = a.get(selector[0])
-        return cons_name, (_raw_mode.strip().lower() if isinstance(_raw_mode, str) and _raw_mode in selector[1] else None)
-    act = str(a.get("action") or "").strip().lower()
-    if cons_name in ("manage_skill", "manage_memory", "manage_mcp_client"):
-        # These entrypoints default to list, never infer writes and reject
-        # action aliases. Resolve exactly the operation they will execute.
-        return cons_name, act or "list"
-    if cons_name == "manage_schedule":
-        if not act:
-            # Mirrors toolbox/builtins/schedules.py:manage_schedule (the entrypoint is the
-            # source of truth; a key it treats as a write must not resolve to 'list',
-            # otherwise a deny on ':upsert' is bypassable by omitting action).
-            act = "upsert" if (a.get("id") and any(a.get(k) is not None for k in (
-                "cron", "text", "command", "type", "enabled", "once", "timeout",
-                "silent", "conversation_key", "entry_node_id", "workflow_id"))) else "list"
-        elif act in ("create", "update"):
-            act = "upsert"
-        elif act == "remove":
-            act = "delete"
-        return cons_name, act
-    if cons_name == "manage_tool":
-        if not act:
-            act = "upsert" if (a.get("name") or a.get("script")) else "reload"
-        elif act in ("create", "update"):
-            act = "upsert"
-        return cons_name, act
-    if cons_name == "search_web":
-        if not act:
-            act = "fetch" if (a.get("urls") and not a.get("query")) else "search"
-        return cons_name, act
-    if act:
-        return cons_name, act
+        field, enum_vals = selector
+        raw = a.get(field)
+        if raw is None or (isinstance(raw, str) and not raw.strip() and (enum_vals is None or raw not in enum_vals)):
+            default_act = spec.get("default_action") if isinstance(spec, dict) else None
+            return cons_name, (default_act.strip().lower() if isinstance(default_act, str) and default_act.strip() else None)
+        if not isinstance(raw, str):
+            return cons_name, None
+        if enum_vals is not None:
+            return cons_name, (raw.strip().lower() if raw in enum_vals else None)
+        return cons_name, (raw.strip().lower() or None)
     return cons_name, None
 
 
@@ -959,6 +965,29 @@ def _parse_node_action_rules(node: "Node") -> tuple[set[str], dict[str, set[str]
     return whole_denied, denied_actions, allowed_only
 
 
+def _allowed_manage_workers_actions(
+    denied_acts: set[str] | None,
+    allowed_only_acts: set[str] | None,
+) -> list[str]:
+    return [
+        act for act in _MANAGE_WORKERS_ACTIONS
+        if (not denied_acts or act not in denied_acts)
+        and (allowed_only_acts is None or act in allowed_only_acts)
+    ]
+
+
+def _is_pseudo_tool_permitted(node: "Node", tool_name: str) -> bool:
+    """Return whether a pseudo-tool should remain exposed on ``node``."""
+    whole_denied, denied_actions, allowed_only = _parse_node_action_rules(node)
+    if tool_name in whole_denied:
+        return False
+    if tool_name not in denied_actions and tool_name not in allowed_only:
+        return True
+    if tool_name == "manage_workers":
+        return bool(_allowed_manage_workers_actions(denied_actions.get(tool_name), allowed_only.get(tool_name)))
+    return False
+
+
 def is_tool_action_allowed(
     node: "Node",
     tool_name: str,
@@ -967,22 +996,18 @@ def is_tool_action_allowed(
 ) -> bool:
     """Return True if the specific action on tool_name is permitted by node.tool_access.
 
-    Pass ``spec`` (the tool's registry schema) when available: for tools whose
-    action selector is a schema-declared ``mode`` enum, the gate then reads the
-    same field the tool reads instead of trusting an unrelated ``action`` argument.
+    Tools without an explicit action declaration only support whole-tool rules; if
+    a node configures ``tool:subaction`` on an undeclared tool (or the call omits /
+    spoofs its declared selector), the gate fails closed.
     """
     whole_denied, denied_actions, allowed_only = _parse_node_action_rules(node)
     cons_name, act = resolve_effective_action(tool_name, args, spec)
     if tool_name in whole_denied or cons_name in whole_denied:
         return False
+    if cons_name not in denied_actions and cons_name not in allowed_only:
+        return True
     if act is None:
-        # A schema-declared selector could not be resolved (missing or non-enum value):
-        # the server may still read it as some other mode, so when the tool carries
-        # action rules the call cannot be proven allowed — fail closed. Tools without
-        # a declared selector keep the legacy 'no action known, no action rule applies'.
-        if _schema_action_selector(spec) is None:
-            return True
-        return not (cons_name in denied_actions or cons_name in allowed_only)
+        return False
     if cons_name in denied_actions and act in denied_actions[cons_name]:
         return False
     if cons_name in allowed_only and act not in allowed_only[cons_name]:
@@ -995,25 +1020,18 @@ def _prune_spec_actions(
     denied_acts: set[str] | None,
     allowed_only_acts: set[str] | None,
 ) -> dict[str, Any] | None:
-    """Prune denied actions from a tool spec's input_schema enum. Returns None if all enum actions are denied."""
+    """Prune denied actions from an explicitly declared ``action_field`` enum."""
     import copy
     if not denied_acts and allowed_only_acts is None:
         return spec
-    schema = spec.get("input_schema")
-    if not isinstance(schema, dict):
+    selector = _declared_action_selector(spec)
+    if selector is None:
+        # Sub-action rules were configured on a tool that declares no sub-actions;
+        # the runtime gate fails closed on every call, so hide the tool here too.
+        return None
+    act_key, enum_vals = selector
+    if not enum_vals:
         return None if (allowed_only_acts is not None and len(allowed_only_acts) == 0) else spec
-    props = schema.get("properties")
-    if not isinstance(props, dict):
-        return spec
-    # Same selector definition the action gate uses (schema-declared 'mode' enum,
-    # no 'action' property), so a pruned enum and the gate cannot disagree.
-    selector = _schema_action_selector(spec)
-    act_key = "action" if "action" in props else (selector[0] if selector else None)
-    if not act_key or not isinstance(props.get(act_key), dict):
-        return spec
-    enum_vals = props[act_key].get("enum")
-    if not isinstance(enum_vals, list) or not enum_vals:
-        return spec
 
     def _ok(val: Any) -> bool:
         v = str(val).strip().lower()
@@ -1097,7 +1115,7 @@ def build_node_tool_specs(
             return False
         if _ct_allow is not None and name not in _ct_allow:
             return False
-        return is_tool_action_allowed(node, name, {})
+        return _is_pseudo_tool_permitted(node, name)
 
     delegate_targets = [str(t).strip() for t in list(node.delegate_targets or []) if str(t).strip()]
     if delegate_targets and _ctl("dispatch_to"):
@@ -1128,5 +1146,11 @@ def build_node_tool_specs(
     # manage_workers 是唯一的工作者控制入口；退役的 preempt_task / cancel_active_tasks
     # 不再注入、不再授权、也不再兼容执行。
     if _ctl("manage_workers"):
-        openai_tools.append(_manage_workers_spec())
+        mw_spec = _manage_workers_spec()
+        _, _mw_denied, _mw_allowed_only = _parse_node_action_rules(node)
+        if "manage_workers" in _mw_denied or "manage_workers" in _mw_allowed_only:
+            mw_spec["function"]["parameters"]["properties"]["action"]["enum"] = _allowed_manage_workers_actions(
+                _mw_denied.get("manage_workers"), _mw_allowed_only.get("manage_workers"),
+            )
+        openai_tools.append(mw_spec)
     return allowed, openai_tools

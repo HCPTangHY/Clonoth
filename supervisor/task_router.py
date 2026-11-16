@@ -435,6 +435,9 @@ class TaskRouterMixin:
             # 原因：cancel 是终态，不应遗留 branch session。做法：只 finalize，不调用输出路由。
             # 目的：符合 finish/cancel 时 merge 回主 session 的架构约束。
             route_session_id = self._finalize_branch_task_locked(task, merge=True)
+            persist_cancel = getattr(self, "_persist_cancel_message_locked", None)
+            if callable(persist_cancel) and not post_hook_task.input.get("_branch_skipped_merge"):
+                persist_cancel(task, action)
         # cancelled → 不做用户输出
 
         # 若该分支因执行了 reset_conversation 而跳过 merge，则不再对已重置的旧父会话触发记忆提取与轮摘要
@@ -741,6 +744,8 @@ class TaskRouterMixin:
         if output_target:
             if output_target == "__source__":
                 return self._route_output_chain_to_source_locked(task, result)
+            if task.output_chain_entry_task_id and self._try_resume_entry_with_unconsumed_preempt_locked(task, result):
+                return
             return self._start_output_chain_task_locked(task, output_target, result)
 
         return self._route_finish_to_caller_or_user_locked(task, result)
@@ -907,16 +912,21 @@ class TaskRouterMixin:
         *,
         delivery_task: Task | None = None,
     ) -> bool:
-        """若入口任务在完成收束前收到了尚未被 Engine 消费的 preempt 消息，
-        先将本轮已完成（含已通过 QA 质检）的回复通过 intermediate_reply 发送，
-        然后原地恢复该入口任务继续消费剩余的 preempt 消息（不关闭分支、不提前消费 Discord trigger）。
+        """Preserve an entry/chain leaf's unconsumed input before final routing.
+
+        Deliver the old result once as intermediate output, then resume the same
+        task without closing its branch, completing waiters or publishing a candidate.
         """
         if not entry.preempt_requested:
             return False
         if not (str(entry.preempt_message or "").strip() or entry.preempt_attachments):
             return False
-        if entry.caller_task_id or entry.input.get("_system_task") or entry.input.get("child_session_id"):
+        if entry.input.get("_system_task"):
             return False
+        if not entry.output_chain_entry_task_id and (entry.caller_task_id or entry.input.get("child_session_id")):
+            return False
+        # A chain leaf can receive preempt directly. Resume that same task so its
+        # input, attachments and receipt IDs stay together; do not publish a candidate.
 
         route_sid = self._route_session_id_for_task_locked(entry)
         text = str((result or {}).get("text") or "").strip() if isinstance(result, dict) else ""
@@ -929,6 +939,7 @@ class TaskRouterMixin:
                 payload={
                     "node_id": str(entry.node_id or ""),
                     "task_id": entry.task_id,
+                    "execution_id": entry.execution_id,
                     "source_inbound_seq": entry.source_inbound_seq,
                     "text": text,
                     "attachments": atts,
@@ -958,6 +969,8 @@ class TaskRouterMixin:
         # [AutoC 2026-06-08] Why: __source__ 表示回到链入口的原始 caller，不是最终节点的直接上游。
         # How: 找到入口 task，完成中间 suspended 等待者，再用入口 task 执行旧式 caller/user 输出。
         # Purpose: coder -> review -> qa 的最终结果只对原始 caller 或用户可见。
+        if task.output_chain_entry_task_id and self._try_resume_entry_with_unconsumed_preempt_locked(task, result):
+            return
         entry_id = str(task.output_chain_entry_task_id or "").strip()
         entry = self.tasks.get(entry_id) if entry_id else None
         if entry is None:
@@ -1148,12 +1161,35 @@ class TaskRouterMixin:
             "error": error,
         }, {"text": f"[error] {error}"}, action_type="fail")
 
-    def _persist_fail_message_locked(self, task: Task, action: dict[str, Any], error: str) -> None:
-        """Append one system/error message to the route session's JSONL.
+    def _persist_terminal_system_message_locked(
+        self,
+        task: Task,
+        *,
+        message_type: str,
+        content: str,
+        allow_child: bool = False,
+    ) -> None:
+        """Append one host-only system notice (error / cancelled) to route session JSONL.
 
-        崩溃安全：落盘失败只记日志，绝不阻断后续 fail 路由（outbound 输出）。
+        LLM history assembly filters out role='system', so these rows never enter
+        model prompts or affect prompt caching, while Web history hydration can
+        faithfully reconstruct why a turn ended.
         """
         try:
+            if not content or not content.strip():
+                return
+            if isinstance(task.input, dict):
+                if task.input.get("_system_task"):
+                    return
+                if task.input.get("_branch_skipped_merge"):
+                    return
+                if task.input.get("_terminal_notice_persisted"):
+                    return
+            _node_id = str(task.node_id or task.tool_name or "").strip()
+            if _node_id.startswith("system."):
+                return
+            if not allow_child and (task.caller_task_id or (isinstance(task.input, dict) and task.input.get("_async_dispatch"))):
+                return
             route_sid = self._route_session_id_for_task_locked(task)
             if not route_sid:
                 return
@@ -1164,22 +1200,58 @@ class TaskRouterMixin:
 
             store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
             _meta: dict[str, Any] = {"task_id": task.task_id}
-            _node_id = str(task.node_id or task.tool_name or "").strip()
             if _node_id:
                 _meta["node_id"] = _node_id
+            if task.cancel_reason:
+                _meta["cancel_reason"] = task.cancel_reason
             msg = Message(
                 id=str(uuid.uuid4()),
                 role="system",
-                content=error[:4000],
-                message_type="error",
+                content=content[:4000],
+                message_type=message_type,
                 created_at=datetime.now(timezone.utc).isoformat(),
                 meta=_meta,
                 source_node_id=_node_id,
                 source_task_id=task.task_id,
             )
             store.append(route_sid, msg)
+            if isinstance(task.input, dict):
+                task.input["_terminal_notice_persisted"] = True
         except Exception:
-            log.exception("persist fail message failed: task=%s", str(task.task_id or "")[:12])
+            log.exception("persist %s message failed: task=%s", message_type, str(task.task_id or "")[:12])
+
+    def _persist_fail_message_locked(self, task: Task, action: dict[str, Any], error: str) -> None:
+        """Append one system/error message to the route session's JSONL."""
+        self._persist_terminal_system_message_locked(
+            task,
+            message_type="error",
+            content=error[:4000],
+            allow_child=not bool(task.caller_task_id),
+        )
+
+    def _persist_cancel_message_locked(
+        self,
+        task: Task,
+        action: dict[str, Any] | None = None,
+        *,
+        default_reason: str = "",
+    ) -> None:
+        """Append one system/cancelled message to the route session's JSONL."""
+        act_err = str((action or task.result or {}).get("error") or "").strip()
+        if task.cancel_reason == "service_restart":
+            text = "任务因服务重启中断。"
+        elif default_reason:
+            text = default_reason
+        elif act_err and act_err not in {"task cancelled", "cancelled"}:
+            text = f"任务已取消（{act_err}）"
+        else:
+            text = "任务已手动取消。"
+        self._persist_terminal_system_message_locked(
+            task,
+            message_type="cancelled",
+            content=text,
+            allow_child=False,
+        )
 
     # ------------------------------------------------------------------ #
     #  统一批量收集

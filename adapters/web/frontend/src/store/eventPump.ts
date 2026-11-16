@@ -39,6 +39,7 @@ import {
 import type { ChatStoreState, StoreGetter, StoreSetter } from './chatTypes';
 import {
   loadContextUsageIntoStore,
+  prefetchSessionPendingApprovals,
   replayPendingApprovals,
   restoreGeneratingStateFromBackend,
 } from './sessionRecovery';
@@ -260,16 +261,10 @@ export function startEventPump(set: StoreSetter, get: StoreGetter): void {
         const active = state.conversations.find((conversation) => conversation.id === state.activeConversationId);
         if (active?.sessionId) {
           void (async () => {
-            // [AutoC 2026-06-18] Why: reconnect recovery previously fetched pending
-            // approvals while history hydration was still in flight. Synthetic
-            // approval_requested events could then render before their tool cards.
-            // How: rebuild the active session history first, restore running flags
-            // without launching another history reload, then replay pending approvals.
-            // Purpose: WebSocket resubscribe presents approval prompts on the correct
-            // recovered message/tool card.
+            const pendingApprovalsPromise = prefetchSessionPendingApprovals(active.sessionId);
             await loadSessionHistoryIntoStore(active.id, active.sessionId, set, get);
+            await replayPendingApprovals(active.sessionId, set, get, pendingApprovalsPromise);
             await restoreGeneratingStateFromBackend(active.id, active.sessionId, set, get, { reloadHistory: false });
-            await replayPendingApprovals(active.sessionId, set, get);
           })();
         }
       }

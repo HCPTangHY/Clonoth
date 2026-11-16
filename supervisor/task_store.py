@@ -231,6 +231,7 @@ class TaskStoreMixin:
             elif task.status == TaskStatus.running and not task.cancel_requested:
                 task.cancel_requested = True
                 task.updated_at = now
+                self._enqueue_worker_task_cancel_locked(task)
                 self._event_task_snapshot("task_cancel_requested", task)
 
     def _find_last_context_ref_locked(self, session_id: str, node_id: str, *, context_key: str | None = None) -> str:
@@ -584,6 +585,7 @@ class TaskStoreMixin:
                     # 原因：pending 任务不会再由 engine 上报完成。做法：调用幂等 finalize。
                     # 目的：让 cancel_active_tasks 与 finish/fail 路径一样清理分支。
                     self._finalize_branch_task_locked(task, merge=True)
+                    self._persist_cancel_message_locked(task)
                     self._cleanup_tool_result_artifacts_for_task(task.task_id)
                     self._event_task_snapshot("task_cancelled", task)
                     count += 1
@@ -593,6 +595,7 @@ class TaskStoreMixin:
                     task.waiting_for_task_id = None
                     task.updated_at = now
                     self._finalize_branch_task_locked(task, merge=True)
+                    self._persist_cancel_message_locked(task)
                     self._cleanup_tool_result_artifacts_for_task(task.task_id)
                     self._event_task_snapshot("task_cancelled", task)
                     count += 1
@@ -604,6 +607,7 @@ class TaskStoreMixin:
                             task.lease_expires_at = None
                             task.updated_at = now
                             self._finalize_branch_task_locked(task, merge=True)
+                            self._persist_cancel_message_locked(task)
                             self._cleanup_tool_result_artifacts_for_task(task.task_id)
                             self._event_task_snapshot("task_cancelled", task)
                             count += 1
@@ -615,9 +619,11 @@ class TaskStoreMixin:
                             task.status = TaskStatus.cancelled
                             task.lease_expires_at = None
                             self._finalize_branch_task_locked(task, merge=True)
+                            self._persist_cancel_message_locked(task)
                             self._cleanup_tool_result_artifacts_for_task(task.task_id)
                             self._event_task_snapshot("task_cancelled", task)
                         else:
+                            self._enqueue_worker_task_cancel_locked(task)
                             self._event_task_snapshot("task_cancel_requested", task)
                         count += 1
             return {"ok": True, "cancelled_count": count}
@@ -659,6 +665,7 @@ class TaskStoreMixin:
                     # 原因：pending 分支不会再进入完成路由。做法：在记录取消事件前 finalize。
                     # 目的：保证显式 task cancel 与自然完成一样回收 branch。
                     self._finalize_branch_task_locked(t, merge=True)
+                    self._persist_cancel_message_locked(t)
                     self._cleanup_tool_result_artifacts_for_task(t.task_id)
                     self._event_task_snapshot("task_cancelled", t)
                     count += 1
@@ -668,6 +675,7 @@ class TaskStoreMixin:
                     t.waiting_for_task_id = None
                     t.updated_at = now
                     self._finalize_branch_task_locked(t, merge=True)
+                    self._persist_cancel_message_locked(t)
                     self._cleanup_tool_result_artifacts_for_task(t.task_id)
                     self._event_task_snapshot("task_cancelled", t)
                     count += 1
@@ -680,6 +688,7 @@ class TaskStoreMixin:
                             t.lease_expires_at = None
                             t.updated_at = now
                             self._finalize_branch_task_locked(t, merge=True)
+                            self._persist_cancel_message_locked(t)
                             self._cleanup_tool_result_artifacts_for_task(t.task_id)
                             self._event_task_snapshot("task_cancelled", t)
                             count += 1
@@ -692,9 +701,11 @@ class TaskStoreMixin:
                             t.status = TaskStatus.cancelled
                             t.lease_expires_at = None
                             self._finalize_branch_task_locked(t, merge=True)
+                            self._persist_cancel_message_locked(t)
                             self._cleanup_tool_result_artifacts_for_task(t.task_id)
                             self._event_task_snapshot("task_cancelled", t)
                         else:
+                            self._enqueue_worker_task_cancel_locked(t)
                             self._event_task_snapshot("task_cancel_requested", t)
                         count += 1
             return {"ok": True, "cancelled_count": count}
@@ -720,6 +731,8 @@ class TaskStoreMixin:
                 task.lease_expires_at = None
                 if task.waiting_for_task_id:
                     task.waiting_for_task_id = None
+                self._finalize_branch_task_locked(task, merge=True)
+                self._persist_cancel_message_locked(task, default_reason="任务因服务重启中断。")
                 self._cleanup_tool_result_artifacts_for_task(task.task_id)
                 self._event_task_snapshot("task_cancelled", task)
                 count += 1
@@ -857,7 +870,7 @@ class TaskStoreMixin:
             return False
         with self._lock:
             task = self.tasks.get(tid)
-            if task is None or task.status != TaskStatus.running:
+            if task is None or task.status != TaskStatus.running or task.cancel_requested:
                 return False
             if task.worker_id != wid or (task.execution_id and task.execution_id != execution_id):
                 return False
@@ -894,6 +907,7 @@ class TaskStoreMixin:
                     task.updated_at = now
                     task.lease_expires_at = None
                     self._finalize_branch_task_locked(task, merge=True)
+                    self._persist_cancel_message_locked(task)
                     self._cleanup_tool_result_artifacts_for_task(task.task_id)
                     self._event_task_snapshot("task_cancelled", task)
                     continue
@@ -961,10 +975,9 @@ class TaskStoreMixin:
                 return None
 
             current_gen = self._current_session_generation_locked(task.session_id)
-            if self.restart_recovery.intercept_completion(task, result):
-                task.completed_execution_id = execution_id
-                task.input["_completed_worker_id"] = wid
-                self.restart_recovery.save()
+            if self.restart_recovery.intercept_completion(
+                task, result, execution_id=execution_id, worker_id=wid,
+            ):
                 return task
             if task.cancel_requested or (current_gen and task.session_generation != current_gen):
                 task.cancel_requested = True
@@ -978,6 +991,7 @@ class TaskStoreMixin:
                 # 做法：在写 task_cancelled 事件前调用分支 finalize，执行 merge 与 cleanup。
                 # 目的：finish/fail/cancel 三类终态都能把分支历史回写主 session。
                 self._finalize_branch_task_locked(task, merge=True)
+                self._persist_cancel_message_locked(task, result)
                 self._mark_child_session_terminal(task)
                 task.completion_state = "routed"
                 task.completed_execution_id = execution_id

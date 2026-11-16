@@ -448,7 +448,7 @@ class GoalCardTests(unittest.IsolatedAsyncioTestCase):
 from test_goal_integration import case, claim, control, finish
 
 
-def test_real_asgi_goal_metadata_binds_card_and_normal_input_stops_goal_timer(case):
+def test_real_asgi_goal_metadata_binds_card_and_normal_input_keeps_goal_active(case):
     from fastapi import APIRouter
     from plugins.ide.goal import _SERVICES, add_routes
     from supervisor import admin_api
@@ -488,10 +488,13 @@ def test_real_asgi_goal_metadata_binds_card_and_normal_input_stops_goal_timer(ca
                 await monitor.refresh()
                 assert monitor.data["status"] != "completed"
                 assert "本轮用时" not in fields(monitor.embed())
-                c.service.on_event({"kind": "input", "session_id": c.sid})
+                old_version = monitor.data['goal_version']
+                c.service.on_event({"kind": "input_routed", "session_id": c.sid, "task_id": root,
+                                    "source_inbound_seq": seq})
                 await monitor.refresh()
-                assert monitor.data["status"] == "paused"
-                assert monitor.data["execution"] is None
+                assert monitor.data["status"] in status_module.ACTIVE
+                assert monitor.data["goal_version"] == old_version + 1
+                assert monitor.data["execution"]["task_id"] == root
                 assert "本轮用时" not in fields(monitor.embed())
             finally:
                 monitor.close()

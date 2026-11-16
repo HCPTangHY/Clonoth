@@ -161,19 +161,45 @@ async def test_registered_tools_reach_asgi_and_request_summary_without_workspace
     history = [{"role": "user", "content": "work on my task"}]
     current_summary(await prepare(case, history, ctx), sid, 0)
     updated = await execute(case, ctx, "update_todos", todo_patch(
-        sid, changes=[{"id": None, "title": "local work", "status": None, "note": None}],
+        sid, items=[{"title": "local work"}, {"title": "second step", "status": "in_progress"}],
     ))
     assert updated["ok"]
     assert updated["data"]["todos"]["revision"] == 1
+    assert [(i["id"], i["status"]) for i in updated["data"]["todos"]["items"]] == [("1", "pending"), ("2", "in_progress")]
     panel = await case.http.get("/v1/plugins/ide/todos", params={"session_id": sid})
     assert panel.status_code == 200
     assert panel.json() == updated["data"]["todos"]
     assert "local work" in current_summary(await prepare(case, history, ctx), sid, 1)
     stale = await execute(case, ctx, "update_todos", todo_patch(
-        sid, changes=[{"id": None, "title": "stale duplicate"}],
+        sid, items=[{"title": "stale duplicate"}],
     ))
     assert not stale["ok"] and "409" in stale["error"]
     assert case.todo.read_list(case.root, sid) == panel.json()
+    # Incremental append updates status by short ID and appends a new item.
+    appended = await execute(case, ctx, "update_todos", todo_patch(
+        sid, expected_revision=1, mode="append",
+        items=[{"id": "1", "status": "completed"}, {"id": "2", "status": "completed"}, {"title": "third step"}],
+    ))
+    assert appended["ok"]
+    assert [(i["id"], i["status"]) for i in appended["data"]["todos"]["items"]] == [
+        ("1", "completed"), ("2", "completed"), ("3", "pending"),
+    ]
+    # Finishing all items injects the reset/clear hint, and default replace overwrites cleanly from scratch.
+    all_done = await execute(case, ctx, "update_todos", todo_patch(
+        sid, expected_revision=2, mode="append", items=[{"id": "3", "status": "completed"}],
+    ))
+    assert all_done["ok"]
+    done_summary = current_summary(await prepare(case, history, ctx), sid, 3)
+    assert "当前清单无未完成事项" in done_summary
+    replaced = await execute(case, ctx, "update_todos", todo_patch(
+        sid, expected_revision=3, items=[{"title": "brand new plan"}],
+    ))
+    assert replaced["ok"]
+    assert [(i["id"], i["title"]) for i in replaced["data"]["todos"]["items"]] == [("1", "brand new plan")]
+    cleared = await execute(case, ctx, "update_todos", todo_patch(
+        sid, expected_revision=4, items=[],
+    ))
+    assert cleared["ok"] and cleared["data"]["todos"]["items"] == []
     for other in {"main", "child", "worker"} - {sid}:
         response = await case.http.get("/v1/plugins/ide/todos", params={"session_id": other})
         assert response.json()["items"] == []
@@ -191,13 +217,13 @@ async def test_fork_discards_parent_summary_but_cannot_use_parent_identity_even_
     assert 'expected_session_id="main"' not in str(request)
     assert inherited == parent  # Cache-warm parent's frozen prefix is never mutated.
     rejected = await execute(case, ctx, "update_todos", todo_patch(
-        "main", changes=[{"id": None, "title": "must not copy parent plan"}],
+        "main", items=[{"title": "must not copy parent plan"}],
     ))
     assert not rejected["ok"] and "409" in rejected["error"]
     for sid in ("main", "child"):
         assert case.todo.read_list(case.root, sid)["items"] == []
     accepted = await execute(case, ctx, "update_todos", todo_patch(
-        "child", changes=[{"id": None, "title": "child-only work"}],
+        "child", items=[{"title": "child-only work"}],
     ))
     assert accepted["ok"]
     assert "child-only work" in current_summary(await prepare(case, inherited, ctx), "child", 1)
@@ -219,7 +245,7 @@ async def test_revision_refresh_reload_and_compaction_leave_original_history_and
     current_summary(first, "main", 0)
     assert "OLD_TODO_SENTINEL" not in str(first)
     update = await execute(case, case.rctx(), "update_todos", todo_patch(
-        "main", changes=[{"id": None, "title": "new plan"}],
+        "main", items=[{"title": "new plan"}],
     ))
     assert update["ok"]
     second = await prepare(case, history)
@@ -306,7 +332,7 @@ async def test_primary_and_fallback_share_request_hook_without_mutating_loop_mes
     assert not response.ok
     current_summary(primary.calls[0][0], "main", 0)
     updated = await execute(case, ctx, "update_todos", todo_patch(
-        "main", changes=[{"id": None, "title": "updated before fallback"}],
+        "main", items=[{"title": "updated before fallback"}],
     ))
     assert updated["ok"]
     # This is the shared entry used by fallback_provider's replacement call.
@@ -374,9 +400,17 @@ async def test_model_tool_specs_and_loader_unload_reload_are_reversible(case, ac
     by_name = {spec["function"]["name"]: spec["function"] for spec in specs}
     assert TOOLS <= allowed and TOOLS <= by_name.keys()
     schema = by_name["update_todos"]["parameters"]
-    assert set(schema["required"]) == {"expected_session_id", "expected_revision", "changes", "remove_ids", "order"}
-    assert set(schema["required"]) == set(schema["properties"])
+    assert set(schema["required"]) == {"expected_session_id", "expected_revision", "items"}
+    assert set(schema["properties"]) == {"expected_session_id", "expected_revision", "mode", "items"}
+    assert "required" not in schema["properties"]["items"]["items"]
     assert "workspace_path" not in schema["properties"]
+    for cls in (OpenAIProvider, AnthropicProvider, GeminiAIStudioProvider):
+        provider = cls(http=object(), api_key="offline", base_url="https://offline.test", model="test")
+        payload = provider.build_payload([{"role": "user", "content": "hi"}], tools=specs, tool_mode="native")
+        assert "update_todos" in str(payload)
+    # Plain 'mode' parameter on a plugin tool is NOT hijacked as an action selector.
+    assert "mode" not in schema["required"]
+    assert schema["properties"]["mode"]["enum"] == ["replace", "append"]
     assert "before_step" not in case.hooks.list_hooks()
     assert len(case.hooks.list_hooks()["before_llm_call"]) == 4
     history = [{"role": "user", "content": "instruction"}]

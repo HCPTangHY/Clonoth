@@ -52,7 +52,8 @@ def test_finish_survives_raw_trace_budget_and_precise_flags(runtime):
     tid, execution = claimed(runtime)
     store = ConversationStore(rt.workspace_root/'data/conversations')
     store.append(state.tasks[tid].session_id, Message(id='too-long', role='tool', content='x'*300_000, source_task_id=tid))
-    finish(state, tid, execution)
+    with patch('supervisor.execution_runtime.EVIDENCE_LIMIT', 256_000):
+        finish(state, tid, execution)
     snapshot = rt.snapshot([tid])
     assert snapshot['evidence'] == []
     assert snapshot['truncated_task_ids'] == [tid]

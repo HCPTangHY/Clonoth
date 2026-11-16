@@ -29,6 +29,14 @@ PLUGIN_META = {
     "web": {
         "panels": [
             {
+                "id": "goal_settings",
+                "slot": "settings",
+                "order": 90,
+                "title": "Goal",
+                "icon": "checklist",
+                "entry": "/v1/plugins/ide/web/goal_settings.html",
+            },
+            {
                 "id": "workspace",
                 "slot": "right",
                 "title": "IDE",
@@ -296,21 +304,24 @@ def register(ctx) -> None:
         dispose = ctx.hooks.register("before_llm_call", _expand_file_mentions, priority=50)
         return [dispose]
 
-    from fastapi import APIRouter, HTTPException, Request
+    from fastapi import APIRouter, Depends, HTTPException, Request
 
     from engine.faces.routes import static_router
+    from supervisor.admin_api import verify_admin_token
 
     # ── 写文件端点 ───────────────────────────────────────────────────
     # 写范围仅限显式设置的会话工作区，不回退 workspace_root（未设工作区 400）。
-    # 鉴权依赖全局 /v1/ 中间件（public 默认 False）。
+    # 鉴权依赖全局 /v1/ 中间件 + 路由级 verify_admin_token。
     MAX_WRITE_BYTES = 4 * 1024 * 1024
 
     from .todo import add_routes
 
-    api = APIRouter()
+    api = APIRouter(dependencies=[Depends(verify_admin_token)])
     add_routes(api)
     from .goal import add_routes as add_goal_routes, register_supervisor
     add_goal_routes(api)
+    from .goal_settings import add_routes as add_goal_settings_routes
+    add_goal_settings_routes(api)
     register_supervisor(ctx)
 
     def _state(request: Request):

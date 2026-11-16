@@ -71,10 +71,20 @@ def register_declared_tools(module_name: str, meta: dict[str, Any], tool_registr
         if not callable(func):
             raise ValueError(f"{module_name}.{name} func must be callable")
         _is_pure = bool(tool.get("pure", False))
+        _extra_kw: dict[str, Any] = {}
+        if isinstance(tool.get("action_field"), str) and tool["action_field"].strip():
+            _extra_kw["action_field"] = tool["action_field"].strip()
+        if callable(tool.get("action_resolver")):
+            _extra_kw["action_resolver"] = tool["action_resolver"]
+        if isinstance(tool.get("default_action"), str) and tool["default_action"].strip():
+            _extra_kw["default_action"] = tool["default_action"].strip()
         try:
-            dispose = register_builtin_tool(name, description, input_schema, func, pure=_is_pure)
+            dispose = register_builtin_tool(name, description, input_schema, func, pure=_is_pure, **_extra_kw)
         except TypeError:
-            dispose = register_builtin_tool(name, description, input_schema, func)
+            try:
+                dispose = register_builtin_tool(name, description, input_schema, func, pure=_is_pure)
+            except TypeError:
+                dispose = register_builtin_tool(name, description, input_schema, func)
         if callable(dispose):
             disposers.append(dispose)
     return disposers

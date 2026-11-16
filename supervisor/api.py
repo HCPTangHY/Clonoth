@@ -69,7 +69,8 @@ from .types import (
 )
 from .panel_auth import PanelAuth
 from .admin_api import create_admin_router
-from .admin_api import get_admin_token, get_web_auth, init_web_auth, verify_admin_token
+from .admin_api import get_admin_token, get_web_auth, init_web_auth, verify_admin_token, verify_machine_admin_token
+import hmac as _hmac
 from engine.model import resolve_provider
 from engine.node import load_node
 
@@ -472,10 +473,12 @@ def create_app(
 
     @app.post("/v1/attachments/upload")
     async def upload_attachment(
+        request: Request,
         file: UploadFile = File(...),
         conversation_key: str = Query("default"),
     ) -> dict[str, Any]:
         """Upload a file attachment. Returns path relative to workspace root."""
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         safe_key = conversation_key.replace(":", "_").replace("/", "_").replace("..", "_")
         att_dir = st.workspace_root / "data" / "attachments" / safe_key
@@ -773,9 +776,12 @@ def create_app(
                 raise HTTPException(409, str(exc)) from exc
             if handled is not None:
                 return {"ok": True, **handled}
-        ok = st.preempt_task(task_id, message=msg, attachments=atts)
-        if not ok:
-            raise HTTPException(status_code=404, detail="task not found or not active")
+        with st._lock:
+            ok = st.preempt_task(task_id, message=msg, attachments=atts)
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found or not active")
+            if body.get("user_input") is True:
+                st.execution_runtime.input_routed(st.tasks[task_id], str(body.get("request_id") or ""), preempt=True)
         return {"ok": True, "task_id": task_id}
 
     @app.get("/v1/tasks/{task_id}/preempted")
@@ -1067,7 +1073,11 @@ def create_app(
     async def async_tools_pending_cancels(worker_id: str) -> dict[str, Any]:
         """Engine 轮询：拉取并清空该 worker 的待消费取消队列。内部端点，不鉴权。"""
         st: SupervisorState = app.state.state
-        return {"ok": True, "async_ids": st.pull_pending_cancels(worker_id)}
+        return {
+            "ok": True,
+            "async_ids": st.pull_pending_cancels(worker_id),
+            "task_ids": st.pull_pending_task_cancels(worker_id),
+        }
 
     @app.get("/v1/tools/reload-seq")
     async def tools_reload_seq() -> dict[str, Any]:
@@ -1137,27 +1147,51 @@ def create_app(
                 continue
         return out
 
-    @app.websocket("/v1/sessions/{session_id}/ws")
-    async def session_ws(websocket: WebSocket, session_id: str) -> None:
-        """Stream durable EventLog rows for one session over WebSocket."""
-        # [AutoC 2026-08-16] WS auth: verify admin token before accepting.
+    async def _authenticate_ws(websocket: WebSocket) -> tuple[bool, Any]:
+        """Authenticate WebSocket via Authorization header, ?token= query, or first-frame auth JSON."""
         _ws_auth = str(websocket.headers.get("authorization") or "")
         _ws_token = _ws_auth[7:].strip() if _ws_auth.lower().startswith("bearer ") else ""
         if not _ws_token:
             _ws_token = str(websocket.query_params.get("token") or "").strip()
-        _admin = get_admin_token()
-        _jwt_ok = False
-        _wa = get_web_auth()
-        if _wa and _wa.available and _wa.setup_completed and _ws_token:
-            _jwt_ok = _wa.verify_jwt(_ws_token) is not None
-        if not _jwt_ok and _ws_token != _admin:
+
+        def _check_tok(tok: str) -> bool:
+            if not tok:
+                return False
+            _admin = get_admin_token()
+            _wa = get_web_auth()
+            if _wa and _wa.available and _wa.setup_completed:
+                if _wa.verify_jwt(tok) is not None:
+                    return True
+            return _hmac.compare_digest(tok, _admin)
+
+        if _ws_token:
+            return _check_tok(_ws_token), None
+
+        # No header/query token: accept first, wait briefly for {"type":"auth","token":...}
+        await websocket.accept()
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=3.0)
+            msg = json.loads(raw)
+            if isinstance(msg, dict) and msg.get("type") == "auth":
+                if _check_tok(str(msg.get("token") or "").strip()):
+                    return True, "__accepted__"
+        except Exception:
+            pass
+        return False, "__accepted__"
+
+    @app.websocket("/v1/sessions/{session_id}/ws")
+    async def session_ws(websocket: WebSocket, session_id: str) -> None:
+        """Stream durable EventLog rows for one session over WebSocket."""
+        ok, state_flag = await _authenticate_ws(websocket)
+        if not ok:
             await websocket.close(code=4003, reason="unauthorized")
             return
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             await websocket.close(code=4004, reason="session not found")
             return
-        await websocket.accept()
+        if state_flag != "__accepted__":
+            await websocket.accept()
 
         # [2026-06-03] Why: replay is removed. WS is a pure live-forward stream.
         # Clients rebuild historical state via GET /v1/sessions/{id}/history.
@@ -1343,21 +1377,13 @@ def create_app(
     @app.websocket("/v1/ws")
     async def global_ws(websocket: WebSocket) -> None:
         """Stream durable EventLog rows for all sessions over WebSocket."""
-        # [AutoC 2026-08-16] WS auth: verify admin token before accepting.
-        _ws_auth = str(websocket.headers.get("authorization") or "")
-        _ws_token = _ws_auth[7:].strip() if _ws_auth.lower().startswith("bearer ") else ""
-        if not _ws_token:
-            _ws_token = str(websocket.query_params.get("token") or "").strip()
-        _admin = get_admin_token()
-        _jwt_ok = False
-        _wa = get_web_auth()
-        if _wa and _wa.available and _wa.setup_completed and _ws_token:
-            _jwt_ok = _wa.verify_jwt(_ws_token) is not None
-        if not _jwt_ok and _ws_token != _admin:
+        ok, state_flag = await _authenticate_ws(websocket)
+        if not ok:
             await websocket.close(code=4003, reason="unauthorized")
             return
         st: SupervisorState = app.state.state
-        await websocket.accept()
+        if state_flag != "__accepted__":
+            await websocket.accept()
 
         # [2026-06-03] Why: replay is removed. WS is a pure live-forward stream.
         # Web frontend rebuilds state via loadSessionHistoryIntoStore(); SDK uses
@@ -1504,47 +1530,7 @@ def create_app(
             st.execution_runtime.record_reply(evt)
         if ev.type == "context_usage":
             st.update_context_usage(session_id, dict(ev.payload or {}))
-        # [AutoC 2026-06-03] Why: scheduler stale-task reaper checks task.updated_at
-        # but the engine heartbeat (renew_lease) only refreshes lease_expires_at,
-        # causing live tasks to be falsely reaped after 10 min of no state mutation.
-        # How: extract task_id from event payload and touch updated_at on running
-        # tasks. Purpose: any engine activity (stream_delta, tool events, replies)
-        # resets the stale timer so only truly dead tasks get reaped.
-        _evt_task_id = str((ev.payload or {}).get("task_id") or "").strip()
-        if _evt_task_id:
-            with st._lock:
-                _evt_task = st.tasks.get(_evt_task_id)
-                if _evt_task is not None and _evt_task.status == TaskStatus.running:
-                    _evt_task.updated_at = datetime.now(timezone.utc)
-                    # [AutoC 2026-06-09] Activity heartbeat: only real
-                    # production events update last_activity_at (not lease).
-                    _evt_task.last_activity_at = datetime.now(timezone.utc)
-                    # [AutoC 2026-06-04] Why: GET /v1/admin/tasks/active must
-                    # return the current activity of each task without relying on
-                    # EventLog or frontend WS inference. How: update current_phase
-                    # and current_detail on the live Task object whenever a
-                    # transient event arrives. Purpose: modal shows real-time
-                    # task state on first open, not just after WS events.
-                    _ev_type = ev.type
-                    _payload = ev.payload or {}
-                    if _ev_type == "stream_delta":
-                        _evt_task.current_phase = "thinking" if _payload.get("type") == "thinking" else "generating"
-                        _evt_task.current_detail = ""
-                    elif _ev_type == "stream_end":
-                        _evt_task.current_phase = ""
-                        _evt_task.current_detail = ""
-                    elif _ev_type == "tool_call_start":
-                        _evt_task.current_phase = "tool_call"
-                        _evt_task.current_detail = str(_payload.get("tool_name") or "")
-                    elif _ev_type == "tool_call_end":
-                        _evt_task.current_phase = ""
-                        _evt_task.current_detail = ""
-                    elif _ev_type == "approval_requested":
-                        _evt_task.current_phase = "awaiting_approval"
-                        _evt_task.current_detail = str(_payload.get("tool_name") or "")
-                    elif _ev_type == "approval_decided":
-                        _evt_task.current_phase = ""
-                        _evt_task.current_detail = ""
+        st.execution_runtime.record_activity(evt)
         return {"ok": True}
 
     @app.get("/v1/sessions")
@@ -1597,6 +1583,7 @@ def create_app(
         body: dict[str, Any] = Body(...),
     ) -> dict[str, Any]:
         """Get or create a session by channel + conversation_key. No task created."""
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         channel = str(body.get("channel") or "").strip()
         conv_key = str(body.get("conversation_key") or "").strip()
@@ -1787,6 +1774,7 @@ def create_app(
     @app.post("/v1/sessions/{session_id}/cancel_active_tasks")
     async def session_cancel_active_tasks(
         session_id: str,
+        request: Request,
         exclude_task_id: str = Query(""),
         # [2026-05-28] 可选 node_id 过滤：只取消指定节点的活跃任务。
         # 为什么：有时只想取消某个子节点的任务，而非 session 内全部。
@@ -1795,6 +1783,7 @@ def create_app(
         node_id: str = Query(""),
     ) -> dict[str, Any]:
         """取消 session 中所有活跃 task。供 AI 工具调用。"""
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         with st._lock:
             # [Fork/Merge 2026-05-17] Why: this endpoint can still be called with
@@ -1810,8 +1799,9 @@ def create_app(
         )
 
     @app.post("/v1/sessions/{session_id}/switch_node")
-    async def session_switch_node(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def session_switch_node(session_id: str, request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         """AI 或外部调用：设置/清除 session 级入口节点覆盖。"""
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         cs: ConfigStore = app.state.config_store
         target = str(body.get("target_node_id") or "").strip()
@@ -2242,6 +2232,7 @@ def create_app(
     @app.post("/v1/tasks/dispatch-async")
     async def dispatch_async(request: Request) -> dict[str, Any]:
         """异步委派子节点：创建子任务后立即返回 task_id，父任务不挂起。"""
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         body = await request.json()
 
@@ -2361,6 +2352,20 @@ def create_app(
             "jwt_available": True,
         }
 
+    _login_failures: dict[str, list[float]] = {}
+    _login_lock = threading.Lock()
+    _LOGIN_WINDOW_SEC = 60.0
+    _LOGIN_MAX_FAILURES = 8
+
+    def _client_key(request: Request) -> str:
+        fwd = str(request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if fwd:
+            return fwd
+        real_ip = str(request.headers.get("x-real-ip") or "").strip()
+        if real_ip:
+            return real_ip
+        return str(request.client.host if request.client else "unknown")
+
     # Web JWT 初始化设置（只能调用一次）
     @app.post("/v1/admin/auth/setup")
     async def admin_auth_setup(request: Request) -> dict[str, Any]:
@@ -2384,27 +2389,54 @@ def create_app(
         wa = get_web_auth()
         if not wa or not wa.available or not wa.setup_completed:
             raise HTTPException(status_code=501, detail="JWT auth not configured")
+        ckey = _client_key(request)
+        now = time.monotonic()
+        with _login_lock:
+            fails = [t for t in _login_failures.get(ckey, []) if now - t < _LOGIN_WINDOW_SEC]
+            _login_failures[ckey] = fails
+            if len(fails) >= _LOGIN_MAX_FAILURES:
+                raise HTTPException(status_code=429, detail="Too many failed login attempts; try again later")
+
         body = await request.json()
         username = str(body.get("username") or "").strip()
         password = str(body.get("password") or "")
         result = wa.login(username, password)
         if not result.get("ok"):
+            with _login_lock:
+                _login_failures.setdefault(ckey, []).append(time.monotonic())
             raise HTTPException(status_code=401, detail=result.get("error", "login failed"))
+        with _login_lock:
+            _login_failures.pop(ckey, None)
         return result
 
     # Web JWT 修改密码（需认证）
     @app.post("/v1/admin/auth/change-password")
     async def admin_auth_change_password(request: Request) -> dict[str, Any]:
-        verify_admin_token(request)  # Require valid session
+        auth_kind = verify_admin_token(request)  # Require valid session
         wa = get_web_auth()
         if not wa or not wa.available or not wa.setup_completed:
             raise HTTPException(status_code=501, detail="JWT auth not configured")
         body = await request.json()
         username = str(body.get("username") or "").strip()
+        old_password = str(body.get("old_password") or "")
         new_password = str(body.get("new_password") or "")
         if not username or not new_password:
             raise HTTPException(status_code=400, detail="username and new_password required")
-        if not wa.change_password(username, new_password):
+        if auth_kind == "jwt":
+            jwt_user = str(getattr(request.state, "auth_user", "") or "")
+            if jwt_user and jwt_user != username:
+                raise HTTPException(status_code=403, detail="Cannot change password for another user")
+        try:
+            changed = wa.change_password(
+                username,
+                new_password,
+                old_password=old_password or None,
+                require_old=(auth_kind != "machine"),
+                rotate_jwt_secret=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not changed:
             raise HTTPException(status_code=404, detail="user not found")
         return {"ok": True}
 

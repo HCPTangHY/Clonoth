@@ -371,6 +371,10 @@ async def _handle_agent_inner(
     if existing_sid:
         try:
             running_tasks = await rt.clonoth_client.get_running_tasks(existing_sid)
+            from .extensions.ide_goal_input import preempt_current
+            if await preempt_current(rt, message, existing_sid, conversation_key, running_tasks,
+                                     full_text, inbound_attachments, is_dm=is_dm):
+                return
             for running_task in running_tasks:
                 if running_task.task_id and running_task.is_user_entry:
                     rt_src_seq = running_task.source_inbound_seq or 0
@@ -451,7 +455,7 @@ async def _handle_agent_inner(
                     await status_msg.delete()
                 except Exception:
                     pass
-            preempt_succeeded = False
+            return  # Accepted input must not be submitted again after callback cleanup.
         elif preempted_src_seq:
             new_trigger = TriggerInfo(
                 inbound_seq=preempted_src_seq,
@@ -468,13 +472,13 @@ async def _handle_agent_inner(
             rt.session_state.register_trigger(new_trigger)
             logger.info("preempt_v2: re-registered trigger for src_seq=%s", preempted_src_seq)
         else:
-            logger.warning("preempt_v2: no trigger and no src_seq, falling back")
+            logger.warning("preempt_v2: accepted input has no trigger or source sequence")
             if status_msg:
                 try:
                     await status_msg.delete()
                 except Exception:
                     pass
-            preempt_succeeded = False
+            return  # Delivery was accepted; a missing UI binding is not a retry signal.
 
         if preempt_succeeded:
             try:

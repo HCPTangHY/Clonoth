@@ -44,24 +44,46 @@ export function hasSourceInboundSeq(payload: EventPayload): boolean {
   return getSourceInboundSeq(payload) !== undefined;
 }
 
-export function getAttachments(value: unknown): Attachment[] {
+export function isInternalReadAttachmentPath(value: string | undefined): boolean {
+  const norm = (value || '').replace(/\\/g, '/').replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
+  return norm.startsWith('data/attachments/read_file/') || norm.includes('/data/attachments/read_file/');
+}
+
+export function getAttachments(value: unknown, excludeInternalRead = false): Attachment[] {
   if (!Array.isArray(value)) {
     return [];
   }
 
-  return value
-    .filter((item): item is Record<string, unknown> => Boolean(getRecord(item)))
-    .map((item) => {
-      const record = item as Record<string, unknown>;
-      return {
-        name: getString(record.name),
-        size: getNumber(record.size),
-        url: getString(record.url) || undefined,
-        type: getString(record.type) || undefined,
-        path: getString(record.path) || undefined,
-        mime_type: getString(record.mime_type) || undefined,
-      };
+  const result: Attachment[] = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      const path = item.replace(/^file:\/\//, '').replace(/^\/+/, '').trim();
+      if (!path || (excludeInternalRead && isInternalReadAttachmentPath(path))) continue;
+      const imageLike = /\.(apng|avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(path);
+      result.push({
+        name: path.split('/').pop() || (imageLike ? '图片' : '附件'),
+        type: imageLike ? 'image' : 'file',
+        path,
+        mime_type: imageLike ? 'image/*' : undefined,
+      });
+      continue;
+    }
+    const record = getRecord(item);
+    if (!record) continue;
+    const path = getString(record.path).replace(/^file:\/\//, '').trim();
+    const url = getString(record.url).trim();
+    if (!path && !url) continue;
+    if (excludeInternalRead && path && isInternalReadAttachmentPath(path)) continue;
+    result.push({
+      name: getString(record.name) || (path || url).split('/').pop() || '附件',
+      size: getNumber(record.size),
+      url: url || undefined,
+      type: getString(record.type) || undefined,
+      path: path || undefined,
+      mime_type: getString(record.mime_type) || undefined,
     });
+  }
+  return result;
 }
 
 export function normalizeConversationKey(value: string): string {

@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from test_goal_integration import case, claim, control, finish, reviewer, start, verdict
 
 
-def test_submit_replaces_running_goal_and_preserves_settings_and_old_root_pause(case):
+def test_submit_updates_running_goal_and_preserves_settings_and_live_root(case):
     c = case
     control(c, 'submit', goal='First target', criteria='Keep criteria',
             reviewer_provider='openai', reviewer_model='review-model')
@@ -23,21 +23,13 @@ def test_submit_replaces_running_goal_and_preserves_settings_and_old_root_pause(
     assert edited['goal_version'] == before['goal_version'] + 1
     for field in ('criteria', 'reviewer_provider', 'reviewer_model', 'rounds', 'stagnation'):
         assert edited[field] == before[field]
-    assert c.state.execution_runtime._is_paused(old_root)
+    assert not c.state.execution_runtime._is_paused(old_root)
     c.service.tick()
-    new_root = c.service.documents[c.sid]['_roots'][-1]
-    assert new_root != old_root
+    assert c.service.documents[c.sid]['_roots'][-1] == old_root
     assert c.state.tasks[old_root].status == 'running'
-    assert c.state.tasks[new_root].node_id == 'main'
-    assert 'data/attachments/reference.png' in c.state.tasks[new_root].input['instruction']
-    assert not c.state.tasks[new_root].input.get('resume_data')
-    finish(c, old_root, 'old target finished')
-    assert c.service.documents[c.sid]['_candidate'] is None
-    callback = c.state.execution_runtime.queue_result(delivery_id='old-late', work_id='old-work',
-        origin_task_id=old_root, session_id=c.sid, text='old result')
-    assert callback['strategy'] == 'held'
-    claim(c, new_root)
-    finish(c, new_root)
+    assert 'data/attachments/reference.png' in str(c.state.tasks[old_root].preempt_message)
+    c.state.consume_preempt_message(old_root)
+    finish(c, old_root, 'updated target finished')
     tid = reviewer(c)
     assert c.state.tasks[tid].input['_execution_options']['model'] == 'review-model'
     finish(c, tid, verdict(True), evidence=False)
@@ -67,10 +59,10 @@ def test_old_review_settles_without_applying_or_pausing_submitted_replacement(ca
     assert c.service.documents[c.sid]['_review'] is None
 
 
-@pytest.mark.parametrize('counters', [{'rounds': 8}, {'stagnation': 3}])
+@pytest.mark.parametrize('counters', [{'rounds': 8}])
 def test_submit_cannot_bypass_budget_and_rejection_changes_nothing(case, counters):
     c = case
-    control(c, 'set', goal='Existing target')
+    control(c, 'set', goal='Existing target', max_rounds=8)
     c.service.documents[c.sid].update(counters)
     before = copy.deepcopy(c.service.documents[c.sid])
     with pytest.raises(HTTPException) as error:

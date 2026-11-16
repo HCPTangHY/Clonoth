@@ -126,3 +126,85 @@ def test_non_ai_interruption_returns_cancel_to_original_caller_without_execution
         resume = restored.tasks[parent.task_id].input['resume_data']
         assert 'cancelled' in str(resume).lower()
     asyncio.run(run())
+
+
+def test_request_restart_initiator_checkpoints_proactively_without_sigterm_and_resumes(tmp_path):
+    from types import SimpleNamespace
+    from toolbox.builtins.system import request_restart
+
+    async def run():
+        state = make_state(tmp_path, 'before')
+        (tmp_path / 'config/nodes/main.yaml').write_text(
+            'id: main\ntype: ai\noutput_mode: hybrid\ntool_mode: native\ntool_access:\n  mode: all\n'
+        )
+        sid = state.get_or_create_session(channel='web', conversation_key='web:initiator')
+        evt = state.eventlog.append(
+            session_id=sid, component='test', type_='inbound_message',
+            payload={'text': 'Deploy and verify', 'use_branch': False},
+        )
+        state.record_inbound_message_event(evt)
+        item = state.assign_next_task(worker_id='worker')
+        tid = item['task_id']
+        registry = FakeRegistry({'request_restart': spec('request_restart')}, {'request_restart': request_restart})
+        response = ProviderResponse(ok=True, text='', tool_calls=[
+            ToolCall(id='restart-call-1', name='request_restart', arguments={'target': 'all', 'reason': 'deploy'}),
+        ])
+        deferred = []
+
+        def capture_thread(*, target, **kwargs):
+            return SimpleNamespace(start=lambda: deferred.append(target))
+
+        async def hooks(point, context):
+            if point == 'before_response':
+                return HookResult(action=TaskAction(action='finish', node_id='main', result={'text': 'Post-restart verification complete'}))
+            return HookResult()
+
+        manager = SimpleNamespace(engines=[], stop_engine=lambda: None, _restart_pending=False)
+        app = create_app(state=state, process_manager=manager, config_store=ConfigStore(path=tmp_path / 'data/config.yaml'))
+        app.state._uvicorn_server = SimpleNamespace(should_exit=False)
+
+        with patch.object(admin_api, '_admin_token', 'restart-test-token'), patch.object(admin_api, '_web_auth', None), \
+             patch('toolbox.builtins.system.request_guard', new=AsyncMock(return_value=({'safety_level': 'auto'}, None))), \
+             patch('supervisor.api.threading.Thread', side_effect=capture_thread), \
+             patch.object(runner, 'fetch_llm_secret', new=AsyncMock(return_value={})), \
+             patch.object(runner, 'normalize_llm_secret', return_value=('test-key', 'http://model.invalid/v1', 'test-model')), \
+             patch.object(ai_step, 'auto_discover_and_register'), patch.object(ai_step, 'load_external_plugins'), \
+             patch.object(ai_step.hook_registry, 'afire', side_effect=hooks), \
+             patch.object(ai_step, '_call_llm_with_retry', new=AsyncMock(return_value=response)) as call:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url='http://restart.invalid',
+                headers={'Authorization': 'Bearer restart-test-token'},
+            ) as http:
+                # Notice: we never cancel ` _handle_task ` externally; it must exit and checkpoint on its own!
+                await asyncio.wait_for(
+                    runner._handle_task(http, http, 'http://restart.invalid', tmp_path, registry, item, 'worker'),
+                    5,
+                )
+            assert len(deferred) == 1
+            assert state.tasks[tid].status == 'suspended'
+            assert state.tasks[tid].cancel_reason == 'service_restart'
+            assert not state.tasks[tid].result.get('checkpoint_error')
+            with patch('supervisor.api.time.sleep'):
+                deferred[0]()
+
+            restored = make_state(tmp_path, 'after')
+            next_item = restored.assign_next_task(worker_id='worker')
+            assert next_item is not None and next_item['task_id'] == tid
+            assert next_item['input']['resume_data']['restart_tool_call_id'] == 'restart-call-1'
+
+            seen = []
+
+            async def continue_model(ls, step):
+                seen.extend(ls.messages)
+                return ProviderResponse(ok=True, text='Post-restart verification complete')
+
+            call.side_effect = continue_model
+            async with app_for(restored, tmp_path) as http:
+                await runner._handle_task(http, http, 'http://restart.invalid', tmp_path, registry, next_item, 'worker')
+
+            assert restored.tasks[tid].status == 'completed'
+            assert registry.started == ['request_restart']
+            tool_rows = {m.get('tool_call_id'): m for m in seen if m.get('role') == 'tool'}
+            assert tool_rows['restart-call-1']['_meta']['tool_result_structured']['ok'] is True
+    asyncio.run(run())

@@ -32,6 +32,12 @@ class _ToolApproval(NamedTuple):
 def _approval_identity(spec: dict[str, Any], arguments: dict[str, Any]) -> str:
     # JSON identity, not Python equality: 1, 1.0 and True must remain distinct.
     # Do not stringify unsupported values or admit NaN/Infinity into an approval.
+    if callable(spec.get("action_resolver")):
+        resolver = spec["action_resolver"]
+        spec = {
+            **spec,
+            "action_resolver": f"{resolver.__module__}:{resolver.__qualname__}@{id(resolver)}",
+        }
     return json.dumps([spec, arguments], sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
@@ -274,6 +280,12 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                     except asyncio.TimeoutError:
                         pass
                     return _error_tool_response(f"script timeout after {timeout_val}s")
+        except asyncio.CancelledError:
+            try:
+                _kill_process_group(proc)  # type: ignore[union-attr]
+            except Exception:
+                pass
+            raise
         except asyncio.TimeoutError:
             try:
                 _kill_process_group(proc)  # type: ignore[union-attr]
@@ -344,7 +356,18 @@ class ToolRegistry:
 
         self.reload()
 
-    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc, *, pure: bool = False) -> Callable[[], None]:
+    def register_builtin_tool(
+        self,
+        name: str,
+        description: str,
+        input_schema: dict[str, Any],
+        func: ToolFunc,
+        *,
+        pure: bool = False,
+        action_field: str | None = None,
+        action_resolver: Callable[[dict[str, Any]], str | None] | None = None,
+        default_action: str | None = None,
+    ) -> Callable[[], None]:
         """Register one builtin tool declared by a built-in plugin.
 
         Why: some built-in tools now live with their owning plugin instead of
@@ -366,12 +389,18 @@ class ToolRegistry:
         if not callable(func):
             raise TypeError(f"builtin tool function is not callable: {clean_name}")
 
-        spec = {
+        spec: dict[str, Any] = {
             "name": clean_name,
             "description": str(description or ""),
             "input_schema": input_schema,
             "pure": bool(pure),
         }
+        if isinstance(action_field, str) and action_field.strip():
+            spec["action_field"] = action_field.strip()
+        if callable(action_resolver):
+            spec["action_resolver"] = action_resolver
+        if isinstance(default_action, str) and default_action.strip():
+            spec["default_action"] = default_action.strip()
         self._tool_specs[clean_name] = spec
         self._tool_funcs[clean_name] = func
 
@@ -630,12 +659,26 @@ class ToolRegistry:
         ]
 
         pure_builtins = {"list_dir", "read_file", "get_context_window"}
+        action_declarations: dict[str, tuple[str, Callable[[dict[str, Any]], str | None]]] = {
+            "grep": ("mode", _builtins.resolve_grep_action),
+            "manage_tool": ("action", _builtins.resolve_manage_tool_action),
+            "manage_schedule": ("action", _builtins.resolve_manage_schedule_action),
+        }
         for name, desc, schema, func in builtins:
             # Why: built-in tools now have a public registration path shared by
             # registry-owned and plugin-owned tools. How: seed the central table
             # through register_builtin_tool(). Purpose: keep one code path for
             # validating and storing builtin specs.
-            self.register_builtin_tool(name, desc, schema, func, pure=(name in pure_builtins))
+            act_meta = action_declarations.get(name)
+            self.register_builtin_tool(
+                name,
+                desc,
+                schema,
+                func,
+                pure=(name in pure_builtins),
+                action_field=act_meta[0] if act_meta else None,
+                action_resolver=act_meta[1] if act_meta else None,
+            )
 
         # [2026-09-06] Why: execute_command runs a second, internal guard
         # (op="execute_command", command-level approval) inside its body. The
@@ -705,6 +748,10 @@ class ToolRegistry:
             result_format = spec.get("result_format")
             if isinstance(result_format, str) and result_format.strip():
                 registered_spec["result_format"] = result_format.strip()
+            for opt_key in ("action_field", "default_action"):
+                opt_val = spec.get(opt_key)
+                if isinstance(opt_val, str) and opt_val.strip():
+                    registered_spec[opt_key] = opt_val.strip()
             self._tool_specs[name] = registered_spec
             self._tool_funcs[name] = _make_script_tool(
                 script_path=py.resolve(), timeout_sec=timeout_sec,
