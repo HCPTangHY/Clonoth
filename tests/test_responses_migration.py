@@ -134,7 +134,9 @@ class ResponsesPayloadTests(unittest.TestCase):
         payload = provider().build_payload([{"role": "user", "content": "hello"}])
         self.assertNotIn("max_output_tokens", payload)
         self.assertNotIn("reasoning", payload)
+        self.assertIs(payload["store"], False)
         self.assertEqual(payload["include"], ["reasoning.encrypted_content"])
+        self.assertIs(provider(store=True).build_payload([])["store"], True)
 
     def test_maximum_token_aliases_and_invalid_values(self):
         for options, expected in (
@@ -502,6 +504,67 @@ class ResponsesTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(response.ok)
             self.assertEqual(len(sent), 1)
             self.assertEqual(response.status_code, 400)
+
+    async def test_item_conflict_http_and_sse_error_strip_ids_and_empty_reasoning_shells(self):
+        conflict_err = {
+            "type": "invalid_request_error",
+            "code": "item_conflict",
+            "message": "An input item conflicts with an existing record.",
+            "param": "input",
+        }
+        # History with empty-summary reasoning (thought_summary=False), message id, and fc_ id
+        messages = [
+            {
+                "role": "assistant",
+                "content": "prior",
+                "tool_calls": [call("call_x")],
+                "_meta": {
+                    "provider": "openai-responses",
+                    "tool_mode": "native",
+                    "tool_call_ids": ["call_x"],
+                    "metadata": {"openai-responses": {"raw_output": [
+                        {"type": "reasoning", "id": "rs_conflict", "encrypted_content": "ENC_BLOB", "summary": []},
+                        {"type": "message", "id": "msg_conflict", "status": "completed", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "prior"}]},
+                        {"type": "function_call", "id": "fc_conflict", "status": "completed",
+                         "call_id": "call_x", "name": "lookup", "arguments": '{"value": "same"}'},
+                    ]}},
+                },
+            },
+            {"role": "tool", "tool_call_id": "call_x", "name": "lookup", "content": "ok"},
+        ]
+
+        for mode in ("chat_http_400", "stream_http_400", "stream_sse_error", "stream_response_failed"):
+            with self.subTest(mode=mode):
+                sent = []
+
+                def handle(request):
+                    sent.append(json.loads(request.content))
+                    if len(sent) == 1:
+                        if mode in ("chat_http_400", "stream_http_400"):
+                            return httpx.Response(400, json={"error": conflict_err})
+                        if mode == "stream_sse_error":
+                            return sse([{"type": "error", "error": conflict_err}])
+                        return sse([{"type": "response.failed", "response": {"error": conflict_err}}])
+                    if mode == "chat_http_400":
+                        return httpx.Response(200, json=completion())
+                    return sse([{"type": "response.completed", "response": completion()}])
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+                    inst = provider(http)
+                    resp = await (inst.chat(messages=messages) if mode == "chat_http_400" else inst.chat_stream(messages=messages))
+                self.assertTrue(resp.ok, resp.error)
+                self.assertEqual(len(sent), 2)
+                self.assertIs(sent[0]["store"], False)
+                retried_items = sent[1]["input"]
+                # Empty reasoning shell was dropped; message & function_call lost 'id'/'status' while keeping 'call_id'
+                self.assertEqual([it["type"] for it in retried_items], ["message", "function_call", "function_call_output"])
+                for it in retried_items:
+                    self.assertNotIn("id", it)
+                    self.assertNotIn("status", it)
+                    self.assertNotIn("encrypted_content", it)
+                self.assertEqual(retried_items[1]["call_id"], "call_x")
+                self.assertEqual(retried_items[2]["call_id"], "call_x")
 
     async def test_incomplete_and_truncated_streams_fail(self):
         for events in (

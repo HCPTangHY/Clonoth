@@ -8,8 +8,10 @@ core llm_call.py or ai_step.py.
 """
 from __future__ import annotations
 
+import html as _html
 import inspect
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,30 @@ from engine.protocol import TaskAction
 
 
 logger = logging.getLogger(__name__)
+
+_HTML_NOISE_RE = re.compile(r"<(style|script)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def compact_error_reason(err: Any, max_len: int = 260) -> str:
+    """Strip HTML/CSS boilerplate (e.g. Google 502 error pages) into a single readable line."""
+    raw = str(err or "").strip()
+    if not raw:
+        return ""
+    if "<" in raw and ">" in raw and (
+        "<!doctype" in raw.lower()
+        or "<html" in raw.lower()
+        or "<style" in raw.lower()
+        or "<body" in raw.lower()
+        or "<title" in raw.lower()
+    ):
+        raw = _HTML_NOISE_RE.sub(" ", raw)
+        raw = _HTML_TAG_RE.sub(" ", raw)
+        raw = _html.unescape(raw)
+    compact = " ".join(raw.split())
+    if len(compact) > max_len:
+        return compact[: max_len - 1].rstrip() + "…"
+    return compact
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
@@ -77,11 +103,16 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
         _val = fb_cfg.get(_opt_key) if _opt_key in fb_cfg else provider_block.get(_opt_key)
         if _val is not None:
             po[_opt_key] = _val
+    from clonoth_runtime import resolve_env_ref
+
+    raw_base_url = (fb_cfg.get("base_url") or "").strip() or (provider_block.get("base_url") or "").strip()
+    raw_api_key = (fb_cfg.get("api_key") or "").strip() or (provider_block.get("api_key") or "").strip()
+    raw_model = (fb_cfg.get("model") or "").strip() or (provider_block.get("model") or "").strip()
     return {
         "provider": provider_name,
-        "base_url": (fb_cfg.get("base_url") or "").strip() or (provider_block.get("base_url") or "").strip(),
-        "api_key": (fb_cfg.get("api_key") or "").strip() or (provider_block.get("api_key") or "").strip(),
-        "model": (fb_cfg.get("model") or "").strip() or (provider_block.get("model") or "").strip(),
+        "base_url": resolve_env_ref(raw_base_url),
+        "api_key": resolve_env_ref(raw_api_key),
+        "model": resolve_env_ref(raw_model),
         "sticky_session": fb_cfg["sticky_session"] if "sticky_session" in fb_cfg else provider_block.get("sticky_session"),
         "provider_options": po,
     }
@@ -309,12 +340,17 @@ class FallbackProviderHandler:
                     )
                     ctx.response = new_resp
                     ctx.provider = fb_provider  # This hook response only, not the configured provider.
-                    _orig_err_part = f"（原因：{str(original_error)[:300]}）" if original_error else ""
+                    _clean_orig = compact_error_reason(original_error, 260)
+                    _orig_err_part = f"（原因：{_clean_orig}）" if _clean_orig else ""
                     _prior_fb_part = f"；此前备用尝试失败：{' | '.join(fallback_errors)}" if fallback_errors else ""
-                    text = f"原渠道 {original_model} 请求失败{_orig_err_part}{_prior_fb_part}，本次改用 {fb_model}（{fb_provider_type}）。"
+                    _ls = (getattr(ctx, "extra", None) or {}).get("loop_state")
+                    _retry_cnt = int(getattr(_ls, "_last_retry_count", 0) or 0)
+                    _fail_verb = f"重试 {_retry_cnt} 次后仍请求失败" if _retry_cnt > 0 else "请求失败"
+                    text = f"原渠道 {original_model} {_fail_verb}{_orig_err_part}{_prior_fb_part}，本次改用 {fb_model}（{fb_provider_type}）。"
                     return hook_result(modified=True, channels={"response_notices": [{
                         "code": "fallback_provider.used", "label": "备用模型", "text": text,
                         "requested": requested, "original_status": status_code,
+                        "retry_count": _retry_cnt,
                         "attempts": attempts,
                     }]})
                 else:
@@ -328,7 +364,7 @@ class FallbackProviderHandler:
                     # [fix 2026-05-28] Record this fallback's failure for later
                     # aggregation into the user-facing error message.
                     fallback_errors.append(
-                        f"[Fallback {fb_provider_type} failed: {str(_fb_err)[:150]}]"
+                        f"[Fallback {fb_provider_type} failed: {compact_error_reason(_fb_err, 150)}]"
                     )
 
             except Exception as exc:
@@ -345,7 +381,7 @@ class FallbackProviderHandler:
                 )
                 # [fix 2026-05-28] Record exception-type failures too.
                 fallback_errors.append(
-                    f"[Fallback {fb_cfg.get('provider', '?')} exception: {str(exc)[:150]}]"
+                    f"[Fallback {fb_cfg.get('provider', '?')} exception: {compact_error_reason(exc, 150)}]"
                 )
 
         # [fix 2026-05-28] Why: when all fallbacks fail, the user only sees the

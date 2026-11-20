@@ -234,12 +234,54 @@ class ConfigStore:
     def _is_provider_block(self, val: Any) -> bool:
         return isinstance(val, dict) and any(k in val for k in ("base_url", "api_key", "model"))
 
+    _SENSITIVE_NESTED_KEYS = frozenset({
+        "api_key", "apikey", "secret", "token", "password", "passwd", "authorization",
+    })
+
+    @classmethod
+    def _redact_nested_public(cls, val: Any) -> Any:
+        if isinstance(val, dict):
+            cleaned: dict[str, Any] = {}
+            for k, v in val.items():
+                k_low = str(k).strip().lower()
+                if k_low in cls._SENSITIVE_NESTED_KEYS or k_low.endswith(("_api_key", "_secret", "_token", "_password")):
+                    _, redacted = _redact_api_key(str(v or ""))
+                    cleaned[k] = redacted
+                else:
+                    cleaned[k] = cls._redact_nested_public(v)
+            return cleaned
+        if isinstance(val, list):
+            return [cls._redact_nested_public(item) for item in val]
+        return val
+
+    def _sanitize_fallback_public(self, fb: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k, v in fb.items():
+            if k in {"api_key", "_source_index", "api_key_present", "api_key_redacted"}:
+                continue
+            if k in {"base_url", "model"} and isinstance(v, str):
+                out[k] = _resolve_env_value(v)
+            else:
+                out[k] = self._redact_nested_public(v)
+        out["provider"] = str(fb.get("provider") or "").strip()
+        raw_key = _resolve_env_value(str(fb.get("api_key") or "")) if "api_key" in fb else ""
+        if raw_key:
+            present, redacted = _redact_api_key(raw_key)
+            out["api_key_present"] = present
+            out["api_key_redacted"] = redacted
+        return out
+
     def get_providers_public(self) -> dict[str, Any]:
         """Return all providers with redacted api_keys, plus active_provider and fallbacks."""
         with self._lock:
             data = self._load_raw()
             active = data.get("provider", "openai")
-            fallbacks = data.get("fallbacks", []) or []
+            raw_fallbacks = data.get("fallbacks", []) or []
+            fallbacks = [
+                self._sanitize_fallback_public(fb)
+                for fb in raw_fallbacks
+                if isinstance(fb, dict) and str(fb.get("provider") or "").strip()
+            ]
 
             providers: dict[str, dict[str, Any]] = {}
             for key, val in data.items():
@@ -296,10 +338,69 @@ class ConfigStore:
             return self.get_providers_public()
 
     def update_fallbacks(self, fallbacks: list[dict[str, Any]]) -> dict[str, Any]:
-        """Replace the fallback chain."""
+        """Replace the fallback chain while preserving untouched extra/secret fields."""
         with self._lock:
             data = self._load_raw()
-            data["fallbacks"] = fallbacks
+            old_raw = data.get("fallbacks", []) or []
+            old_list = [f for f in old_raw if isinstance(f, dict)]
+            normalized: list[dict[str, Any]] = []
+
+            for item in fallbacks:
+                if not isinstance(item, dict):
+                    raise ValueError("Each fallback entry must be an object")
+                provider = str(item.get("provider") or "").strip()
+                if not provider:
+                    raise ValueError("Fallback entry requires a non-empty 'provider'")
+
+                src_idx = item.get("_source_index")
+                preserved: dict[str, Any] = {}
+                if (
+                    isinstance(src_idx, int)
+                    and not isinstance(src_idx, bool)
+                    and 0 <= src_idx < len(old_list)
+                    and str(old_list[src_idx].get("provider") or "").strip() == provider
+                ):
+                    preserved = {
+                        k: v for k, v in old_list[src_idx].items()
+                        if k not in {"provider", "_source_index", "api_key_present", "api_key_redacted"}
+                    }
+
+                if "model" in item:
+                    model_val = str(item.get("model") or "").strip()
+                    if model_val:
+                        preserved["model"] = model_val
+                    else:
+                        preserved.pop("model", None)
+
+                if "base_url" in item:
+                    url_val = str(item.get("base_url") or "").strip()
+                    if url_val:
+                        preserved["base_url"] = url_val
+                    elif "_source_index" not in item:
+                        preserved.pop("base_url", None)
+
+                if "api_key" in item:
+                    key_val = str(item.get("api_key") or "").strip()
+                    if key_val:
+                        preserved["api_key"] = key_val
+                    elif "_source_index" not in item:
+                        preserved.pop("api_key", None)
+
+                for k, v in item.items():
+                    if k in {"provider", "model", "base_url", "api_key", "_source_index", "api_key_present", "api_key_redacted"}:
+                        continue
+                    if v is None or (isinstance(v, str) and not v.strip()):
+                        preserved.pop(k, None)
+                    else:
+                        preserved[k] = v
+
+                entry: dict[str, Any] = {"provider": provider}
+                if "model" in preserved:
+                    entry["model"] = preserved.pop("model")
+                entry.update(preserved)
+                normalized.append(entry)
+
+            data["fallbacks"] = normalized
             self._save_raw(data)
             self.reload()
             return self.get_providers_public()

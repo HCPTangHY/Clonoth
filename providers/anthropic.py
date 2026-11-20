@@ -20,7 +20,7 @@ from typing import Any, Callable, Awaitable
 
 import httpx
 
-from .base import BaseProvider, ProviderResponse, ToolCall, sanitize_tool_call_id
+from .base import BaseProvider, ProviderResponse, ToolCall, merge_extra_body, sanitize_tool_call_id
 
 log = logging.getLogger(__name__)
 
@@ -565,7 +565,7 @@ class AnthropicProvider(BaseProvider):
                     "type": "text", "text": system_text,
                     "cache_control": deepcopy(cache_control),
                 }]
-        return payload
+        return merge_extra_body(payload, self._options)
 
     # ===================================================================
     # Non-streaming: chat()

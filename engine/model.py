@@ -14,8 +14,25 @@ from .node import Node
 
 _current_sticky_sid_var: ContextVar[str] = ContextVar("_current_sticky_sid_var", default="")
 _PROVIDER_OPTION_KEYS = (
-    "reasoning_field", "reasoning_effort", "max_tokens", "max_completion_tokens", "thought_summary",
+    "reasoning_field",
+    "reasoning_effort",
+    "max_tokens",
+    "max_completion_tokens",
+    "thought_summary",
+    "wrap_user_cer",
+    "tail_system_prompt",
 )
+
+
+def _merge_nested_dicts(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in patch.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _merge_nested_dicts(existing, value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
 
 
 def parse_sticky_session_config(raw: Any) -> dict[str, Any] | None:
@@ -177,6 +194,12 @@ def resolve_provider(
 
     raw_options = override.get("provider_options")
     override_options = deepcopy(raw_options) if isinstance(raw_options, dict) else {}
+    if isinstance(override.get("extra_body"), dict):
+        existing_eb = override_options.get("extra_body")
+        override_options["extra_body"] = _merge_nested_dicts(
+            existing_eb if isinstance(existing_eb, dict) else {},
+            override["extra_body"],
+        )
     for key in _PROVIDER_OPTION_KEYS:
         if key in override and override[key] is not None:
             override_options[key] = deepcopy(override[key])
@@ -202,11 +225,23 @@ def resolve_provider(
             base_url = resolve_env_ref(str(pcfg["base_url"]).strip())
         if not api_key and pcfg.get("api_key"):
             api_key = resolve_env_ref(str(pcfg["api_key"]).strip())
+        if isinstance(pcfg.get("provider_options"), dict):
+            provider_defaults = _merge_nested_dicts(provider_defaults, pcfg["provider_options"])
+        if isinstance(pcfg.get("extra_body"), dict):
+            existing_eb = provider_defaults.get("extra_body")
+            provider_defaults["extra_body"] = _merge_nested_dicts(
+                existing_eb if isinstance(existing_eb, dict) else {},
+                pcfg["extra_body"],
+            )
         for key in _PROVIDER_OPTION_KEYS:
             if key in pcfg and pcfg[key] is not None:
                 provider_defaults[key] = deepcopy(pcfg[key])
         if isinstance(pcfg.get("thinking_config"), dict):
-            provider_defaults["thinking_config"] = deepcopy(pcfg["thinking_config"])
+            existing_tc = provider_defaults.get("thinking_config")
+            provider_defaults["thinking_config"] = {
+                **(existing_tc if isinstance(existing_tc, dict) else {}),
+                **deepcopy(pcfg["thinking_config"]),
+            }
         if "sticky_session" in pcfg:
             provider_defaults["sticky_session"] = deepcopy(pcfg["sticky_session"])
     if not model:

@@ -944,13 +944,62 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 return None
             return dict(info.workspace or {})
 
+    _FORBIDDEN_WORKSPACE_TREES = (
+        Path("/etc"),
+        Path("/root"),
+        Path("/proc"),
+        Path("/sys"),
+        Path("/dev"),
+        Path("/boot"),
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/usr"),
+        Path("/lib"),
+        Path("/lib64"),
+        Path("/run"),
+        Path("/var/log"),
+    )
+    _FORBIDDEN_WORKSPACE_EXACT = frozenset({
+        Path("/"),
+        Path("/tmp"),
+        Path("/var"),
+        Path("/home"),
+        Path("/opt"),
+        Path("/www"),
+        Path("/www/wwwroot"),
+    })
+
+    def _validate_session_workspace_path(self, raw_path: str) -> str:
+        resolved = Path(raw_path).expanduser().resolve()
+        if resolved in self._FORBIDDEN_WORKSPACE_EXACT:
+            raise ValueError(f"workspace path not allowed: {raw_path}")
+        for sys_dir in self._FORBIDDEN_WORKSPACE_TREES:
+            try:
+                resolved.relative_to(sys_dir)
+                raise ValueError(f"workspace path inside restricted system directory: {raw_path}")
+            except ValueError as exc:
+                if "restricted system directory" in str(exc):
+                    raise
+        data_root = (self.workspace_root.resolve() / "data").resolve()
+        if resolved == data_root:
+            raise ValueError("workspace path cannot be the runtime data directory")
+        try:
+            rel_data = resolved.relative_to(data_root)
+            if rel_data.parts and rel_data.parts[0] not in {"temp", "workspaces"}:
+                raise ValueError("workspace path cannot point into runtime state directory")
+        except ValueError as exc:
+            if "cannot point into runtime state" in str(exc):
+                raise
+        return str(resolved)
+
     def set_session_workspace(self, session_id: str, workspace: dict[str, Any]) -> dict[str, Any] | None:
         """设置 session 级工作区配置并持久化。"""
         sid = (session_id or "").strip()
         clean = dict(workspace or {}) if isinstance(workspace, dict) else {}
         # 只保留 name/path 两个字段，避免脏数据
         name = str(clean.get("name") or "").strip()
-        path = str(clean.get("path") or "").strip() or None
+        raw_path = str(clean.get("path") or "").strip() or None
+        path = self._validate_session_workspace_path(raw_path) if raw_path else None
         clean = {"name": name}
         if path:
             clean["path"] = path

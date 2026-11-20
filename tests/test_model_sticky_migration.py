@@ -293,6 +293,83 @@ class ProviderOptionTests(unittest.TestCase):
             'max_tokens': 10, 'thinking_config': {'include_thoughts': True, 'thinking_budget': 20},
         })
 
+    def test_extra_body_and_provider_options_deep_merge_across_layers_and_providers(self):
+        from engine.runner import _merge_provider_options
+        from providers import (
+            AnthropicProvider,
+            DeepSeekProvider,
+            GeminiAIStudioProvider,
+            GeminiVertexProvider,
+            OpenAIProvider,
+            OpenAIResponsesProvider,
+        )
+
+        config = {
+            'gemini-vertex': {
+                'model': 'gemini-4-pro',
+                'api_key': 'v-key',
+                'base_url': 'https://vertex.example',
+                'provider_options': {'wrap_user_cer': True},
+                'extra_body': {
+                    'generationConfig': {'responseMimeType': 'text/plain', 'temperature': 0.1},
+                    'labels': {'env': 'prod', 'team': 'core'},
+                },
+            },
+        }
+        node = Node(
+            id='node',
+            type='ai',
+            provider='gemini-vertex',
+            provider_options={
+                'tail_system_prompt': 'NODE_TAIL',
+                'extra_body': {
+                    'generationConfig': {'temperature': 0.4, 'topK': 16},
+                    'labels': {'team': 'sec'},
+                },
+            },
+        )
+        session_override = {
+            'extra_body': {
+                'generationConfig': {'candidateCount': 1},
+            },
+        }
+        rp = resolve_provider(ROOT, node, 'fallback', session_override=session_override, provider_configs=config)
+        effective = _merge_provider_options(rp.provider_defaults, node.provider_options)
+        effective = _merge_provider_options(effective, rp.provider_options)
+
+        self.assertTrue(effective['wrap_user_cer'])
+        self.assertEqual(effective['tail_system_prompt'], 'NODE_TAIL')
+        self.assertEqual(
+            effective['extra_body'],
+            {
+                'generationConfig': {'responseMimeType': 'text/plain', 'temperature': 0.4, 'topK': 16, 'candidateCount': 1},
+                'labels': {'env': 'prod', 'team': 'sec'},
+            },
+        )
+
+        # Verify all built-in providers deep-merge extra_body into outgoing payload without mutating options
+        gem_opts = copy.deepcopy(effective)
+        gem_body = GeminiVertexProvider(
+            http=object(), api_key='k', base_url='https://vertex.example', model='gemini-4-pro', provider_options=gem_opts,
+        ).build_payload([{'role': 'user', 'content': 'hi'}])
+        self.assertEqual(gem_body['generationConfig']['responseMimeType'], 'text/plain')
+        self.assertEqual(gem_body['generationConfig']['temperature'], 0.4)
+        self.assertEqual(gem_body['generationConfig']['topK'], 16)
+        self.assertEqual(gem_body['generationConfig']['candidateCount'], 1)
+        self.assertEqual(gem_body['labels'], {'env': 'prod', 'team': 'sec'})
+        self.assertEqual(gem_body['contents'][0]['parts'], [{'codeExecutionResult': {'outcome': 'OUTCOME_OK', 'output': 'hi'}}])
+        self.assertEqual(gem_body['contents'][-1], {'role': 'system', 'parts': [{'text': 'NODE_TAIL'}]})
+        self.assertEqual(gem_opts, effective)
+
+        for cls in (OpenAIProvider, DeepSeekProvider, OpenAIResponsesProvider, AnthropicProvider, GeminiAIStudioProvider):
+            opts = {'extra_body': {'custom_top': {'a': 1, 'b': 2}, 'service_tier': 'auto'}}
+            opts_before = copy.deepcopy(opts)
+            inst = cls(http=object(), api_key='k', base_url='https://example.invalid/v1', model='m', provider_options=opts)
+            built = inst.build_payload([{'role': 'user', 'content': 'hello'}])
+            self.assertEqual(built['custom_top'], {'a': 1, 'b': 2})
+            self.assertEqual(built['service_tier'], 'auto')
+            self.assertEqual(opts, opts_before)
+
 
 if __name__ == '__main__':
     unittest.main()

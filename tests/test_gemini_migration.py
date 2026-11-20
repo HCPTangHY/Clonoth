@@ -156,6 +156,46 @@ class GeminiPayloadMigrationTests(unittest.TestCase):
             p.model = "gemini-4-argon"
             self.assertEqual(p._usage(usage)["prompt_tokens"], 88000 if cls is GeminiVertexProvider else 162000)
 
+    def test_wrap_user_cer_and_tail_system_prompt(self):
+        messages = [
+            {"role": "system", "content": "static system"},
+            {"role": "user", "content": "first user"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "lookup", "arguments": {"q": "x"}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "lookup", "content": '{"ok": true}'},
+            {"role": "developer", "content": "[SKILLS:ACTIVE]"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "caption"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]},
+        ]
+
+        p = provider(GeminiVertexProvider, wrap_user_cer=True, tail_system_prompt="TAIL_PROMPT_V1")
+        payload1 = p.build_payload(messages)
+        # systemInstruction remains plain text
+        self.assertEqual(payload1["systemInstruction"], {"parts": [{"text": "static system"}]})
+        # user #1 wrapped in CER
+        self.assertEqual(
+            payload1["contents"][0],
+            {"role": "user", "parts": [{"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "first user"}}]},
+        )
+        # tool result remains functionResponse (never wrapped in CER)
+        self.assertIn("functionResponse", payload1["contents"][2]["parts"][0])
+        # mid-conversation developer message became user with CER
+        self.assertEqual(
+            payload1["contents"][3],
+            {"role": "user", "parts": [{"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "[SKILLS:ACTIVE]"}}]},
+        )
+        # multimodal user message: text wrapped in CER, inlineData preserved
+        self.assertEqual(
+            payload1["contents"][4]["parts"],
+            [
+                {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "caption"}},
+                {"inlineData": {"mimeType": "image/png", "data": "AAAA"}},
+            ],
+        )
+        # Vertex system tail loaded from tail_system_prompt option
+        self.assertEqual(payload1["contents"][-1], {"role": "system", "parts": [{"text": "TAIL_PROMPT_V1"}]})
+
 
 class GeminiTransportMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_signature_retry_is_bounded_and_keeps_stored_parts(self):

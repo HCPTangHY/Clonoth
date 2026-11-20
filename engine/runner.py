@@ -1408,6 +1408,12 @@ async def _run_node_task(
         node_provider_options = getattr(node, "provider_options", {}) or {}
         if not isinstance(node_provider_options, dict):
             node_provider_options = {}
+        node_extra = getattr(node, "extra", None)
+        if isinstance(node_extra, dict) and isinstance(node_extra.get("extra_body"), dict):
+            node_provider_options = _merge_provider_options(
+                node_provider_options,
+                {"extra_body": node_extra["extra_body"]},
+            )
         # Model defaults override runtime defaults, never explicit node options.
         # Sticky config is a lower-priority transport fallback: explicit runtime,
         # node and session settings must still be able to disable it.

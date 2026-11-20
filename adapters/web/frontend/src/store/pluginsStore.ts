@@ -81,6 +81,10 @@ interface PluginsState {
   standalonePanels: PanelContribution[];
   /** settings-view panels: full-page iframe tabs in the settings sidebar */
   settingsPanels: ResolvedPanel[];
+  /** host built-in slot scripts, registered at module init */
+  hostSlots: SlotContribution[];
+  /** slot scripts from the plugin manifest */
+  manifestSlots: SlotContribution[];
   slotsBySlot: Record<string, SlotContribution[]>;
   stylesByOwner: Record<string, string>;
   clientScriptsEnabled: boolean;
@@ -101,6 +105,27 @@ function deriveStandalone(host: PanelContribution[], manifest: PanelContribution
   return [...host, ...manifest].filter((p) => p.standalone);
 }
 
+function deriveSlotsBySlot(
+  host: SlotContribution[],
+  manifest: SlotContribution[],
+  scriptsEnabled: boolean,
+): Record<string, SlotContribution[]> {
+  const bySlot: Record<string, SlotContribution[]> = {};
+  const active = scriptsEnabled ? [...host, ...manifest] : [...host];
+  for (const entry of active) {
+    const slot = String(entry.slot || '').trim();
+    if (!slot || slot === '__proto__' || slot === 'constructor' || slot === 'prototype') continue;
+    if (!Object.prototype.hasOwnProperty.call(bySlot, slot)) {
+      bySlot[slot] = [];
+    }
+    bySlot[slot].push(entry);
+  }
+  for (const list of Object.values(bySlot)) {
+    list.sort((a, b) => b.priority - a.priority);
+  }
+  return bySlot;
+}
+
 const LS_CLIENT_SCRIPTS = 'clonoth_client_scripts';
 
 function readClientScriptsPref(): boolean {
@@ -118,6 +143,8 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
   manifestPanels: [],
   standalonePanels: [],
   settingsPanels: [],
+  hostSlots: [],
+  manifestSlots: [],
   slotsBySlot: {},
   stylesByOwner: {},
   clientScriptsEnabled: readClientScriptsPref(),
@@ -133,10 +160,9 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       // backend unreachable or not yet authenticated; keep previous state
       return;
     }
-    const scriptsOn = get().clientScriptsEnabled;
     const manifestPanels: PanelContribution[] = [];
     const settingsPanels: ResolvedPanel[] = [];
-    const slotsBySlot: Record<string, SlotContribution[]> = {};
+    const manifestSlots: SlotContribution[] = [];
     const stylesByOwner: Record<string, string> = {};
     for (const plugin of plugins) {
       const web = plugin.web;
@@ -160,26 +186,20 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
           manifestPanels.push({ key, owner, overlayId: key, title, priority, standalone: panel.standalone !== false, kind: 'iframe', entry: panel.entry });
         }
       }
-      if (scriptsOn) {
-        for (const slot of web.slots || []) {
-          if (!slot?.slot_id || !slot.slot || !slot.script) continue;
-          const entry: SlotContribution = {
-            slotId: slot.slot_id,
-            owner,
-            slot: slot.slot,
-            script: slot.script,
-            priority: Number.isFinite(slot.priority) ? Number(slot.priority) : 50,
-            mode: slot.mode === 'replace' ? 'replace' : 'append',
-          };
-          (slotsBySlot[entry.slot] ||= []).push(entry);
-        }
+      for (const slot of web.slots || []) {
+        if (!slot?.slot_id || !slot.slot || !slot.script) continue;
+        manifestSlots.push({
+          slotId: slot.slot_id,
+          owner,
+          slot: slot.slot,
+          script: slot.script,
+          priority: Number.isFinite(slot.priority) ? Number(slot.priority) : 50,
+          mode: slot.mode === 'replace' ? 'replace' : 'append',
+        });
       }
       if (typeof web.styles === 'string' && web.styles.trim()) {
         stylesByOwner[owner] = web.styles;
       }
-    }
-    for (const list of Object.values(slotsBySlot)) {
-      list.sort((a, b) => b.priority - a.priority);
     }
     // [AutoC 2026-08-28] 插件页签确定性排序。Why: /v1/plugins 的顺序继承
     // hook 注册顺序，随挂载时机波动，四个设置页签顺序每次刷新都可能变。
@@ -191,7 +211,8 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       manifestPanels,
       settingsPanels,
       standalonePanels: deriveStandalone(s.hostPanels, manifestPanels),
-      slotsBySlot,
+      manifestSlots,
+      slotsBySlot: deriveSlotsBySlot(s.hostSlots, manifestSlots, s.clientScriptsEnabled),
       stylesByOwner,
     }));
     // annotators are rebuilt from the same manifest fetch; fire-and-forget so a
@@ -220,7 +241,10 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     } catch {
       /* storage unavailable; in-memory flag still flips */
     }
-    set({ clientScriptsEnabled: enabled });
+    set((s) => ({
+      clientScriptsEnabled: enabled,
+      slotsBySlot: deriveSlotsBySlot(s.hostSlots, s.manifestSlots, enabled),
+    }));
     void get().refresh();
   },
 }));
@@ -248,5 +272,22 @@ export function registerHostPanel(entry: Omit<PanelContribution, 'owner' | 'kind
     if (s.hostPanels.some((p) => p.key === full.key)) return s;
     const hostPanels = [...s.hostPanels, full];
     return { hostPanels, standalonePanels: deriveStandalone(hostPanels, s.manifestPanels) };
+  });
+}
+
+/**
+ * Register a host built-in slot script into the same slot registry the plugin
+ * manifest feeds. Symmetric with registerHostPanel: host slot contributions
+ * participate in priority ordering and replace mode alongside backend plugins.
+ */
+export function registerHostSlot(entry: Omit<SlotContribution, 'owner'>): void {
+  const full: SlotContribution = { ...entry, owner: 'host' };
+  usePluginsStore.setState((s) => {
+    if (s.hostSlots.some((x) => x.slotId === full.slotId)) return s;
+    const hostSlots = [...s.hostSlots, full];
+    return {
+      hostSlots,
+      slotsBySlot: deriveSlotsBySlot(hostSlots, s.manifestSlots, s.clientScriptsEnabled),
+    };
   });
 }

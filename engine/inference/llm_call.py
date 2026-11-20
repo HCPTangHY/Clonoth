@@ -511,11 +511,13 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 ls.retry_max_delay,
             )
             if hasattr(ls.rctx, "step_notices"):
+                from engine.builtin.fallback_provider import compact_error_reason
+                _clean_retry_reason = compact_error_reason(_retry_reason, 260)
                 ls.rctx.step_notices.append({
                     "code": "llm.retry",
                     "level": "warning",
                     "label": "模型请求重试",
-                    "text": f"模型请求将重试。 第 {_retry_attempt} 次，共 {ls.retry_max} 次。 {round(_delay, 2)} 秒后重试。 原因：{_retry_reason}",
+                    "text": f"模型请求将重试。 第 {_retry_attempt} 次，共 {ls.retry_max} 次。 {round(_delay, 2)} 秒后重试。 原因：{_clean_retry_reason}",
                 })
             await ls.rctx.emit_event("llm_retry", {
                 "node_id": ls.node.id,

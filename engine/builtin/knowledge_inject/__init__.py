@@ -11,7 +11,7 @@ import logging
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
-from supervisor.admin_api import verify_admin_token
+from supervisor.admin_api import require_admin_token
 
 
 class RawContent(BaseModel):
@@ -2782,7 +2782,7 @@ def _register_admin_routes(routes: Any) -> None:
     """组装 admin/config 端点与设置面板静态资源（纯注册，无注解）。"""
     from engine.faces.routes import static_router
 
-    router = APIRouter(dependencies=[Depends(verify_admin_token)])
+    router = APIRouter(dependencies=[Depends(require_admin_token)])
     router.add_api_route("/skills", _skills_list_route, methods=["GET"])
     router.add_api_route("/skills/{name}/raw", _skills_raw_route, methods=["GET"])
     router.add_api_route("/skills/{name}/raw", _skills_update_route, methods=["PUT"])
@@ -2792,7 +2792,7 @@ def _register_admin_routes(routes: Any) -> None:
     router.add_api_route("/skill_pins", _skill_pins_put_route, methods=["PUT"])
     routes.register(router, mount="admin/config", description="skills 配置端点")
 
-    mem_router = APIRouter(dependencies=[Depends(verify_admin_token)])
+    mem_router = APIRouter(dependencies=[Depends(require_admin_token)])
     mem_router.add_api_route("/memory", _memory_list_route, methods=["GET"])
     mem_router.add_api_route("/memory/raw", _memory_raw_route, methods=["GET"])
     mem_router.add_api_route("/memory/raw", _memory_raw_put_route, methods=["PUT"])

@@ -64,9 +64,10 @@ const safeSessionId = (sessionId: string) => sessionId || 'no-session';
 // priority and wins; unloading it restores the host entry on the next manifest
 // refresh.
 import { PluginPanel } from '../components/plugins/PluginPanel';
-import { registerHostPanel, usePluginsStore } from '../store/pluginsStore';
+import reasoningEffortSlotScript from '../plugins/reasoningEffortSlot.js?raw';
+import { registerHostPanel, registerHostSlot, usePluginsStore } from '../store/pluginsStore';
 
-// host seeding: built-in overlays as registry contributions (priority 0)
+// host seeding: built-in overlays & composer controls as registry contributions
 registerHostPanel({
   key: 'host:files',
   overlayId: 'files',
@@ -74,6 +75,14 @@ registerHostPanel({
   priority: 0,
   standalone: false,
   Component: WorkspaceFileTree,
+});
+
+registerHostSlot({
+  slotId: 'host.reasoning_effort',
+  slot: 'input_controls',
+  priority: 50,
+  mode: 'append',
+  script: reasoningEffortSlotScript,
 });
 
 /** Resolve a panel overlay id through the unified panel registry. */

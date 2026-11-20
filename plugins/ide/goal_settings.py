@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 import yaml
 
-from supervisor.admin_api import verify_admin_token
+from supervisor.admin_api import require_admin_token
 from supervisor.runtime_config import WRITE_LOCK, patch_integer, read_raw, revision, write_raw
 
 
@@ -40,13 +40,13 @@ def add_routes(router: APIRouter) -> None:
             raise HTTPException(503, 'Goal runtime unavailable')
         return Path(runtime.workspace_root)
 
-    @router.get('/goal/settings', dependencies=[Depends(verify_admin_token)])
+    @router.get('/goal/settings', dependencies=[Depends(require_admin_token)])
     def read_settings(request: Request) -> dict:
         with WRITE_LOCK:
             raw = read_raw(root_for(request))
             return {'default_max_rounds': _value(raw), 'revision': revision(raw)}
 
-    @router.put('/goal/settings', dependencies=[Depends(verify_admin_token)])
+    @router.put('/goal/settings', dependencies=[Depends(require_admin_token)])
     async def save_settings(request: Request) -> dict:
         raw_body = bytearray()
         async for chunk in request.stream():

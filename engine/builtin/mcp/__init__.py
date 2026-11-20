@@ -33,7 +33,7 @@ from typing import Any, Callable
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from supervisor.admin_api import verify_admin_token
+from supervisor.admin_api import require_admin_token
 
 from . import mcp_runtime
 
@@ -782,7 +782,7 @@ def update_mcp_clients_raw_endpoint(payload: RawContent, request: Request) -> di
 def _register_admin_routes(routes: Any) -> None:
     from engine.faces.routes import static_router
 
-    router = APIRouter(dependencies=[Depends(verify_admin_token)])
+    router = APIRouter(dependencies=[Depends(require_admin_token)])
     router.add_api_route("/mcp-clients", list_mcp_clients_endpoint, methods=["GET"])
     router.add_api_route("/mcp-clients/raw", get_mcp_clients_raw_endpoint, methods=["GET"])
     router.add_api_route("/mcp-clients/raw", update_mcp_clients_raw_endpoint, methods=["PUT"])

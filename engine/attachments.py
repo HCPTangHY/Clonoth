@@ -10,6 +10,7 @@ import base64
 import io
 import logging
 import mimetypes
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -145,14 +146,65 @@ def _is_allowed_attachment_path(rel_path: str) -> bool:
     )
 
 
+_SAFE_DATA_ATTACHMENT_DIRS = frozenset({"attachments", "artifacts", "temp"})
+_SENSITIVE_NAME_RE = re.compile(
+    r"(?:^|[^a-z0-9]|my|the|auth|api|admin|user|bot|client|server|access|refresh|private|secret)"
+    r"(key|keys|secret|secrets|token|tokens|password|passwd|pwd|credential|credentials|apikey|api_key|auth_token|private_key)"
+    r"(?:$|[^a-z0-9])"
+)
+_BLOCKED_SUFFIXES = (
+    ".bak",
+    ".orig",
+    ".old",
+    ".save",
+    ".swp",
+    "~",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".jks",
+    ".kdbx",
+    "_account.json",
+)
+
+
+def _is_protected_data_target(data_rel: Path) -> bool:
+    """Strict allowlist under data/: only safe files in attachments/artifacts/temp are permitted."""
+    parts = data_rel.parts
+    if len(parts) < 2 or parts[0] not in _SAFE_DATA_ATTACHMENT_DIRS:
+        return True
+    for seg in parts[1:]:
+        seg_lower = seg.lower()
+        # Reject hidden dotfiles/dotdirs (.env, .env.*, .admin_token, .git, etc.)
+        if seg.startswith("."):
+            return True
+        if _SENSITIVE_NAME_RE.search(seg_lower):
+            return True
+    name_lower = parts[-1].lower()
+    if name_lower.endswith(_BLOCKED_SUFFIXES) or ".bak." in name_lower:
+        return True
+    if name_lower in {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"}:
+        return True
+    return False
+
+
 def _resolve_attachment_path(rel_path: str, workspace_root: Path) -> Path:
-    """Reject traversal and symlinks that leave the workspace data/ directory."""
+    """Reject traversal, symlinks leaving data/, and protected credential/state files."""
     if not _is_allowed_attachment_path(rel_path):
         raise ValueError("path is outside allowed data/ directory")
     root = workspace_root.resolve()
+    data_root = root / "data"
     path = (root / rel_path).resolve()
-    if not path.is_relative_to(root / "data"):
+    if not path.is_relative_to(data_root):
         raise ValueError("path escapes workspace data/ directory")
+    if _is_protected_data_target(path.relative_to(data_root)):
+        raise ValueError("path points to a protected runtime or credential file")
+    try:
+        if path.exists() and path.stat().st_nlink > 1:
+            raise ValueError("path points to a protected runtime or credential file")
+    except OSError:
+        pass
     return path
 
 

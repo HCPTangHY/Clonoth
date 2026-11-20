@@ -112,7 +112,11 @@ export async function ensureComposerSession(conversationId: string, isCurrent: (
       if (!isCurrent()) throw new Error('会话已切换，目标未提交。');
       if (nodeId) await switchNode(result.session_id, nodeId);
       if (!isCurrent()) throw new Error('会话已切换，目标未提交。');
-      if (override) await updateSessionProviderOverride(result.session_id, getStoredAdminToken(), override);
+      if (override) {
+        const saved = await updateSessionProviderOverride(result.session_id, getStoredAdminToken(), override);
+        useSettingsStore.getState().setSessionProviderOverride(saved);
+        useSettingsStore.getState().setPendingProviderOverride(null);
+      }
       if (!isCurrent()) throw new Error('会话已切换，目标未提交。');
       await updateSessionApprovalRules(result.session_id, rules);
       if (!isCurrent()) throw new Error('会话已切换，目标未提交。');
@@ -676,6 +680,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       });
       sessionId = result.session_id;
       handled = Boolean(result.handled);
+      if (providerOverride) {
+        useSettingsStore.getState().setSessionProviderOverride(providerOverride);
+      }
       void useSessionApprovalStore.getState().load(sessionId);
       const inboundSeq = result.inbound_seq;
       if (inboundSeq > 0) {

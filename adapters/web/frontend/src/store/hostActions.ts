@@ -9,7 +9,13 @@
 // frontend action surface follows the same shape as the backend contributions
 // container (mount by name, consume generically), ending per-plugin whitelist
 // edits.
+import {
+  clearSessionProviderOverride,
+  getSessionProviderOverride,
+  updateSessionProviderOverride,
+} from '../api/supervisorClient';
 import { useChatStore } from './chatStore';
+import { dispatchPluginEvent } from './pluginRuntime';
 import { useViewStore } from './viewStore';
 import { useSettingsStore } from './settingsStore';
 
@@ -126,4 +132,71 @@ registerHostAction('openPanel', (panelId, intent) => {
   if (!id) return;
   useViewStore.getState().setPanelOverlay('right', id, intent);
   useSettingsStore.getState().setRightPanelOpen(true);
+});
+
+// Broadcast session/pending provider_override mutations so slot contributions stay in sync
+useSettingsStore.subscribe((state, prev) => {
+  if (
+    state.sessionProviderOverride !== prev.sessionProviderOverride ||
+    state.pendingProviderOverride !== prev.pendingProviderOverride
+  ) {
+    dispatchPluginEvent('session_provider_override_changed', {
+      sessionProviderOverride: state.sessionProviderOverride,
+      pendingProviderOverride: state.pendingProviderOverride,
+    });
+  }
+});
+
+registerHostAction('getSessionProviderOverride', async (sessionId) => {
+  const sid = String(sessionId ?? '').trim();
+  const settings = useSettingsStore.getState();
+  if (!sid) {
+    settings.setSessionProviderOverride(settings.pendingProviderOverride);
+    return settings.pendingProviderOverride;
+  }
+  if (!settings.adminToken) return settings.sessionProviderOverride;
+  try {
+    const override = await getSessionProviderOverride(sid, settings.adminToken);
+    useSettingsStore.getState().setSessionProviderOverride(override);
+    return override;
+  } catch {
+    useSettingsStore.getState().setSessionProviderOverride(null);
+    return null;
+  }
+});
+
+registerHostAction('patchSessionProviderOverride', async (sessionId, patch) => {
+  if (!patch || typeof patch !== 'object') return null;
+  const sid = String(sessionId ?? '').trim();
+  const settings = useSettingsStore.getState();
+  const base = sid ? settings.sessionProviderOverride : settings.pendingProviderOverride;
+  const next: Record<string, unknown> = { ...(base || {}) };
+
+  for (const [key, val] of Object.entries(patch as Record<string, unknown>)) {
+    if (val === null || val === undefined || val === '') {
+      delete next[key];
+      if (key === 'reasoning_effort' && next.provider_options && typeof next.provider_options === 'object') {
+        const po = { ...(next.provider_options as Record<string, unknown>) };
+        delete po.reasoning_effort;
+        if (Object.keys(po).length > 0) next.provider_options = po;
+        else delete next.provider_options;
+      }
+    } else {
+      next[key] = val;
+    }
+  }
+
+  if (!sid) {
+    const normalized = Object.keys(next).length > 0 ? next : null;
+    settings.setPendingProviderOverride(normalized);
+    settings.setSessionProviderOverride(normalized);
+    return normalized;
+  }
+
+  if (!settings.adminToken) throw new Error('未登录');
+  const saved = Object.keys(next).length === 0
+    ? await clearSessionProviderOverride(sid, settings.adminToken)
+    : await updateSessionProviderOverride(sid, settings.adminToken, next);
+  useSettingsStore.getState().setSessionProviderOverride(saved);
+  return saved;
 });

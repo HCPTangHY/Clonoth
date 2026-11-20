@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from .base import BaseProvider, ProviderResponse, ToolCall
+from .base import BaseProvider, ProviderResponse, ToolCall, merge_extra_body
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ class GeminiProvider(BaseProvider):
     is_vertex = False
     default_max_tokens = 65535
     default_thought_summary = True
+    default_wrap_user_cer = False
 
     def __init__(
         self,
@@ -85,6 +86,7 @@ class GeminiProvider(BaseProvider):
         messages: list[dict[str, Any]],
         *,
         strip_thoughts: bool = False,
+        wrap_user_cer: bool = False,
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert OpenAI-format messages → Gemini contents + system instruction.
 
@@ -120,7 +122,7 @@ class GeminiProvider(BaseProvider):
             seen_non_system = True
             # ── user ──
             if role == "user":
-                contents.append({"role": "user", "parts": _user_parts(msg)})
+                contents.append({"role": "user", "parts": _user_parts(msg, wrap_cer=wrap_user_cer)})
                 continue
 
             # ── assistant / model ──
@@ -218,7 +220,7 @@ class GeminiProvider(BaseProvider):
             # ── fallback: treat unknown roles as user ──
             txt = _extract_text(msg)
             if txt:
-                contents.append({"role": "user", "parts": [{"text": txt}]})
+                contents.append({"role": "user", "parts": [_user_text_part(txt, wrap_user_cer)]})
 
         system_text = "\n\n".join(system_parts) if system_parts else None
         return system_text, contents
@@ -251,6 +253,18 @@ class GeminiProvider(BaseProvider):
 
     # ── Build request body ───────────────────────────────────────────
 
+    def _should_wrap_user_cer(self) -> bool:
+        raw = self._options.get("wrap_user_cer", self.default_wrap_user_cer)
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(raw)
+
+    def _resolve_tail_system_text(self) -> str:
+        raw_prompt = self._options.get("tail_system_prompt")
+        if isinstance(raw_prompt, str) and raw_prompt:
+            return raw_prompt
+        return " "
+
     def _build_body(
         self,
         messages: list[dict[str, Any]],
@@ -259,7 +273,11 @@ class GeminiProvider(BaseProvider):
         strip_thoughts: bool = False,
         strip_system_role: bool = False,
     ) -> dict[str, Any]:
-        system_text, contents = self._convert_messages(messages, strip_thoughts=strip_thoughts)
+        system_text, contents = self._convert_messages(
+            messages,
+            strip_thoughts=strip_thoughts,
+            wrap_user_cer=self._should_wrap_user_cer(),
+        )
         # Request-only channel compatibility tails, not recorded execution results.
         # This matches the selected upstream policy, not a general Google API guarantee.
         if not contents:
@@ -267,7 +285,7 @@ class GeminiProvider(BaseProvider):
         elif contents[-1].get("role") == "model":
             contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
         elif self.is_vertex and not strip_system_role:
-            contents.append({"role": "system", "parts": [{"text": " "}]})
+            contents.append({"role": "system", "parts": [{"text": self._resolve_tail_system_text()}]})
         elif not self.is_vertex:
             contents.append({
                 "role": "model",
@@ -332,7 +350,7 @@ class GeminiProvider(BaseProvider):
         if thinking:
             gen_config["thinkingConfig"] = thinking
         body["generationConfig"] = gen_config
-        return body
+        return merge_extra_body(body, self._options)
 
     def prepare_history(
         self, messages: list[dict[str, Any]], *, tool_mode: str = "native",
@@ -686,7 +704,13 @@ def _extract_text(msg: dict[str, Any]) -> str | None:
     return None
 
 
-def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
+def _user_text_part(text: str, wrap_cer: bool = False) -> dict[str, Any]:
+    if wrap_cer:
+        return {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": text}}
+    return {"text": text}
+
+
+def _user_parts(msg: dict[str, Any], *, wrap_cer: bool = False) -> list[dict[str, Any]]:
     """Build Gemini 'parts' array for a user message.
 
     Handles plain text and OpenAI multi-modal content arrays
@@ -694,12 +718,12 @@ def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
     """
     content = msg.get("content", "")
     if isinstance(content, str):
-        return [{"text": content}] if content else [{"text": " "}]
+        return [_user_text_part(content if content else " ", wrap_cer)]
     if isinstance(content, list):
         parts: list[dict[str, Any]] = []
         for item in content:
             if item.get("type") == "text":
-                parts.append({"text": item.get("text", "")})
+                parts.append(_user_text_part(item.get("text", ""), wrap_cer))
             elif item.get("type") == "image_url":
                 url = (item.get("image_url") or {}).get("url", "")
                 # Handle base64 data URIs: "data:<mime>;base64,<data>"
@@ -712,9 +736,9 @@ def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
                     # External URL — Gemini supports fileData for GCS URIs;
                     # for http(s) URLs, we'd need to download. For now, pass
                     # as text fallback since Gemini doesn't accept arbitrary URLs.
-                    parts.append({"text": f"[Image: {url}]"})
-        return parts or [{"text": " "}]
-    return [{"text": str(content)}]
+                    parts.append(_user_text_part(f"[Image: {url}]", wrap_cer))
+        return parts or [_user_text_part(" ", wrap_cer)]
+    return [_user_text_part(str(content), wrap_cer)]
 
 
 def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:

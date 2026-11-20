@@ -351,6 +351,39 @@ class ResponseNoticeTests(unittest.TestCase):
         # Notices must never be recorded as model-visible channel history.
         self.assertFalse(rt.channel_history)
 
+    def test_discord_callback_skips_self_recovered_retry_and_keeps_fallback_notice(self):
+        rt = _FakeRuntime()
+        cb = DiscordCallbacks(rt)
+        channel = _FakeChannel(1)
+        trigger = _trigger(7, 1, 3)
+        trigger.platform_data["message"] = _FakeMessage(mid=10, channel=channel)
+
+        # Self-recovered retry without fallback: nothing sent to Discord
+        _run(cb.send_response_notice(trigger, "discord:1", {
+            "notices": [
+                {"code": "llm.retry", "text": "模型请求将重试。 第 1 次，共 3 次。"},
+                {"code": "llm.retry", "text": "模型请求将重试。 第 2 次，共 3 次。"},
+            ],
+        }))
+        channel.send.assert_not_awaited()
+
+        # Fallback occurred: sends only the fallback summary (with retry reason, HTML stripped)
+        _run(cb.send_response_notice(trigger, "discord:1", {
+            "notices": [
+                {"code": "llm.retry", "text": "模型请求将重试。 第 1 次，共 3 次。"},
+                {
+                    "code": "fallback_provider.used",
+                    "text": "原渠道 gemini-pro 重试 3 次后仍请求失败（原因：<!DOCTYPE html><title>Error 502</title><style>*{margin:0}</style><p>502 Bad Gateway</p>），本次改用 deepseek-v4（deepseek）。",
+                },
+            ],
+        }))
+        channel.send.assert_awaited_once()
+        desc = channel.send.await_args.kwargs["embed"].description
+        self.assertIn("重试 3 次后仍请求失败", desc)
+        self.assertIn("Error 502", desc)
+        self.assertNotIn("<style>", desc)
+        self.assertNotIn("模型请求将重试", desc)
+
 
 # ---------------------------------------------------------------------------
 #  SDK health: old/new supervisor compatibility

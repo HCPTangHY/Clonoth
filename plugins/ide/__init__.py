@@ -222,16 +222,18 @@ def _msg_text_and_writer(msg: dict):
 def _expand_file_mentions(ctx) -> None:
     """before_llm_call handler：展开 user 消息中的工作区 @path 引用。"""
     # 优先 session 工作区（与前端 session 级文件树同基准），回退 engine 运行根。
+    install_root = ctx.extra.get("workspace_root")
+    if not install_root and ctx.rctx is not None:
+        install_root = getattr(ctx.rctx, "workspace_root", None)
     ws_root = ctx.extra.get("workspace")
     if not ws_root and ctx.rctx is not None:
         ws_root = getattr(ctx.rctx, "workspace", None)
     if not ws_root:
-        ws_root = ctx.extra.get("workspace_root")
-    if not ws_root and ctx.rctx is not None:
-        ws_root = getattr(ctx.rctx, "workspace_root", None)
+        ws_root = install_root
     if not ws_root:
         return
     ws_root = Path(ws_root).resolve()
+    policy_root = Path(install_root).resolve() if install_root else ws_root
     freeze = ctx.extra.get("freeze_message_metadata")
     expanded: set[str] = set()
     for msg in ctx.messages:
@@ -251,7 +253,7 @@ def _expand_file_mentions(ctx) -> None:
             # appearing in an old message after a later workspace or file change.
             snapshot = freeze(msg, "ide.reference_snapshot", lambda: {
                 "workspace": str(ws_root),
-                "suffix": _reference_suffix(text, ws_root, set(), use_cache=False),
+                "suffix": _reference_suffix(text, ws_root, expanded=set(), use_cache=False, policy_root=policy_root),
             })
             if snapshot is not None:
                 if snapshot.get("suffix"):
@@ -260,12 +262,23 @@ def _expand_file_mentions(ctx) -> None:
             continue
         # Legacy direct hook callers have no durable store; retain only their
         # per-request expansion contract, without claiming cross-request freezing.
-        suffix = _reference_suffix(text, ws_root, expanded)
+        suffix = _reference_suffix(text, ws_root, expanded, policy_root=policy_root)
         if suffix:
             writer(text + suffix)
 
 
-def _reference_suffix(text: str, ws_root: Path, expanded: set[str], *, use_cache: bool = True) -> str:
+def _reference_suffix(
+    text: str,
+    ws_root: Path,
+    expanded: set[str],
+    *,
+    use_cache: bool = True,
+    policy_root: Path | None = None,
+) -> str:
+    from supervisor.policy import PolicyEngine
+    from supervisor.types import SafetyLevel
+
+    policy = PolicyEngine(workspace_root=(policy_root or ws_root))
     parts: list[str] = []
     for m in _MENTION_RE.finditer(text):
         raw = m.group(1)
@@ -279,6 +292,8 @@ def _reference_suffix(text: str, ws_root: Path, expanded: set[str], *, use_cache
         except ValueError:
             continue
         if not target.is_file():
+            continue
+        if policy.evaluate_read_file(path=str(target), workspace=ws_root).safety_level != SafetyLevel.auto:
             continue
         key = target.as_posix()
         if key in expanded:
@@ -307,16 +322,17 @@ def register(ctx) -> None:
     from fastapi import APIRouter, Depends, HTTPException, Request
 
     from engine.faces.routes import static_router
-    from supervisor.admin_api import verify_admin_token
+    from supervisor.admin_api import require_admin_token
+    from supervisor.types import SafetyLevel
 
     # ── 写文件端点 ───────────────────────────────────────────────────
     # 写范围仅限显式设置的会话工作区，不回退 workspace_root（未设工作区 400）。
-    # 鉴权依赖全局 /v1/ 中间件 + 路由级 verify_admin_token。
+    # 鉴权依赖全局 /v1/ 中间件 + 路由级 require_admin_token。
     MAX_WRITE_BYTES = 4 * 1024 * 1024
 
     from .todo import add_routes
 
-    api = APIRouter(dependencies=[Depends(verify_admin_token)])
+    api = APIRouter(dependencies=[Depends(require_admin_token)])
     add_routes(api)
     from .goal import add_routes as add_goal_routes, register_supervisor
     add_goal_routes(api)
@@ -713,8 +729,13 @@ def register(ctx) -> None:
             if not root.is_dir():
                 raise HTTPException(status_code=404, detail="directory not found")
 
+        st = _state(request)
+        exclude_dirs = list(_SEARCH_EXCLUDE_DIRS)
+        if base == st.workspace_root.resolve():
+            exclude_dirs.append("data")
+
         cmd = ["grep", "-rInI", "--color=never"]
-        cmd.extend(f"--exclude-dir={d}" for d in _SEARCH_EXCLUDE_DIRS)
+        cmd.extend(f"--exclude-dir={d}" for d in exclude_dirs)
         if case_insensitive:
             cmd.append("-i")
         cmd.append("-E" if regex else "-F")
@@ -779,6 +800,8 @@ def register(ctx) -> None:
             try:
                 rel = full.relative_to(rel_base).as_posix()
             except ValueError:
+                continue
+            if st.policy.evaluate_read_file(path=str(full), workspace=base).safety_level != SafetyLevel.auto:
                 continue
             files.append({"path": rel, "matches": by_file[path]})
         return {

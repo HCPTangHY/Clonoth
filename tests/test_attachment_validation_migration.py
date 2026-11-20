@@ -45,7 +45,7 @@ class AttachmentValidationTests(unittest.TestCase):
         self.png = buffer.getvalue()
 
     def write(self, name, data):
-        path = self.root / "data" / name
+        path = self.root / "data" / "attachments" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
         return path.relative_to(self.root).as_posix()
@@ -130,9 +130,9 @@ class AttachmentValidationTests(unittest.TestCase):
         part = attachments_to_content_parts([att], self.root)[0]
         self.assertIn("local text 中文", part["text"])
         with patch.object(Path, "open", side_effect=AssertionError("must not read cwd")):
-            deferred = attachments_to_content_parts([att, {"path": "data/picture.png", "type": "image"}])
+            deferred = attachments_to_content_parts([att, {"path": "data/attachments/picture.png", "type": "image"}])
         self.assertNotIn("local text", deferred[0]["text"])
-        self.assertEqual(deferred[1]["image_url"]["url"], "file://data/picture.png")
+        self.assertEqual(deferred[1]["image_url"]["url"], "file://data/attachments/picture.png")
 
     def test_large_text_files_are_metadata_only_without_reading(self):
         path = self.write("large.txt", b"x" * (attachment_module._TEXT_FILE_MAX_BYTES + 1))
@@ -158,12 +158,13 @@ class AttachmentValidationTests(unittest.TestCase):
     def test_symlinks_outside_data_are_rejected_before_reads(self):
         (self.outside / "private.txt").write_text("outside-fixture")
         (self.outside / "picture.png").write_bytes(self.png)
+        (self.root / "data" / "attachments").mkdir(parents=True, exist_ok=True)
         for name in ("private.txt", "picture.png"):
-            (self.root / "data" / name).symlink_to(self.outside / name)
+            (self.root / "data" / "attachments" / name).symlink_to(self.outside / name)
         with patch.object(Path, "open", side_effect=AssertionError("outside symlinks must not be read")):
             for name, kind in (("private.txt", "file"), ("picture.png", "image")):
                 with self.subTest(name=name):
-                    path = "data/" + name
+                    path = "data/attachments/" + name
                     part = attachments_to_content_parts([{"path": path, "type": kind}], self.root)[0]
                     self.assertIn("escapes workspace data/", part["text"])
                     self.assertNotIn("outside-fixture", part["text"])
@@ -178,16 +179,17 @@ class AttachmentValidationTests(unittest.TestCase):
 
     def test_symlinks_remaining_inside_data_are_allowed(self):
         target = self.write("picture.png", self.png)
-        (self.root / "data" / "link.png").symlink_to(self.root / target)
-        self.assertEqual(self.resolve("data/link.png")["type"], "image_url")
+        (self.root / "data" / "attachments" / "link.png").symlink_to(self.root / target)
+        self.assertEqual(self.resolve("data/attachments/link.png")["type"], "image_url")
 
     def test_oversized_images_are_rejected_before_both_read_paths(self):
-        path = self.root / "data" / "large.png"
+        path = self.root / "data" / "attachments" / "large.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as output:
             output.truncate(25 * 1024 * 1024 + 1)
         with patch.object(Path, "open", side_effect=AssertionError("oversized image must not be read")):
-            parts = attachments_to_content_parts([{"path": "data/large.png", "type": "image"}], self.root)
-            resolved = self.resolve("data/large.png")
+            parts = attachments_to_content_parts([{"path": "data/attachments/large.png", "type": "image"}], self.root)
+            resolved = self.resolve("data/attachments/large.png")
         for part in (parts[0], resolved):
             self.assertEqual(part["type"], "text")
             self.assertIn("25MiB limit", part["text"])
@@ -201,9 +203,9 @@ class AttachmentValidationTests(unittest.TestCase):
         self.assertIn("25MiB limit", saved["invalid_image_reason"])
 
     def test_missing_file_warning_contains_path_and_reason(self):
-        part = self.resolve("data/missing.png")
+        part = self.resolve("data/attachments/missing.png")
         self.assertEqual(part["type"], "text")
-        self.assertIn("data/missing.png", part["text"])
+        self.assertIn("data/attachments/missing.png", part["text"])
         self.assertIn("file does not exist", part["text"])
 
     def test_image_is_revalidated_if_file_changes_before_provider_request(self):
@@ -270,6 +272,53 @@ class AttachmentValidationTests(unittest.TestCase):
     def test_save_rejects_session_path_traversal(self):
         with self.assertRaisesRegex(ValueError, "outside allowed data/"):
             save_attachment(self.root, "../../outside", self.png, filename="picture.png")
+
+    def test_protected_data_allowlist_and_sensitive_filenames(self):
+        blocked_rel_paths = (
+            "data/root_note.txt",
+            "data/memory/default.yaml",
+            "data/logs/supervisor.log",
+            "data/secrets/plain.txt",
+            "data/transcripts/s1.jsonl",
+            "data/temp/gemini_ais_keys_alive_28.txt",
+            "data/temp/zoaholic_api_yaml.bak.20261120",
+            "data/temp/.env.prod",
+            "data/attachments/s1/api_key.txt",
+            "data/attachments/s1/mytoken.txt",
+            "data/attachments/s1/mypasswd.txt",
+            "data/artifacts/gitea_ereuna_account.json",
+        )
+        for rel in blocked_rel_paths:
+            full = self.root / rel
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text("sensitive-payload", encoding="utf-8")
+            with self.subTest(blocked=rel):
+                part = attachments_to_content_parts([{"path": rel, "type": "file"}], self.root)[0]
+                self.assertIn("protected runtime or credential file", part["text"])
+                self.assertNotIn("sensitive-payload", part["text"])
+
+        # Hardlink to protected file under data/ must also be blocked
+        import os
+        secret_src = self.root / "data" / ".admin_token"
+        secret_src.write_text("secret-token-value", encoding="utf-8")
+        hardlink_dst = self.root / "data" / "attachments" / "s1" / "harmless.txt"
+        os.link(secret_src, hardlink_dst)
+        part_hl = attachments_to_content_parts([{"path": "data/attachments/s1/harmless.txt", "type": "file"}], self.root)[0]
+        self.assertIn("protected runtime or credential file", part_hl["text"])
+        self.assertNotIn("secret-token-value", part_hl["text"])
+
+        allowed_rel_paths = (
+            "data/temp/results_lang_keywords_bag.jsonl",
+            "data/attachments/s1/keyboard_shortcut.txt",
+            "data/artifacts/report.md",
+        )
+        for rel in allowed_rel_paths:
+            full = self.root / rel
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text("benign-content", encoding="utf-8")
+            with self.subTest(allowed=rel):
+                part = attachments_to_content_parts([{"path": rel, "type": "file"}], self.root)[0]
+                self.assertIn("benign-content", part["text"])
 
     def test_session_history_structured_filters_phantom_and_read_file_attachments(self):
         import json

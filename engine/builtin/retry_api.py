@@ -40,9 +40,9 @@ class RetryApiPlugin:
             return  # engine process: no HTTP surface
 
         from fastapi import APIRouter, Depends
-        from supervisor.admin_api import verify_admin_token
+        from supervisor.admin_api import require_admin_token
 
-        router = APIRouter(dependencies=[Depends(verify_admin_token)])
+        router = APIRouter(dependencies=[Depends(require_admin_token)])
         router.add_api_route(
             "/{session_id}/retry",
             retry_session_inbound,

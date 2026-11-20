@@ -1599,10 +1599,17 @@ async def run_ai_node(
         _step_notices = list(getattr(ls.rctx, "step_notices", None) or [])
         if hasattr(ls.rctx, "step_notices"):
             ls.rctx.step_notices = []
+        _hook_notices = list(_usage_result.channels.get("response_notices") or [])
+        # Per-attempt llm.retry notices are diagnostic; self-recovered retries need
+        # no user notice, and fallback_provider.used already summarizes retry count + reason.
+        _visible_step_notices = [
+            n for n in _step_notices
+            if not (isinstance(n, dict) and n.get("code") == "llm.retry")
+        ]
         ls.rctx.response_info = {
             "provider": getattr(_usage_ctx.provider, "name", "") or "unknown",
             "model": getattr(_usage_ctx.provider, "model", "") or "",
-            "notices": _step_notices + list(_usage_result.channels.get("response_notices") or []),
+            "notices": _visible_step_notices + _hook_notices,
             "usage": dict(ls.last_usage),
         }
 

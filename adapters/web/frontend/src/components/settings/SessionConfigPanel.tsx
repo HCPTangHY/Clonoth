@@ -293,14 +293,16 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     if (!sid) {
       // [2026-06-16] Welcome page: no session yet. Store the override locally;
       // it will be applied via postInbound when the first message creates a session.
-      const next: Record<string, unknown> = {};
+      const next: Record<string, unknown> = { ...(useSettingsStore.getState().pendingProviderOverride || {}) };
       for (const key of ['provider', 'model', 'base_url'] as const) {
         const value = edit[key].trim();
         if (value) next[key] = value;
+        else delete next[key];
       }
       if (edit.api_key.trim()) next.api_key = edit.api_key.trim();
-      setPendingProviderOverride(next);
-      setSessionProviderOverride(next);
+      const normalized = Object.keys(next).length > 0 ? next : null;
+      setPendingProviderOverride(normalized);
+      setSessionProviderOverride(normalized);
       setModelMsg('已为下一条消息保存');
       return;
     }

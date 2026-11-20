@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from providers.base import BaseProvider, ProviderResponse, ToolCall
+from providers.base import BaseProvider, ProviderResponse, ToolCall, merge_extra_body
 # Reuse the base-URL normalizer from the sibling openai provider
 from providers.openai import _normalize_base_url
 
@@ -53,31 +53,48 @@ _LEGACY_TOOL_RECORD_RE = re.compile(
 
 
 def _strip_encrypted_content(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove encrypted_content from reasoning items, keeping summary."""
+    """Strip server-bound item IDs, status fields, and encrypted reasoning blobs."""
     cleaned: list[dict[str, Any]] = []
     for item in items:
-        if isinstance(item, dict) and item.get("type") == "reasoning":
-            # [2026-05-06] Why: OpenAI can reject stale encrypted reasoning
-            # content when verifying prior turns. How: copy only reasoning items
-            # and drop encrypted_content while preserving summary. Purpose: keep
-            # useful visible reasoning summaries without resending unverifiable
-            # encrypted blobs.
-            new_item = {k: v for k, v in item.items() if k != "encrypted_content"}
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        if item.get("type") == "reasoning":
+            # [2026-05-06 / item_conflict fix] Drop encrypted_content and server
+            # record id/status. If neither visible summary nor reasoning content
+            # remains, omit the empty reasoning shell so stateless /v1/responses
+            # never rejects a bare item.
+            new_item = {
+                k: v for k, v in item.items()
+                if k not in {"encrypted_content", "id", "status"}
+            }
+            has_summary = bool(new_item.get("summary"))
+            has_content = bool(new_item.get("content"))
+            if not has_summary and not has_content:
+                continue
             if "summary" not in new_item:
                 new_item["summary"] = []
             cleaned.append(new_item)
         else:
-            cleaned.append(item)
+            # Strip server primary-key 'id' (msg_xxx / fc_xxx) and 'status' while
+            # keeping 'call_id' intact so function_call <-> function_call_output pairs stay valid.
+            cleaned.append({
+                k: v for k, v in item.items()
+                if k not in {"id", "status"}
+            })
     return cleaned
 
 
-def _is_encrypted_content_error(error_msg: str) -> bool:
-    """Return True for OpenAI encrypted reasoning verification failures."""
+def _is_encrypted_content_error(error_msg: str, *, error_code: str = "") -> bool:
+    """Return True for OpenAI encrypted reasoning or cross-upstream item_conflict errors."""
+    code_lower = str(error_code or "").strip().lower()
+    if code_lower in {"item_conflict", "invalid_encrypted_content"}:
+        return True
     lower = str(error_msg or "").lower()
-    # [2026-05-06] Why: generic verification/decryption errors may refer to
-    # unrelated inputs. How: require an encrypted-content marker plus the known
-    # OpenAI verification/decryption phrases. Purpose: retry only the safe
-    # fallback path requested for reasoning.encrypted_content failures.
+    if "item_conflict" in lower or "conflicts with an existing record" in lower:
+        return True
+    # [2026-05-06] Require an encrypted-content marker plus the known
+    # OpenAI verification/decryption phrases for text-only error matching.
     has_encrypted_marker = "encrypted content" in lower or "encrypted_content" in lower
     has_verification_failure = "could not be verified" in lower or "could not be decrypted" in lower
     return has_encrypted_marker and has_verification_failure
@@ -104,13 +121,32 @@ def _normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
     return result
 
 
+def _extract_error_details(body_data: Any, fallback_text: str = "") -> tuple[str, str]:
+    """Extract (error_code, error_message) from a parsed JSON body or SSE event."""
+    if isinstance(body_data, dict):
+        err_obj = body_data.get("error")
+        if isinstance(err_obj, dict):
+            code = str(err_obj.get("code") or "").strip()
+            msg = str(err_obj.get("message") or fallback_text or err_obj)
+            return code, msg
+        code = str(body_data.get("code") or "").strip()
+        if "message" in body_data and body_data.get("message") is not None:
+            return code, str(body_data.get("message"))
+    return "", fallback_text
+
+
+def _response_error_details(resp: httpx.Response) -> tuple[str, str]:
+    """Extract (error_code, error_message) from an HTTP error response."""
+    fallback = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+    try:
+        return _extract_error_details(resp.json(), fallback)
+    except Exception:
+        return "", fallback
+
+
 def _response_error_message(resp: httpx.Response) -> str:
     """Extract an API error message from an HTTP response."""
-    try:
-        body = resp.json()
-        return body.get("error", {}).get("message", resp.text[:500])
-    except Exception:
-        return resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+    return _response_error_details(resp)[1]
 
 
 class OpenAIResponsesProvider(BaseProvider):
@@ -418,14 +454,16 @@ class OpenAIResponsesProvider(BaseProvider):
             return ProviderResponse(ok=False, error=str(exc))
 
         if resp.status_code >= 400:
-            err_msg = _response_error_message(resp)
-            if resp.status_code == 400 and _is_encrypted_content_error(err_msg):
-                # [2026-05-06] Why: stale encrypted reasoning from saved
-                # Responses output can make OpenAI reject the request. How: strip
-                # encrypted_content from reasoning input items and resend this
-                # payload once. Purpose: recover the conversation while keeping
-                # the retry bounded and preserving summaries.
-                log.warning("Encrypted content verification failed, retrying without encrypted reasoning")
+            err_code, err_msg = _response_error_details(resp)
+            if resp.status_code == 400 and _is_encrypted_content_error(err_msg, error_code=err_code):
+                # [2026-05-06] Why: stale encrypted reasoning or foreign item IDs
+                # from saved Responses output can make OpenAI reject the request.
+                # How: strip server IDs and encrypted_content from input items and
+                # resend once. Purpose: recover the conversation cleanly.
+                log.warning(
+                    "Responses input conflict/encrypted verification failed (code=%s), retrying without stateful IDs/encrypted reasoning",
+                    err_code or "unknown",
+                )
                 payload["input"] = _strip_encrypted_content(payload["input"])
                 try:
                     resp = await self._http.post(
@@ -503,23 +541,19 @@ class OpenAIResponsesProvider(BaseProvider):
                 ) as stream:
                     if stream.status_code >= 400:
                         body = await stream.aread()
+                        fallback_err = body.decode("utf-8", errors="replace")[:500]
                         try:
-                            data = json.loads(body)
-                            err_msg = data.get("error", {}).get("message", body.decode()[:500])
+                            err_code, err_msg = _extract_error_details(json.loads(body), fallback_err)
                         except Exception:
-                            err_msg = body.decode("utf-8", errors="replace")[:500]
+                            err_code, err_msg = "", fallback_err
                         if (
                             attempt == 0
                             and stream.status_code == 400
-                            and _is_encrypted_content_error(err_msg)
+                            and _is_encrypted_content_error(err_msg, error_code=err_code)
                         ):
-                            # [2026-05-06] Why: OpenAI can reject encrypted
-                            # reasoning before sending any SSE event. How: strip
-                            # encrypted_content and continue to the second and
-                            # final attempt. Purpose: recover once without an
-                            # unbounded retry loop.
                             log.warning(
-                                "Encrypted content verification failed, retrying stream without encrypted reasoning"
+                                "Responses input conflict/encrypted verification failed (code=%s), retrying stream without stateful IDs/encrypted reasoning",
+                                err_code or "unknown",
                             )
                             payload["input"] = _strip_encrypted_content(payload["input"])
                             continue
@@ -656,17 +690,15 @@ class OpenAIResponsesProvider(BaseProvider):
 
                         # --- error / failure ---
                         elif etype == "response.failed":
-                            err = event.get("response", {}).get("error", {})
-                            err_msg = err.get("message", str(err))
-                            if attempt == 0 and not emitted and _is_encrypted_content_error(err_msg):
-                                # [2026-05-06] Why: OpenAI may report encrypted
-                                # reasoning failure as response.failed after the
-                                # SSE connection opens. How: close this stream,
-                                # strip encrypted_content, and retry exactly once.
-                                # Purpose: support both HTTP 400 and in-stream
-                                # failure shapes for the same fallback.
+                            resp_obj = event.get("response", {})
+                            err_code, err_msg = _extract_error_details(
+                                resp_obj if isinstance(resp_obj, dict) else {},
+                                str(resp_obj.get("error", resp_obj) if isinstance(resp_obj, dict) else event),
+                            )
+                            if attempt == 0 and not emitted and _is_encrypted_content_error(err_msg, error_code=err_code):
                                 log.warning(
-                                    "Encrypted content verification failed, retrying stream without encrypted reasoning"
+                                    "Responses input conflict/encrypted verification failed (code=%s), retrying stream without stateful IDs/encrypted reasoning",
+                                    err_code or "unknown",
                                 )
                                 payload["input"] = _strip_encrypted_content(payload["input"])
                                 retry_without_encrypted = True
@@ -682,7 +714,15 @@ class OpenAIResponsesProvider(BaseProvider):
                                 text="".join(text_parts) or None, reasoning="".join(thinking_parts) or None,
                             )
                         elif etype == "error":
-                            err_msg = event.get("message", str(event))
+                            err_code, err_msg = _extract_error_details(event, str(event))
+                            if attempt == 0 and not emitted and _is_encrypted_content_error(err_msg, error_code=err_code):
+                                log.warning(
+                                    "Responses stream error conflict/encrypted verification failed (code=%s), retrying stream without stateful IDs/encrypted reasoning",
+                                    err_code or "unknown",
+                                )
+                                payload["input"] = _strip_encrypted_content(payload["input"])
+                                retry_without_encrypted = True
+                                break
                             return ProviderResponse(
                                 ok=False, error=f"Stream error: {err_msg}",
                                 text="".join(text_parts) or None, reasoning="".join(thinking_parts) or None,
@@ -787,6 +827,7 @@ class OpenAIResponsesProvider(BaseProvider):
             "model": self.model,
             "input": input_items,
             "stream": stream,
+            "store": bool(self._options.get("store", False)),
             # Request encrypted reasoning tokens for multi-turn round-trip
             "include": ["reasoning.encrypted_content"],
         }
@@ -840,7 +881,7 @@ class OpenAIResponsesProvider(BaseProvider):
             reasoning.pop("summary", None)
         if reasoning:
             payload["reasoning"] = reasoning
-        return payload
+        return merge_extra_body(payload, self._options)
 
     # ------------------------------------------------------------------
     # Non-streaming response parser

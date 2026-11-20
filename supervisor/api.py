@@ -468,8 +468,24 @@ def create_app(
     @app.put("/v1/config/fallbacks")
     async def update_fallbacks(body: FallbacksUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
+        from providers import registry as provider_registry
+        available = provider_registry.list()
+        for idx, fb in enumerate(body.fallbacks):
+            if not isinstance(fb, dict):
+                raise HTTPException(status_code=400, detail=f"fallbacks[{idx}] must be an object")
+            prov = str(fb.get("provider") or "").strip()
+            if not prov:
+                raise HTTPException(status_code=400, detail=f"fallbacks[{idx}].provider is required")
+            if prov not in available:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown fallback provider '{prov}' at index {idx}. Available: {available}",
+                )
         cs: ConfigStore = app.state.config_store
-        return cs.update_fallbacks(body.fallbacks)
+        try:
+            return _with_registered(cs.update_fallbacks(body.fallbacks))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/v1/attachments/upload")
     async def upload_attachment(
@@ -558,21 +574,31 @@ def create_app(
         if not target.is_file():
             raise HTTPException(status_code=404, detail="file not found")
 
-        # ── Access check: session workspace ──
-        if session_workspace:
-            try:
-                target.relative_to(session_workspace)
-                return FileResponse(str(target))
-            except ValueError:
-                pass
-
-        # ── Access check: data/ safe directories (always allowed) ──
+        # ── Access check 1: data/ only serves safe files in attachments, artifacts, and temp ──
         _data_dir = (ws_root / "data").resolve()
         try:
-            target.relative_to(_data_dir)
+            _rel_data = target.relative_to(_data_dir)
+            from engine.attachments import _is_protected_data_target
+
+            if _is_protected_data_target(_rel_data) or target.stat().st_nlink > 1:
+                raise HTTPException(status_code=403, detail="protected runtime data file")
             return FileResponse(str(target))
         except ValueError:
             pass
+
+        # ── Access check 2: session workspace (validated & policy-checked) ──
+        if session_workspace:
+            try:
+                st._validate_session_workspace_path(str(session_workspace))
+                target.relative_to(session_workspace)
+            except ValueError:
+                raise HTTPException(status_code=403, detail="file outside session workspace")
+            from .types import SafetyLevel as _SL
+
+            decision = st.policy.evaluate_read_file(path=str(target), workspace=session_workspace)
+            if decision.safety_level != _SL.auto:
+                raise HTTPException(status_code=403, detail=f"file access restricted ({decision.reason})")
+            return FileResponse(str(target))
 
         raise HTTPException(status_code=403, detail="file outside session workspace")
 
@@ -1148,11 +1174,9 @@ def create_app(
         return out
 
     async def _authenticate_ws(websocket: WebSocket) -> tuple[bool, Any]:
-        """Authenticate WebSocket via Authorization header, ?token= query, or first-frame auth JSON."""
+        """Authenticate WebSocket via Authorization header or first-frame auth JSON."""
         _ws_auth = str(websocket.headers.get("authorization") or "")
         _ws_token = _ws_auth[7:].strip() if _ws_auth.lower().startswith("bearer ") else ""
-        if not _ws_token:
-            _ws_token = str(websocket.query_params.get("token") or "").strip()
 
         def _check_tok(tok: str) -> bool:
             if not tok:
@@ -1910,7 +1934,10 @@ def create_app(
         st: SupervisorState = app.state.state
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="workspace must be a JSON object")
-        result = st.set_session_workspace(session_id, body)
+        try:
+            result = st.set_session_workspace(session_id, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if result is None:
             raise HTTPException(status_code=404, detail="session not found")
         return result
@@ -1941,11 +1968,17 @@ def create_app(
         # Resolve workspace path
         ws_path: Path | None = None
         if path:
-            ws_path = Path(path).resolve()
+            try:
+                ws_path = Path(st._validate_session_workspace_path(path))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         elif session_id:
             ws = st.get_session_workspace(session_id)
             if ws and isinstance(ws, dict) and ws.get("path"):
-                ws_path = Path(ws["path"]).resolve()
+                try:
+                    ws_path = Path(st._validate_session_workspace_path(str(ws["path"])))
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if not ws_path:
             # Fall back to workspace_root
@@ -2358,13 +2391,17 @@ def create_app(
     _LOGIN_MAX_FAILURES = 8
 
     def _client_key(request: Request) -> str:
-        fwd = str(request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-        if fwd:
-            return fwd
-        real_ip = str(request.headers.get("x-real-ip") or "").strip()
-        if real_ip:
-            return real_ip
-        return str(request.client.host if request.client else "unknown")
+        peer = str(request.client.host if request.client else "").strip()
+        if peer in {"127.0.0.1", "::1", "localhost", "testclient", ""}:
+            fwd = str(request.headers.get("x-forwarded-for") or "").strip()
+            if fwd:
+                parts = [p.strip() for p in fwd.split(",") if p.strip()]
+                if parts:
+                    return parts[-1]
+            real_ip = str(request.headers.get("x-real-ip") or "").strip()
+            if real_ip:
+                return real_ip
+        return peer or "unknown"
 
     # Web JWT 初始化设置（只能调用一次）
     @app.post("/v1/admin/auth/setup")
@@ -2515,12 +2552,15 @@ def create_app(
     if getattr(state, "routes_face", None) is not None:
         state.routes_face.attach(app, workspace_root=state.workspace_root)
 
-    # 启动时打印 token 并写入共享文件供 engine 读取
+    # 启动时写入共享文件供 engine 读取（0600 权限，不在 stdout 打印完整明文）
     token = get_admin_token()
     _token_file = state.workspace_root / "data" / ".admin_token"
     _token_file.parent.mkdir(parents=True, exist_ok=True)
     _token_file.write_text(token, encoding="utf-8")
-    print(f"[admin] 管理 Token: {token}", flush=True)
+    try:
+        os.chmod(_token_file, 0o600)
+    except OSError:
+        pass
     print(f"[admin] Token 已写入: {_token_file}", flush=True)
 
     return app

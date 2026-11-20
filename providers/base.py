@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+import copy
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+
+
+def _deep_merge_dict(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    for key, value in source.items():
+        existing = target.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            target[key] = _deep_merge_dict(dict(existing), value)
+        else:
+            target[key] = copy.deepcopy(value)
+    return target
+
+
+def merge_extra_body(
+    payload: dict[str, Any],
+    options: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Deep-merge options['extra_body'] into the outgoing upstream request payload."""
+    if not isinstance(options, dict):
+        return payload
+    extra = options.get("extra_body")
+    if isinstance(extra, dict) and extra:
+        _deep_merge_dict(payload, extra)
+    return payload
 
 # [AutoC 2026-07-28] Anthropic 要求 tool_call id 匹配 ^[a-zA-Z0-9_-]+$。
 # 某些上游 OpenAI 兼容端点返回 "grep:9"、"shell:0" 等含冒号的 id。

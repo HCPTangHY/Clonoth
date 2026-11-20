@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import ast as _ast
+import builtins as _builtins
 import logging as _logging
 from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 from pathlib import Path
@@ -12,6 +14,52 @@ from typing import Any
 import yaml as _yaml
 
 _dclog = _logging.getLogger("engine.dynamic_context")
+
+_ALLOWED_INTERNAL_IMPORTS = frozenset({"_strptime", "time", "locale"})
+
+
+def _safe_import(name: str, globals: Any = None, locals: Any = None, fromlist: Any = (), level: int = 0) -> Any:
+    if level == 0 and name in _ALLOWED_INTERNAL_IMPORTS:
+        return _builtins.__import__(name, globals, locals, fromlist, level)
+    raise ImportError(f"import {name!r} is not allowed in dynamic_context")
+
+
+_SAFE_EVAL_BUILTINS: dict[str, Any] = {
+    "__import__": _safe_import,
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "float": float,
+    "int": int,
+    "isinstance": isinstance,
+    "len": len,
+    "list": list,
+    "max": max,
+    "min": min,
+    "range": range,
+    "round": round,
+    "set": set,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "zip": zip,
+}
+
+
+def _validate_dynamic_expr(expr: str) -> Any:
+    tree = _ast.parse(expr, "<dynamic_context>", "eval")
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Attribute) and node.attr.startswith("__"):
+            raise ValueError(f"dunder attribute {node.attr!r} is not allowed")
+        if isinstance(node, _ast.Name) and node.id.startswith("__"):
+            raise ValueError(f"dunder name {node.id!r} is not allowed")
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str) and "__" in node.value:
+            raise ValueError("dunder substring in string literal is not allowed")
+    return compile(tree, "<dynamic_context>", "eval")
 
 
 def _load_dynamic_context_vars(
@@ -65,7 +113,8 @@ def _load_dynamic_context_vars(
         if not isinstance(expr, str):
             continue
         try:
-            val = eval(expr, {"__builtins__": __builtins__}, eval_ctx)  # noqa: S307
+            code = _validate_dynamic_expr(expr)
+            val = eval(code, {"__builtins__": _SAFE_EVAL_BUILTINS}, eval_ctx)  # noqa: S307
             result[str(name)] = str(val)
         except Exception as exc:
             _dclog.warning("dynamic_context var %r eval failed: %s (expr=%r)", name, exc, expr)

@@ -103,6 +103,11 @@ def verify_admin_token(
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def require_admin_token(request: Request) -> str:
+    """FastAPI Depends() wrapper so internal keyword flags are not exposed as URL query params."""
+    return verify_admin_token(request, allow_jwt=True, allow_query=False)
+
+
 def verify_machine_admin_token(request: Request) -> str:
     """Require machine-level CLONOTH_ADMIN_TOKEN (rejects Web JWT unless explicitly enabled)."""
     allow_jwt = _env_truthy("CLONOTH_ALLOW_JWT_HIGH_RISK")
@@ -191,13 +196,16 @@ def _validate_schedules_raw_update(workspace_root: Path, new_content: str) -> No
 
 
 def create_admin_router(workspace_root: Path) -> APIRouter:
-    router = APIRouter(dependencies=[Depends(verify_admin_token)])
+    router = APIRouter(dependencies=[Depends(require_admin_token)])
 
     def _safe_path(base_dir: Path, rel_path: str, suffix: str = "") -> Path:
         name = rel_path if not suffix or rel_path.endswith(suffix) else rel_path + suffix
-        p = (base_dir / name).resolve()
-        if not str(p).startswith(str(base_dir.resolve())):
-            raise HTTPException(status_code=400, detail="Invalid path")
+        base_resolved = base_dir.resolve()
+        p = (base_resolved / name).resolve()
+        try:
+            p.relative_to(base_resolved)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid path") from None
         return p
 
     def _read_yaml(p: Path) -> dict[str, Any]:

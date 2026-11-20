@@ -5,7 +5,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from .base import BaseProvider, ProviderResponse, ToolCall, sanitize_tool_call_id
+from .base import BaseProvider, ProviderResponse, ToolCall, merge_extra_body, sanitize_tool_call_id
 
 
 def _parse_first_json_object(raw: str) -> dict | None:
@@ -213,6 +213,7 @@ class OpenAIProvider(BaseProvider):
         self._api_key = k
         self._base_url = _normalize_base_url(base_url)
         options = provider_options if isinstance(provider_options, dict) else {}
+        self._options = options
         field = reasoning_field if reasoning_field is not None else options.get("reasoning_field")
         if field is None:
             field = self.default_reasoning_field
@@ -295,7 +296,7 @@ class OpenAIProvider(BaseProvider):
             payload["max_tokens"] = self._max_tokens
         if self._max_completion_tokens is not None:
             payload["max_completion_tokens"] = self._max_completion_tokens
-        return payload
+        return merge_extra_body(payload, self._options)
 
     async def chat_stream(
         self,

@@ -1,13 +1,14 @@
-// [2026-06-03] Model & Provider settings — dynamic multi-provider editor.
-import { useEffect, useState } from 'react';
+// [2026-06-03] Model & Provider settings — dynamic multi-provider & fallback chain editor.
+import { useEffect, useRef, useState } from 'react';
 
 import {
-  type ProviderConfigPublic,
+  type FallbackEntryPublic,
   type ProvidersResponse,
   deleteProvider,
   getProviders,
   reloadConfig,
   setActiveProvider,
+  updateFallbacks,
   upsertProvider,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
@@ -17,6 +18,14 @@ interface ProviderEditState {
   base_url: string;
   model: string;
   api_key: string;
+}
+
+interface FallbackEditItem {
+  key: string;
+  provider: string;
+  model: string;
+  sourceIndex?: number;
+  hasExtraFields?: boolean;
 }
 
 const emptyEdit = (): ProviderEditState => ({ base_url: '', model: '', api_key: '' });
@@ -36,19 +45,43 @@ export const ModelSettingsPage = () => {
   const [newName, setNewName] = useState('');
   const [addingNew, setAddingNew] = useState(false);
 
+  // fallback chain editor state
+  const fbSeqRef = useRef(0);
+  const [fallbackEdits, setFallbackEdits] = useState<FallbackEditItem[]>([]);
+  const [savingFallbacks, setSavingFallbacks] = useState(false);
+
+  const buildFallbackEdits = (fallbacks: FallbackEntryPublic[] | undefined): FallbackEditItem[] =>
+    (fallbacks || []).map((fb, idx) => {
+      const extraKeys = Object.keys(fb || {}).filter(k => k !== 'provider' && k !== 'model');
+      return {
+        key: `fb-${++fbSeqRef.current}`,
+        provider: String(fb.provider || ''),
+        model: String(fb.model || ''),
+        sourceIndex: idx,
+        hasExtraFields: extraKeys.length > 0,
+      };
+    });
+
+  const applyResponse = (resp: ProvidersResponse) => {
+    setData(prev => ({
+      ...resp,
+      registered: resp.registered ?? prev?.registered ?? [],
+    }));
+    const e: Record<string, ProviderEditState> = {};
+    for (const [name, cfg] of Object.entries(resp.providers)) {
+      e[name] = { base_url: cfg.base_url, model: cfg.model, api_key: '' };
+    }
+    setEdits(e);
+    setFallbackEdits(buildFallbackEdits(resp.fallbacks));
+  };
+
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
     setLoading(true);
     setMsg('');
     try {
       const resp = await getProviders(adminToken);
-      setData(resp);
-      // init edit states from loaded data
-      const e: Record<string, ProviderEditState> = {};
-      for (const [name, cfg] of Object.entries(resp.providers)) {
-        e[name] = { base_url: cfg.base_url, model: cfg.model, api_key: '' };
-      }
-      setEdits(e);
+      applyResponse(resp);
     } catch (err) {
       setMsg(err instanceof Error ? err.message : '加载失败');
     } finally {
@@ -59,15 +92,6 @@ export const ModelSettingsPage = () => {
   useEffect(() => {
     void load();
   }, [adminToken, isAuthenticated]);
-
-  const applyResponse = (resp: ProvidersResponse) => {
-    setData(resp);
-    const e: Record<string, ProviderEditState> = {};
-    for (const [name, cfg] of Object.entries(resp.providers)) {
-      e[name] = { base_url: cfg.base_url, model: cfg.model, api_key: '' };
-    }
-    setEdits(e);
-  };
 
   const handleSave = async (name: string) => {
     if (!adminToken) return;
@@ -138,7 +162,7 @@ export const ModelSettingsPage = () => {
     try {
       await reloadConfig(adminToken);
       await load();
-      setMsg('✅ 配置已重载');
+      setMsg('配置已重载');
     } catch (err) {
       setMsg(err instanceof Error ? err.message : '重载失败');
     }
@@ -150,13 +174,104 @@ export const ModelSettingsPage = () => {
 
   const providerNames = data ? Object.keys(data.providers) : [];
 
+  const fallbacksDirty = (() => {
+    if (!data) return false;
+    const orig = data.fallbacks || [];
+    if (orig.length !== fallbackEdits.length) return true;
+    return fallbackEdits.some((item, idx) => {
+      const o = orig[idx];
+      if (!o) return true;
+      return (
+        item.provider !== String(o.provider || '')
+        || item.model.trim() !== String(o.model || '').trim()
+        || item.sourceIndex !== idx
+      );
+    });
+  })();
+
+  const handleAddFallback = () => {
+    const defaultProvider =
+      providerNames.find(name => name !== data?.active_provider)
+      || providerNames[0]
+      || data?.registered?.[0]
+      || '';
+    if (!defaultProvider) return;
+    setFallbackEdits(prev => [
+      ...prev,
+      {
+        key: `fb-${++fbSeqRef.current}`,
+        provider: defaultProvider,
+        model: '',
+      },
+    ]);
+  };
+
+  const handleUpdateFallback = (index: number, patch: Partial<Pick<FallbackEditItem, 'provider' | 'model'>>) => {
+    setFallbackEdits(prev =>
+      prev.map((item, idx) => {
+        if (idx !== index) return item;
+        const nextProvider = patch.provider !== undefined ? patch.provider : item.provider;
+        const providerChanged = nextProvider !== item.provider;
+        return {
+          ...item,
+          ...patch,
+          sourceIndex: providerChanged ? undefined : item.sourceIndex,
+        };
+      }),
+    );
+  };
+
+  const handleMoveFallback = (index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    setFallbackEdits(prev => {
+      if (target < 0 || target >= prev.length) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(index, 1);
+      next.splice(target, 0, moved);
+      return next;
+    });
+  };
+
+  const handleRemoveFallback = (index: number) => {
+    setFallbackEdits(prev => prev.filter((_, idx) => idx !== index));
+  };
+
+  const handleResetFallbacks = () => {
+    if (!data) return;
+    setFallbackEdits(buildFallbackEdits(data.fallbacks));
+  };
+
+  const handleSaveFallbacks = async () => {
+    if (!adminToken) return;
+    setSavingFallbacks(true);
+    setMsg('');
+    try {
+      const payload = fallbackEdits.map(item => {
+        const trimmedModel = item.model.trim();
+        const keepSource = item.hasExtraFields && item.sourceIndex !== undefined;
+        return {
+          provider: item.provider.trim(),
+          ...(trimmedModel ? { model: trimmedModel } : keepSource ? { model: '' } : {}),
+          ...(keepSource ? { _source_index: item.sourceIndex } : {}),
+        };
+      });
+      const resp = await updateFallbacks(adminToken, payload);
+      applyResponse(resp);
+      setMsg('Fallback 链已保存');
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : '保存 Fallback 链失败');
+    } finally {
+      setSavingFallbacks(false);
+    }
+  };
+
   return (
     <section className="mx-auto flex h-full max-w-4xl flex-col gap-5 overflow-y-auto p-4 sm:p-6">
       <div>
         <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">设置</p>
         <h2 className="mt-1 font-mono text-xl font-semibold tracking-[-0.04em]">模型与渠道</h2>
         <p className="mt-2 max-w-2xl text-sm text-[var(--duties-secondary)]">
-          管理 LLM Provider 渠道配置。当前活跃渠道会被标记。
+          管理 LLM Provider 渠道配置与自动回退顺序。当前活跃渠道会被标记。
         </p>
       </div>
 
@@ -205,6 +320,7 @@ export const ModelSettingsPage = () => {
                       <button
                         className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)]"
                         onClick={() => handleSetActive(name)}
+                        type="button"
                       >
                         设为活跃
                       </button>
@@ -213,6 +329,7 @@ export const ModelSettingsPage = () => {
                       <button
                         className="text-xs text-red-400 underline hover:text-red-300"
                         onClick={() => handleDelete(name)}
+                        type="button"
                       >
                         删除
                       </button>
@@ -275,26 +392,164 @@ export const ModelSettingsPage = () => {
             );
           })()}
 
-          {/* Fallback display */}
-          {data && data.fallbacks.length > 0 && (
+          {/* Fallback chain editor */}
+          {data && (
             <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-              <p className="mb-2 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">Fallback 链</p>
-              <div className="flex flex-wrap gap-2">
-                {data.fallbacks.map((fb, i) => (
-                  <span
-                    key={i}
-                    className="border border-[var(--duties-border)] px-2 py-1 font-mono text-xs text-[var(--duties-secondary)]"
-                  >
-                    {i + 1}. {fb.provider || JSON.stringify(fb)}
+              <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <p className="font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">Fallback 链</p>
+                  <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
+                    主请求触发限流或上游故障时按顺序依次尝试。模型留空则继承对应渠道默认模型，也可指定独立回退模型。
+                  </p>
+                </div>
+                {fallbacksDirty && (
+                  <span className="border border-[var(--duties-border)] px-2 py-0.5 font-mono text-[0.65rem] text-[var(--duties-tertiary)]">
+                    未保存修改
                   </span>
-                ))}
+                )}
+              </div>
+
+              {fallbackEdits.length === 0 ? (
+                <div className="mb-3 border border-dashed border-[var(--duties-border)] px-3 py-3 text-xs text-[var(--duties-secondary)]">
+                  当前未配置 Fallback 链。点击下方“添加回退项”可串联备用渠道或同渠道的备用模型。
+                </div>
+              ) : (
+                <div className="mb-3 flex flex-col gap-2.5">
+                  {fallbackEdits.map((item, idx) => {
+                    const inheritedModel = data.providers[item.provider]?.model || '';
+                    const selectableProviders = providerNames.includes(item.provider) || !item.provider
+                      ? providerNames
+                      : [item.provider, ...providerNames];
+                    const isUnconfigured = Boolean(item.provider) && !providerNames.includes(item.provider);
+
+                    return (
+                      <div
+                        key={item.key}
+                        className="flex flex-col gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 sm:flex-row sm:items-end"
+                      >
+                        <div className="flex items-center justify-between sm:pb-2">
+                          <span className="w-6 font-mono text-xs font-semibold text-[var(--duties-tertiary)]">
+                            {idx + 1}.
+                          </span>
+                          <div className="flex items-center gap-2 sm:hidden">
+                            <button
+                              className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)] disabled:no-underline disabled:opacity-40"
+                              disabled={idx === 0}
+                              onClick={() => handleMoveFallback(idx, -1)}
+                              type="button"
+                            >
+                              上移
+                            </button>
+                            <button
+                              className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)] disabled:no-underline disabled:opacity-40"
+                              disabled={idx === fallbackEdits.length - 1}
+                              onClick={() => handleMoveFallback(idx, 1)}
+                              type="button"
+                            >
+                              下移
+                            </button>
+                            <button
+                              className="text-xs text-red-400 underline hover:text-red-300"
+                              onClick={() => handleRemoveFallback(idx)}
+                              type="button"
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="sm:w-48">
+                          <label className="mb-1 block text-[0.65rem] text-[var(--duties-tertiary)]">
+                            回退渠道 {isUnconfigured ? '（未配置顶层块）' : ''}
+                          </label>
+                          <select
+                            className="w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2.5 py-1.5 font-mono text-xs text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+                            onChange={e => handleUpdateFallback(idx, { provider: e.target.value })}
+                            value={item.provider}
+                          >
+                            {selectableProviders.map(pName => (
+                              <option key={pName} value={pName}>
+                                {pName}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div className="min-w-0 flex-1">
+                          <label className="mb-1 block text-[0.65rem] text-[var(--duties-tertiary)]">
+                            覆盖模型（可选）
+                          </label>
+                          <input
+                            className="w-full border border-[var(--duties-border)] bg-transparent px-2.5 py-1.5 font-mono text-xs text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+                            onChange={e => handleUpdateFallback(idx, { model: e.target.value })}
+                            placeholder={
+                              inheritedModel
+                                ? `留空继承渠道默认 (${inheritedModel})`
+                                : '留空继承渠道默认模型'
+                            }
+                            value={item.model}
+                          />
+                        </div>
+
+                        <div className="hidden items-center gap-2 pb-1.5 sm:flex">
+                          <button
+                            className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)] disabled:no-underline disabled:opacity-40"
+                            disabled={idx === 0}
+                            onClick={() => handleMoveFallback(idx, -1)}
+                            type="button"
+                          >
+                            上移
+                          </button>
+                          <button
+                            className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)] disabled:no-underline disabled:opacity-40"
+                            disabled={idx === fallbackEdits.length - 1}
+                            onClick={() => handleMoveFallback(idx, 1)}
+                            type="button"
+                          >
+                            下移
+                          </button>
+                          <button
+                            className="text-xs text-red-400 underline hover:text-red-300"
+                            onClick={() => handleRemoveFallback(idx)}
+                            type="button"
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    disabled={providerNames.length === 0 && (data.registered || []).length === 0}
+                    onClick={handleAddFallback}
+                  >
+                    + 添加回退项
+                  </Button>
+                  {fallbacksDirty && (
+                    <Button disabled={savingFallbacks} onClick={handleResetFallbacks}>
+                      撤销修改
+                    </Button>
+                  )}
+                </div>
+                <Button
+                  disabled={savingFallbacks || !fallbacksDirty}
+                  onClick={handleSaveFallbacks}
+                  variant="primary"
+                >
+                  {savingFallbacks ? '保存中...' : '保存 Fallback 链'}
+                </Button>
               </div>
             </div>
           )}
 
           {/* Reload */}
           <div className="flex items-center gap-3">
-            <Button onClick={handleReload}>🔄 重载配置</Button>
+            <Button onClick={handleReload}>重载配置</Button>
             <p className="text-xs text-[var(--duties-secondary)]">重新读取 config.yaml，不中断服务</p>
           </div>
         </>

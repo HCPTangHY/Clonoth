@@ -554,10 +554,25 @@ export interface ProviderConfigPublic {
   api_key_redacted: string;
 }
 
+export interface FallbackEntryPublic {
+  provider: string;
+  model?: string;
+  base_url?: string;
+  api_key_present?: boolean;
+  api_key_redacted?: string;
+  [key: string]: any;
+}
+
+export interface FallbackEntryUpdate {
+  provider: string;
+  model?: string;
+  _source_index?: number;
+}
+
 export interface ProvidersResponse {
   active_provider: string;
   providers: Record<string, ProviderConfigPublic>;
-  fallbacks: Array<Record<string, any>>;
+  fallbacks: FallbackEntryPublic[];
   registered: string[];
 }
 
@@ -598,7 +613,7 @@ export async function setActiveProvider(token: string, provider: string): Promis
 
 export async function updateFallbacks(
   token: string,
-  fallbacks: Array<Record<string, any>>,
+  fallbacks: FallbackEntryUpdate[],
 ): Promise<ProvidersResponse> {
   const resp = await apiFetch('/config/fallbacks', {
     method: 'PUT',
