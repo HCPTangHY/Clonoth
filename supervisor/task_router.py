@@ -491,49 +491,24 @@ class TaskRouterMixin:
             ).strip()
             if compact_target_session_id:
                 task.input["_compact_target_session_id"] = compact_target_session_id
-                # [fix 2026-09-03] Why: concurrent entry-branch forks of one session
-                # all cross the compact threshold on the same inherited history, each
-                # dispatching its own compactor LLM call, then rewriting the same
-                # JSONL concurrently (observed 4 compact_start within 46s on one
-                # session). How: if another caller already waits on a compactor for
-                # the same target, or a standalone API compact for it is still
-                # active, skip creating a duplicate compactor and resume this caller
-                # immediately with a no-op deduped compact_done. The deduped flag
-                # tells the engine to not re-dispatch on resume. Purpose: at most
-                # one in-flight compaction per target session — no duplicate LLM
-                # cost, no file race. Runs under the state lock, so check+mark is
-                # atomic across engine workers.
-                _dup = any(
-                    _o.task_id != task.task_id
-                    and _o.status == TaskStatus.suspended
-                    and _o.input.get("_compact_dispatch_pending")
-                    and str(_o.input.get("_compact_target_session_id") or "") == compact_target_session_id
-                    for _o in self.tasks.values()
-                ) or any(
-                    str(_o.input.get("_compact_apply_to_session_id") or "") == compact_target_session_id
-                    and str(_o.node_id or "") == "system.compactor"
-                    and _o.status in (TaskStatus.pending, TaskStatus.running)
-                    for _o in self.tasks.values()
+                active_compactor = self._find_active_compactor_for_target_locked(
+                    compact_target_session_id,
+                    exclude_caller_id=task.task_id,
                 )
-                if _dup:
+                if active_compactor is not None:
                     log.info(
-                        "compact dedupe: target=%s already compacting, skip duplicate dispatch from task=%s",
-                        compact_target_session_id, str(task.task_id or "")[:12],
+                        "compact coalesce: target=%s already compacting via compactor=%s, suspending caller=%s to wait together",
+                        compact_target_session_id,
+                        str(active_compactor.task_id or "")[:12],
+                        str(task.task_id or "")[:12],
                     )
-                    task.status = TaskStatus.pending
-                    task.waiting_for_task_id = None
+                    task.status = TaskStatus.suspended
+                    task.waiting_for_task_id = active_compactor.task_id
                     task.worker_id = None
                     task.lease_expires_at = None
                     task.updated_at = _now()
-                    task.input["resume_data"] = {
-                        "type": "compact_done",
-                        "success": True,
-                        "before": 0,
-                        "after": 0,
-                        "deduped": True,
-                    }
-                    task.input.pop("_compact_dispatch_pending", None)
-                    self._event_task_snapshot("task_resumed", task)
+                    task.input["_compact_coalesced"] = True
+                    self._event_task_snapshot("task_suspended", task)
                     return
 
         created_child_ids: list[str] = []
@@ -2005,14 +1980,74 @@ class TaskRouterMixin:
     #  压缩 dispatch 结果处理
     # ------------------------------------------------------------------ #
 
+    def _find_active_compactor_for_target_locked(
+        self,
+        target_session_id: str,
+        *,
+        exclude_caller_id: str = "",
+    ) -> Task | None:
+        """Find a live (pending/running) system.compactor task for target_session_id.
+
+        Also cleans up stale _compact_dispatch_pending flags on suspended callers
+        whose compactor child is no longer pending or running.
+        """
+        target = str(target_session_id or "").strip()
+        if not target:
+            return None
+
+        for other in list(self.tasks.values()):
+            if other.task_id == exclude_caller_id:
+                continue
+            if other.status != TaskStatus.suspended or not other.input.get("_compact_dispatch_pending"):
+                continue
+            if str(other.input.get("_compact_target_session_id") or "").strip() != target:
+                continue
+            wait_id = str(other.waiting_for_task_id or "").strip()
+            comp = self.tasks.get(wait_id) if wait_id else None
+            if comp is None:
+                comp = next(
+                    (
+                        t for t in self.tasks.values()
+                        if t.caller_task_id == other.task_id
+                        and str(t.node_id or "") == "system.compactor"
+                    ),
+                    None,
+                )
+            if comp is not None and comp.status in (TaskStatus.pending, TaskStatus.running):
+                return comp
+            # Stale _compact_dispatch_pending whose compactor is no longer active: clear it
+            log.warning(
+                "compact stale cleanup: clearing orphaned _compact_dispatch_pending on task=%s (compactor=%s status=%s)",
+                str(other.task_id or "")[:12],
+                str(comp.task_id if comp else wait_id)[:12],
+                comp.status.value if comp else "missing",
+            )
+            other.input.pop("_compact_dispatch_pending", None)
+            other.input.pop("_compact_coalesced", None)
+
+        for other in self.tasks.values():
+            if (
+                str(other.node_id or "") == "system.compactor"
+                and other.status in (TaskStatus.pending, TaskStatus.running)
+                and str(other.input.get("_compact_apply_to_session_id") or "").strip() == target
+            ):
+                return other
+        return None
+
     def _is_compact_dispatch_result(self, task: Task) -> bool:
         """判断是否是 compactor 子 task 的完成事件。"""
         caller_id = (task.caller_task_id or "").strip()
         if caller_id:
             caller = self.tasks.get(caller_id)
-            if not caller:
-                return False
-            return bool(caller.input.get("_compact_dispatch_pending"))
+            if caller and caller.input.get("_compact_dispatch_pending"):
+                return True
+        if str(task.node_id or "") == "system.compactor" and any(
+            t.status == TaskStatus.suspended
+            and t.input.get("_compact_dispatch_pending")
+            and t.waiting_for_task_id == task.task_id
+            for t in self.tasks.values()
+        ):
+            return True
 
         # [2026-06-06] Why: manual API compact now creates a standalone
         # system.compactor task without a suspended caller. How: recognize the
@@ -2072,6 +2107,12 @@ class TaskRouterMixin:
                         type_="compact_done",
                         payload=payload,
                     )
+                    self._resume_coalesced_compact_waiters_locked(
+                        task.task_id,
+                        target_session_id,
+                        compact_result=cr,
+                        success=bool(payload["success"]),
+                    )
                     return
 
                 record_compact_failure(target_session_id)
@@ -2098,6 +2139,12 @@ class TaskRouterMixin:
                             type_="compact_done",
                             payload=payload,
                         )
+                        self._resume_coalesced_compact_waiters_locked(
+                            task.task_id,
+                            target_session_id,
+                            compact_result=cr,
+                            success=True,
+                        )
                         return
                 except Exception as exc:
                     payload["error"] = str(exc)
@@ -2121,6 +2168,11 @@ class TaskRouterMixin:
             type_="compact_failed",
             payload=payload,
         )
+        self._resume_coalesced_compact_waiters_locked(
+            task.task_id,
+            target_session_id,
+            success=False,
+        )
 
     def _apply_compact_result_locked(self, task: Task) -> None:
         """compactor 完成后，对父 task 的上下文执行压缩并恢复父 task。
@@ -2140,7 +2192,19 @@ class TaskRouterMixin:
             self._apply_standalone_compact_result_locked(task, standalone_target_session_id)
             return
         if not caller or caller.status != TaskStatus.suspended:
-            return
+            # Primary caller may have been cancelled while a coalesced waiter is still suspended
+            caller = next(
+                (
+                    t for t in self.tasks.values()
+                    if t.status == TaskStatus.suspended
+                    and t.input.get("_compact_dispatch_pending")
+                    and t.waiting_for_task_id == task.task_id
+                ),
+                None,
+            )
+            if caller is None:
+                return
+            caller.input.pop("_compact_coalesced", None)
 
         act = str((task.result or {}).get("action") or "").strip()
         parent_ctx_ref = str(
@@ -2212,6 +2276,10 @@ class TaskRouterMixin:
                             caller, parent_ctx_ref,
                             compact_result=cr, success=True,
                         )
+                        self._resume_coalesced_compact_waiters_locked(
+                            task.task_id, target_sid_for_conv,
+                            compact_result=cr, success=True,
+                        )
                         return
                 except Exception as _et:
                     log.warning("compact: emergency truncation failed: %s", _et)
@@ -2232,12 +2300,20 @@ class TaskRouterMixin:
                         caller, parent_ctx_ref,
                         compact_result=cr, success=True,
                     )
+                    self._resume_coalesced_compact_waiters_locked(
+                        task.task_id, target_sid_for_conv,
+                        compact_result=cr, success=True,
+                    )
                     return
                 # before == after：消息未减少，计入熔断器防止同会话循环重试
                 from engine.compact import record_compact_failure
                 record_compact_failure(target_sid_for_conv)
                 self._resume_compact_parent_locked(
                     caller, parent_ctx_ref,
+                    compact_result=cr, success=False,
+                )
+                self._resume_coalesced_compact_waiters_locked(
+                    task.task_id, target_sid_for_conv,
                     compact_result=cr, success=False,
                 )
                 return
@@ -2287,6 +2363,9 @@ class TaskRouterMixin:
         )
         self._resume_compact_parent_locked(
             caller, parent_ctx_ref, success=False,
+        )
+        self._resume_coalesced_compact_waiters_locked(
+            task.task_id, _fail_sid, success=False,
         )
 
     def _apply_compact_via_conv_store_locked(
@@ -2661,6 +2740,7 @@ class TaskRouterMixin:
         self, caller: Task, context_ref: str, *,
         compact_result: dict[str, int] | None = None,
         before: int = 0, after: int = 0, success: bool = True,
+        deduped: bool = False,
     ) -> None:
         """恢复等待压缩的父 task。"""
         caller.status = TaskStatus.pending
@@ -2672,10 +2752,48 @@ class TaskRouterMixin:
             _rd = {"type": "compact_done", "success": success, **compact_result}
         else:
             _rd = {"type": "compact_done", "success": success, "before": before, "after": after}
+        if deduped:
+            _rd["deduped"] = True
         caller.input["resume_data"] = _rd
         caller.input["context_ref"] = context_ref
         caller.input.pop("_compact_dispatch_pending", None)
+        caller.input.pop("_compact_coalesced", None)
         self._event_task_snapshot("task_resumed", caller)
+
+    def _resume_coalesced_compact_waiters_locked(
+        self,
+        compactor_task_id: str,
+        target_session_id: str,
+        *,
+        compact_result: dict[str, int] | None = None,
+        before: int = 0,
+        after: int = 0,
+        success: bool = True,
+    ) -> None:
+        """Resume any secondary tasks that coalesced onto the same compaction."""
+        target = str(target_session_id or "").strip()
+        for waiter in list(self.tasks.values()):
+            if waiter.status != TaskStatus.suspended or not waiter.input.get("_compact_dispatch_pending"):
+                continue
+            same_compactor = bool(compactor_task_id and waiter.waiting_for_task_id == compactor_task_id)
+            same_target = bool(target and str(waiter.input.get("_compact_target_session_id") or "").strip() == target)
+            if not (same_compactor or same_target):
+                continue
+            w_ctx_ref = str(
+                waiter.result.get("context_ref")
+                or waiter.input.get("context_ref")
+                or ""
+            ).strip()
+            is_coalesced = bool(waiter.input.get("_compact_coalesced", True))
+            self._resume_compact_parent_locked(
+                waiter,
+                w_ctx_ref,
+                compact_result=compact_result,
+                before=before,
+                after=after,
+                success=success,
+                deduped=is_coalesced,
+            )
 
 
     # ------------------------------------------------------------------ #

@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from providers import GeminiAIStudioProvider, GeminiVertexProvider
+from providers.gemini import _merge_user_turns_and_cers
 
 
 CHANNELS = (GeminiAIStudioProvider, GeminiVertexProvider)
@@ -47,7 +48,16 @@ def test_final_target_tail_conditions_and_input_isolation(cls, strip_system_role
     original = deepcopy(messages)
     p = provider(cls)
     prepared = p.prepare_history(messages)
-    _, converted = p._convert_messages(prepared, strip_thoughts=strip_thoughts)
+    wrap_cer = p._should_wrap_user_cer()
+    nonce = p._user_cer_nonce() if wrap_cer else ""
+    _, converted = p._convert_messages(
+        prepared,
+        strip_thoughts=strip_thoughts,
+        wrap_user_cer=wrap_cer,
+        nonce=nonce,
+    )
+    if wrap_cer:
+        converted = _merge_user_turns_and_cers(converted)
     assert messages == original
     if ending == "assistant":
         assert converted[-1]["role"] == "model", "converter must not hide the actual tail from channel policy"
@@ -62,7 +72,10 @@ def test_final_target_tail_conditions_and_input_isolation(cls, strip_system_role
     kwargs = {"strip_system_role": strip_system_role, "strip_thoughts": strip_thoughts}
     body = p.build_payload(messages, **kwargs)
     assert body["contents"] == converted + tail
-    assert body["systemInstruction"] == {"parts": [{"text": "static"}]}
+    if cls is GeminiAIStudioProvider:
+        assert body["systemInstruction"]["parts"][0]["text"].startswith("static\n\nIMPORTANT TRANSPORT RULE:")
+    else:
+        assert body["systemInstruction"] == {"parts": [{"text": "static"}]}
     assert p.build_payload(messages, **kwargs) == body, "repeated requests must not accumulate tails"
     assert p.prepare_history(messages) == prepared, "tails never become replay history"
     body["contents"][-1]["parts"][0]["test_mutation"] = True

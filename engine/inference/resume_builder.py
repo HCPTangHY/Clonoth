@@ -496,20 +496,26 @@ async def _emit_compact_done(
         or getattr(rctx, "parent_session_id", "")
         or getattr(rctx, "session_id", "")
     )
-    if resume_data.get("success", True):
-        record_compact_success(_compact_sid)
-    else:
-        record_compact_failure(_compact_sid)
+    is_deduped = bool(resume_data.get("deduped"))
+    if not is_deduped:
+        if resume_data.get("success", True):
+            record_compact_success(_compact_sid)
+        else:
+            record_compact_failure(_compact_sid)
     _cd_payload = {
         "node_id": node.id,
         "success": resume_data.get("success", True),
         "before": resume_data.get("before", 0),
         "after": resume_data.get("after", 0),
     }
+    if is_deduped:
+        _cd_payload["deduped"] = True
     # task 粒度信息（ConvStore 路径产生）
     for _k in ("total_segments", "kept_segments", "compressed_segments"):
         if _k in resume_data:
             _cd_payload[_k] = resume_data[_k]
+    if is_deduped:
+        return
     get_bus().emit(Signal(name="compact.done", payload=_cd_payload))
     await rctx.emit_event("compact_done", _cd_payload)
 

@@ -251,8 +251,14 @@ class OpenAIResponsesProvider(BaseProvider):
             role = msg.get("role", "")
 
             if role in {"system", "developer"}:
-                # System messages are extracted into the top-level instructions field.
-                instructions_parts.append(_extract_text(msg))
+                text = _extract_text(msg)
+                if text:
+                    _flush_unpaired_function_calls(pending_calls, items)
+                    items.append({
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": text}],
+                    })
                 continue
 
             if role == "user":

@@ -250,6 +250,12 @@ class RestartRecovery:
         approvals = {aid: Approval.model_validate(raw) for aid, raw in data.get("approvals", {}).items()}
         restored: list[str] = []
         cancelled_sessions = set(data.get("cancelled_sessions", []))
+        def _is_stateless_system_task(t: Task) -> bool:
+            return (
+                str(t.node_id or "") in {"system.compactor", "system.turn_summarizer"}
+                or bool(t.input.get("_compact_dispatch") or t.input.get("_turn_summary_dispatch"))
+            )
+
         for task in tasks.values():
             if st._task_terminal(task) or task.restart_id != data["restart_id"]:
                 continue
@@ -264,6 +270,11 @@ class RestartRecovery:
             if interrupted and task.kind == TaskKind.tool:
                 task.status = TaskStatus.pending
                 task.input["_restart_cancelled_tool"] = True
+            elif _is_stateless_system_task(task) and (interrupted or task.result.get("checkpoint_error")):
+                task.status = TaskStatus.pending
+                task.cancel_reason = ""
+                task.result = {}
+                task.input.pop("resume_data", None)
             elif task.result.get("checkpoint_error"):
                 task.status = TaskStatus.suspended
                 task.cancel_reason = "restart_checkpoint_failed"
@@ -284,6 +295,38 @@ class RestartRecovery:
             task.current_phase = ""
             task.current_detail = ""
             restored.append(task.task_id)
+
+        # Ensure no parent task stays permanently suspended waiting for a dead/missing compactor
+        for caller in tasks.values():
+            if caller.status != TaskStatus.suspended or not caller.input.get("_compact_dispatch_pending"):
+                continue
+            wait_id = str(caller.waiting_for_task_id or "").strip()
+            compactor = tasks.get(wait_id) if wait_id else None
+            if compactor is None:
+                compactor = next(
+                    (
+                        t for t in tasks.values()
+                        if t.caller_task_id == caller.task_id
+                        and str(t.node_id or "") == "system.compactor"
+                        and t.status in {TaskStatus.pending, TaskStatus.running}
+                    ),
+                    None,
+                )
+            if compactor is None or compactor.status not in {TaskStatus.pending, TaskStatus.running}:
+                caller.status = TaskStatus.pending
+                caller.waiting_for_task_id = None
+                caller.cancel_reason = ""
+                caller.input.pop("_compact_dispatch_pending", None)
+                caller.input.pop("_compact_coalesced", None)
+                caller.input["resume_data"] = {
+                    "type": "compact_done",
+                    "success": False,
+                    "before": 0,
+                    "after": 0,
+                }
+                caller.updated_at = _now()
+                if caller.task_id not in restored:
+                    restored.append(caller.task_id)
         info = {"restart_id": data["restart_id"], "restored_task_ids": restored,
                 "resumed_task_ids": restored, "preserved_task_ids": list(tasks),
                 "planned_restart": True, "downtime_sec": max(0.0, time.time() - data["started_at"])}

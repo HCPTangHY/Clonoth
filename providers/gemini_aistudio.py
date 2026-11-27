@@ -8,3 +8,4 @@ class GeminiAIStudioProvider(GeminiProvider):
 
     provider_name = "gemini-aistudio"
     default_base_url = "https://generativelanguage.googleapis.com"
+    default_wrap_user_cer = True

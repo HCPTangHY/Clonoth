@@ -181,14 +181,23 @@ class ResponsesPayloadTests(unittest.TestCase):
         self.assertEqual(payload["max_output_tokens"], 256)
         self.assertEqual(payload["reasoning"], {"effort": "medium", "summary": "auto"})
 
-    def test_developer_and_system_messages_become_instructions(self):
+    def test_developer_and_system_messages_become_developer_input_items_in_place(self):
         payload = provider().build_payload([
             {"role": "system", "content": "first"},
             {"role": "developer", "content": "second"},
             {"role": "user", "content": "hello"},
+            {"role": "developer", "content": "turn-tail"},
         ])
-        self.assertEqual(payload["instructions"], "first\n\nsecond")
-        self.assertEqual(len(payload["input"]), 1)
+        self.assertNotIn("instructions", payload)
+        self.assertEqual(
+            payload["input"],
+            [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "first"}]},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "second"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "turn-tail"}]},
+            ],
+        )
 
     def test_complete_raw_output_uses_call_id_and_preserves_all_data(self):
         for mode in ("native", "fake-native"):

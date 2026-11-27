@@ -436,6 +436,131 @@ class HostAsyncTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.status_code, 422)
                     self.assertEqual(state.is_task_preempted('task'), remaining)
 
+    async def test_deduped_compact_done_skips_duplicate_event_and_breaker(self):
+        context = SimpleNamespace(parent_session_id='parent', session_id='branch', emit_event=AsyncMock())
+        with patch.object(resume_builder, 'record_compact_success') as record, \
+                patch.object(resume_builder, 'record_compact_failure') as failed, \
+                patch.object(resume_builder, 'get_bus', return_value=Mock()) as bus:
+            await resume_builder._emit_compact_done(
+                resume_data={'success': True, 'before': 20, 'after': 5, 'deduped': True},
+                node=SimpleNamespace(id='node'),
+                rctx=context,
+            )
+            record.assert_not_called()
+            failed.assert_not_called()
+            bus.return_value.emit.assert_not_called()
+            context.emit_event.assert_not_awaited()
+
+    async def test_cache_warm_fork_skips_auto_compact_on_initial_step(self):
+        from engine.builtin import compact as builtin_compact
+        ls = SimpleNamespace(
+            compacted=False,
+            compact_threshold=100,
+            _cache_warm_fork=True,
+            last_prompt_tokens=500,
+            messages=[{'role': 'user', 'content': 'x' * 1000}],
+            rctx=SimpleNamespace(child_session_id='parent:_worker:1', parent_session_id='parent', session_id='parent', conversation_store=None),
+        )
+        ctx_step0 = SimpleNamespace(step=0, extra={'step_count': 0, 'loop_state': ls})
+        self.assertIsNone(await builtin_compact._check_and_compact(ctx_step0, ls))
+        self.assertFalse(ls.compacted)
+
+    def test_concurrent_compact_coalesces_waiters_and_cleans_stale_pending(self):
+        import copy
+        from supervisor.eventlog import EventLog
+        from supervisor.policy import PolicyEngine
+        from supervisor.state import SupervisorState
+        from supervisor.types import TaskKind, TaskStatus
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = SupervisorState(
+                workspace_root=root,
+                eventlog=EventLog(root / 'data/events.jsonl', 'test'),
+                policy=PolicyEngine(workspace_root=root),
+            )
+            sid = state.get_or_create_session(channel='discord', conversation_key='ch:1')
+            gen = state._current_session_generation_locked(sid)
+            stale_comp = state._create_task_locked(session_id=sid, session_generation=gen, kind=TaskKind.node, node_id='system.compactor')
+            stale_comp.status = TaskStatus.suspended
+            stale_parent = state._create_task_locked(
+                session_id='branch_stale', session_generation=gen, kind=TaskKind.node, node_id='ereuna_main',
+                input_data={'parent_session_id': sid, '_compact_dispatch_pending': True, '_compact_target_session_id': sid},
+            )
+            stale_parent.status = TaskStatus.suspended
+            stale_parent.waiting_for_task_id = stale_comp.task_id
+            caller_a = state._create_task_locked(session_id='branch_a', session_generation=gen, kind=TaskKind.node, node_id='ereuna_main', input_data={'parent_session_id': sid})
+            caller_a.status = TaskStatus.running
+            caller_b = state._create_task_locked(session_id='branch_b', session_generation=gen, kind=TaskKind.node, node_id='ereuna_main', input_data={'parent_session_id': sid})
+            caller_b.status = TaskStatus.running
+
+            dispatch_action = {
+                'action': 'dispatch',
+                'target_node': 'system.compactor',
+                'dispatch_input': {
+                    'instruction': 'summarize',
+                    '_compact_dispatch': True,
+                    'target_session_id': sid,
+                    '_compact_keep_recent': 2,
+                },
+            }
+            state._route_dispatch_locked(caller_a, copy.deepcopy(dispatch_action))
+            self.assertFalse(stale_parent.input.get('_compact_dispatch_pending', False))
+            self.assertEqual(caller_a.status, TaskStatus.suspended)
+            compactor_id = caller_a.waiting_for_task_id
+            self.assertTrue(compactor_id)
+
+            state._route_dispatch_locked(caller_b, copy.deepcopy(dispatch_action))
+            # caller_b coalesces onto the same compactor and stays suspended until compaction finishes
+            self.assertEqual(caller_b.status, TaskStatus.suspended)
+            self.assertEqual(caller_b.waiting_for_task_id, compactor_id)
+            self.assertTrue(caller_b.input.get('_compact_coalesced'))
+
+            compactor = state.tasks[compactor_id]
+            compactor.status = TaskStatus.completed
+            compactor.result = {'action': 'fail', 'error': 'simulated failure'}
+            state._apply_compact_result_locked(compactor)
+            self.assertEqual(caller_a.status, TaskStatus.pending)
+            self.assertEqual(caller_b.status, TaskStatus.pending)
+            self.assertFalse(caller_a.input['resume_data'].get('deduped', False))
+            self.assertTrue(caller_b.input['resume_data'].get('deduped', False))
+
+    def test_restart_recovery_resumes_stateless_compactor_and_orphan_compact_caller(self):
+        from supervisor.eventlog import EventLog
+        from supervisor.policy import PolicyEngine
+        from supervisor.state import SupervisorState
+        from supervisor.types import TaskKind, TaskStatus
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            st = SupervisorState(
+                workspace_root=root,
+                eventlog=EventLog(root / 'data/events.jsonl', 'before'),
+                policy=PolicyEngine(workspace_root=root),
+            )
+            sid = st.get_or_create_session(channel='discord', conversation_key='ch:2')
+            parent = st._create_task_locked(
+                session_id=sid, session_generation=st._current_session_generation_locked(sid),
+                kind=TaskKind.node, node_id='ereuna_main',
+                input_data={'instruction': 'hi', '_compact_dispatch_pending': True, '_compact_target_session_id': sid},
+            )
+            comp = st._create_task_locked(
+                session_id=sid, session_generation=st._current_session_generation_locked(sid),
+                kind=TaskKind.node, node_id='system.compactor', caller_task_id=parent.task_id,
+                input_data={'instruction': 'sum', '_compact_dispatch': True},
+            )
+            parent.status = TaskStatus.suspended
+            parent.waiting_for_task_id = comp.task_id
+            comp.status = TaskStatus.running
+            st.restart_recovery.begin()
+            st.restart_recovery.finalize()
+            # finalize marks running compactor with checkpoint_error; restore must put compactor back to pending
+            restored = SupervisorState(
+                workspace_root=root,
+                eventlog=EventLog(root / 'data/events.jsonl', 'after'),
+                policy=PolicyEngine(workspace_root=root),
+            )
+            self.assertEqual(restored.tasks[comp.task_id].status, TaskStatus.pending)
+            self.assertEqual(restored.tasks[parent.task_id].status, TaskStatus.suspended)
+
 
 if __name__ == '__main__':
     unittest.main()

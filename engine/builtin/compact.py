@@ -155,6 +155,10 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     """Return a compactor dispatch action when the legacy threshold says so."""
     if ls.compacted or ls.compact_threshold <= 0:
         return None
+    step_count = int((getattr(ctx, "extra", None) or {}).get("step_count", 0) or 0)
+    if getattr(ls, "_cache_warm_fork", False) and getattr(ctx, "step", 0) == step_count:
+        # Preserve the inherited hot prefix on the initial step of a cache-warm fork worker.
+        return None
     compact_sid = _compact_target_session_id(ls)
     if is_compact_circuit_open(compact_sid):
         return None

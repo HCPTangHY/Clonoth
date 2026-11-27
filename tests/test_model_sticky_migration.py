@@ -357,7 +357,9 @@ class ProviderOptionTests(unittest.TestCase):
         self.assertEqual(gem_body['generationConfig']['topK'], 16)
         self.assertEqual(gem_body['generationConfig']['candidateCount'], 1)
         self.assertEqual(gem_body['labels'], {'env': 'prod', 'team': 'sec'})
-        self.assertEqual(gem_body['contents'][0]['parts'], [{'codeExecutionResult': {'outcome': 'OUTCOME_OK', 'output': 'hi'}}])
+        cer_out = gem_body['contents'][0]['parts'][0]['codeExecutionResult']['output']
+        self.assertIn('<user_message n="', cer_out)
+        self.assertIn('\nhi\n</user_message n="', cer_out)
         self.assertEqual(gem_body['contents'][-1], {'role': 'system', 'parts': [{'text': 'NODE_TAIL'}]})
         self.assertEqual(gem_opts, effective)
 

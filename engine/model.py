@@ -19,8 +19,6 @@ _PROVIDER_OPTION_KEYS = (
     "max_tokens",
     "max_completion_tokens",
     "thought_summary",
-    "wrap_user_cer",
-    "tail_system_prompt",
 )
 
 
